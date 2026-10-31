@@ -304,6 +304,7 @@ pub fn assert_metadata_read_plan(conn: &Connection, state: &FileState, oid: git2
             params![
                 oid.to_string(),
                 "java",
+                brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 unit.fq_name(),
                 code_unit_kind_to_i64(unit.kind()),
                 unit.short_name(),

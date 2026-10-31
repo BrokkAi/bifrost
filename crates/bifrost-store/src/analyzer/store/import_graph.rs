@@ -1914,7 +1914,11 @@ impl AnalyzerStore {
                 }
             }
         }
-        let exhausted = edges.len() > edge_limit;
+        let exhausted = !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            edges.len(),
+            edge_limit,
+        )
+        .allows(0);
         edges.truncate(edge_limit);
         transaction.commit()?;
         Ok(Some(WorkspaceImportGraphRead { edges, exhausted }))

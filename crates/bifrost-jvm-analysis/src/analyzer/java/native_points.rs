@@ -1333,7 +1333,7 @@ fn java_native_external_type(
     token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
     spelling: &str,
 ) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
-    let selected = java_selected_jdk_artifact(java, query);
+    let selected = java.selected_jdk_artifact_for_file(query.analyzer, query.file);
     match java.resolve_type_name_with_selected_jdk(
         token,
         query.analyzer.semantic_model_overlay(),
@@ -1356,7 +1356,7 @@ fn java_native_static_external_type(
     query: BoundedReceiverQuery<'_>,
     fqn: &str,
 ) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
-    let selected = java_selected_jdk_artifact(java, query);
+    let selected = java.selected_jdk_artifact_for_file(query.analyzer, query.file);
     let surface = match selected
         .as_ref()
         .and_then(|evidence| evidence.artifact_sha256.as_deref())
@@ -1393,7 +1393,7 @@ fn java_native_external_method_resolution(
     form: JavaNativeReceiverForm,
 ) -> Option<JavaNativeExternalMethodResolution> {
     let canonical = format!("{owner}.{member}");
-    let selected = java_selected_jdk_artifact(java, query);
+    let selected = java.selected_jdk_artifact_for_file(query.analyzer, query.file);
     let resolved: JvmExternalMember = java.resolve_member_name_with_selected_jdk(
         token,
         query.analyzer.semantic_model_overlay(),
@@ -1916,18 +1916,6 @@ fn publish_java_external_call_boundary(
             )),
         });
     }
-}
-
-fn java_selected_jdk_artifact(
-    java: &JavaAnalyzer,
-    query: BoundedReceiverQuery<'_>,
-) -> Option<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence> {
-    let home = java.selected_jdk_home_for_file(query.file).ok()?;
-    query
-        .analyzer
-        .active_semantic_model_snapshot()?
-        .jdk_artifact_for_home(home)
-        .cloned()
 }
 
 // The creation keyword has no producer reference. Navigate through the same

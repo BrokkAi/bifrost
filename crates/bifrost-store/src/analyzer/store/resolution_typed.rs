@@ -1911,8 +1911,20 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         session: Option<
             &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
         >,
-    ) -> StoreResult<Option<Option<String>>> {
+    ) -> StoreResult<
+        Option<Option<crate::analyzer::resolution::fact_source::ModelCallableResultDeclaration>>,
+    > {
         self.read_unindexed_model_callable_result(frontier, cancellation, session)
+    }
+
+    fn model_member_callable_result(
+        &self,
+        member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<Option<crate::analyzer::resolution::fact_source::ModelCallableResultDeclaration>>,
+    > {
+        self.read_model_member_callable_result(member, cancellation)
     }
 
     fn go_model_owner_declarations(

@@ -13,6 +13,7 @@
 //! free functions over [`JsTsMemoSource`] rather than duplicated methods.
 
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
+use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -305,24 +306,30 @@ pub(crate) fn module_import_skeleton(
 pub(crate) fn get_direct_ancestors(
     host: &dyn JsTsMemoSource,
     code_unit: &CodeUnit,
-) -> Vec<CodeUnit> {
-    (*memoized_value(
-        host,
-        &host.memo_caches().direct_ancestors,
-        code_unit,
-        weight_code_unit_vec_by_unit,
-        || compute_direct_ancestors(host, code_unit),
-    ))
-    .clone()
+) -> HierarchyAnswer {
+    HierarchyAnswer::complete(
+        (*memoized_value(
+            host,
+            &host.memo_caches().direct_ancestors,
+            code_unit,
+            weight_code_unit_vec_by_unit,
+            || compute_direct_ancestors(host, code_unit),
+        ))
+        .clone(),
+    )
 }
 
 pub(crate) fn get_direct_descendants(
     host: &dyn JsTsMemoSource,
     code_unit: &CodeUnit,
-) -> HashSet<CodeUnit> {
-    brokk_bifrost_analysis::analyzer::whole_workspace_descendants(|scope| {
-        get_direct_descendants_within(host, code_unit, scope)
-    })
+) -> HierarchyAnswer {
+    let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+    get_direct_descendants_within(
+        host,
+        code_unit,
+        &DescendantIndexScope::whole_workspace(&cancellation),
+    )
+    .expect("a descendant index that cannot stop always completes")
 }
 
 /// The memo exists because the per-class ancestor misses behind this build
@@ -332,12 +339,30 @@ pub(crate) fn get_direct_descendants_within(
     host: &dyn JsTsMemoSource,
     code_unit: &CodeUnit,
     scope: &DescendantIndexScope<'_>,
-) -> Option<HashSet<CodeUnit>> {
-    Some(
-        super::workspace_facts::descendants(host, scope)?
-            .index
-            .descendants(code_unit),
-    )
+) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
+    use brokk_bifrost_core::analyzer::capabilities::{Cancelled, HierarchyOpenReason};
+    let descendants = super::workspace_facts::descendants(host, scope);
+    if scope.cancellation().is_cancelled() {
+        host.analyzer().record_query_incomplete(
+            brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::Cancelled,
+        );
+        host.analyzer().record_unattributed_read();
+        return Err(Cancelled);
+    }
+    let Some(descendants) = descendants else {
+        brokk_bifrost_analysis::analyzer::record_descendant_query_failure(host.analyzer());
+        return Ok(HierarchyAnswer {
+            open: vec![HierarchyOpenReason::DescendantIndexUnavailable],
+            ..HierarchyAnswer::default()
+        });
+    };
+    let mut edges: Vec<_> = descendants
+        .index
+        .descendants(code_unit)
+        .into_iter()
+        .collect();
+    edges.sort();
+    Ok(HierarchyAnswer::complete(edges))
 }
 
 // --- Usage index -----------------------------------------------------------

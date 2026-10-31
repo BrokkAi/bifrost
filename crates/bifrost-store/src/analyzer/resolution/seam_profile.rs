@@ -123,7 +123,6 @@ pub(crate) fn record_hierarchy_order_step() {
     }
 }
 
-use super::fact_resolution::GO_MODEL_CALLABLE_RESULT_UNTYPED;
 use std::path::PathBuf;
 
 use std::sync::atomic::AtomicBool;
@@ -326,6 +325,7 @@ seam_methods! {
     GoMemberDeclarations => "go_member_declarations", "SelectedTypedFactSource";
     GoModelOwnerDeclarations => "go_model_owner_declarations", "SelectedTypedFactSource";
     UnindexedModelCallableResult => "unindexed_model_callable_result", "SelectedTypedFactSource";
+    ModelMemberCallableResult => "model_member_callable_result", "SelectedTypedFactSource";
     JavaInheritanceDeclarations => "java_inheritance_declarations", "SelectedTypedFactSource";
     RustSupertraitOwners => "rust_supertrait_owners", "SelectedTypedFactSource";
     RustExternalTypeIdentities => "rust_external_type_identities", "SelectedTypedFactSource";
@@ -409,52 +409,8 @@ impl MethodCounters {
     }
 }
 
-/// The remaining G1b gap allowed to retain the legacy Go receiver answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[doc(hidden)]
-pub enum GoModelLegacyReason {
-    CallableResultUntyped,
-}
-impl GoModelLegacyReason {
-    pub fn from_named_reason(reason: &str) -> Option<Self> {
-        match reason {
-            GO_MODEL_CALLABLE_RESULT_UNTYPED => Some(Self::CallableResultUntyped),
-            _ => None,
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::CallableResultUntyped => GO_MODEL_CALLABLE_RESULT_UNTYPED,
-        }
-    }
-}
-
-/// Count admissions where the remaining callable-result gap was present.
-#[doc(hidden)]
-pub fn record_go_model_legacy(
-    reason: GoModelLegacyReason,
-    site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
-) {
-    let Some(profile) = profile() else {
-        return;
-    };
-    let counter = match reason {
-        GoModelLegacyReason::CallableResultUntyped => &profile.go_reverse.legacy_model_result_sites,
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
-    profile.write_line(
-        &serde_json::json!({
-            "kind": "go_model_legacy_receiver", "reason": reason.label(),
-            "path": site.path, "start_byte": site.focus_start_byte, "end_byte": site.focus_end_byte,
-        })
-        .to_string(),
-    );
-    profile.dirty.store(true, Ordering::Relaxed);
-}
-
 #[derive(Default)]
 struct GoReverseCounters {
-    legacy_model_result_sites: AtomicU64,
     targets: AtomicU64,
     candidate_sites: AtomicU64,
     forward_candidate_sites: AtomicU64,
@@ -575,7 +531,7 @@ impl Drop for GoRenamePhaseScope {
 }
 
 impl GoReverseCounters {
-    fn snapshot(&self) -> [u64; 19] {
+    fn snapshot(&self) -> [u64; 18] {
         [
             self.targets.load(Ordering::Relaxed),
             self.candidate_sites.load(Ordering::Relaxed),
@@ -599,7 +555,6 @@ impl GoReverseCounters {
             self.candidate_not_name_reference.load(Ordering::Relaxed),
             self.member_access_sites.load(Ordering::Relaxed),
             self.member_access_unknown_sites.load(Ordering::Relaxed),
-            self.legacy_model_result_sites.load(Ordering::Relaxed),
         ]
     }
 }
@@ -674,7 +629,7 @@ impl Profile {
         })
     }
 
-    fn go_reverse_snapshot(&self) -> [u64; 19] {
+    fn go_reverse_snapshot(&self) -> [u64; 18] {
         self.go_reverse.snapshot()
     }
 
@@ -820,9 +775,6 @@ pub fn write_totals() {
         "candidate_admission": candidate_admission_object(profile.candidate_admission_snapshot()),
         "uptime_ms": profile.started.elapsed().as_millis(),
         "requests": profile.requests.load(Ordering::Relaxed),
-        "go_model_legacy_receiver_sites": {
-            (GO_MODEL_CALLABLE_RESULT_UNTYPED): profile.go_reverse_snapshot()[18],
-        },
         "methods": method_object(&counters, None),
     })
     .to_string();
@@ -1047,7 +999,7 @@ struct OpenRequest {
     sql_before: Option<(u64, u64, u128)>,
     root_source_before: [u64; 2],
     candidate_before: [[u64; 2]; 2],
-    go_reverse_before: [u64; 19],
+    go_reverse_before: [u64; 18],
     rename_phase_before: [[u64; 5]; 4],
     overlapped: bool,
 }
@@ -1105,11 +1057,8 @@ impl Drop for RequestScope {
             "bounded": profile.root_source_bounded.load(Ordering::Relaxed) - open.root_source_before[0],
             "universal": profile.root_source_universal.load(Ordering::Relaxed) - open.root_source_before[1],
         });
-        let go_reverse: [u64; 19] =
+        let go_reverse: [u64; 18] =
             std::array::from_fn(|index| go_reverse_now[index] - open.go_reverse_before[index]);
-        line["go_model_legacy_receiver_sites"] = serde_json::json!({
-            (GO_MODEL_CALLABLE_RESULT_UNTYPED): go_reverse[18],
-        });
         line["native_go_reverse"] = serde_json::json!({
             "targets": go_reverse[0],
             "candidate_sites": go_reverse[1],
@@ -2181,7 +2130,7 @@ where
         session: Option<
             &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
         >,
-    ) -> StoreResult<Option<Option<String>>> {
+    ) -> StoreResult<Option<Option<super::fact_source::ModelCallableResultDeclaration>>> {
         let _key_scope = brokk_bifrost_core::cache_db::sql_profile::key_scope(1);
         record_call(SeamMethod::UnindexedModelCallableResult, 1);
         let outcome = self
@@ -2189,6 +2138,22 @@ where
             .unindexed_model_callable_result(frontier, cancellation, session);
         if let Ok(Some(Some(_))) = &outcome {
             record_rows(SeamMethod::UnindexedModelCallableResult, 1);
+        }
+        outcome
+    }
+
+    fn model_member_callable_result(
+        &self,
+        member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<super::fact_source::ModelCallableResultDeclaration>>> {
+        let _key_scope = brokk_bifrost_core::cache_db::sql_profile::key_scope(1);
+        record_call(SeamMethod::ModelMemberCallableResult, 1);
+        let outcome = self
+            .inner
+            .model_member_callable_result(member, cancellation);
+        if let Ok(Some(Some(_))) = &outcome {
+            record_rows(SeamMethod::ModelMemberCallableResult, 1);
         }
         outcome
     }
@@ -2674,7 +2639,7 @@ mod tests {
         );
         // #5671: the root-inventory admission session is forwarded and counted too.
         assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 95, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 96, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -2703,7 +2668,7 @@ mod tests {
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
         // #5671: profile the root-inventory session accessor with the other methods.
-        assert_eq!(METHOD_COUNT, 130);
+        assert_eq!(METHOD_COUNT, 131);
     }
 
     #[cfg(test)]

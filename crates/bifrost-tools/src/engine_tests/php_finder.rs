@@ -155,3 +155,60 @@ mod php_extraction_tests {
         );
     }
 }
+
+#[test]
+fn php_incomplete_descendants_skip_alias_augmentation() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::languages::{CandidateCtx, LanguageSupport};
+    use brokk_bifrost_analysis::analyzer::{
+        AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete, capture_query_reads,
+    };
+    use brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason;
+    use brokk_bifrost_core::analyzer::{CodeUnitIndex, Language};
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_php::graph_support::php_import_alias_candidates;
+    use brokk_bifrost_php_analysis::PhpAnalyzer;
+    let project = InlineTestProject::with_language(Language::Php)
+        .file("Base.php", "<?php namespace Demo; class Base {}")
+        .file(
+            "Alias.php",
+            "<?php namespace Client; use Demo\\Base as Alias;",
+        )
+        .build();
+    let analyzer = PhpAnalyzer::new(project.project_dyn());
+    let owner = analyzer
+        .declarations(&project.file("Base.php"))
+        .into_iter()
+        .find(|unit| unit.identifier() == "Base")
+        .unwrap();
+    let (_, reads) = capture_query_reads(&analyzer, || {
+        let _query = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+            "refused alias hierarchy".into(),
+        ));
+        let failure =
+            php_import_alias_candidates(&owner, &analyzer, Some(&analyzer), &analyzer, &|| {
+                panic!("incomplete hierarchy must skip alias files")
+            })
+            .unwrap_err();
+        assert!(
+            failure
+                .open
+                .iter()
+                .any(|reason| matches!(reason, HierarchyOpenReason::DescendantIndexUnavailable)),
+            "{failure:?}"
+        );
+        let token = CancellationToken::default();
+        let augmentation = brokk_bifrost_php_analysis::analyzer::php::PhpSupport
+            .candidate_augmentation(&CandidateCtx {
+                analyzer: &analyzer,
+                target: &owner,
+                cancellation: &token,
+            });
+        assert!(
+            augmentation
+                .is_none_or(|value| value.supplemental.is_empty() && value.protected.is_empty())
+        );
+    });
+    assert!(reads.unattributed_reads() > 0, "{reads:?}");
+}

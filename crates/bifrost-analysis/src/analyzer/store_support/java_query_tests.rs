@@ -110,8 +110,13 @@ pub fn publish_shared_jvm_consumer<A: LanguageAdapter>(
     let (state, facts) = parsed_operation_state(root, path, source, adapter);
     let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
     let package = state.package_name.clone();
-    let prepared =
-        AnalyzerStore::prepare_parsed_blob(oid, storage, generation, adapter, state).unwrap();
+    let prepared = AnalyzerStore::prepare_parsed_blob(
+        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, storage),
+        generation,
+        adapter,
+        state,
+    )
+    .unwrap();
     let (outcomes, _) =
         store.persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
     assert!(

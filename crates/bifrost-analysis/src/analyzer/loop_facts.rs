@@ -233,9 +233,7 @@ pub fn nested_loop_facts(
     }
 
     let language = language_for_file(&prepared.file);
-    let regions = crate::analyzer::structural_spec_for(language)
-        .map(|spec| spec.conditional_regions(prepared.syntax.tree().root_node(), source))
-        .unwrap_or_default();
+    let regions = prepared.syntax.conditional_regions();
     nested_facts_from_observations(&observations, &environment, source, language, &regions)
 }
 
@@ -761,7 +759,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let regions = crate::analyzer::structural_spec_for(language)
-            .map(|spec| spec.conditional_regions(tree.root_node(), source))
+            .map(|spec| {
+                spec.preprocess(source)
+                    .map(|p| p.conditional_regions(source))
+                    .unwrap_or_default()
+            })
             .unwrap_or_default();
         let nested =
             nested_facts_from_observations(&observations, &environment, source, language, &regions);

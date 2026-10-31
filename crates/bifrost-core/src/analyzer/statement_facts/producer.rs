@@ -5,7 +5,7 @@ use super::{
     StatementFactKind, StatementFactRows, SwitchCaseFact, SwitchFact,
 };
 use crate::analyzer::structural::body_relations::{BodyState, BodyStateAnswer, body_state};
-use crate::analyzer::structural::conditional_regions::ConditionalRegions;
+use crate::analyzer::structural::conditional_regions::{Activation, ConditionalRegions};
 use crate::analyzer::structural::{
     kinds::{NormalizedKind, Role},
     spec::StructuralSpec,
@@ -22,6 +22,19 @@ pub trait StatementFactSyntax: Sync {
     /// A grammar hook need not supply every statement-fact kind.
     fn supports_kind(&self, _kind: StatementFactKind) -> bool {
         true
+    }
+    /// Whether entering this statement can reach the statement after its owner
+    /// without first entering another statement.
+    fn reaches_following_statement(&self, _node: Node<'_>, _source: &str) -> bool {
+        false
+    }
+    /// Post-test loops are excluded from indentation controls.
+    fn is_indentation_loop(&self, _node: Node<'_>) -> bool {
+        false
+    }
+    /// Wrappers whose embedded body completes directly into the following statement.
+    fn is_transparent_body_owner(&self, _node: Node<'_>) -> bool {
+        false
     }
     /// AST fields carrying each normalized role, including wrapper handling.
     fn roles<'tree>(&self, node: Node<'tree>, role: Role) -> Vec<Node<'tree>>;
@@ -183,26 +196,41 @@ impl<'a> StatementFacts<'a> {
         let Some(enum_node) = self.syntax.switch_enum(switch, source) else {
             return false;
         };
-        self.enum_missing_case(enum_node, cases, source)
+        self.enum_missing_case(enum_node, cases, source, source).0
     }
 
-    fn enum_missing_case(&self, enum_node: Node<'_>, cases: &[Node<'_>], source: &str) -> bool {
+    fn enum_missing_case(
+        &self,
+        enum_node: Node<'_>,
+        cases: &[Node<'_>],
+        switch_source: &str,
+        enum_source: &str,
+    ) -> (bool, bool) {
         if self.default_present(cases) {
-            return false;
+            return (false, true);
         }
-        let Some((_, enumerators)) = self.syntax.enumeration(enum_node, source) else {
-            return false;
+        let Some((_, enumerators)) = self.syntax.enumeration(enum_node, enum_source) else {
+            return (false, false);
         };
         let declared: HashSet<_> = enumerators.iter().map(|item| item.name.as_str()).collect();
-        let values: HashSet<_> = cases
+        let tests: Vec<_> = cases
             .iter()
             .flat_map(|case| self.syntax.roles(*case, Role::Test))
-            .filter_map(|value| self.syntax.name(value))
-            .filter_map(|name| name.utf8_text(source.as_bytes()).ok())
             .collect();
-        !values.is_empty()
+        let names = |value| {
+            self.syntax
+                .name(value)
+                .and_then(|name| name.utf8_text(switch_source.as_bytes()).ok())
+        };
+        let values: HashSet<_> = tests.iter().filter_map(|value| names(*value)).collect();
+        let missing = !values.is_empty()
             && values.iter().all(|name| declared.contains(name))
-            && declared.iter().any(|name| !values.contains(name))
+            && declared.iter().any(|name| !values.contains(name));
+        let proven = !tests.is_empty()
+            && tests
+                .iter()
+                .all(|value| names(*value).is_some_and(|name| declared.contains(name)));
+        (missing, proven)
     }
 
     /// Apply an analyzer-proven enum binding using the same completeness rule
@@ -211,11 +239,21 @@ impl<'a> StatementFacts<'a> {
         &self,
         switch: Node<'_>,
         enumeration: Node<'_>,
-        source: &str,
+        switch_source: &str,
+        enum_source: &str,
         rows: &mut StatementFactRows,
-    ) {
-        if !self.enum_missing_case(enumeration, &self.switch_cases(switch), source) {
-            return;
+    ) -> bool {
+        let (missing, proven) = self.enum_missing_case(
+            enumeration,
+            &self.switch_cases(switch),
+            switch_source,
+            enum_source,
+        );
+        if !proven {
+            return false;
+        }
+        if !missing {
+            return true;
         }
         let range = node_range(switch);
         let fact = rows
@@ -234,6 +272,7 @@ impl<'a> StatementFacts<'a> {
                 kind: StatementFactKind::MissingCaseInSwitch,
             });
         }
+        true
     }
 
     pub fn tightly_bounded(&self, loop_node: Node<'_>, source: &str) -> bool {
@@ -377,6 +416,126 @@ impl<'a> StatementFacts<'a> {
         .then(|| body_state(block, regions))
     }
 
+    fn nested_if<'tree>(
+        &self,
+        node: Node<'tree>,
+        regions: &ConditionalRegions,
+    ) -> Option<Node<'tree>> {
+        if !self.is(node, NormalizedKind::If) || self.role(node, Role::Alternative).is_some() {
+            return None;
+        }
+        let mut inner = self.role(node, Role::Consequence)?;
+        while self.is(inner, NormalizedKind::Block) {
+            let mut children = named_children_iter(inner).filter(|child| {
+                self.syntax.is_code_child(*child)
+                    && regions.activation_at(child.start_byte()) == Activation::CertainActive
+            });
+            let child = children.next()?;
+            if children.next().is_some() {
+                return None;
+            }
+            inner = child;
+        }
+        (self.is(inner, NormalizedKind::If) && self.role(inner, Role::Alternative).is_none())
+            .then_some(inner)
+    }
+
+    fn blocks<'tree>(&self, node: Node<'tree>) -> Vec<Node<'tree>> {
+        let mut blocks = Vec::new();
+        let mut current = node;
+        while let Some(parent) = current.parent() {
+            if self.is(parent, NormalizedKind::Block) {
+                blocks.push(parent);
+            }
+            if !self.is(current, NormalizedKind::If) {
+                break;
+            }
+            current = parent;
+        }
+        blocks
+    }
+
+    fn indentation_successor<'tree>(
+        &self,
+        node: Node<'tree>,
+        source: &str,
+        regions: &ConditionalRegions,
+    ) -> Option<Node<'tree>> {
+        let mut current = node;
+        loop {
+            let parent = current.parent()?;
+            // Embedded bodies have no statement siblings: an else arm or a
+            // post-test condition is not the successor of the completed body.
+            if self.is(parent, NormalizedKind::If)
+                && [Role::Consequence, Role::Alternative]
+                    .into_iter()
+                    .any(|role| self.role(parent, role) == Some(current))
+            {
+                current = parent;
+                continue;
+            }
+            if self.role(parent, Role::Body) == Some(current) {
+                if self.syntax.is_transparent_body_owner(parent)
+                    || (self.is(parent, NormalizedKind::Loop)
+                        && self.syntax.reaches_following_statement(parent, source))
+                {
+                    current = parent;
+                    continue;
+                }
+                return None;
+            }
+            if let Some(next) = current.next_named_sibling() {
+                if self.syntax.is_code_child(next)
+                    && regions.activation_at(next.start_byte()) != Activation::DecidedInactive
+                {
+                    return Some(next);
+                }
+                current = next;
+                continue;
+            }
+            if self.is(parent, NormalizedKind::Block) {
+                current = parent;
+            } else {
+                return None;
+            }
+        }
+    }
+
+    fn indentation_body<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        let body = if self.is(node, NormalizedKind::If) {
+            self.role(node, Role::Alternative)
+                .or_else(|| self.role(node, Role::Consequence))?
+        } else if self.syntax.is_indentation_loop(node) {
+            self.role(node, Role::Body)?
+        } else {
+            return None;
+        };
+        if self.is(body, NormalizedKind::Block)
+            || (self.is(node, NormalizedKind::If) && self.is(body, NormalizedKind::If))
+        {
+            return None;
+        }
+        Some(body)
+    }
+
+    fn indentation_matches(
+        &self,
+        node: Node<'_>,
+        body: Node<'_>,
+        next: Node<'_>,
+        source: &str,
+    ) -> bool {
+        let blocks = self.blocks(node);
+        if !self.blocks(next).iter().any(|block| blocks.contains(block)) {
+            return false;
+        }
+        let column = |node: Node<'_>| {
+            let start = node.start_byte() - node.start_position().column;
+            source[start..node.start_byte()].encode_utf16().count()
+        };
+        body.start_position().row == next.start_position().row || column(body) == column(next)
+    }
+
     pub fn classify(
         &self,
         node: Node<'_>,
@@ -475,6 +634,57 @@ impl<'a> StatementFacts<'a> {
             Some(NormalizedKind::Call) => check_owner(node, StatementFactKind::AllocaInLoop),
             _ => {}
         }
+        for kind in [
+            StatementFactKind::NestedIfStatements,
+            StatementFactKind::MisleadingIndentation,
+        ] {
+            if !self.syntax.supports_kind(kind) {
+                continue;
+            }
+            let (present, uncertain) = match kind {
+                StatementFactKind::NestedIfStatements if self.is(node, NormalizedKind::If) => {
+                    let inner = self.nested_if(node, regions);
+                    let uncertain = if let Some(body) =
+                        inner.and_then(|inner| self.role(inner, Role::Consequence))
+                    {
+                        regions.has_uncertain_text(node.start_byte()..body.start_byte())
+                            || regions.has_uncertain_text(body.end_byte()..node.end_byte())
+                    } else {
+                        regions.has_uncertain_text(node.byte_range())
+                    };
+                    (inner.is_some(), uncertain)
+                }
+                StatementFactKind::MisleadingIndentation => {
+                    if let Some(body) = self.indentation_body(node) {
+                        if let Some(next) = self.indentation_successor(node, source, regions) {
+                            let entry = if self.is(node, NormalizedKind::If) {
+                                body
+                            } else {
+                                node
+                            };
+                            (
+                                self.syntax.reaches_following_statement(entry, source)
+                                    // A post-test loop enters its body before it can exit.
+                                    && (!self.is(entry, NormalizedKind::Loop)
+                                        || self.syntax.is_indentation_loop(entry))
+                                    && self.indentation_matches(node, body, next, source),
+                                regions.has_uncertain_text(node.start_byte()..next.end_byte()),
+                            )
+                        } else {
+                            (false, regions.has_uncertain_text(node.byte_range()))
+                        }
+                    } else {
+                        (false, false)
+                    }
+                }
+                _ => (false, false),
+            };
+            if uncertain {
+                undecided.push(StatementFact { range, kind });
+            } else if present {
+                rows.statements.push(StatementFact { range, kind });
+            }
+        }
         let decided = |kind| !undecided.iter().any(|fact| fact.kind == kind);
         if let Some(kind) = self.classify(node, source, regions)
             && decided(kind)
@@ -515,6 +725,7 @@ impl<'a> StatementFacts<'a> {
                 default_present: self.default_present(&cases),
                 long_case,
                 missing_enum_case: missing_case,
+                enum_proof_undecided: false,
             });
         }
         if self.is(node, NormalizedKind::If)
@@ -585,15 +796,15 @@ pub fn capture_statement_facts(
     spec: &dyn StructuralSpec,
     root: Node<'_>,
     source: &str,
+    regions: &ConditionalRegions,
 ) -> StatementFactRows {
     let mut rows = StatementFactRows::default();
     let Some(producer) = StatementFacts::new(spec) else {
         return rows;
     };
-    let regions = spec.conditional_regions(root, source);
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        producer.capture(node, source, &regions, &mut rows);
+        producer.capture(node, source, regions, &mut rows);
         let children: Vec<_> = named_children_iter(node).collect();
         stack.extend(children.into_iter().rev());
     }

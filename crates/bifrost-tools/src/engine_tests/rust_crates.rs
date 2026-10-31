@@ -1885,13 +1885,14 @@ mod tests {
                 if !pin.params.is_empty() {
                     pin.params = match pin.name.as_str() {
                         "rust_crate_replaced_blob_id" => {
-                            vec![text(&root_oid), text("rust"), Integer(generation)]
+                            vec![text(&root_oid), text("rust"), Integer(generation), Blob(Vec::new())]
                         }
                         "rust_crate_reinsert_blob" => vec![
                             Integer(root_blob),
                             text(&root_oid),
                             text("rust"),
                             Integer(generation),
+                            Blob(Vec::new()),
                         ],
                         "rust_crate_module_walk" => {
                             vec![text("app/src/lib.rs"), text(&cfg), text("[]")]
@@ -4085,7 +4086,11 @@ mod outer {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         let actual_impl_rows = store
-            .rust_trait_impl_rows(placed_trait.0, placed_trait.1, &placed_trait.2)
+            .rust_trait_impl_rows(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(placed_trait.0, "rust"),
+                placed_trait.1,
+                &placed_trait.2,
+            )
             .unwrap()
             .into_iter()
             .map(|row| {
@@ -4118,7 +4123,11 @@ mod outer {
             "Rust summary endpoints preserve the legacy placed impl and subject rows"
         );
         let actual_trait_spellings = store
-            .rust_trait_impl_spellings(placed_trait.0, placed_trait.1, &placed_trait.2)
+            .rust_trait_impl_spellings(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(placed_trait.0, "rust"),
+                placed_trait.1,
+                &placed_trait.2,
+            )
             .unwrap();
         let expected_trait_spellings = conn
             .prepare(
@@ -4147,7 +4156,11 @@ mod outer {
             "Rust summary endpoints preserve the resolved source spellings"
         );
         let actual_types = store
-            .rust_types_implementing(placed_trait.0, placed_trait.1, &placed_trait.2)
+            .rust_types_implementing(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(placed_trait.0, "rust"),
+                placed_trait.1,
+                &placed_trait.2,
+            )
             .unwrap()
             .into_iter()
             .map(|(blob, declaration, path)| (blob.to_string(), declaration, path))
@@ -4179,7 +4192,11 @@ mod outer {
             "Rust summary endpoints preserve the types implementing a placed trait"
         );
         let actual_traits = store
-            .rust_traits_implemented_by(placed_foo.0, placed_foo.1, &placed_foo.2)
+            .rust_traits_implemented_by(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(placed_foo.0, "rust"),
+                placed_foo.1,
+                &placed_foo.2,
+            )
             .unwrap()
             .into_iter()
             .map(|(blob, declaration, path)| (blob.to_string(), declaration, path))
@@ -4238,7 +4255,10 @@ mod outer {
             .unwrap();
         let actual_impl_traits = store
             .rust_traits_of_impl(
-                Oid::from_str(&impl_oid).unwrap(),
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    Oid::from_str(&impl_oid).unwrap(),
+                    "rust",
+                ),
                 impl_declaration,
                 &impl_rel_path,
             )
@@ -4562,7 +4582,11 @@ mod outer {
             .unwrap();
         let trait_oid = Oid::from_str(&trait_oid).unwrap();
         let impl_rows = store
-            .rust_trait_impl_rows(trait_oid, trait_declaration, "app/src/tr.rs")
+            .rust_trait_impl_rows(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(trait_oid, "rust"),
+                trait_declaration,
+                "app/src/tr.rs",
+            )
             .unwrap();
         assert!(
             impl_rows
@@ -4571,7 +4595,11 @@ mod outer {
             "the live-summary reader observes the derived impl row: {impl_rows:?}"
         );
         let spellings = store
-            .rust_trait_impl_spellings(trait_oid, trait_declaration, "app/src/tr.rs")
+            .rust_trait_impl_spellings(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(trait_oid, "rust"),
+                trait_declaration,
+                "app/src/tr.rs",
+            )
             .unwrap();
         assert!(
             spellings.iter().any(|spelling| spelling == "Trait"),

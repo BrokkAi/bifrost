@@ -6283,6 +6283,9 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         )
         .with_declaration_only(true)
         .with_callable_arity(CallableArity::exact(0))
+        .with_overload_discriminator(Some(
+            brokk_bifrost_core::analyzer::tree_walk::overload_discriminator(Vec::<String>::new()),
+        ))
         .with_callable_linkage(cpp_callable_linkage(statement, self.source, ancestry))
         // The reparse proves class ownership, but carries no original class
         // access ladder. Preserve unknown access rather than guessing it.
@@ -6383,6 +6386,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         )
         .with_declaration_only(true)
         .with_callable_arity(CallableArity::exact(arity))
+        .with_overload_discriminator(Some(cpp_overload_discriminator(declarator, &synthetic)))
         .with_callable_linkage(cpp_callable_linkage(statement, self.source, ancestry))
         // The reparse proves class ownership, but carries no original
         // class access ladder. Preserve unknown access rather than
@@ -10123,7 +10127,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         let Some(arguments) = call.child_by_field_name("arguments") else {
             return;
         };
-        let Some((signature, parameter_labels)) =
+        let Some((signature, parameter_labels, discriminator)) =
             recovered_macro_qualified_function_parameters(arguments, self.source)
         else {
             return;
@@ -10160,6 +10164,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
             .with_declaration_only(true)
             .with_callable_arity(CallableArity::exact(arity))
+            .with_overload_discriminator(Some(discriminator))
             .with_callable_linkage(linkage)
             .with_callable_modifiers(
                 modifiers.is_static,
@@ -10183,7 +10188,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         let Some(arguments) = call.child_by_field_name("arguments") else {
             return;
         };
-        let Some((mut signature, parameter_labels)) =
+        let Some((mut signature, parameter_labels, discriminator)) =
             recovered_macro_qualified_function_parameters(arguments, self.source)
         else {
             return;
@@ -10209,6 +10214,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
             .with_declaration_only(false)
             .with_callable_arity(CallableArity::exact(arity))
+            .with_overload_discriminator(Some(discriminator))
             .with_callable_linkage(linkage)
             .with_callable_modifiers(
                 modifiers.is_static,
@@ -15417,6 +15423,10 @@ fn cpp_signature_metadata<'tree>(
         },
     };
     let enrich = |mut metadata: SignatureMetadata| {
+        metadata = metadata.with_overload_discriminator(Some(cpp_overload_discriminator(
+            function_declarator,
+            source,
+        )));
         // #3507: a qualified definition repeats none of the class body's
         // dispatch facts, so this row publishes none either.
         if let Some(dispatch) = dispatch {
@@ -19437,16 +19447,24 @@ fn recovered_macro_decorated_constructor_declarator<'tree>(
 fn recovered_macro_qualified_function_parameters(
     arguments: Node<'_>,
     source: &str,
-) -> Option<(String, Vec<String>)> {
+) -> Option<(String, Vec<String>, [u8; 32])> {
+    use brokk_bifrost_core::analyzer::tree_walk::{
+        overload_discriminator, overload_parameter_tokens,
+    };
     if arguments.kind() != "argument_list" {
         return None;
     }
     let mut cursor = arguments.walk();
     let named = arguments.named_children(&mut cursor).collect::<Vec<_>>();
     if named.is_empty() {
-        return Some(("()".to_string(), Vec::new()));
+        return Some((
+            "()".to_string(),
+            Vec::new(),
+            overload_discriminator(Vec::<String>::new()),
+        ));
     }
     let mut types = Vec::new();
+    let mut tokens = Vec::new();
     let mut labels = Vec::new();
     let mut index = 0;
     while index < named.len() {
@@ -19464,11 +19482,16 @@ fn recovered_macro_qualified_function_parameters(
             return None;
         }
         let parameter_name = parameter_name.named_child(0)?;
+        tokens.extend(overload_parameter_tokens(Some(parameter_type), source));
         types.push(normalize_cpp_whitespace(node_text(parameter_type, source)));
         labels.push(normalize_cpp_whitespace(node_text(parameter_name, source)));
         index += 2;
     }
-    Some((format!("({})", types.join(", ")), labels))
+    Some((
+        format!("({})", types.join(", ")),
+        labels,
+        overload_discriminator(tokens),
+    ))
 }
 
 /// Recognize the phantom field tree-sitter emits for a macro-qualified
@@ -22060,6 +22083,85 @@ fn cpp_is_indexable_item_kind(kind: &str) -> bool {
             | "preproc_ifdef"
             | "preproc_call"
     )
+}
+
+fn cpp_overload_discriminator(declarator: Node<'_>, source: &str) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::tree_walk::{
+        canonical_type_tokens, overload_discriminator, overload_parameter_tokens,
+    };
+    let mut tokens = Vec::new();
+    if let Some(parameters) = declarator.child_by_field_name("parameters") {
+        for slot in cpp_callable_parameter_slots(parameters, source) {
+            match slot {
+                CppParameterSlot::Declared { parameter, .. } => {
+                    tokens.extend(overload_parameter_tokens(
+                        parameter.child_by_field_name("type"),
+                        source,
+                    ));
+                    let mut cursor = parameter.walk();
+                    for qualifier in parameter.named_children(&mut cursor) {
+                        if qualifier.kind() == "type_qualifier" {
+                            tokens.extend(canonical_type_tokens(qualifier, source));
+                        }
+                    }
+                    // Pointer/reference/array/function declarators carry type
+                    // structure outside the base type. Exclude only the name.
+                    if let Some(declarator) = parameter.child_by_field_name("declarator") {
+                        let name = crate::structural::declarator_name_node(declarator);
+                        let mut pending = vec![(declarator, name)];
+                        while let Some((node, excluded_name)) = pending.pop() {
+                            if Some(node) == excluded_name {
+                                continue;
+                            }
+                            if node.child_count() == 0 {
+                                tokens.extend(canonical_type_tokens(node, source));
+                            } else {
+                                let parameter = matches!(
+                                    node.kind(),
+                                    "parameter_declaration" | "optional_parameter_declaration"
+                                );
+                                let excluded_name = if parameter {
+                                    node.child_by_field_name("declarator")
+                                        .and_then(crate::structural::declarator_name_node)
+                                } else {
+                                    excluded_name
+                                };
+                                let default = parameter
+                                    .then(|| node.child_by_field_name("default_value"))
+                                    .flatten();
+                                for index in (0..node.child_count()).rev() {
+                                    let child = node.child(index).expect("child");
+                                    if Some(child) != default {
+                                        pending.push((child, excluded_name));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                CppParameterSlot::Ellipsis => tokens.push("<ellipsis>".to_owned()),
+                CppParameterSlot::OptionalVoid => {}
+            }
+        }
+    }
+    let mut cursor = declarator.walk();
+    let mut qualifiers = declarator
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "type_qualifier")
+        .map(|node| canonical_type_tokens(node, source))
+        .collect::<Vec<_>>();
+    qualifiers.sort();
+    for qualifier in qualifiers {
+        tokens.push("<member-qualifier>".to_owned());
+        tokens.extend(qualifier);
+    }
+    for qualifier in declarator.named_children(&mut cursor) {
+        if qualifier.kind() == "ref_qualifier" {
+            tokens.push("<member-qualifier>".to_owned());
+            tokens.extend(canonical_type_tokens(qualifier, source));
+        }
+    }
+    overload_discriminator(tokens)
 }
 
 #[cfg(test)]

@@ -1,18 +1,5 @@
 use crate::analyzer::semantic_model::ArtifactExtraction;
-use crate::analyzer::semantic_model::conversion::authored_concurrency_effect_from_compiled;
 use std::sync::Arc;
-
-use crate::analyzer::semantic_model::conversion::authored_declared_effect_from_compiled;
-
-use crate::analyzer::semantic_model::conversion::authored_result_predicate_from_compiled;
-
-use crate::analyzer::semantic_model::conversion::authored_summary_effect_from_compiled;
-
-use crate::analyzer::semantic_model::conversion::authored_summary_input_from_compiled;
-
-use crate::analyzer::semantic_model::conversion::authored_summary_output_from_compiled;
-
-use crate::analyzer::semantic_model::conversion::authored_summary_value_transfer_from_compiled;
 
 use crate::analyzer::semantic_model::model::*;
 
@@ -394,152 +381,45 @@ pub fn compiled_flow_claims_agree(
         && left.returned_callables == right.returned_callables
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledClassDecoratorIdentity {
-    pub direct: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub factory_keywords: Option<Vec<CompiledClassDecoratorKeyword>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledClassDecoratorKeyword {
-    pub name: String,
-    pub allowed_values: Vec<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledConditionalResultRefinement {
-    pub result_ordinal: u32,
-    pub outcome: bool,
-    pub parameter_ordinal: u32,
-    pub predicate: CompiledResultPredicate,
-    pub proof_effect: CompiledPredicateProofEffect,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledConditionalIndirectWrite {
-    pub result_ordinal: u32,
-    pub outcome: bool,
-    pub parameter_ordinal: u32,
-    pub target: CompiledIndirectWriteTarget,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledIndirectWriteTarget {
-    Pointee,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledPredicateProofEffect {
-    Establishes,
-    DoesNotEstablish,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledNormalReturnRefinement {
-    pub parameter_ordinal: u32,
-    pub predicate: CompiledResultPredicate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledNormalReturnTypeRefinement {
-    pub parameter_ordinal: u32,
-    pub class_parameter_ordinal: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_receiver_members: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledResultContract {
-    pub result_ordinal: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub condition_result_ordinal: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub predicate: Option<CompiledResultPredicate>,
-    /// Reviewed predicate over the protected result. It is an independent
-    /// correlation for a paired contract and the validity predicate itself
-    /// for a direct contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_success_predicate: Option<CompiledResultPredicate>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub member_contracts: Vec<CompiledResultMemberContract>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledResultUseObligation {
-    pub result_ordinal: u32,
-    pub kind: ResultUseObligationKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure_predicate: Option<CompiledResultPredicate>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledResultMemberContract {
-    pub member: String,
-    pub parameter_count: u32,
-    pub completeness: Completeness,
-    /// Compiled mirror of the operation-precondition review state. `None` and
-    /// `Some([])` are intentionally distinct semantic claims.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preconditions: Option<Vec<CompiledOperationPrecondition>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub declared_effects: Vec<CompiledDeclaredEffect>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledOperationPrecondition {
-    pub input: CompiledSummaryInput,
-    pub predicate: CompiledResultPredicate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledResultPredicate {
-    Null,
-    NonNull,
-    True,
-    False,
-    Eof,
-    #[serde(rename = "nonzero")]
-    NonZero,
-    MinusOne,
-}
-
-/// Compiled mirror of `AuthoredDeclaredEffect` (#2437).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledDeclaredEffect {
-    pub id: String,
-    pub timing: CompiledDeclaredEffectTiming,
-    pub certainty: CompiledDeclaredEffectCertainty,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledDeclaredEffectTiming {
-    Immediate,
-    Deferred,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledDeclaredEffectCertainty {
-    Definite,
-    Possible,
-}
+pub use crate::analyzer::semantic_model::model::{
+    AuthoredAtomicOperation as CompiledAtomicOperation,
+    AuthoredClassDecoratorIdentity as CompiledClassDecoratorIdentity,
+    AuthoredClassDecoratorKeyword as CompiledClassDecoratorKeyword,
+    AuthoredConcurrencyEffect as CompiledConcurrencyEffect,
+    AuthoredCondWaiters as CompiledCondWaiters,
+    AuthoredConditionalIndirectWrite as CompiledConditionalIndirectWrite,
+    AuthoredConditionalResultRefinement as CompiledConditionalResultRefinement,
+    AuthoredDeclaredEffect as CompiledDeclaredEffect,
+    AuthoredIndirectWriteTarget as CompiledIndirectWriteTarget,
+    AuthoredLockCondition as CompiledLockCondition, AuthoredLockMode as CompiledLockMode,
+    AuthoredNormalReturnRefinement as CompiledNormalReturnRefinement,
+    AuthoredNormalReturnTypeRefinement as CompiledNormalReturnTypeRefinement,
+    AuthoredOperationPrecondition as CompiledOperationPrecondition,
+    AuthoredPredicateProofEffect as CompiledPredicateProofEffect,
+    AuthoredResultContract as CompiledResultContract,
+    AuthoredResultMemberContract as CompiledResultMemberContract,
+    AuthoredResultPredicate as CompiledResultPredicate,
+    AuthoredResultUseObligation as CompiledResultUseObligation,
+    AuthoredReturnedCallable as CompiledReturnedCallable,
+    AuthoredSummaryEffect as CompiledSummaryEffect,
+    AuthoredSummaryExitKind as CompiledSummaryExitKind,
+    AuthoredSummaryInput as CompiledSummaryInput,
+    AuthoredSummaryLocation as CompiledSummaryLocation,
+    AuthoredSummaryLocationKind as CompiledSummaryLocationKind,
+    AuthoredSummaryOutput as CompiledSummaryOutput, AuthoredSummaryPort as CompiledSummaryPort,
+    AuthoredSummaryTransfer as CompiledSummaryTransfer,
+    AuthoredSyncMapOperation as CompiledSyncMapOperation,
+    AuthoredTaskSpawnCondition as CompiledTaskSpawnCondition,
+    DeclaredEffectCertainty as CompiledDeclaredEffectCertainty,
+    DeclaredEffectTiming as CompiledDeclaredEffectTiming,
+    SummaryMoveInvalidation as CompiledSummaryMoveInvalidation,
+    SummaryValuePreservation as CompiledSummaryValuePreservation,
+    SummaryValueTransfer as CompiledSummaryValueTransfer,
+    SummaryValueTransferKind as CompiledSummaryValueTransferKind,
+    SummaryValueTransferLimitation as CompiledSummaryValueTransferLimitation,
+    SummaryValueTransferLimitationKind as CompiledSummaryValueTransferLimitationKind,
+    SummaryValueTransferOperation as CompiledSummaryValueTransferOperation,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -586,375 +466,6 @@ impl CompiledProcedureTarget {
     pub const fn accepts_parameter_count(&self, actual: u32) -> bool {
         self.callable_arity().accepts(actual as usize)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledSummaryLocation {
-    pub id: String,
-    pub location_kind: CompiledSummaryLocationKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledSummaryLocationKind {
-    Capture,
-    Heap,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompiledSummaryInput {
-    Receiver {},
-    Parameter { ordinal: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompiledSummaryOutput {
-    NormalReturn {},
-    IndexedNormalReturn { ordinal: u32 },
-    Receiver {},
-    Capture { location: String },
-    Heap { location: String },
-    ExceptionalReturn {},
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompiledSummaryPort {
-    Input { input: CompiledSummaryInput },
-    Output { output: CompiledSummaryOutput },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledSummaryTransfer {
-    pub input: CompiledSummaryInput,
-    pub exit_kind: CompiledSummaryExitKind,
-    pub output: CompiledSummaryOutput,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_transfer: Option<CompiledSummaryValueTransfer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledSummaryValueTransfer {
-    pub kind: CompiledSummaryValueTransferKind,
-    pub operation: CompiledSummaryValueTransferOperation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompiledSummaryValueTransferKind {
-    Copy {},
-    AggregateCopy {},
-    Move {
-        invalidation: CompiledSummaryMoveInvalidation,
-    },
-    Conversion {
-        preservation: CompiledSummaryValuePreservation,
-    },
-    Boxing {},
-    Unboxing {},
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledSummaryMoveInvalidation {
-    Invalidated,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledSummaryValuePreservation {
-    Identity,
-    Preserving,
-    Changing,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompiledSummaryValueTransferOperation {
-    None {},
-    Implicit {
-        member: String,
-    },
-    Unknown {
-        limitation: CompiledSummaryValueTransferLimitation,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledSummaryValueTransferLimitation {
-    pub kind: CompiledSummaryValueTransferLimitationKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledSummaryValueTransferLimitationKind {
-    BudgetExhausted,
-    Cancelled,
-    Unsupported,
-    UnresolvedIdentity,
-    AmbiguousIdentity,
-    IncompleteInput,
-    Other,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledSummaryExitKind {
-    Normal,
-    Exceptional,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompiledSummaryEffect {
-    Allocation {
-        event: String,
-        output: CompiledSummaryOutput,
-    },
-    Call {
-        event: String,
-        callee: String,
-    },
-    Escape {
-        event: String,
-        input: CompiledSummaryInput,
-    },
-    UnknownCall {
-        event: String,
-        input: CompiledSummaryInput,
-    },
-    UnknownCallBoundary {
-        event: String,
-    },
-    AmbiguousCall {
-        event: String,
-        input: CompiledSummaryInput,
-        candidates: Vec<String>,
-    },
-    Sanitize {
-        input: CompiledSummaryInput,
-        output: CompiledSummaryOutput,
-        removes: Vec<String>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompiledConcurrencyEffect {
-    Unsupported {
-        protocol: String,
-    },
-    TaskSpawn {
-        callable: CompiledSummaryInput,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        group: Option<CompiledSummaryInput>,
-        /// The spawn condition this modeled call establishes itself. `None` is
-        /// an unconditional spawn; `call_result_true` is the
-        /// `errgroup.Group.TryGo` contract, where the callable starts exactly
-        /// when the call's boolean result reports that it did.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        condition: Option<CompiledTaskSpawnCondition>,
-        /// The timer object this spawn call returns, when the spawned
-        /// callback belongs to a cancellable timer (`time.AfterFunc`). A
-        /// later `timer_stop` or `timer_reset` on the same object binds
-        /// against this identity.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timer: Option<CompiledSummaryOutput>,
-    },
-    TaskJoin {
-        group: CompiledSummaryInput,
-    },
-    /// One `sync.Once.Do` call: `callable` runs at most once per `once`
-    /// object, and the completion of that single execution synchronizes
-    /// before the return of every `Do` on the same object.
-    ///
-    /// The contract is the `sync.Once` package documentation together with
-    /// the Go memory model's "the return of a call of `f` from `once.Do(f)`
-    /// is synchronized before the return of any call of `once.Do(f)`". The
-    /// package documentation's panic clause is part of the same completion:
-    /// a panicking `f` is still considered to have returned, so later calls
-    /// of `Do` return without calling `f`. This is not a mutex and not an
-    /// unconditional spawn: the callable is conditional on the object's
-    /// completion state, and the effect itself carries the completion
-    /// barrier that publishes it.
-    OnceDo {
-        once: CompiledSummaryInput,
-        callable: CompiledSummaryInput,
-    },
-    LockAcquire {
-        lock: CompiledSummaryInput,
-        mode: CompiledLockMode,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        condition: Option<CompiledLockCondition>,
-    },
-    LockRelease {
-        lock: CompiledSummaryInput,
-        mode: CompiledLockMode,
-    },
-    WaitGroupAdd {
-        group: CompiledSummaryInput,
-        delta: CompiledSummaryInput,
-    },
-    WaitGroupDone {
-        group: CompiledSummaryInput,
-    },
-    WaitGroupWait {
-        group: CompiledSummaryInput,
-    },
-    Atomic {
-        location: CompiledSummaryInput,
-        operation: CompiledAtomicOperation,
-    },
-    /// Associate the condition variable named by `condition` with `lock`.
-    ///
-    /// `condition` is the constructed object, so the association is published
-    /// to the *result* of the construction call and consumed by every later
-    /// `CondWait`/`CondNotify` on the same object.
-    CondBind {
-        condition: CompiledSummaryOutput,
-        lock: CompiledSummaryInput,
-    },
-    /// Release the associated locker, suspend the task, and re-acquire it.
-    CondWait {
-        condition: CompiledSummaryInput,
-    },
-    /// Wake one or every suspended waiter without claiming one exists.
-    CondNotify {
-        condition: CompiledSummaryInput,
-        waiters: CompiledCondWaiters,
-    },
-    /// One `sync.Map` entry operation on the (map, key) entry named by the
-    /// exact receiver and key inputs. The compiled form carries the reviewed
-    /// classification; the solver binds observation and guard structure.
-    SyncMap {
-        map: CompiledSummaryInput,
-        /// The key input naming the entry; `Clear` names none.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        key: Option<CompiledSummaryInput>,
-        operation: CompiledSyncMapOperation,
-    },
-    /// One `(*time.Timer).Stop` call: when the call's boolean result is
-    /// established true, the `time.AfterFunc` callback for `timer` did not
-    /// and will not run. The solver binds the guard structure.
-    TimerStop {
-        timer: CompiledSummaryInput,
-    },
-    /// One `(*time.Timer).Reset` call, which re-arms `timer` and voids the
-    /// `timer_stop` cancellation downstream of it.
-    TimerReset {
-        timer: CompiledSummaryInput,
-    },
-    ChannelClose {
-        channel: CompiledSummaryPort,
-        fresh: bool,
-    },
-    ChannelCloseAsync {
-        channel: CompiledSummaryPort,
-        fresh: bool,
-    },
-    ChannelClosePropagate {
-        source: CompiledSummaryPort,
-        target: CompiledSummaryPort,
-        target_fresh: bool,
-    },
-    /// One `testing.T.Run` call: `callable` is the subtest callback and
-    /// `group` is the parent test node (issue #3383). The solver spawns the
-    /// callback on every path and joins it at the call exactly when no
-    /// execution of the callback calls `Parallel` on its own parameter.
-    SubtestRun {
-        callable: CompiledSummaryInput,
-        group: CompiledSummaryInput,
-    },
-    /// One `testing.T.Parallel` call marking `receiver` (issue #3383). The
-    /// solver consumes it as classification evidence for the enclosing `Run`
-    /// callback; it creates no task and orders nothing by itself.
-    SubtestParallel {
-        receiver: CompiledSummaryInput,
-    },
-    /// One `testing.T.Cleanup` call: `callable` is the registered callback
-    /// and `group` is the test node whose completion runs it (issue #3383).
-    /// The solver spawns the callback as a deferred task and joins the
-    /// receiver's subtest subtree before its body.
-    SubtestCleanup {
-        callable: CompiledSummaryInput,
-        group: CompiledSummaryInput,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledReturnedCallable {
-    pub result_ordinal: u32,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub at_most_once: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub concurrency_effects: Vec<CompiledConcurrencyEffect>,
-}
-
-/// The documented entry-level classification of one `sync.Map` operation
-/// (issue #3370). See the authored form for the per-variant contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledSyncMapOperation {
-    Store,
-    Delete,
-    Clear,
-    Load,
-    Range,
-    LoadOrStore,
-    LoadAndDelete,
-    Swap,
-    CompareAndSwap,
-    CompareAndDelete,
-}
-
-/// How many suspended waiters one notification can resume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledCondWaiters {
-    One,
-    All,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledLockMode {
-    Shared,
-    Exclusive,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledLockCondition {
-    CallResultTrue,
-}
-
-/// The spawn condition a compiled summary call establishes by its own boolean
-/// result (issue #3371). `CallResultTrue` is `errgroup.Group.TryGo`: the
-/// callable starts in a new goroutine exactly when the call reports that it
-/// did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledTaskSpawnCondition {
-    CallResultTrue,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompiledAtomicOperation {
-    Load,
-    Store,
-    ReadModifyWrite,
 }
 
 pub type CompiledDeclarationFactSlices<'a> = (
@@ -2306,184 +1817,21 @@ pub fn authored_procedure_summary_from_compiled(
         covers_overrides: summary.covers_overrides,
         normal_continuation_absent: summary.normal_continuation_absent,
         normal_result_count: summary.normal_result_count,
-        locations: summary
-            .locations
-            .iter()
-            .map(|location| AuthoredSummaryLocation {
-                id: location.id.clone(),
-                location_kind: match location.location_kind {
-                    CompiledSummaryLocationKind::Capture => AuthoredSummaryLocationKind::Capture,
-                    CompiledSummaryLocationKind::Heap => AuthoredSummaryLocationKind::Heap,
-                },
-            })
-            .collect(),
-        transfers: summary
-            .transfers
-            .iter()
-            .map(|transfer| AuthoredSummaryTransfer {
-                input: authored_summary_input_from_compiled(&transfer.input),
-                exit_kind: match transfer.exit_kind {
-                    CompiledSummaryExitKind::Normal => AuthoredSummaryExitKind::Normal,
-                    CompiledSummaryExitKind::Exceptional => AuthoredSummaryExitKind::Exceptional,
-                },
-                output: authored_summary_output_from_compiled(&transfer.output),
-                value_transfer: transfer
-                    .value_transfer
-                    .as_ref()
-                    .map(authored_summary_value_transfer_from_compiled),
-            })
-            .collect(),
+        locations: summary.locations.clone(),
+        transfers: summary.transfers.clone(),
         transfer_partitions: summary.transfer_partitions.clone(),
-        effects: summary
-            .effects
-            .iter()
-            .map(authored_summary_effect_from_compiled)
-            .collect(),
-        concurrency_effects: summary
-            .concurrency_effects
-            .iter()
-            .map(authored_concurrency_effect_from_compiled)
-            .collect(),
-        returned_callables: summary
-            .returned_callables
-            .iter()
-            .map(|callable| AuthoredReturnedCallable {
-                result_ordinal: callable.result_ordinal,
-                at_most_once: callable.at_most_once,
-                concurrency_effects: callable
-                    .concurrency_effects
-                    .iter()
-                    .map(authored_concurrency_effect_from_compiled)
-                    .collect(),
-            })
-            .collect(),
-        declared_effects: summary
-            .declared_effects
-            .iter()
-            .map(authored_declared_effect_from_compiled)
-            .collect(),
-        preconditions: summary.preconditions.as_ref().map(|preconditions| {
-            preconditions
-                .iter()
-                .map(|precondition| AuthoredOperationPrecondition {
-                    input: authored_summary_input_from_compiled(&precondition.input),
-                    predicate: authored_result_predicate_from_compiled(precondition.predicate),
-                })
-                .collect()
-        }),
-        result_contracts: summary
-            .result_contracts
-            .iter()
-            .map(|contract| AuthoredResultContract {
-                result_ordinal: contract.result_ordinal,
-                condition_result_ordinal: contract.condition_result_ordinal,
-                predicate: contract
-                    .predicate
-                    .map(authored_result_predicate_from_compiled),
-                result_success_predicate: contract
-                    .result_success_predicate
-                    .map(authored_result_predicate_from_compiled),
-                member_contracts: contract
-                    .member_contracts
-                    .iter()
-                    .map(|member| AuthoredResultMemberContract {
-                        member: member.member.clone(),
-                        parameter_count: member.parameter_count,
-                        completeness: member.completeness,
-                        preconditions: member.preconditions.as_ref().map(|preconditions| {
-                            preconditions
-                                .iter()
-                                .map(|precondition| AuthoredOperationPrecondition {
-                                    input: authored_summary_input_from_compiled(
-                                        &precondition.input,
-                                    ),
-                                    predicate: authored_result_predicate_from_compiled(
-                                        precondition.predicate,
-                                    ),
-                                })
-                                .collect()
-                        }),
-                        declared_effects: member
-                            .declared_effects
-                            .iter()
-                            .map(authored_declared_effect_from_compiled)
-                            .collect(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        result_use_obligations: summary
-            .result_use_obligations
-            .iter()
-            .map(|obligation| AuthoredResultUseObligation {
-                result_ordinal: obligation.result_ordinal,
-                kind: obligation.kind,
-                failure_predicate: obligation
-                    .failure_predicate
-                    .map(authored_result_predicate_from_compiled),
-            })
-            .collect(),
-        conditional_result_refinements: summary
-            .conditional_result_refinements
-            .iter()
-            .map(|refinement| AuthoredConditionalResultRefinement {
-                result_ordinal: refinement.result_ordinal,
-                outcome: refinement.outcome,
-                parameter_ordinal: refinement.parameter_ordinal,
-                predicate: authored_result_predicate_from_compiled(refinement.predicate),
-                proof_effect: match refinement.proof_effect {
-                    CompiledPredicateProofEffect::Establishes => {
-                        AuthoredPredicateProofEffect::Establishes
-                    }
-                    CompiledPredicateProofEffect::DoesNotEstablish => {
-                        AuthoredPredicateProofEffect::DoesNotEstablish
-                    }
-                },
-            })
-            .collect(),
-        conditional_indirect_writes: summary
-            .conditional_indirect_writes
-            .iter()
-            .map(|write| AuthoredConditionalIndirectWrite {
-                result_ordinal: write.result_ordinal,
-                outcome: write.outcome,
-                parameter_ordinal: write.parameter_ordinal,
-                target: match write.target {
-                    CompiledIndirectWriteTarget::Pointee => AuthoredIndirectWriteTarget::Pointee,
-                },
-            })
-            .collect(),
-        normal_return_refinements: summary
-            .normal_return_refinements
-            .iter()
-            .map(|refinement| AuthoredNormalReturnRefinement {
-                parameter_ordinal: refinement.parameter_ordinal,
-                predicate: authored_result_predicate_from_compiled(refinement.predicate),
-            })
-            .collect(),
-        normal_return_type_refinements: summary
-            .normal_return_type_refinements
-            .iter()
-            .map(|refinement| AuthoredNormalReturnTypeRefinement {
-                parameter_ordinal: refinement.parameter_ordinal,
-                class_parameter_ordinal: refinement.class_parameter_ordinal,
-                required_receiver_members: refinement.required_receiver_members.clone(),
-            })
-            .collect(),
-        class_decorator_identity: summary.class_decorator_identity.as_ref().map(|identity| {
-            AuthoredClassDecoratorIdentity {
-                direct: identity.direct,
-                factory_keywords: identity.factory_keywords.as_ref().map(|keywords| {
-                    keywords
-                        .iter()
-                        .map(|keyword| AuthoredClassDecoratorKeyword {
-                            name: keyword.name.clone(),
-                            allowed_values: keyword.allowed_values.clone(),
-                        })
-                        .collect()
-                }),
-            }
-        }),
+        effects: summary.effects.clone(),
+        concurrency_effects: summary.concurrency_effects.clone(),
+        returned_callables: summary.returned_callables.clone(),
+        declared_effects: summary.declared_effects.clone(),
+        preconditions: summary.preconditions.clone(),
+        result_contracts: summary.result_contracts.clone(),
+        result_use_obligations: summary.result_use_obligations.clone(),
+        conditional_result_refinements: summary.conditional_result_refinements.clone(),
+        conditional_indirect_writes: summary.conditional_indirect_writes.clone(),
+        normal_return_refinements: summary.normal_return_refinements.clone(),
+        normal_return_type_refinements: summary.normal_return_type_refinements.clone(),
+        class_decorator_identity: summary.class_decorator_identity.clone(),
     }
 }
 

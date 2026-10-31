@@ -30,7 +30,7 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
          AND (name LIKE 'resolution_%' OR name LIKE 'source_%'
               OR name LIKE 'python_binding_%' OR name LIKE 'python_member_%'
               OR name LIKE 'go_context_%' OR name LIKE 'go_package_%'
-              OR name = 'semantic_ir_call_sites') AND ?1 = ''",
+              OR name = 'semantic_ir_call_sites' OR name = 'csharp_compilation_symbols') AND ?1 = ''",
         "",
     );
     assert_eq!(
@@ -48,6 +48,36 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
         ],
         "both receiver place variants must have an enforced parent relation",
     );
+    assert!(
+        tables
+            .iter()
+            .any(|table| table == "csharp_compilation_symbols")
+    );
+    assert_eq!(
+        string_column(
+            &conn,
+            "SELECT \"from\" || ':' || \"table\" || '.' || \"to\" || ':' || on_delete FROM pragma_foreign_key_list(?1)",
+            "csharp_compilation_symbols"
+        ),
+        ["compilation_id:csharp_compilations.compilation_id:CASCADE"]
+    );
+    let compilation_columns = string_column(
+        &conn,
+        "SELECT name FROM pragma_table_info(?1)",
+        "csharp_compilations",
+    );
+    for column in [
+        "configuration",
+        "target_framework",
+        "symbols_closed",
+        "open_reason",
+        "symbol_set_digest",
+    ] {
+        assert!(
+            compilation_columns.iter().any(|name| name == column),
+            "{compilation_columns:?}"
+        );
+    }
     for state in PlannerStatisticsState::BOTH {
         state.install(&conn);
         for table in &tables {
@@ -100,7 +130,9 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
                 foreign_keys.entry(id).or_default().push(column);
             }
             for (id, columns) in &foreign_keys {
-                if columns.len() < 2 || !columns.iter().any(|column| column == "blob_id") {
+                if table != "csharp_compilation_symbols"
+                    && (columns.len() < 2 || !columns.iter().any(|column| column == "blob_id"))
+                {
                     continue;
                 }
                 if keys
@@ -114,13 +146,22 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
                 // is linear, not a repeated semantic-parent scan. Still
                 // require the child blob lookup below; never exempt a
                 // composite semantic parent whose blob can have many rows.
-                let (parent, target) = &blob_parents[id];
+                let (parent, target) = if table == "csharp_compilation_symbols" {
+                    &(
+                        "csharp_compilations".to_owned(),
+                        "compilation_id".to_owned(),
+                    )
+                } else {
+                    &blob_parents[id]
+                };
                 let parent_key = string_column(
                     &conn,
                     "SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk",
                     parent,
                 );
-                let parent_bounded = parent_key.len() == 1 && parent_key[0] == *target;
+                let parent_bounded = table != "csharp_compilation_symbols"
+                    && parent_key.len() == 1
+                    && parent_key[0] == *target;
                 let predicates = columns
                     .iter()
                     .enumerate()

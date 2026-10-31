@@ -16,7 +16,6 @@ mod encode;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use git2::Oid;
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, ToSql, TransactionBehavior, params};
 
@@ -339,7 +338,7 @@ pub(super) const SEMANTIC_IR_PUBLICATION_SQL: &str = "SELECT publications.blob_i
   FROM blobs
   JOIN semantic_ir_publications AS publications ON publications.blob_id = blobs.id
   JOIN semantic_ir_producer_epochs AS epochs ON epochs.lang = publications.lang
- WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2
+ WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2 AND blobs.parse_variant = ?3
    AND publications.publication_state = 'complete'
    AND publications.producer_epoch = epochs.producer_epoch";
 
@@ -386,13 +385,12 @@ impl AnalyzerStore {
     #[doc(hidden)]
     pub fn semantic_ir_publication(
         &self,
-        oid: Oid,
-        lang: &str,
+        key: &super::BlobKey,
     ) -> Result<Option<SemanticIrPublication>> {
         let conn = self.read_conn()?;
         let mut statement = conn.prepare_cached(SEMANTIC_IR_PUBLICATION_SQL)?;
         let publication = statement
-            .query_row(params![oid.to_string(), lang], |row| {
+            .query_row(params![key.oid.to_string(), key.lang, key.variant], |row| {
                 let blob_id: i64 = row.get(0)?;
                 let digest: Vec<u8> = row.get(1)?;
                 let source_bytes: i64 = row.get(2)?;

@@ -121,6 +121,8 @@ use crate::analyzer::resolution::SeamProfiled;
 
 mod context_preparation;
 #[cfg(any(test, feature = "test-support"))]
+pub mod csharp_demand;
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod csharp_imports;
 #[cfg(any(test, feature = "test-support"))]
@@ -1098,6 +1100,29 @@ impl NativeDemandInstaller {
     }
 }
 
+/// Dispatch from the locator even when its semantic has no mount ordinal.
+fn native_demand_installer_for_reference(
+    locator: &SelectedSemanticLocator,
+    reference: SemanticId,
+) -> std::result::Result<Option<(Language, NativeDemandInstaller)>, SelectedResolutionUnavailable> {
+    let installer = brokk_bifrost_core::analyzer::model::LanguageDialect::from_config_label(
+        locator.storage_language(),
+    )
+    .and_then(|dialect| {
+        let language = dialect.language();
+        super::store_language_support(language)
+            .and_then(|support| support.demand_installer())
+            .map(|installer| (language, installer))
+    });
+    if installer.is_some() && reference.ordinal().is_none() {
+        return Err(SelectedResolutionUnavailable::NativeDemandUnavailable {
+            storage_language: locator.storage_language().to_owned(),
+            persisted_relative_path: locator.relative_path().to_owned(),
+        });
+    }
+    Ok(installer)
+}
+
 struct RetainedNativeCallerDemand {
     language: Language,
     caller: PathBuf,
@@ -1698,6 +1723,29 @@ enum SelectedContentValidationOutcome {
 }
 
 #[doc(hidden)]
+type ImportReferenceReadMemo = ExactReadMemo<(i64, git2::Oid, Vec<u8>), Vec<u32>>;
+
+/// Pure persisted reads shared only within a selected point batch.
+/// Blob ids are valid keys only while selection is fixed: the batch refuses
+/// fills after a snapshot change. Blob ids are reused across selections; do
+/// not lift this owner above a batch without re-keying by content OID.
+/// 8192 entries per memo gives headroom over the measured 1300 per file.
+#[derive(Default)]
+pub struct SelectedPointReadMemos {
+    pub(crate) reference_evidence:
+        std::rc::Rc<RefCell<super::resolution_lexical::ReferenceLocalPathReadMemo>>,
+    pub(crate) import_references: RefCell<ImportReferenceReadMemo>,
+}
+
+impl SelectedPointReadMemos {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn read_counts_for_test(&self) -> (usize, usize, usize) {
+        let evidence = self.reference_evidence.borrow().bounded_counts();
+        let imports = self.import_references.borrow().bounded_counts();
+        (evidence.0, imports.0, evidence.1 + imports.1)
+    }
+}
+
 pub struct ReadySelectedResolution<'store, 'input> {
     store: &'store AnalyzerStore,
     #[doc(hidden)]
@@ -1734,7 +1782,7 @@ pub struct ReadySelectedResolution<'store, 'input> {
     pub operation_demand_state: Arc<crate::analyzer::resolution::SelectedDemandState>,
     // Publication identities bound by this query, dropped with the request.
     go_publications: RefCell<HashMap<i64, super::GoContextIdentity>>,
-    go_snapshot: Option<super::WorkspaceSnapshotId>,
+    snapshots: WorkspaceSnapshots,
     go_base_profile: std::cell::Cell<Option<[u8; 32]>>,
     // One forward request selects one caller package variant, restored on exit.
     go_active_package: std::cell::Cell<Option<(i64, i64, Option<&'static str>)>>,
@@ -1751,6 +1799,7 @@ pub struct ReadySelectedResolution<'store, 'input> {
     /// Reader memos retained only while one graph-stage unit is active.
     graph_stage_candidate_cache: RefCell<Option<std::rc::Rc<UnconditionalCandidateCache>>>,
     boundary_candidate_read_memo: BoundaryCandidateReadMemo,
+    pub(crate) point_read_memos: std::rc::Rc<SelectedPointReadMemos>,
     #[doc(hidden)]
     pub jvm_context_profile: RefCell<Option<jvm_context::JvmContextReadProfile>>,
     package_reference_read_memo: std::rc::Rc<RefCell<ExactReadMemo<PackageReferenceReadKey, bool>>>,
@@ -1828,6 +1877,11 @@ impl std::ops::DerefMut for ReadySelectedResolution<'_, '_> {
 }
 
 impl<'store> ReadySelectedResolution<'store, '_> {
+    /// The input snapshot that authorizes reads for this storage language.
+    pub fn snapshot(&self, storage_key: &str) -> Option<&super::WorkspaceSnapshotId> {
+        self.snapshots.get(storage_key)
+    }
+
     pub(super) fn model_authority(&self) -> Option<Arc<dyn SelectedModelAuthority + Send + Sync>> {
         let services = self
             .analyzer
@@ -1910,13 +1964,19 @@ impl<'store> ReadySelectedResolution<'store, '_> {
                 &self.inventory,
                 std::rc::Rc::clone(cache),
             )
-            .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo));
+            .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo))
+            .with_reference_read_memo(std::rc::Rc::clone(
+                &self.point_read_memos.reference_evidence,
+            ));
         }
         SelectedResolutionLexicalSource::new_on_demand_with_unconditional_cache(
             &self.inventory,
             std::rc::Rc::clone(&self.operation_candidate_cache),
         )
         .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo))
+        .with_reference_read_memo(std::rc::Rc::clone(
+            &self.point_read_memos.reference_evidence,
+        ))
     }
 
     fn bind_go_context_publication(&self, publication: super::GoContextIdentity) {
@@ -1932,14 +1992,13 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         }
     }
 
-    #[doc(hidden)]
-    pub fn typed_source(&self) -> SelectedResolutionTypedSource<'_, 'store> {
+    fn selected_jvm_external_providers(&self) -> Vec<String> {
         let mut providers = nominal_rules::jvm_external_owner_relations().providers(self.analyzer);
         let authority = self.model_authority();
-        let external_models = authority
+        if let Some(models) = authority
             .as_ref()
-            .and_then(|authority| authority.active_models());
-        if let Some(models) = &external_models {
+            .and_then(|authority| authority.active_models())
+        {
             providers.extend(
                 models
                     .shards()
@@ -1949,6 +2008,16 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         }
         providers.sort_unstable();
         providers.dedup();
+        providers
+    }
+
+    #[doc(hidden)]
+    pub fn typed_source(&self) -> SelectedResolutionTypedSource<'_, 'store> {
+        let providers = self.selected_jvm_external_providers();
+        let authority = self.model_authority();
+        let external_models = authority
+            .as_ref()
+            .and_then(|authority| authority.active_models());
         SelectedResolutionTypedSource::new_on_demand(&self.inventory)
             .with_go_context_binder(self)
             .with_context_identities(self.context_identities.clone())
@@ -2515,6 +2584,13 @@ pub struct SelectedResolutionOperation<'store, 'input> {
         ExactReadMemo<jvm_context::JvmPackageTargetKey, Arc<[jvm_context::JvmImportTarget]>>,
     >,
     jvm_package_presence_memo: RefCell<jvm_context::JvmPackagePresenceMemo>,
+    jvm_declared_type_memo: RefCell<jvm_context::JvmDeclaredTypeMemo>,
+    jvm_declared_owner_memo: RefCell<jvm_context::JvmDeclaredOwnerMemo>,
+    jvm_declaration_package_memo: RefCell<jvm_context::JvmDeclarationPackageMemo>,
+    jvm_indexed_type_memo:
+        RefCell<ExactReadMemo<crate::analyzer::resolution::ExternalOwnerIdentity, bool>>,
+    jvm_external_provider_ids: std::cell::OnceCell<Vec<String>>,
+    jvm_on_demand_type_ranks: RefCell<ExactReadMemo<SemanticId, jvm_demand::JvmBindingPrecedence>>,
     /// Complete node/visibility reads for distinct selected JVM inputs.
     jvm_endpoint_memo: RefCell<jvm_context::JvmEndpointMemo>,
     import_token_memo: RefCell<imports::ImportTokenMemo>,
@@ -2524,6 +2600,12 @@ pub struct SelectedResolutionOperation<'store, 'input> {
 }
 
 impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
+    /// Attach the batch's pure persisted reads before doing point work.
+    pub fn with_point_read_memos(mut self, memos: std::rc::Rc<SelectedPointReadMemos>) -> Self {
+        self.ready.point_read_memos = memos;
+        self
+    }
+
     #[doc(hidden)]
     pub fn worker_input(&self) -> &CapturedSelectedResolutionInput<'input> {
         &self.captured_input
@@ -3771,8 +3853,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         };
         super::read_rust_usage_facts_with_session(
             self.ready.inventory.connection(),
-            &mount.blob_oid().to_string(),
-            "rust",
+            &super::BlobKey::unvaried(mount.blob_oid(), "rust"),
             None,
         )
     }
@@ -8852,6 +8933,12 @@ impl AnalyzerStore {
                             jvm_package_target_memo: RefCell::default(),
                             jvm_package_uncertainty_memo: RefCell::default(),
                             jvm_package_presence_memo: RefCell::default(),
+                            jvm_declared_type_memo: RefCell::default(),
+                            jvm_declared_owner_memo: RefCell::default(),
+                            jvm_declaration_package_memo: RefCell::default(),
+                            jvm_indexed_type_memo: RefCell::default(),
+                            jvm_external_provider_ids: std::cell::OnceCell::new(),
+                            jvm_on_demand_type_ranks: RefCell::default(),
                             jvm_endpoint_memo: RefCell::default(),
                             import_token_memo: RefCell::default(),
                             jvm_visibility_memo: RefCell::default(),
@@ -9002,7 +9089,7 @@ impl AnalyzerStore {
                 context_identities: SelectedContextIdentities::new(),
                 operation_demand_state: Arc::default(),
                 go_publications: RefCell::default(),
-                go_snapshot: input.snapshots.get("go").cloned(),
+                snapshots: input.snapshots.clone(),
                 go_base_profile: std::cell::Cell::new(None),
                 go_active_package: std::cell::Cell::new(None),
                 go_definition_contexts: RefCell::default(),
@@ -9013,6 +9100,7 @@ impl AnalyzerStore {
                 ),
                 graph_stage_candidate_cache: RefCell::new(None),
                 boundary_candidate_read_memo: std::rc::Rc::new(RefCell::default()),
+                point_read_memos: std::rc::Rc::default(),
                 jvm_context_profile: RefCell::new(
                     crate::analyzer::resolution::seam_profile::enabled()
                         .then(jvm_context::JvmContextReadProfile::default),
@@ -9426,23 +9514,14 @@ impl SelectedResolutionOperation<'_, '_> {
                             artifacts.take(),
                             |operation| resolve_with_provider(operation, None).map(resolve_plain),
                         )?
-                    } else if let Some((language, installer)) = {
-                        // Locating the reference already memoized its mount ordinal. A
-                        // reference without one keeps the plain operation it had before.
-                        let language = reference
-                            .ordinal()
-                            .map(|ordinal| {
-                                self.mount_table()
-                                    .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))
-                                    .map(|mount| mount.semantic_language())
-                            })
-                            .transpose()?;
-                        language.and_then(|language| {
-                            super::store_language_support(language)
-                                .and_then(|support| support.demand_installer())
-                                .map(|installer| (language, installer))
-                        })
-                    } {
+                    } else if let Some((language, installer)) =
+                        match native_demand_installer_for_reference(locator, reference) {
+                            Ok(installer) => installer,
+                            Err(reason) => {
+                                return Ok(SelectedResolutionOperationOutcome::Unavailable(reason));
+                            }
+                        }
+                    {
                         let prepared = match self.native_demand_preparation(
                             installer,
                             language,
@@ -9452,9 +9531,12 @@ impl SelectedResolutionOperation<'_, '_> {
                         )? {
                             NativeDemandPreparationOutcome::Ready(prepared) => prepared,
                             NativeDemandPreparationOutcome::Unavailable => {
-                                return Err(StoreError::new(format!(
-                                    "native demand preparation unavailable for {locator:?}"
-                                )));
+                                return Ok(SelectedResolutionOperationOutcome::Unavailable(
+                                    SelectedResolutionUnavailable::NativeDemandUnavailable {
+                                        storage_language: locator.storage_language().to_owned(),
+                                        persisted_relative_path: locator.relative_path().to_owned(),
+                                    },
+                                ));
                             }
                             NativeDemandPreparationOutcome::Cancelled => {
                                 return Ok(SelectedResolutionOperationOutcome::Cancelled(
@@ -12501,7 +12583,7 @@ pub(super) fn rust_crate_point_sql_pins() -> Vec<(&'static str, &'static str, us
             (
                 "rust_point_item_macro_decisions",
                 super::RUST_ITEM_MACRO_DECISIONS_SQL,
-                2,
+                3,
             ),
             (
                 "rust_point_selected_macro_item_unit",

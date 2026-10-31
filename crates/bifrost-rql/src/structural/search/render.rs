@@ -1940,19 +1940,7 @@ fn render_unit_declaration(
         .map(|declaration| render_declaration(analyzer, &declaration, detail, cache))
 }
 
-/// A stable, domain-separated digest of one declaration's #1475 canonical
-/// identity. The digest input is the structured identity (kind-tagged
-/// segments, namespace, language, recorded generic arity), never a rendered
-/// FQN or signature string, so same-spelling decoys with different segment
-/// kinds hash apart and aliases/partial types canonicalized by the analyzer
-/// hash together.
-pub(super) fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
-    let identity = crate::structural::canonical_identity_of(analyzer, unit);
-    let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.canonical_member_id.v1");
-    hasher.update(serde_json::to_vec(&identity).expect("canonical identity serializes"));
-    format!("{:x}", hasher.finalize())
-}
+pub(super) use crate::structural::identity_routes::canonical_member_digest;
 
 pub(super) fn render_generation_site_ref(
     analyzer: &dyn IAnalyzer,
@@ -2504,6 +2492,7 @@ pub(super) fn augment_public_result_with_semantic_overlay(
     }
 
     let mut modeled = Vec::new();
+    let mut missing_names = Vec::new();
     for root in roots {
         match traversal {
             None => modeled.push(root),
@@ -2525,16 +2514,16 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                 }
             }
             Some(QueryStep::Supertypes(hierarchy)) => {
-                let (symbols, conflict) =
-                    model_hierarchy_symbols(&overlay, &root, *hierarchy, true);
-                modeled.extend(symbols);
-                ambiguous_match |= conflict;
+                let hierarchy_result = model_hierarchy_symbols(&overlay, &root, *hierarchy, true);
+                modeled.extend(hierarchy_result.symbols);
+                ambiguous_match |= hierarchy_result.ambiguous;
+                missing_names.extend(hierarchy_result.missing_names);
             }
             Some(QueryStep::Subtypes(hierarchy)) => {
-                let (symbols, conflict) =
-                    model_hierarchy_symbols(&overlay, &root, *hierarchy, false);
-                modeled.extend(symbols);
-                ambiguous_match |= conflict;
+                let hierarchy_result = model_hierarchy_symbols(&overlay, &root, *hierarchy, false);
+                modeled.extend(hierarchy_result.symbols);
+                ambiguous_match |= hierarchy_result.ambiguous;
+                missing_names.extend(hierarchy_result.missing_names);
             }
             Some(_) => unreachable!("model overlay traversal was validated above"),
         }
@@ -2604,7 +2593,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                     .contains("semantic-model declaration conflict")
         })
     {
-        result.diagnostics.push(CodeQueryDiagnostic {
+        result
+            .diagnostics
+            .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -2616,19 +2608,43 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                     .to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
+    }
+    missing_names.sort();
+    missing_names.dedup();
+    if !missing_names.is_empty() {
+        result
+            .diagnostics
+            .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message: format!(
+                    "model hierarchy names unmodeled type {}; the walk stops there",
+                    missing_names.join(", ")
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            }));
     }
 }
 
-pub(super) fn model_hierarchy_symbols(
+struct ModelHierarchyResult {
+    symbols: Vec<Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
+    missing_names: Vec<String>,
+    ambiguous: bool,
+}
+
+fn model_hierarchy_symbols(
     overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
     root: &crate::analyzer::semantic_model::SemanticModelSymbol,
     traversal: HierarchyTraversal,
     supertypes: bool,
-) -> (
-    Vec<Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
-    bool,
-) {
+) -> ModelHierarchyResult {
     let max_depth = match traversal {
         HierarchyTraversal::Direct => 1,
         HierarchyTraversal::Depth(depth) => depth.get(),
@@ -2638,7 +2654,8 @@ pub(super) fn model_hierarchy_symbols(
     let mut visited = HashSet::default();
     visited.insert(root.id.clone());
     let mut symbols = Vec::new();
-    let mut conflict = false;
+    let mut ambiguous = false;
+    let mut missing_names = Vec::new();
     while let Some((id, depth)) = queue.pop_front() {
         if depth >= max_depth {
             continue;
@@ -2650,7 +2667,7 @@ pub(super) fn model_hierarchy_symbols(
         };
         for relation in relations.records {
             if relation.provenance.ambiguous {
-                conflict = true;
+                ambiguous = true;
                 continue;
             }
             if !matches!(
@@ -2671,7 +2688,11 @@ pub(super) fn model_hierarchy_symbols(
             if matched.disposition
                 != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
             {
-                conflict |= !matched.records.is_empty();
+                if matched.records.is_empty() {
+                    missing_names.push(endpoint.clone());
+                } else {
+                    ambiguous = true;
+                }
                 continue;
             }
             let symbol = matched.records[0].clone();
@@ -2681,7 +2702,11 @@ pub(super) fn model_hierarchy_symbols(
             }
         }
     }
-    (symbols, conflict)
+    ModelHierarchyResult {
+        symbols,
+        missing_names,
+        ambiguous,
+    }
 }
 
 pub(super) fn model_pattern_is_supported(pattern: &Pattern) -> bool {
@@ -4551,6 +4576,7 @@ pub(super) fn push_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     budget: &CodeQueryExecutionBudget,
 ) {
+    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
     note_budget_work(CodeQueryDiagnosticCode::ExecutionBudgetExhausted, budget);
     if already_reported(
         diagnostics,
@@ -4560,6 +4586,7 @@ pub(super) fn push_budget_diagnostic(
     }
     diagnostics.push(incomplete_diagnostic(
         CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+        brokk_bifrost_rql::Incompleteness::Content,
         "workspace",
         "query_code execution budget exhausted before the query finished; refine the query with where, languages, kind/name anchors, or a narrower pattern".to_string(),
         Vec::new(),
@@ -4570,6 +4597,7 @@ pub(super) fn push_pipeline_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     budget: &CodeQueryExecutionBudget,
 ) {
+    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
     note_budget_work(CodeQueryDiagnosticCode::PipelineBudgetExhausted, budget);
     if already_reported(
         diagnostics,
@@ -4579,6 +4607,7 @@ pub(super) fn push_pipeline_budget_diagnostic(
     }
     diagnostics.push(incomplete_diagnostic(
         CodeQueryDiagnosticCode::PipelineBudgetExhausted,
+        brokk_bifrost_rql::Incompleteness::Content,
         "workspace",
         "query_code pipeline budget exhausted while producing seed and edge rows; refine the match, where, or languages filters".to_string(),
         Vec::new(),
@@ -4590,6 +4619,7 @@ pub(super) fn push_import_graph_budget_diagnostic(
     resolved_files: usize,
     resolved_edges: usize,
 ) {
+    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
     crate::profiling::note_with(|| {
         format!(
             "query_code.{} resolved_files={} resolved_edges={}",
@@ -4606,6 +4636,7 @@ pub(super) fn push_import_graph_budget_diagnostic(
     }
     diagnostics.push(incomplete_diagnostic(
         CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
+        brokk_bifrost_rql::Incompleteness::Content,
         "workspace",
         "query_code import graph budget exhausted while resolving files and direct edges; import traversal results are partial".to_string(),
         Vec::new(),
@@ -4620,6 +4651,7 @@ pub(super) fn push_truncation_diagnostic(
     note_budget_work(CodeQueryDiagnosticCode::ResultLimitReached, budget);
     diagnostics.push(incomplete_diagnostic(
         CodeQueryDiagnosticCode::ResultLimitReached,
+        brokk_bifrost_rql::Incompleteness::Content,
         "workspace",
         format!(
             "query_code reached the query limit of {limit} and returned the first {limit} results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
@@ -4645,7 +4677,8 @@ pub(super) fn push_broad_query_diagnostic(
     budget: &CodeQueryExecutionBudget,
 ) {
     note_budget_work(CodeQueryDiagnosticCode::BroadQuery, budget);
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::BroadQuery,
@@ -4655,7 +4688,7 @@ pub(super) fn push_broad_query_diagnostic(
         message: "broad unanchored query_code query scanned the workspace without a source anchor; add where, languages, exact name predicates, or a more specific pattern to reduce work and output".to_string(),
     exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 /// Generic structural relationships projected alongside a match row.

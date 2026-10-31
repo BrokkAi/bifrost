@@ -53,6 +53,14 @@ pub(in crate::analyzer::kotlin::semantic) fn child_of_kind<'tree>(
     })
 }
 
+/// The value-producing expression a `property_declaration` initializes with,
+/// using this module's comment-filtered named-child policy.
+pub(in crate::analyzer::kotlin::semantic) fn property_initializer(
+    node: Node<'_>,
+) -> Option<Node<'_>> {
+    brokk_bifrost_jvm::kotlin::syntax::kotlin_property_initializer(named_children(node))
+}
+
 /// Syntax that owns its own executable boundary, and therefore terminates a
 /// body-local scan such as the free-`this` or local-binding walks.
 pub(in crate::analyzer::kotlin::semantic) fn is_kotlin_nested_execution_boundary(
@@ -131,27 +139,6 @@ pub(in crate::analyzer::kotlin::semantic) fn is_declaration_site(node: Node<'_>)
             "class_body" | "enum_class_body" | "source_file"
         )
     })
-}
-
-/// The value-producing expression a `property_declaration` initializes with,
-/// skipping the binding, its type, and any accessors.
-pub(in crate::analyzer::kotlin::semantic) fn property_initializer(
-    node: Node<'_>,
-) -> Option<Node<'_>> {
-    let mut seen_binding = false;
-    for child in named_children(node) {
-        match child.kind() {
-            "modifiers" | "binding_pattern_kind" | "type_constraints" => continue,
-            "variable_declaration" | "multi_variable_declaration" => {
-                seen_binding = true;
-                continue;
-            }
-            "getter" | "setter" | "property_delegate" | "receiver_type" => continue,
-            _ if seen_binding => return Some(child),
-            _ => continue,
-        }
-    }
-    None
 }
 
 pub(super) use brokk_bifrost_jvm::kotlin::syntax::kotlin_parameter_default as class_parameter_default;

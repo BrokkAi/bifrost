@@ -1,3 +1,4 @@
+use super::{DerivationExecutionCause, Incompleteness};
 use std::sync::Arc;
 
 use super::witness_projection::{
@@ -105,6 +106,7 @@ impl TypestateQueryState {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::UnresolvedProtocolReference,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!(
                     "typestate protocol reference `{protocol_ref}` was not supplied by the host"
                 ),
@@ -115,6 +117,7 @@ impl TypestateQueryState {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::UnresolvedProtocolReference,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!("typestate protocol reference `{protocol_ref}` is not registered"),
             );
             return Vec::new();
@@ -203,6 +206,7 @@ impl TypestateQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateProviderFailed,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             format!("typestate analysis failed: {error}"),
                         );
                         self.cache
@@ -225,6 +229,7 @@ impl TypestateQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::Cancelled,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             "typestate solver was cancelled".to_string(),
                         );
                     }
@@ -242,6 +247,7 @@ impl TypestateQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             exceeded.to_string(),
                         );
                     }
@@ -280,6 +286,7 @@ impl TypestateQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             "typestate finding or witness reconstruction budget was exhausted"
                                 .to_string(),
                         );
@@ -291,6 +298,7 @@ impl TypestateQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::Cancelled,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             "typestate finding collection was cancelled".to_string(),
                         );
                         self.cache
@@ -310,6 +318,7 @@ impl TypestateQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateProviderFailed,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             format!("typestate finding collection failed: {error}"),
                         );
                         self.cache
@@ -357,6 +366,7 @@ impl TypestateQueryState {
                     push_deduplicated_diagnostic(
                         &mut self.diagnostics,
                         CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
+                        Incompleteness::Operational(DerivationExecutionCause::Provider),
                         format!(
                             "typestate finding retention omitted at least {} finding(s)",
                             report.omitted()
@@ -367,6 +377,7 @@ impl TypestateQueryState {
                     push_deduplicated_diagnostic(
                         &mut self.diagnostics,
                         CodeQueryDiagnosticCode::TypestateAnalysisPartial,
+                        Incompleteness::Operational(DerivationExecutionCause::Provider),
                         "typestate analysis retained incomplete semantic evidence".to_string(),
                     );
                 }
@@ -491,7 +502,12 @@ impl TypestateQueryState {
                 CodeQueryDiagnosticCode::TypestateRegistrationStale
             }
         };
-        push_deduplicated_diagnostic(&mut self.diagnostics, code, error.to_string());
+        push_deduplicated_diagnostic(
+            &mut self.diagnostics,
+            code,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            error.to_string(),
+        );
     }
 
     fn record_semantic_status(&mut self, status: SemanticInputStatus) {
@@ -499,6 +515,7 @@ impl TypestateQueryState {
             SemanticInputStatus::Unsupported { capability } => push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::TypestateCapabilityUnsupported,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!(
                     "typestate analysis requires unsupported semantic capability `{}`",
                     capability.label()
@@ -509,12 +526,14 @@ impl TypestateQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     format!("typestate semantic input exceeded its budget: {exceeded}"),
                 );
             }
             SemanticInputStatus::Cancelled => push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::Cancelled,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 "typestate semantic input materialization was cancelled".to_string(),
             ),
             SemanticInputStatus::Complete
@@ -564,6 +583,7 @@ impl TypestateQueryState {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::TypestateWitnessTruncated,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!("typestate witness projection truncated {count} witness(es)"),
             );
         }

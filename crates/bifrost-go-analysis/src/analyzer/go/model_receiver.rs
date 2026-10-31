@@ -6,23 +6,16 @@ use crate::analyzer::usages::get_definition::go::{
 };
 use brokk_bifrost_analysis::analyzer::QueryScope;
 use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
-use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
-use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason;
-use brokk_bifrost_analysis::analyzer::resolution::seam_profile::GoModelLegacyReason;
-use brokk_bifrost_analysis::analyzer::resolution::selected_context::SelectedContextIdentities;
 use brokk_bifrost_analysis::analyzer::semantic::{
     DeferredMemberSelection, MemberReceiverPreparation, ResolverOwnedExternalCalleeIdentity,
 };
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::GO_IMPORT_INCOMPLETE;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection;
-use brokk_bifrost_analysis::analyzer::structural::BoundaryStatus;
 use brokk_bifrost_analysis::analyzer::usages::get_definition::{
     DefinitionLookupDiagnostic, DefinitionLookupOutcome, DefinitionLookupStatus,
     ExactExternalCallProof,
 };
 use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, Language, resolve_analyzer};
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
-use std::collections::BTreeSet;
 
 pub(crate) struct GoSelectedModelReceiverCall {
     pub outcome: DefinitionLookupOutcome,
@@ -266,40 +259,6 @@ pub(crate) fn go_selected_model_receiver_call(
         });
     }
     GoModelReceiverSelection::Handled(Box::new(result))
-}
-
-/// Absence of an owner never admits legacy: a named native G1b gap must.
-/// A reached model owner, including a missing or rejected member, stays native.
-pub(crate) fn legacy_model_reasons(
-    selection: Option<&ProjectedNativeModelMemberSelection>,
-    completion: &ResolutionCompletion,
-    identities: &SelectedContextIdentities,
-) -> BTreeSet<GoModelLegacyReason> {
-    if selection.is_some() {
-        return BTreeSet::new();
-    }
-    let ResolutionCompletion::Incomplete(reasons) = completion else {
-        return BTreeSet::new();
-    };
-    let mut selected = BTreeSet::new();
-    for reason in reasons.iter() {
-        match reason {
-            ResolutionIncompleteReason::OpenBoundary { status, .. }
-                if *status == BoundaryStatus::ExternalDeclaredUnindexed => {}
-            ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
-                let Some((name, _)) = identities.named_reason(*semantic) else {
-                    return BTreeSet::new();
-                };
-                if let Some(reason) = GoModelLegacyReason::from_named_reason(name) {
-                    selected.insert(reason);
-                } else if name != GO_IMPORT_INCOMPLETE {
-                    return BTreeSet::new();
-                }
-            }
-            _ => return BTreeSet::new(),
-        }
-    }
-    selected
 }
 
 /// Static membership shares the native receiver operation with modeled calls;

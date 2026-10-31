@@ -11,9 +11,9 @@
 //! Node offsets still refer to the original file, so no transformed source ever
 //! exists and cache identity stays the raw checkout bytes.
 //!
-//! Branch selection is deterministic: within an `#if` / `#elif` / `#else`
-//! chain the first branch is active, except a branch whose condition is the
-//! literal `false`. There is no compilation-constant model.
+//! Branch selection follows compilation environments and file-local symbol
+//! assignments. Undecided chains retain their earliest possibly active branch
+//! and carry structured uncertainty through every consumer.
 //!
 //! The line scanner here is a lexical pre-pass, not a fallback for missing
 //! structure: before it runs there is no tree, and a real C# lexer likewise
@@ -31,7 +31,9 @@ pub const CSHARP_INACTIVE_BRANCHES_DETAIL: &str =
     "conditional compilation: inactive branches excluded from the index";
 
 /// The result of scanning one C# file for preprocessor directives.
+#[derive(Debug)]
 pub struct PreprocessorScan {
+    pub decisions: PreprocessorDecisions,
     /// Byte ranges the parser may read, or `None` when the file has no
     /// directives at all and must simply be parsed whole.
     pub included_ranges: Option<Vec<tree_sitter::Range>>,
@@ -40,6 +42,63 @@ pub struct PreprocessorScan {
     pub has_inactive_regions: bool,
     /// Conditional directives and their branch spans, including skipped text.
     pub branches: Vec<ConditionalBranch>,
+    /// File-local symbol assignments, in source order.
+    pub symbol_directives: Vec<SymbolDirective>,
+}
+
+impl brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor for PreprocessorScan {
+    fn included_ranges(&self) -> Option<&[tree_sitter::Range]> {
+        self.included_ranges.as_deref()
+    }
+    fn conditional_regions(
+        &self,
+        source: &str,
+    ) -> brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions {
+        self.conditional_regions(source)
+    }
+    fn estimated_retained_bytes(&self) -> usize {
+        let strings = |set: &std::collections::BTreeSet<String>| {
+            set.iter().map(|s| 64 + s.capacity()).sum::<usize>()
+        };
+        std::mem::size_of::<Self>()
+            + self.included_ranges.as_ref().map_or(0, |r| {
+                r.capacity() * std::mem::size_of::<tree_sitter::Range>()
+            })
+            + self.branches.capacity() * std::mem::size_of::<ConditionalBranch>()
+            + self
+                .branches
+                .iter()
+                .map(|b| b.condition.capacity() + b.directive.capacity())
+                .sum::<usize>()
+            + self.symbol_directives.capacity() * std::mem::size_of::<SymbolDirective>()
+            + self
+                .symbol_directives
+                .iter()
+                .map(|d| d.symbol.capacity())
+                .sum::<usize>()
+            + self.decisions.chains.capacity() * std::mem::size_of::<ChainDecision>()
+            + strings(&self.decisions.referenced_symbols)
+            + self
+                .decisions
+                .chains
+                .iter()
+                .map(|d| match d {
+                    ChainDecision::Decided(_) => 0,
+                    ChainDecision::Undecided(r) => {
+                        strings(&r.unknown_symbols)
+                            + strings(&r.open_reasons)
+                            + r.disagreeing_owners.capacity() * std::mem::size_of::<String>()
+                            + r.disagreeing_owners
+                                .iter()
+                                .map(String::capacity)
+                                .sum::<usize>()
+                    }
+                })
+                .sum::<usize>()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// One branch of a conditional chain. Offsets refer to the original source.
@@ -55,37 +114,28 @@ pub struct ConditionalBranch {
     /// The closing endif range on the chain's final branch, when present.
     pub closing_directive: Option<(usize, usize)>,
     pub kept: bool,
-}
-
-impl ConditionalBranch {
-    fn condition_value(
-        &self,
-    ) -> brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionValue {
-        use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionValue;
-        match (self.directive.as_str(), self.condition.as_str()) {
-            ("else", _) | (_, "true") => ConditionValue::Decided(true),
-            (_, "false") => ConditionValue::Decided(false),
-            _ => ConditionValue::Unknown,
-        }
-    }
+    /// Whether all owners prove this branch unreachable.
+    pub definitely_inactive: bool,
 }
 
 impl PreprocessorScan {
-    /// One shared certainty decision per chain, independent of nesting/selection.
+    /// Activation comes from the same decisions that selected the parser ranges.
     pub fn chain_activations(
         &self,
     ) -> Vec<brokk_bifrost_core::analyzer::structural::conditional_regions::ChainActivation> {
         use brokk_bifrost_core::analyzer::structural::conditional_regions::{
             ConditionValue, chain_activation,
         };
-        let mut chains = Vec::<Vec<ConditionValue>>::new();
-        for branch in &self.branches {
-            if chains.len() <= branch.chain {
-                chains.resize_with(branch.chain + 1, Vec::new);
-            }
-            chains[branch.chain].push(branch.condition_value());
-        }
-        chains.into_iter().map(chain_activation).collect()
+        self.decisions
+            .chains
+            .iter()
+            .map(|decision| match decision {
+                ChainDecision::Decided(index) => chain_activation(
+                    (0..=index.unwrap_or(0)).map(|i| ConditionValue::Decided(Some(i) == *index)),
+                ),
+                ChainDecision::Undecided(_) => chain_activation([ConditionValue::Unknown]),
+            })
+            .collect()
     }
 
     pub fn conditional_regions(
@@ -100,7 +150,7 @@ impl PreprocessorScan {
         let mut regions = Vec::new();
         for branch in &self.branches {
             let index = &mut indices[branch.chain];
-            let activation = chains[branch.chain].branch(*index, branch.condition_value());
+            let activation = chains[branch.chain].branch(*index, brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionValue::Decided(!branch.definitely_inactive));
             *index += 1;
             regions.push(ConditionalRegion {
                 range: branch.directive_end..branch.end_byte,
@@ -124,6 +174,355 @@ impl PreprocessorScan {
     }
 }
 
+/// The symbols supplied by one owning compilation. An open environment's
+/// producer must list in `defined` only symbols defined under every evaluation
+/// of its unknown parts (for example, proven implicit framework symbols).
+/// Missing symbols in an open environment are unknown. In a closed environment
+/// every missing symbol is false. Explicit file-local undefinitions remain false.
+/// The empty compilation key and `no_owning_compilation` reason are reserved for
+/// the evaluator's synthetic no-owner environment. Real owners use non-empty
+/// compilation keys and discovery's fixed set of open reason labels.
+#[derive(Debug, Clone)]
+pub struct SymbolEnvironment {
+    pub compilation_key: String,
+    pub defined: std::collections::BTreeSet<String>,
+    pub closed: bool,
+    pub open_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainDecision {
+    /// Branch indices are local to the chain. None means no branch executes
+    /// (including chains nested inside a definitely inactive branch).
+    Decided(Option<usize>),
+    Undecided(DecisionReason),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionReason {
+    pub unknown_symbols: std::collections::BTreeSet<String>,
+    pub open_reasons: std::collections::BTreeSet<String>,
+    pub disagreeing_owners: Vec<String>,
+    pub invalid_condition: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreprocessorDecisions {
+    pub chains: Vec<ChainDecision>,
+    pub referenced_symbols: std::collections::BTreeSet<String>,
+    pub decision_digest: [u8; 32],
+    pub assignment_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolDirective {
+    pub offset: usize,
+    pub symbol: String,
+    pub defined: bool,
+}
+
+// A flat shunting-yard program avoids recursion both in parsing and evaluation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpressionOp {
+    Open,
+    Not,
+    Equal,
+    Unequal,
+    And,
+    Or,
+}
+impl ExpressionOp {
+    fn precedence(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Or => 1,
+            Self::And => 2,
+            Self::Equal | Self::Unequal => 3,
+            Self::Not => 4,
+        }
+    }
+    fn apply(self, values: &mut Vec<Option<bool>>) -> Option<()> {
+        let right = values.pop()?;
+        let value = if self == Self::Not {
+            right.map(|v| !v)
+        } else {
+            let left = values.pop()?;
+            match self {
+                Self::And if left == Some(false) || right == Some(false) => Some(false),
+                Self::Or if left == Some(true) || right == Some(true) => Some(true),
+                Self::And => left.zip(right).map(|(a, b)| a && b),
+                Self::Or => left.zip(right).map(|(a, b)| a || b),
+                Self::Equal => left.zip(right).map(|(a, b)| a == b),
+                Self::Unequal => left.zip(right).map(|(a, b)| a != b),
+                _ => return None,
+            }
+        };
+        values.push(value);
+        Some(())
+    }
+}
+
+/// Consume one identifier from the directive expression's lexical subset.
+fn condition_identifier(text: &str) -> Option<(&str, &str)> {
+    let end = text
+        .char_indices()
+        .take_while(|&(i, c)| c == '_' || c.is_alphabetic() || (i > 0 && c.is_ascii_digit()))
+        .map(|(i, c)| i + c.len_utf8())
+        .last()?;
+    Some(text.split_at(end))
+}
+
+fn evaluate_condition(
+    text: &str,
+    lookup: impl Fn(&str) -> Option<bool>,
+    symbols: &mut std::collections::BTreeSet<String>,
+) -> (Option<bool>, bool) {
+    let mut values = Vec::new();
+    let mut operators = Vec::new();
+    let mut rest = text;
+    let mut operand = true;
+    let parsed = (|| {
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() || rest.starts_with("//") {
+                break;
+            }
+            if operand {
+                if let Some(next) = rest.strip_prefix('!') {
+                    operators.push(ExpressionOp::Not);
+                    rest = next;
+                    continue;
+                }
+                if let Some(next) = rest.strip_prefix('(') {
+                    operators.push(ExpressionOp::Open);
+                    rest = next;
+                    continue;
+                }
+                let (name, next) = condition_identifier(rest)?;
+                values.push(match name {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => {
+                        symbols.insert(name.to_owned());
+                        lookup(name)
+                    }
+                });
+                rest = next;
+                operand = false;
+            } else if let Some(next) = rest.strip_prefix(')') {
+                while operators.last().is_some_and(|op| *op != ExpressionOp::Open) {
+                    operators.pop()?.apply(&mut values)?;
+                }
+                if operators.pop()? != ExpressionOp::Open {
+                    return None;
+                }
+                rest = next;
+            } else {
+                let (token, op) = [
+                    ("==", ExpressionOp::Equal),
+                    ("!=", ExpressionOp::Unequal),
+                    ("&&", ExpressionOp::And),
+                    ("||", ExpressionOp::Or),
+                ]
+                .into_iter()
+                .find(|(token, _)| rest.starts_with(token))?;
+                while operators
+                    .last()
+                    .is_some_and(|top| top.precedence() >= op.precedence())
+                {
+                    operators.pop()?.apply(&mut values)?;
+                }
+                operators.push(op);
+                rest = &rest[token.len()..];
+                operand = true;
+            }
+        }
+        if operand {
+            return None;
+        }
+        while let Some(op) = operators.pop() {
+            op.apply(&mut values)?;
+        }
+        if values.len() != 1 {
+            return None;
+        }
+        values.pop()
+    })();
+    match parsed {
+        Some(value) => (value, false),
+        None => (None, true),
+    }
+}
+
+struct OwnerState<'a> {
+    owner: &'a SymbolEnvironment,
+    local: std::collections::HashMap<String, Option<bool>>,
+    decisions: Vec<ChainDecision>,
+    remaining: Vec<Option<bool>>,
+    active: Vec<Option<bool>>,
+}
+impl OwnerState<'_> {
+    fn lookup(&self, name: &str) -> Option<bool> {
+        self.local.get(name).copied().unwrap_or_else(|| {
+            if self.owner.defined.contains(name) {
+                Some(true)
+            } else if self.owner.closed {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    }
+    fn branch(
+        &mut self,
+        chain: usize,
+        index: usize,
+        parent: Option<usize>,
+        condition: Option<&str>,
+    ) {
+        let parent_active = parent.map_or(Some(true), |p| self.active[p]);
+        while self.decisions.len() <= chain {
+            self.decisions.push(ChainDecision::Decided(None));
+            self.remaining.push(Some(true));
+            self.active.push(Some(false));
+        }
+        if self.remaining[chain] == Some(false) || parent_active == Some(false) {
+            self.active[chain] = Some(false);
+            return;
+        }
+        let mut used = std::collections::BTreeSet::new();
+        let (value, invalid) = match condition {
+            None => (Some(true), false),
+            Some(condition) => evaluate_condition(condition, |name| self.lookup(name), &mut used),
+        };
+        self.active[chain] = if value == Some(false) {
+            Some(false)
+        } else if parent_active.is_none() || self.remaining[chain].is_none() {
+            None
+        } else {
+            value
+        };
+        if parent_active.is_none() || self.remaining[chain].is_none() || value.is_none() {
+            let mut reason = match &self.decisions[chain] {
+                ChainDecision::Undecided(r) => r.clone(),
+                _ => DecisionReason::default(),
+            };
+            if let Some(p) = parent
+                && let ChainDecision::Undecided(r) = &self.decisions[p]
+            {
+                reason.unknown_symbols.extend(r.unknown_symbols.clone());
+                reason.open_reasons.extend(r.open_reasons.clone());
+                reason.invalid_condition |= r.invalid_condition;
+            }
+            reason
+                .unknown_symbols
+                .extend(used.into_iter().filter(|name| self.lookup(name).is_none()));
+            reason.invalid_condition |= invalid;
+            if let Some(label) = &self.owner.open_reason {
+                reason.open_reasons.insert(label.clone());
+            }
+            self.decisions[chain] = ChainDecision::Undecided(reason);
+            self.remaining[chain] = None;
+        } else if value == Some(true) {
+            self.decisions[chain] = ChainDecision::Decided(Some(index));
+            self.remaining[chain] = Some(false);
+        }
+    }
+}
+
+fn merge_decision(owners: &[OwnerState<'_>], chain: usize) -> ChainDecision {
+    let first = &owners[0].decisions[chain];
+    if matches!(first, ChainDecision::Decided(_))
+        && owners.iter().all(|o| &o.decisions[chain] == first)
+    {
+        return first.clone();
+    }
+    let mut reason = DecisionReason::default();
+    let mut decided = Vec::new();
+    for owner in owners {
+        match &owner.decisions[chain] {
+            ChainDecision::Undecided(r) => {
+                reason.unknown_symbols.extend(r.unknown_symbols.clone());
+                reason.open_reasons.extend(r.open_reasons.clone());
+                reason.invalid_condition |= r.invalid_condition;
+            }
+            ChainDecision::Decided(outcome) => decided.push((owner.owner, outcome)),
+        }
+    }
+    if decided
+        .first()
+        .is_some_and(|(_, first)| decided.iter().any(|(_, outcome)| outcome != first))
+    {
+        reason.disagreeing_owners = decided
+            .iter()
+            .map(|(owner, _)| owner.compilation_key.clone())
+            .collect();
+    }
+    ChainDecision::Undecided(reason)
+}
+
+fn finish_decisions(
+    owners: &[OwnerState<'_>],
+    count: usize,
+    referenced_symbols: std::collections::BTreeSet<String>,
+) -> PreprocessorDecisions {
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+    let mut assignment = CanonicalHasher::new(b"csharp-preprocessor-assignment-v1");
+    for state in owners.iter().filter(|_| count != 0) {
+        let owner = state.owner;
+        assignment.value(owner.compilation_key.as_bytes());
+        assignment.value(&[u8::from(owner.closed)]);
+        assignment.value(&[u8::from(owner.open_reason.is_some())]);
+        if let Some(reason) = &owner.open_reason {
+            assignment.value(reason.as_bytes());
+        }
+        for symbol in &referenced_symbols {
+            assignment.value(symbol.as_bytes());
+            assignment.value(&[if owner.defined.contains(symbol) {
+                1
+            } else if owner.closed {
+                0
+            } else {
+                2
+            }]);
+        }
+    }
+    let chains: Vec<_> = (0..count)
+        .map(|chain| {
+            if owners[0].decisions.len() <= chain {
+                ChainDecision::Decided(None)
+            } else {
+                merge_decision(owners, chain)
+            }
+        })
+        .collect();
+    let mut digest = CanonicalHasher::new(b"csharp-preprocessor-decisions-v1");
+    for decision in &chains {
+        match decision {
+            ChainDecision::Decided(index) => {
+                digest.value(b"decided");
+                digest.value(&index.map(|i| i as u64).unwrap_or(u64::MAX).to_be_bytes());
+            }
+            ChainDecision::Undecided(r) => {
+                digest.value(b"undecided");
+                let symbols: Vec<_> = r.unknown_symbols.iter().collect();
+                digest.sequence("symbols", &symbols, |h, s| h.value(s.as_bytes()));
+                let reasons: Vec<_> = r.open_reasons.iter().collect();
+                digest.sequence("reasons", &reasons, |h, s| h.value(s.as_bytes()));
+                digest.sequence("owners", &r.disagreeing_owners, |h, s| {
+                    h.value(s.as_bytes())
+                });
+                digest.value(&[u8::from(r.invalid_condition)]);
+            }
+        }
+    }
+    PreprocessorDecisions {
+        chains,
+        referenced_symbols,
+        decision_digest: digest.finish(),
+        assignment_digest: assignment.finish(),
+    }
+}
 /// Lexical mode carried across lines while scanning for directive lines.
 ///
 /// C# directives are recognized only when the lexer is outside comments and
@@ -141,6 +540,8 @@ enum LexMode {
 /// One entry of the `#if` / `#elif` / `#else` / `#endif` stack.
 #[derive(Clone, Copy)]
 struct ChainState {
+    chain: usize,
+    index: usize,
     /// True when the branch currently open emits source.
     branch_active: bool,
     /// True once some branch of this chain has been chosen as the active one.
@@ -149,13 +550,55 @@ struct ChainState {
     parent_active: bool,
 }
 
-/// Scan `source` for preprocessor directives and compute the included ranges.
-pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
+/// Scan and decide in one source-order pass over the original bytes.
+///
+/// The default reading keeps the earliest branch whose merged reachability is
+/// not definitely false. Later branches never revise that choice.
+/// In a compiling configuration no multi-line input element spans a directive
+/// recognized in that owner's reading: a directive inside a comment or string
+/// would not be recognized and the chain would not terminate. Thus recognized
+/// directives start in a clean lexical state, and one lexical mode following
+/// the merged reading is consistent for all owners. Differing readings are
+/// confined to branches of undecided chains. Noncompiling configurations are
+/// outside this contract; the default reading retains the undecided obligation.
+pub fn scan_and_decide_preprocessor(
+    source: &str,
+    owners: &[SymbolEnvironment],
+) -> PreprocessorScan {
+    let unowned = SymbolEnvironment {
+        compilation_key: String::new(),
+        defined: Default::default(),
+        closed: false,
+        open_reason: Some("no_owning_compilation".to_owned()),
+    };
+    let mut owners: Vec<_> = owners.iter().collect();
+    owners.sort_by(|a, b| a.compilation_key.cmp(&b.compilation_key));
+    assert!(owners.iter().all(|o| !o.compilation_key.is_empty()));
+    assert!(
+        owners
+            .windows(2)
+            .all(|w| w[0].compilation_key != w[1].compilation_key)
+    );
+    if owners.is_empty() {
+        owners.push(&unowned);
+    }
+    let mut owners: Vec<_> = owners
+        .into_iter()
+        .map(|owner| OwnerState {
+            owner,
+            local: Default::default(),
+            decisions: Vec::new(),
+            remaining: Vec::new(),
+            active: Vec::new(),
+        })
+        .collect();
+    let mut referenced_symbols = std::collections::BTreeSet::new();
     let bytes = source.as_bytes();
     let mut mode = LexMode::Normal;
     let mut stack: Vec<ChainState> = Vec::new();
     let mut branches: Vec<ConditionalBranch> = Vec::new();
     let mut branch_stack: Vec<usize> = Vec::new();
+    let mut symbol_directives = Vec::new();
     let mut next_chain = 0;
     let mut any_directive = false;
     let mut has_inactive_regions = false;
@@ -194,7 +637,81 @@ pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
                     branch_stack.push(previous);
                 }
             }
-            apply_directive(body, &mut stack);
+            if matches!(keyword, "define" | "undef") {
+                let symbol = condition.split("//").next().unwrap_or("").trim();
+                let directive = SymbolDirective {
+                    offset: line_start,
+                    symbol: symbol.to_owned(),
+                    defined: keyword == "define",
+                };
+                for owner in &mut owners {
+                    let active = stack
+                        .last()
+                        .map_or(Some(true), |state| owner.active[state.chain]);
+                    if active != Some(false) {
+                        owner
+                            .local
+                            .insert(directive.symbol.clone(), active.map(|_| directive.defined));
+                    }
+                }
+                symbol_directives.push(directive);
+            }
+            match keyword {
+                "if" => {
+                    let chain = next_chain;
+                    let parent = stack.last().map(|s| s.chain);
+                    for owner in &mut owners {
+                        owner.branch(chain, 0, parent, Some(condition));
+                    }
+                    let active =
+                        region_active && owners.iter().any(|o| o.active[chain] != Some(false));
+                    stack.push(ChainState {
+                        chain,
+                        index: 0,
+                        branch_active: active,
+                        chosen: active,
+                        parent_active: region_active,
+                    });
+                }
+                "elif" | "else" => {
+                    let parent = stack.iter().rev().nth(1).map(|s| s.chain);
+                    if let Some(state) = stack.last_mut() {
+                        state.index += 1;
+                        for owner in &mut owners {
+                            owner.branch(
+                                state.chain,
+                                state.index,
+                                parent,
+                                (keyword != "else").then_some(condition),
+                            );
+                        }
+                        let active = state.parent_active
+                            && !state.chosen
+                            && owners.iter().any(|o| o.active[state.chain] != Some(false));
+                        state.branch_active = active;
+                        state.chosen |= active;
+                    }
+                }
+                "endif" => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+            if matches!(keyword, "if" | "elif") {
+                // Record every symbol in recognized conditions, including syntax
+                // after a parse error and conditions after a taken branch.
+                let mut rest = condition;
+                while !rest.is_empty() && !rest.starts_with("//") {
+                    if let Some((name, next)) = condition_identifier(rest) {
+                        if !matches!(name, "true" | "false") {
+                            referenced_symbols.insert(name.to_owned());
+                        }
+                        rest = next;
+                    } else {
+                        rest = &rest[rest.chars().next().unwrap().len_utf8()..];
+                    }
+                }
+            }
             if matches!(keyword, "if" | "elif" | "else") {
                 let chain = if keyword == "if" {
                     let chain = next_chain;
@@ -215,6 +732,11 @@ pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
                     condition: condition.trim().to_owned(),
                     directive: keyword.to_owned(),
                     closing_directive: None,
+                    definitely_inactive: owners.iter().all(|o| {
+                        o.active
+                            .get(chain)
+                            .is_none_or(|active| *active == Some(false))
+                    }),
                     kept: stack.last().is_some_and(|state| state.branch_active),
                 });
             }
@@ -233,18 +755,23 @@ pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
         line_start = line_end;
     }
 
+    let decisions = finish_decisions(&owners, next_chain, referenced_symbols);
     if !any_directive {
         return PreprocessorScan {
+            decisions,
             included_ranges: None,
             has_inactive_regions: false,
             branches,
+            symbol_directives,
         };
     }
 
     PreprocessorScan {
+        decisions,
         included_ranges: Some(build_ranges(bytes, &kept)),
         has_inactive_regions,
         branches,
+        symbol_directives,
     }
 }
 
@@ -288,50 +815,10 @@ fn build_ranges(bytes: &[u8], kept: &[(usize, usize)]) -> Vec<tree_sitter::Range
     ranges
 }
 
-/// Update the conditional stack for one directive.
-///
-/// `body` is the directive text with the leading `#` and whitespace removed.
-/// Unbalanced input never panics: a stray `#else`, `#elif`, or `#endif` with no
-/// open chain is a no-op, and chains still open at end of file simply end.
-fn apply_directive(body: &str, stack: &mut Vec<ChainState>) {
-    let (keyword, condition) = match body.find(|c: char| c.is_whitespace()) {
-        Some(split) => (&body[..split], body[split..].trim()),
-        None => (body, ""),
-    };
-    let parent_active = stack.last().is_none_or(|state| state.branch_active);
-    match keyword {
-        "if" => {
-            let active = parent_active && !is_literal_false(condition);
-            stack.push(ChainState {
-                branch_active: active,
-                chosen: active,
-                parent_active,
-            });
-        }
-        "elif" => {
-            if let Some(state) = stack.last_mut() {
-                let active = state.parent_active && !state.chosen && !is_literal_false(condition);
-                state.branch_active = active;
-                state.chosen |= active;
-            }
-        }
-        "else" => {
-            if let Some(state) = stack.last_mut() {
-                let active = state.parent_active && !state.chosen;
-                state.branch_active = active;
-                state.chosen |= active;
-            }
-        }
-        "endif" => {
-            stack.pop();
-        }
-        _ => {}
-    }
-}
-
-/// A condition is decidable only when it is exactly the literal `false`.
-fn is_literal_false(condition: &str) -> bool {
-    condition.trim() == "false"
+/// The unowned case uses the reserved open compilation, including file-local
+/// assignments and literal expression proofs.
+pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
+    scan_and_decide_preprocessor(source, &[])
 }
 
 /// Advance the cross-line lexical mode across one source line.
@@ -508,7 +995,7 @@ fn scan_and_parse_csharp(
     Some((tree, scan))
 }
 
-fn parse_csharp_scan_with_cancellation(
+pub fn parse_csharp_scan_with_cancellation(
     source: &str,
     scan: &PreprocessorScan,
     cancellation: Option<&CancellationToken>,

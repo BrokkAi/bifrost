@@ -13,6 +13,7 @@ use crate::analyzer::{
     TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -618,6 +619,10 @@ impl MultiAnalyzer {
 
     pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
         without_project_reads(|| {
+            // Maintenance inputs have no query owner, even on a request thread.
+            let _maintenance = brokk_bifrost_core::analyzer::carried_context::push(None);
+            let carried_context =
+                brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             let mut delegates = self.delegates.clone();
             if let Some(context) = &self.build_context {
                 let active_languages = context.project_languages();
@@ -640,11 +645,13 @@ impl MultiAnalyzer {
                 .collect::<Vec<_>>()
                 .into_par_iter()
                 .map(|(language, delegate)| {
-                    without_project_reads(|| {
-                        (
-                            *language,
-                            delegate.update_all_with_progress(progress.clone()),
-                        )
+                    carried_context.run(|| {
+                        without_project_reads(|| {
+                            (
+                                *language,
+                                delegate.update_all_with_progress(progress.clone()),
+                            )
+                        })
                     })
                 })
                 .collect();
@@ -1255,7 +1262,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             .is_some_and(|provider| provider.supports_type_hierarchy(code_unit))
     }
 
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
         if let Some(ancestors) = crate::analyzer::languages::language_support_for_hook(
@@ -1264,7 +1271,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         )
         .and_then(|support| support.workspace_direct_ancestors(self, token, code_unit))
         {
-            return ancestors;
+            return HierarchyAnswer::complete(ancestors);
         }
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
@@ -1281,7 +1288,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
             .map(|provider| provider.member_family_ancestors(owner))
             .unwrap_or_default();
-        ancestors.resolved = self.get_direct_ancestors(owner);
+        ancestors.resolved = self.get_direct_ancestors(owner).edges;
         ancestors
     }
 
@@ -1295,17 +1302,20 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             .is_none_or(|provider| provider.member_family_inventory_matches(member, inventory))
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        crate::analyzer::whole_workspace_descendants(|scope| {
-            self.get_direct_descendants_within(code_unit, scope)
-        })
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+        let cancellation = crate::cancellation::CancellationToken::default();
+        self.get_direct_descendants_within(
+            code_unit,
+            &crate::analyzer::DescendantIndexScope::whole_workspace(&cancellation),
+        )
+        .expect("uncancelled hierarchy completes")
     }
 
     fn get_direct_ancestors_within(
         &self,
         code_unit: &CodeUnit,
         scope: &crate::analyzer::DescendantIndexScope<'_>,
-    ) -> Option<Vec<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
         if let Some(ancestors) = crate::analyzer::languages::language_support_for_hook(
@@ -1315,14 +1325,16 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         .and_then(|support| {
             support.workspace_direct_ancestors_within(self, token, code_unit, scope)
         }) {
-            return ancestors;
+            return ancestors
+                .map(HierarchyAnswer::complete)
+                .ok_or(brokk_bifrost_core::analyzer::capabilities::Cancelled);
         }
         match self
             .delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
         {
             Some(provider) => provider.get_direct_ancestors_within(code_unit, scope),
-            None => Some(Vec::new()),
+            None => Ok(HierarchyAnswer::default()),
         }
     }
 
@@ -1330,7 +1342,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         &self,
         code_unit: &CodeUnit,
         scope: &crate::analyzer::DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
         let mut descendants = match self
@@ -1338,7 +1350,10 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
         {
             Some(provider) => provider.get_direct_descendants_within(code_unit, scope)?,
-            None => HashSet::default(),
+            None if scope.cancellation().is_cancelled() => {
+                return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
+            }
+            None => HierarchyAnswer { open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable], ..HierarchyAnswer::default() },
         };
         for language in self.languages() {
             let support = crate::analyzer::languages::language_support_for_hook(
@@ -1346,9 +1361,17 @@ impl TypeHierarchyProvider for MultiAnalyzer {
                 "workspace_additional_direct_descendants",
             )
             .expect("registered delegate has language support");
-            descendants.extend(
-                support.workspace_additional_direct_descendants(self, token, code_unit, scope)?,
-            );
+            match support.workspace_additional_direct_descendants(self, token, code_unit, scope) {
+                Some(edges) => descendants.merge(HierarchyAnswer::complete(edges.into_iter().collect())),
+                None if scope.cancellation().is_cancelled() => return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled),
+                None => descendants.open.push(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable),
+            }
+        }
+        descendants.edges.sort();
+        descendants.edges.dedup();
+        if !descendants.is_complete() {
+            crate::analyzer::record_descendant_query_failure(self);
+            return Ok(descendants);
         }
         if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
         {
@@ -1358,10 +1381,10 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
                 crate::analyzer::read_ledger::LookupKind::Descendants,
                 crate::analyzer::read_ledger::LookupQuestion::declaration(code_unit),
-                crate::analyzer::read_ledger::declaration_set_digest(&descendants),
+                crate::analyzer::read_ledger::declaration_set_digest(&descendants.edges),
             ));
         }
-        Some(descendants)
+        Ok(descendants)
     }
 }
 
@@ -2400,18 +2423,34 @@ impl IAnalyzer for MultiAnalyzer {
         crate::analyzer::i_analyzer::record_store_error_on_current_contexts(error);
     }
 
+    fn current_query_read_completion(&self) -> Result<(), QueryReadIncomplete> {
+        let contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned");
+        crate::analyzer::i_analyzer::current_query_context_value(&contexts, |context| {
+            context.read_completion().err()
+        })
+        .map_or(Ok(()), Err)
+    }
+
     fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
         crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(reason);
     }
 
     fn warm_query_indexes(&self) {
         without_project_reads(|| {
+            // Maintenance inputs have no query owner, even on a request thread.
+            let _maintenance = brokk_bifrost_core::analyzer::carried_context::push(None);
+            let carried_context =
+                brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             self.delegates
                 .values()
                 .collect::<Vec<_>>()
                 .into_par_iter()
                 .for_each(|delegate| {
-                    without_project_reads(|| delegate.analyzer().warm_query_indexes())
+                    carried_context
+                        .run(|| without_project_reads(|| delegate.analyzer().warm_query_indexes()))
                 });
         })
     }
@@ -2453,6 +2492,10 @@ impl IAnalyzer for MultiAnalyzer {
         // Refresh inputs belong to no product, even when a query triggered it.
         // The outer scope covers serial discovery; each worker enters its own.
         without_project_reads(|| {
+            // Maintenance inputs have no query owner, even on a request thread.
+            let _maintenance = brokk_bifrost_core::analyzer::carried_context::push(None);
+            let carried_context =
+                brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             let mut delegates = self.delegates.clone();
             let active_languages = self
                 .build_context
@@ -2483,23 +2526,27 @@ impl IAnalyzer for MultiAnalyzer {
                 .collect::<Vec<_>>()
                 .into_par_iter()
                 .map(|(language, delegate)| {
-                    without_project_reads(|| {
-                        if missing_languages.contains(language) {
-                            // Construction indexed the complete current language
-                            // file set, including this delta. Applying it again is
-                            // redundant and can schedule avoidable store GC work.
-                            return (*language, delegate.clone(), false);
-                        }
-                        let relevant: BTreeSet<ProjectFile> = changed_files
-                            .iter()
-                            .filter(|file| delegate.should_receive_changed_file(*language, file))
-                            .cloned()
-                            .collect();
-                        if relevant.is_empty() {
-                            (*language, delegate.clone(), false)
-                        } else {
-                            (*language, delegate.update(&relevant), true)
-                        }
+                    carried_context.run(|| {
+                        without_project_reads(|| {
+                            if missing_languages.contains(language) {
+                                // Construction indexed the complete current language
+                                // file set, including this delta. Applying it again is
+                                // redundant and can schedule avoidable store GC work.
+                                return (*language, delegate.clone(), false);
+                            }
+                            let relevant: BTreeSet<ProjectFile> = changed_files
+                                .iter()
+                                .filter(|file| {
+                                    delegate.should_receive_changed_file(*language, file)
+                                })
+                                .cloned()
+                                .collect();
+                            if relevant.is_empty() {
+                                (*language, delegate.clone(), false)
+                            } else {
+                                (*language, delegate.update(&relevant), true)
+                            }
+                        })
                     })
                 })
                 .collect();

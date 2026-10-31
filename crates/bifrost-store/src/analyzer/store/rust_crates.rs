@@ -45,9 +45,9 @@ use super::WorkspaceSnapshots;
 
 use crate::analyzer::pool_memo::install_on_dedicated_build_pool;
 
-pub(super) const REPLACED_BLOB_ID_SQL: &str = "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3 AND (EXISTS(SELECT 1 FROM rust_crate_container_sources WHERE blob_id = blobs.id) OR EXISTS(SELECT 1 FROM rust_crate_exports WHERE declaration_blob_id = blobs.id))";
+pub(super) const REPLACED_BLOB_ID_SQL: &str = "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3 AND parse_variant = ?4 AND (EXISTS(SELECT 1 FROM rust_crate_container_sources WHERE blob_id = blobs.id) OR EXISTS(SELECT 1 FROM rust_crate_exports WHERE declaration_blob_id = blobs.id))";
 pub(super) const REINSERT_BLOB_SQL: &str =
-    "INSERT INTO blobs(id, blob_oid, lang, generation) VALUES(?1, ?2, ?3, ?4)";
+    "INSERT INTO blobs(id, blob_oid, lang, generation, parse_variant) VALUES(?1, ?2, ?3, ?4, ?5)";
 
 pub(super) const INSERT_NAMING_SQL: &str =
     "INSERT INTO rust_crate_file_naming VALUES(?1,?2,jsonb(?3),jsonb(?4))";
@@ -650,6 +650,8 @@ impl AnalyzerStore {
         snapshot: &WorkspaceSnapshotId,
         scope: CrateReconcileScope,
     ) -> Result<()> {
+        let carried_context =
+            brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         assert_eq!(snapshot.lang, "rust");
         let started = std::time::Instant::now();
         let scope_kind = match &scope {
@@ -951,33 +953,35 @@ impl AnalyzerStore {
                 (1..=wave_count)
                     .into_par_iter()
                     .filter_map(|ordinal| {
-                        let derive = || -> Result<()> {
-                            let item = {
-                                let conn = schedule.lock().unwrap();
-                                let (id, forced) =
-                                    conn.query_row(WAVE_UNIT_SQL, [ordinal as i64], |row| {
-                                        Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
-                                    })?;
-                                read_staged_crate(&conn, id, forced)?
+                        carried_context.run(|| {
+                            let derive = || -> Result<()> {
+                                let item = {
+                                    let conn = schedule.lock().unwrap();
+                                    let (id, forced) =
+                                        conn.query_row(WAVE_UNIT_SQL, [ordinal as i64], |row| {
+                                            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+                                        })?;
+                                    read_staged_crate(&conn, id, forced)?
+                                };
+                                let derived = self.derive_rust_crate(
+                                    &item,
+                                    &snapshots,
+                                    &epoch,
+                                    Some(&schedule),
+                                    &naming,
+                                )?;
+                                schedule.lock().unwrap().execute(
+                                    "INSERT INTO temp.rust_schedule_outputs VALUES(?1,?2,?3)",
+                                    params![
+                                        derived.key.as_slice(),
+                                        derived.topology_id,
+                                        derived.surface.as_slice()
+                                    ],
+                                )?;
+                                Ok(())
                             };
-                            let derived = self.derive_rust_crate(
-                                &item,
-                                &snapshots,
-                                &epoch,
-                                Some(&schedule),
-                                &naming,
-                            )?;
-                            schedule.lock().unwrap().execute(
-                                "INSERT INTO temp.rust_schedule_outputs VALUES(?1,?2,?3)",
-                                params![
-                                    derived.key.as_slice(),
-                                    derived.topology_id,
-                                    derived.surface.as_slice()
-                                ],
-                            )?;
-                            Ok(())
-                        };
-                        derive().err()
+                            derive().err()
+                        })
                     })
                     .collect::<Vec<_>>()
             });
@@ -2122,8 +2126,8 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
             SQL_RUST_CRATE_VERSIONS_6,
             2,
         ),
-        ("rust_crate_replaced_blob_id", REPLACED_BLOB_ID_SQL, 3),
-        ("rust_crate_reinsert_blob", REINSERT_BLOB_SQL, 4),
+        ("rust_crate_replaced_blob_id", REPLACED_BLOB_ID_SQL, 4),
+        ("rust_crate_reinsert_blob", REINSERT_BLOB_SQL, 5),
         ("rust_crate_reconcile_sql_blobs_8", SQL_BLOBS_8, 1),
         (
             "rust_crate_reconcile_sql_rust_crate_topologies_9",
@@ -2289,8 +2293,8 @@ mod tests {
         // Keep the fixture at the store boundary: both production SQL queries
         // and the production fixed-point loop run against these source rows.
         conn.execute_batch(
-            "CREATE TABLE blobs(id, blob_oid, lang, generation);
-             INSERT INTO blobs VALUES(1,'root','rust',0),(2,'macros','rust',0);
+            "CREATE TABLE blobs(id, blob_oid, lang, generation, parse_variant BLOB NOT NULL DEFAULT x'');
+             INSERT INTO blobs(id, blob_oid, lang, generation) VALUES(1,'root','rust',0),(2,'macros','rust',0);
              CREATE TABLE workspace_file_versions(file_version_id, rel_path, blob_oid, lang, generation);
              INSERT INTO workspace_file_versions VALUES
                (1,'src/lib.rs','root','rust',0),(2,'src/macros.rs','macros','rust',0);

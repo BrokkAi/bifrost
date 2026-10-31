@@ -703,6 +703,10 @@ struct ProgressReporter {
 /// request. Phase and status notifications are not spaced.
 const BUILD_PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long one partial result may wait for a slow client before it is
+/// dropped. It holds up only this request's own task, never the analyzer.
+const PARTIAL_RESULT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
 impl ProgressReporter {
     /// A reporter for this request, or `None` when the caller did not opt in.
     /// The token is carried through to every notification exactly as
@@ -747,12 +751,29 @@ impl ProgressReporter {
         .await;
     }
 
+    /// One finished part of the request's result, under `_meta[kind]`.
+    ///
+    /// It is given longer than a phase to reach a slow client, because a later
+    /// notification does not replace it; the final result still carries it.
+    async fn partial_result(&self, kind: String, value: Value) {
+        let step = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut params =
+            rmcp::model::ProgressNotificationParam::new(self.token.clone(), step as f64)
+                .with_message(format!("partial result: {kind}"));
+        params.meta = Some(rmcp::model::NotificationMetaObject::from(
+            serde_json::Map::from_iter([(kind, value)]),
+        ));
+        self.send_within(params, PARTIAL_RESULT_SEND_TIMEOUT).await;
+    }
+
     async fn send(&self, params: rmcp::model::ProgressNotificationParam) {
         // A slow/disconnected client loses observations, never analyzer capacity
         // or prompt cancellation. There is at most one send per request.
-        match tokio::time::timeout(Duration::from_millis(25), self.peer.notify_progress(params))
-            .await
-        {
+        self.send_within(params, Duration::from_millis(25)).await;
+    }
+
+    async fn send_within(&self, params: rmcp::model::ProgressNotificationParam, timeout: Duration) {
+        match tokio::time::timeout(timeout, self.peer.notify_progress(params)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 eprintln!("bifrost: failed to send MCP progress notification: {error}")
@@ -1477,6 +1498,21 @@ impl BifrostMcpHandler {
         // (issue #3170). The receiver and this sender both live as long as that
         // loop, so `recv` cannot return `None` while the call is running.
         let (phase_tx, mut phase_rx) = tokio::sync::mpsc::channel::<String>(32);
+        // Partial results go through their own unbounded channel: unlike a
+        // phase, a dropped one is never superseded. Its size is bounded by the
+        // result it is part of, which the request holds anyway.
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+        let bifrost_cancellation = match progress {
+            Some(_) => bifrost_cancellation.with_result_sink(move |kind, value| {
+                // The receiver is gone only once the request has answered;
+                // the final result already holds this part.
+                match result_tx.send((kind.to_string(), value)) {
+                    Ok(()) => {}
+                    Err(_after_the_answer) => {}
+                }
+            }),
+            None => bifrost_cancellation,
+        };
         let bifrost_cancellation = match progress {
             Some(_) => {
                 let phases = phase_tx.clone();
@@ -1597,6 +1633,12 @@ impl BifrostMcpHandler {
                     progress
                         .expect("the phase sink is installed only when the caller opted into progress")
                         .phase(phase)
+                        .await;
+                }
+                Some((kind, value)) = result_rx.recv() => {
+                    progress
+                        .expect("the result sink is installed only when the caller opted into progress")
+                        .partial_result(kind, value)
                         .await;
                 }
                 _ = build_ticks.tick(), if progress.is_some() => {

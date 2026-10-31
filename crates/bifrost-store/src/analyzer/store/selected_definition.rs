@@ -109,7 +109,7 @@ const SELECTED_UNIT_COLUMNS: &str = "keys.blob_oid, units.lang, units.unit_key, 
      units.fq_anchor_kind, units.fq_anchor_pop,
      units.fq_package_tail_segments, units.fq_segment_count,
      units.exact_fqn_tail, units.fq_segment_bytes,
-     units.normalized_fqn_tail";
+     units.normalized_fqn_tail, keys.parse_variant AS parse_variant";
 
 /// The mount and interior joins every request-driven selected reader opens.
 const SELECTED_REQUEST_INTERIOR_JOINS: &str = "FROM json_each(?1) AS request
@@ -450,7 +450,7 @@ impl SelectedResolutionMountInventory<'_> {
                     .query_map([blob], |row| {
                         Ok((
                             super::candidate_row_from_row(row)?,
-                            ResolutionLocalKey::new(row.get::<_, i64>(19)?),
+                            ResolutionLocalKey::new(row.get::<_, i64>(20)?),
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -624,8 +624,8 @@ impl SelectedResolutionMountInventory<'_> {
                             Ok((
                                 super::candidate_row_from_row(row)?,
                                 (
-                                    SelectedResolutionMountOrdinal::new(row.get::<_, u32>(19)?),
-                                    ResolutionLocalKey::new(row.get::<_, i64>(20)?),
+                                    SelectedResolutionMountOrdinal::new(row.get::<_, u32>(20)?),
+                                    ResolutionLocalKey::new(row.get::<_, i64>(21)?),
                                 ),
                             ))
                         })?

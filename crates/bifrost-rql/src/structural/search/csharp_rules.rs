@@ -6,17 +6,26 @@
 // selection stays in tree-sitter nodes and fields.
 
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::usages::get_definition::parse_tree_for_language;
+use crate::analyzer::usages::get_definition::{
+    DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language_preprocessed,
+    resolve_definition_batch_with_source,
+};
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::query::CSharpRule;
-use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    csharp_integer_literal_value, declarator_initializer,
+use brokk_bifrost_analysis::analyzer::structural::lexical_environment::{
+    BindingOfOutcome, EnvironmentFileResult, binding_of, environment_for_file,
 };
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
+    csharp_integer_literal_value, declaration_modifier_words, declarator_initializer,
+};
+use brokk_bifrost_core::analyzer::structural::conditional_regions::Activation;
 use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
+use brokk_bifrost_core::analyzer::structural::occurrences::Namespace;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+use brokk_bifrost_core::analyzer::tree_walk::expression_target_node;
 use tree_sitter::{Node, Tree};
 
-use super::field_metadata::{field_sites, FieldSite};
+use super::field_metadata::{FieldSite, field_sites};
 use super::language_rules::{LanguageRuleMatches, UndecidedSite};
 
 /// Return the exact structural spans selected by one closed C# relation.
@@ -29,13 +38,15 @@ pub(super) fn matches_for_file(
     if language_for_file(file) != Language::CSharp {
         return LanguageRuleMatches::default();
     }
-    let Some(tree) = parse_tree_for_language(file, Language::CSharp, source) else {
+    let Some((tree, preprocessor)) = parse_tree_for_language_preprocessed(file, Language::CSharp, source) else {
         return LanguageRuleMatches::default();
     };
     let fields = field_sites(analyzer, file);
     let mut undecided = Vec::new();
     let ranges = match rule {
-        CSharpRule::StaticArray => static_array_fields(&tree, source, &fields, &mut undecided),
+        CSharpRule::StaticArray => {
+            static_array_fields(analyzer, file, &tree, source, &fields, &mut undecided, &preprocessor.as_ref().map(|p| p.conditional_regions(source)).unwrap_or_default())
+        }
         CSharpRule::UseNumberConstant => {
             number_constant_uses(&tree, source, &fields, &mut undecided)
         }
@@ -50,11 +61,15 @@ pub(super) fn matches_for_file(
 }
 
 fn static_array_fields(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
     tree: &Tree,
     source: &str,
     fields: &[FieldSite],
     undecided: &mut Vec<UndecidedSite>,
+    regions: &brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions,
 ) -> Vec<Range> {
+    let environment = environment_for_file(analyzer, file);
     let mut matches = Vec::new();
     for node in descendants(tree.root_node()) {
         if node.kind() != "field_declaration" {
@@ -80,7 +95,118 @@ fn static_array_fields(
             if !identity.is_array() {
                 continue;
             }
-            if initializer_shape(declarator, source) != InitializerShape::Empty {
+            let Some(owner) = enclosing_type(declarator) else {
+                continue;
+            };
+            if declaration_modifier_words(owner, source)
+                .iter()
+                .any(|word| word == "partial")
+            {
+                undecided.push(UndecidedSite::at(
+                    node_range(declarator),
+                    "a partial type can define the field in another file",
+                ));
+                continue;
+            }
+            let mut shapes = Vec::new();
+            if let Some(value) = declarator_initializer(declarator) {
+                shapes.push(expression_shape(value, source));
+            }
+            let mut uncertain = regions.has_uncertain_text(declarator.byte_range());
+            for constructor in descendants(owner).into_iter().filter(|child| {
+                child.kind() == "constructor_declaration" && enclosing_type(*child) == Some(owner)
+            }) {
+                if !declaration_modifier_words(constructor, source)
+                    .iter()
+                    .any(|word| word == "static")
+                {
+                    continue;
+                }
+                if regions.activation_at(constructor.start_byte()) == Activation::DecidedInactive {
+                    continue;
+                }
+                // Omitted conditional text can contain a definition that is not in the tree.
+                uncertain |= regions.has_uncertain_omission(constructor.byte_range());
+                for definition in descendants(constructor) {
+                    if regions.activation_at(definition.start_byte()) == Activation::DecidedInactive
+                    {
+                        continue;
+                    }
+                    if definition.kind() == "assignment_expression" {
+                        if let Some(left) = definition.child_by_field_name("left") {
+                            let target = field_target(
+                                left,
+                                declarator,
+                                source,
+                                &environment,
+                                analyzer,
+                                file,
+                            );
+                            uncertain |= target.is_none();
+                            if target == Some(true) {
+                                if regions.has_uncertain_text(definition.byte_range()) {
+                                    uncertain = true;
+                                    continue;
+                                }
+                                let simple = definition
+                                    .child_by_field_name("operator")
+                                    .is_some_and(|op| op.kind() == "=");
+                                shapes.push(if simple {
+                                    definition
+                                        .child_by_field_name("right")
+                                        .map_or(DefinitionShape::Disqualifies, |value| {
+                                            expression_shape(value, source)
+                                        })
+                                } else {
+                                    DefinitionShape::Disqualifies
+                                });
+                            }
+                        }
+                    } else if definition.kind() == "argument" {
+                        let children = {
+                            let mut cursor = definition.walk();
+                            definition.children(&mut cursor).collect::<Vec<_>>()
+                        };
+                        if children
+                            .iter()
+                            .any(|child| matches!(child.kind(), "out" | "ref"))
+                        {
+                            for child in children.iter().filter(|child| child.is_named()) {
+                                let target = field_target(
+                                    *child,
+                                    declarator,
+                                    source,
+                                    &environment,
+                                    analyzer,
+                                    file,
+                                );
+                                uncertain |= target.is_none();
+                                if target == Some(true) {
+                                    if regions.has_uncertain_text(definition.byte_range()) {
+                                        uncertain = true;
+                                    } else {
+                                        shapes.push(DefinitionShape::Disqualifies);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if uncertain {
+                undecided.push(UndecidedSite::at(
+                    node_range(declarator),
+                    "a field definition has an unproven binding or conditional activation",
+                ));
+            } else if shapes.contains(&DefinitionShape::Undecided) {
+                undecided.push(UndecidedSite::at(
+                    node_range(declarator),
+                    "an array length may be a compile-time constant that is not folded",
+                ));
+            } else if shapes
+                .iter()
+                .all(|shape| *shape == DefinitionShape::Qualifies)
+            {
                 matches.push(node_range(declarator));
             }
         }
@@ -89,68 +215,145 @@ fn static_array_fields(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum InitializerShape {
-    Empty,
-    NonEmpty,
-    Unknown,
+enum DefinitionShape {
+    Qualifies,
+    Disqualifies,
+    Undecided,
 }
 
-fn initializer_shape(declarator: Node<'_>, source: &str) -> InitializerShape {
-    let Some(initializer) = declarator_initializer(declarator) else {
-        return InitializerShape::Unknown;
-    };
-    match initializer.kind() {
-        "array_initializer_expression" | "initializer_expression" => list_shape(initializer),
-        "implicit_array_creation_expression" => descendants(initializer)
-            .into_iter()
-            .find(|node| {
-                matches!(
-                    node.kind(),
-                    "array_initializer_expression" | "initializer_expression"
-                )
-            })
-            .map_or(InitializerShape::Unknown, |initializer| {
-                list_shape(initializer)
-            }),
-        "array_creation_expression" => array_creation_shape(initializer, source),
-        _ => InitializerShape::Unknown,
+fn field_target(
+    node: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+    environment: &EnvironmentFileResult,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<bool> {
+    let node = expression_target_node(node);
+    let spelling = |node: Node<'_>| source[node.byte_range()].trim_start_matches('@');
+    let name = spelling(declarator.child_by_field_name("name").expect("field name"));
+    match node.kind() {
+        "identifier" if spelling(node) == name => {
+            match binding_of(environment, name, node.start_byte(), Some(Namespace::Value)) {
+                BindingOfOutcome::NoBinding => Some(true),
+                BindingOfOutcome::Incomplete(_) => None,
+                _ => Some(false),
+            }
+        }
+        "member_access_expression"
+            if node
+                .child_by_field_name("name")
+                .is_some_and(|member| spelling(member) == name) =>
+        {
+            // Qualified targets use the resolver, including aliases, nested types,
+            // and a qualifier shadowed by a local value.
+            let member = node.child_by_field_name("name").expect("member name");
+            let outcomes = resolve_definition_batch_with_source(
+                analyzer,
+                vec![DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(member.start_byte()),
+                    end_byte: Some(member.end_byte()),
+                }],
+                file.clone(),
+                std::sync::Arc::from(source),
+            );
+            let outcome = outcomes.first()?;
+            if outcome.status != DefinitionLookupStatus::Resolved || outcome.definitions.len() != 1
+            {
+                return None;
+            }
+            Some(
+                outcome.definitions[0].is_field()
+                    && outcome.definitions[0].source() == file
+                    && analyzer
+                        .ranges_of(&outcome.definitions[0])
+                        .contains(&node_range(declarator)),
+            )
+        }
+        _ => Some(false),
     }
 }
 
-fn array_creation_shape(node: Node<'_>, source: &str) -> InitializerShape {
-    if let Some(initializer) = descendants(node).into_iter().find(|child| {
-        matches!(
-            child.kind(),
-            "array_initializer_expression" | "initializer_expression"
-        )
-    }) {
-        return list_shape(initializer);
+fn expression_shape(root: Node<'_>, source: &str) -> DefinitionShape {
+    let mut pending = vec![root];
+    let mut undecided = false;
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "parenthesized_expression" => pending.extend(named_children(node)),
+            "conditional_expression" => {
+                pending.extend(node.child_by_field_name("consequence"));
+                pending.extend(node.child_by_field_name("alternative"));
+            }
+            "null_literal" => {}
+            "array_initializer_expression" | "initializer_expression" => {
+                if list_shape(node) == DefinitionShape::Disqualifies {
+                    return DefinitionShape::Disqualifies;
+                }
+            }
+            "array_creation_expression" | "implicit_array_creation_expression" => {
+                if let Some(initializer) = named_children(node).into_iter().find(|child| {
+                    matches!(
+                        child.kind(),
+                        "array_initializer_expression" | "initializer_expression"
+                    )
+                }) {
+                    if list_shape(initializer) == DefinitionShape::Disqualifies {
+                        return DefinitionShape::Disqualifies;
+                    }
+                } else {
+                    for rank in descendants(node)
+                        .into_iter()
+                        .filter(|child| child.kind() == "array_rank_specifier")
+                    {
+                        for size in named_children(rank) {
+                            let size = expression_target_node(size);
+                            match csharp_integer_literal_value(size, source)
+                                .and_then(|value| value.decimal)
+                            {
+                                // A zero dimension makes the created array empty.
+                                Some(value) if value == "0" => {
+                                    return DefinitionShape::Disqualifies;
+                                }
+                                Some(_) => {}
+                                None => {
+                                    // CodeQL tests the absence of a length whose constant value is 0.
+                                    // Calls and object creations cannot be C# constants, so they
+                                    // qualify. Other expressions may fold to 0; until we fold
+                                    // constants, those sites remain undecided.
+                                    if !matches!(
+                                        expression_target_node(size).kind(),
+                                        "invocation_expression"
+                                            | "object_creation_expression"
+                                            | "implicit_object_creation_expression"
+                                    ) {
+                                        undecided = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => return DefinitionShape::Disqualifies,
+        }
     }
-    if array_creation_is_empty(node, source) {
-        InitializerShape::Empty
+    if undecided {
+        DefinitionShape::Undecided
     } else {
-        InitializerShape::Unknown
+        DefinitionShape::Qualifies
     }
 }
 
-fn list_shape(initializer: Node<'_>) -> InitializerShape {
+fn list_shape(initializer: Node<'_>) -> DefinitionShape {
     if initializer.named_child_count() == 0 {
-        InitializerShape::Empty
+        // An initializer with no elements creates an empty array.
+        DefinitionShape::Disqualifies
     } else {
-        InitializerShape::NonEmpty
+        DefinitionShape::Qualifies
     }
-}
-
-fn array_creation_is_empty(node: Node<'_>, source: &str) -> bool {
-    descendants(node).into_iter().any(|rank| {
-        rank.kind() == "array_rank_specifier"
-            && rank.named_child_count() == 1
-            && rank
-                .named_child(0)
-                .and_then(|size| csharp_integer_literal_value(size, source))
-                .and_then(|value| value.decimal)
-                .is_some_and(|value| value == "0")
-    })
 }
 
 #[derive(Clone)]
@@ -214,7 +417,10 @@ fn number_constant_uses(
         }
         let owner_id = enclosing_type(literal).map_or(0, |owner| owner.id());
         let Some(value) = csharp_integer_literal_value(literal, source) else {
-            if constants.iter().any(|constant| constant.owner_id == owner_id) {
+            if constants
+                .iter()
+                .any(|constant| constant.owner_id == owner_id)
+            {
                 undecided.push(UndecidedSite::at(
                     literal_range,
                     "the integer literal value is not decoded",

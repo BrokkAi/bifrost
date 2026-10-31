@@ -245,7 +245,13 @@ then does it deduplicate keys. Item and detailed evidence move together.
 
 The invariant is: for every row key, the merged value is the first value in
 the full branch-major execution, and its provenance is the same bounded prefix
-of that execution's trace sequence, with the same truncation indication.
+of that execution's trace sequence, with the same truncation indication. This
+is the choice the implementation makes today; another reasonable choice of
+representative value and bounded provenance prefix is acceptable (owner
+decision 2026-10-30) as long as it is chosen deterministically (the run-to-run
+contract in AGENTS.md), the provenance is truthful and bounded, the
+truncation indication is carried, and incremental and full evaluation of the
+same code agree.
 Ordered union concatenation is associative, as is retaining a bounded prefix
 while propagating truncation. Flattening nested unions without intervening
 steps preserves this invariant, including when branches enumerate overlapping

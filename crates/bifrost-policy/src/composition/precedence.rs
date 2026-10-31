@@ -190,12 +190,12 @@ where
         false
     }
 
-    /// Select the one non-superseded candidate, if the candidate set is
-    /// non-empty. An incomparable live set is an explicit ambiguity.
-    pub(crate) fn unique_winner(
+    /// Reduce a semantic observation to its non-superseded declarations.
+    /// Independent declarations remain live.
+    pub(crate) fn live_candidates(
         &self,
         candidates: impl IntoIterator<Item = K>,
-    ) -> Result<Option<K>, PrecedenceError<K>> {
+    ) -> Result<Vec<K>, PrecedenceError<K>> {
         let mut candidates: Vec<_> = candidates.into_iter().collect();
         candidates.sort();
         candidates.dedup();
@@ -216,6 +216,16 @@ where
             })
             .cloned()
             .collect();
+        Ok(winners)
+    }
+
+    /// Select the one non-superseded candidate, if the candidate set is
+    /// non-empty. An incomparable live set is an explicit ambiguity.
+    pub(crate) fn unique_winner(
+        &self,
+        candidates: impl IntoIterator<Item = K>,
+    ) -> Result<Option<K>, PrecedenceError<K>> {
+        let winners = self.live_candidates(candidates)?;
         match winners.as_slice() {
             [] => Ok(None),
             [winner] => Ok(Some(winner.clone())),

@@ -2254,6 +2254,28 @@ pub fn resolve_value_identity_with_source(
     source: Arc<str>,
     cancellation: Option<&CancellationToken>,
 ) -> Option<ResolvedValueIdentity> {
+    match resolve_value_identity_with_source_outcome(analyzer, request, file, source, cancellation)
+    {
+        Ok(identity) => identity,
+        Err(_) => {
+            // This best-effort identity surface cannot return operational
+            // provenance. Its read receipt must still refuse reuse.
+            analyzer.mark_execution_dependent();
+            None
+        }
+    }
+}
+
+/// Resolve the same identity while preserving operational lookup stops.
+/// `Ok(None)` is a content rejection; an opaque failed provider is never one.
+pub fn resolve_value_identity_with_source_outcome(
+    analyzer: &dyn IAnalyzer,
+    request: DefinitionLookupRequest,
+    file: ProjectFile,
+    source: Arc<str>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<ResolvedValueIdentity>, crate::analyzer::read_ledger::DerivationExecutionCause> {
+    use crate::analyzer::read_ledger::DerivationExecutionCause;
     let outcome = if let Some(cancellation) = cancellation {
         resolve_definition_batch_with_source_and_cancellation(
             analyzer,
@@ -2271,7 +2293,34 @@ pub fn resolve_value_identity_with_source(
         )
     }
     .into_iter()
-    .next()?;
+    .next()
+    .expect("one definition request produces one outcome");
+    let status = outcome.status;
+    match status {
+        DefinitionLookupStatus::Cancelled => return Err(DerivationExecutionCause::Cancelled),
+        DefinitionLookupStatus::ExceededBudget(_) => return Err(DerivationExecutionCause::Budget),
+        DefinitionLookupStatus::Unavailable | DefinitionLookupStatus::Incomplete => {
+            return Err(DerivationExecutionCause::Provider);
+        }
+        DefinitionLookupStatus::Resolved
+        | DefinitionLookupStatus::NoDefinition
+        | DefinitionLookupStatus::UnresolvableImportBoundary
+        | DefinitionLookupStatus::Ambiguous
+        | DefinitionLookupStatus::UnsupportedLanguage
+        | DefinitionLookupStatus::InvalidLocation
+        | DefinitionLookupStatus::NotFound => {}
+    }
+    value_identity_from_lookup(analyzer, &request, &file, &source, cancellation, outcome)
+}
+
+fn value_identity_from_lookup(
+    analyzer: &dyn IAnalyzer,
+    request: &DefinitionLookupRequest,
+    file: &ProjectFile,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+    outcome: DefinitionLookupOutcome,
+) -> Result<Option<ResolvedValueIdentity>, crate::analyzer::read_ledger::DerivationExecutionCause> {
     if outcome.status == DefinitionLookupStatus::Resolved {
         let mut definitions = outcome.definitions;
         definitions.sort_by_key(|definition| definition.declaration_id());
@@ -2295,31 +2344,47 @@ pub fn resolve_value_identity_with_source(
             _ => None,
         };
         if resolved.is_some() {
-            return resolved;
+            return Ok(resolved);
         }
-        return language_support_for_hook(language_for_file(&file), "definition_value_identity")?
-            .definition_value_identity(analyzer, &request, &file, &source, cancellation);
+        let Some(support) =
+            language_support_for_hook(language_for_file(file), "definition_value_identity")
+        else {
+            return Ok(None);
+        };
+        return support.definition_value_identity(analyzer, request, file, source, cancellation);
     }
 
     if outcome.status == DefinitionLookupStatus::InvalidLocation {
-        return language_support_for_hook(language_for_file(&file), "definition_value_identity")?
-            .definition_value_identity(analyzer, &request, &file, &source, cancellation);
+        let Some(support) =
+            language_support_for_hook(language_for_file(file), "definition_value_identity")
+        else {
+            return Ok(None);
+        };
+        return support.definition_value_identity(analyzer, request, file, source, cancellation);
     }
 
     if outcome.status != DefinitionLookupStatus::UnresolvableImportBoundary
         || !matches!(
-            crate::analyzer::common::language_for_file(&file),
+            crate::analyzer::common::language_for_file(file),
             Language::Python | Language::CSharp
         )
     {
-        return None;
+        return Ok(None);
     }
-    if crate::analyzer::common::language_for_file(&file) == Language::CSharp {
-        let reference = outcome.reference.as_ref()?.text.as_str();
-        let overlay = analyzer.semantic_model_overlay()?;
+    if crate::analyzer::common::language_for_file(file) == Language::CSharp {
+        let Some(reference) = outcome
+            .reference
+            .as_ref()
+            .map(|reference| reference.text.as_str())
+        else {
+            return Ok(None);
+        };
+        let Some(overlay) = analyzer.semantic_model_overlay() else {
+            return Ok(None);
+        };
         let matched = overlay.symbols_named(reference);
         let [symbol] = matched.records.as_slice() else {
-            return None;
+            return Ok(None);
         };
         if matched.disposition
             != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
@@ -2330,16 +2395,20 @@ pub fn resolve_value_identity_with_source(
             || symbol.provenance.completeness
                 != crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
         {
-            return None;
+            return Ok(None);
         }
-        return Some(ResolvedValueIdentity {
+        return Ok(Some(ResolvedValueIdentity {
             kind: ResolvedValueIdentityKind::ActiveSemanticModel,
             identity: symbol.id.clone(),
             aliases: symbol.aliases.clone(),
-        });
+        }));
     }
-    language_support_for_hook(language_for_file(&file), "definition_value_identity")?
-        .definition_value_identity(analyzer, &request, &file, &source, cancellation)
+    let Some(support) =
+        language_support_for_hook(language_for_file(file), "definition_value_identity")
+    else {
+        return Ok(None);
+    };
+    support.definition_value_identity(analyzer, request, file, source, cancellation)
 }
 
 #[doc(hidden)]
@@ -3599,28 +3668,66 @@ pub fn parse_tree_for_language(
     language: Language,
     source: &str,
 ) -> Option<Tree> {
+    parse_tree_for_language_outcome(file, language, source)
+        .ok()
+        .flatten()
+}
+
+/// Parse once and retain the preprocessing evidence for source-backed consumers.
+pub fn parse_tree_for_language_preprocessed(
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+) -> Option<(
+    Tree,
+    Option<std::sync::Arc<dyn brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor>>,
+)> {
     if language == Language::CSharp {
-        return brokk_bifrost_csharp::preprocessor::parse_csharp(source);
+        let (tree, scan) = brokk_bifrost_csharp::preprocessor::parse_csharp_scanned(source)?;
+        return Some((tree, Some(std::sync::Arc::new(scan))));
+    }
+    parse_tree_for_language(file, language, source).map(|tree| (tree, None))
+}
+
+pub fn parse_tree_for_language_outcome(
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+) -> Result<Option<Tree>, crate::analyzer::read_ledger::DerivationExecutionCause> {
+    use crate::analyzer::read_ledger::DerivationExecutionCause;
+    let failed = || {
+        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+        DerivationExecutionCause::Provider
+    };
+    if language == Language::CSharp {
+        return brokk_bifrost_csharp::preprocessor::parse_csharp(source)
+            .map(Some)
+            .ok_or_else(failed);
     }
     if language == Language::Go {
-        return brokk_bifrost_go::parse::parse_go(source);
+        return brokk_bifrost_go::parse::parse_go(source)
+            .map(Some)
+            .ok_or_else(failed);
     }
-    let grammar = crate::analyzer::parser_language_for_path(language, file.rel_path())?;
+    let Some(grammar) = crate::analyzer::parser_language_for_path(language, file.rel_path()) else {
+        return Ok(None);
+    };
     let mut parser = Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(source, None)?;
+    parser.set_language(&grammar).map_err(|_| failed())?;
+    let tree = parser.parse(source, None).ok_or_else(failed)?;
     if language == Language::Cpp
         && let Some(ranges) =
             brokk_bifrost_cpp::graph::syntax::function_macro_included_ranges(source, &tree, || {
                 false
             })
-            .continue_value()?
+            .continue_value()
+            .ok_or_else(failed)?
     {
         drop(tree);
-        parser.set_included_ranges(&ranges).ok()?;
-        return parser.parse(source, None);
+        parser.set_included_ranges(&ranges).map_err(|_| failed())?;
+        return parser.parse(source, None).map(Some).ok_or_else(failed);
     }
-    Some(tree)
+    Ok(Some(tree))
 }
 
 #[doc(hidden)]

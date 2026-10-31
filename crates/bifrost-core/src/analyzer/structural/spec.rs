@@ -255,12 +255,11 @@ pub trait StructuralSpec: Send + Sync + 'static {
 
     /// Conditional-compilation evidence for this file. It is query-time data,
     /// not part of persisted structural rows.
-    fn conditional_regions(
+    fn preprocess(
         &self,
-        _root: Node<'_>,
         _source: &str,
-    ) -> super::conditional_regions::ConditionalRegions {
-        super::conditional_regions::ConditionalRegions::default()
+    ) -> Option<std::sync::Arc<dyn crate::analyzer::prepared_syntax::SourcePreprocessor>> {
+        None
     }
 
     /// A tree re-parsed around syntax the bundled grammar cannot represent, or
@@ -621,6 +620,18 @@ pub trait StructuralSpec: Send + Sync + 'static {
         _candidate: BindingScopeCandidate<'_>,
     ) -> BindingScopeSelection {
         BindingScopeSelection::Use
+    }
+
+    /// The declaration whose signature and body are in scope for this formal.
+    fn type_parameter_owner<'tree>(&self, _name: Node<'tree>) -> Option<Node<'tree>> {
+        None
+    }
+
+    /// Whether this syntax owner stops inheritance of enclosing type formals.
+    /// Owners without ordinary lexical scopes (for example static fields) are
+    /// barriers over their syntax range as well.
+    fn type_parameter_scope_barrier(&self, _owner: Node<'_>) -> bool {
+        false
     }
 
     /// Source-backed binders implicitly introduced by this syntax scope.

@@ -381,10 +381,16 @@ mod tests {
         }
     }
     impl TypeHierarchyProvider for ImportHost {
-        fn get_direct_ancestors(&self, _unit: &CodeUnit) -> Vec<CodeUnit> {
+        fn get_direct_ancestors(
+            &self,
+            _unit: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
             unimplemented!()
         }
-        fn get_direct_descendants(&self, _unit: &CodeUnit) -> HashSet<CodeUnit> {
+        fn get_direct_descendants(
+            &self,
+            _unit: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
             unimplemented!()
         }
     }

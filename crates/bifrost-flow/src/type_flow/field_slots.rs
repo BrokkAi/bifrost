@@ -4064,7 +4064,8 @@ mod tests {
         .expect("the durable index remains available after the operational failure");
         assert_eq!(recovered.kind, FieldSlotIndexAcquisitionKind::PersistentHit);
         assert_eq!(recovered.miss_reason, None);
-        assert_eq!(recovered.index.digest(), failed.index.digest());
+        // The store-error fallback may have incomplete descendant reads; #8185 tracks request-memo-owned reasons to avoid unrelated degradation.
+        assert_eq!(recovered.index.digest(), cold.index.digest());
     }
 
     #[hardwon(

@@ -66,8 +66,7 @@ mod jvm_extraction_tests {
         )).unwrap();
             let state = parsed_fixture_state(&JavaAdapter, "Owner.java", &source);
             let parsed = prepare_parsed_blob(
-                oid(source.as_bytes()),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(source.as_bytes()), "java"),
                 snapshot.generation,
                 &JavaAdapter,
                 state,
@@ -132,7 +131,7 @@ mod jvm_extraction_tests {
                 .unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>().unwrap();
             let cost = persisted_blob_mutation_cost_fallback_statement(
-                &mut conn.prepare_cached(persisted_blob_mutation_cost_fallback_sql()).unwrap(), &raw_oid, "java",
+                &mut conn.prepare_cached(persisted_blob_mutation_cost_fallback_sql()).unwrap(),&brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::from_str(&raw_oid).unwrap(), "java"),
             ).unwrap();
             let mut measurements = Vec::new();
             for statistics in PlannerStatisticsState::BOTH {

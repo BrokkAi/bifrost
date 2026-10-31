@@ -1,0 +1,9 @@
+{
+  "project": {
+    "restore": {
+      "originalTargetFrameworks": [
+        "net10.0"
+      ]
+    }
+  }
+}

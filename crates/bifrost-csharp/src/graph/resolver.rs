@@ -3045,34 +3045,80 @@ pub(super) fn usage_attribute_type_candidates(
         return Vec::new();
     };
     let mut type_candidates = |spelling: &str| {
-        if let Some(unit) = resolve_in_enclosing_nested_type_scopes(
-            csharp,
-            token,
-            class_ranges,
-            spelling,
-            name.start_byte(),
-        ) {
-            return Some(vec![unit]);
-        }
-        let mut declaration_candidates = |fqn: &str| {
-            Some(graph_support::usage_type_candidates_by_fqn(
-                csharp, token, fqn,
-            ))
-        };
-        usage_visible_type_candidates_at_with_lookups(
-            csharp,
-            token,
-            file,
-            &context,
-            spelling,
-            &mut declaration_candidates,
-        )
+        attribute_spelling_candidates(csharp, token, file, class_ranges, &context, name, spelling)
     };
     hierarchy::usage_unambiguous_attribute_type_candidates(
         csharp,
         token,
         &names,
         &mut type_candidates,
+    )
+}
+
+/// The workspace attribute classes an attribute's `name` node can denote, and
+/// whether more than one logical class remains.
+///
+/// This is the usage-side ladder of [`usage_attribute_type_candidates`], but an
+/// ambiguous answer stays distinguishable from no workspace answer, so a caller
+/// can fall back to external declarations only when the workspace has none.
+pub fn attribute_type_candidates_of_name(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    name: Node<'_>,
+    source: &str,
+) -> (Vec<CodeUnit>, bool) {
+    let names = csharp_attribute_type_names(name, source);
+    let Some(context) = graph_support::CSharpLookupContext::at(source, name, || true) else {
+        return (Vec::new(), false);
+    };
+    let class_ranges = csharp.class_range_index(file);
+    let mut type_candidates = |spelling: &str| {
+        attribute_spelling_candidates(csharp, token, file, &class_ranges, &context, name, spelling)
+    };
+    let mut attribute_class_is_applicable = |candidate: &CodeUnit| {
+        Some(hierarchy::usage_attribute_class_is_applicable(
+            csharp, token, candidate,
+        ))
+    };
+    hierarchy::attribute_type_candidates_with_lookups(
+        &names,
+        &mut type_candidates,
+        &mut attribute_class_is_applicable,
+    )
+    .unwrap_or((Vec::new(), false))
+}
+
+fn attribute_spelling_candidates(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    class_ranges: &ClassRangeIndex,
+    context: &graph_support::CSharpLookupContext,
+    name: Node<'_>,
+    spelling: &str,
+) -> Option<Vec<CodeUnit>> {
+    if let Some(unit) = resolve_in_enclosing_nested_type_scopes(
+        csharp,
+        token,
+        class_ranges,
+        spelling,
+        name.start_byte(),
+    ) {
+        return Some(vec![unit]);
+    }
+    let mut declaration_candidates = |fqn: &str| {
+        Some(graph_support::usage_type_candidates_by_fqn(
+            csharp, token, fqn,
+        ))
+    };
+    usage_visible_type_candidates_at_with_lookups(
+        csharp,
+        token,
+        file,
+        context,
+        spelling,
+        &mut declaration_candidates,
     )
 }
 
@@ -3639,7 +3685,7 @@ fn predefined_value_type(type_node: Node<'_>, source: &str) -> bool {
 /// Answers `None` for a `var` local, whose type comes from an initializer this
 /// walk does not evaluate, and for every name this file does not declare, which
 /// includes an inherited field.
-fn visible_declared_type_node<'tree>(
+pub(crate) fn visible_declared_type_node<'tree>(
     node: Node<'tree>,
     source: &str,
     name: &str,
@@ -4570,14 +4616,14 @@ pub fn compatible_receiver_type_names(
                 // Through the reference's own source: a membership view
                 // derives each base contribution by its part's membership.
                 let provider: &dyn TypeHierarchyProvider = csharp;
-                let mut stack = provider.get_direct_ancestors(&owner);
+                let mut stack = provider.get_direct_ancestors(&owner).definite().to_vec();
                 let mut seen = HashSet::default();
                 while let Some(ancestor) = stack.pop() {
                     if !seen.insert(ancestor.clone()) {
                         continue;
                     }
                     compatible.insert(csharp_normalize_full_name(&ancestor.fq_name()));
-                    stack.extend(provider.get_direct_ancestors(&ancestor));
+                    stack.extend(provider.get_direct_ancestors(&ancestor).definite().to_vec());
                 }
             }
         }
@@ -5199,7 +5245,7 @@ pub fn nearest_member_candidates_for_owner_inner(
             }
         } else if let Some(hierarchy) = hierarchy {
             for current in current_level {
-                for ancestor in hierarchy.get_direct_ancestors(&current) {
+                for ancestor in hierarchy.get_direct_ancestors(&current).definite().to_vec() {
                     let mut parts = graph_support::partial_type_parts(csharp, &ancestor);
                     if parts.is_empty() {
                         parts.push(ancestor);

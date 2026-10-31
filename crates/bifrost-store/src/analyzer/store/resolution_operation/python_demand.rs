@@ -28,8 +28,8 @@
 //! per-read proof. Retained reflective operations of these forms contribute one
 //! python_dynamic_receiver_mutation_open reverse query obligation. Forms with
 //! no retained mutation operation cannot contribute to that operation count.
-//! Forward definitions expose neither this obligation nor python_environment_open
-//! yet; their query-obligation channel is tracked by #7362.
+//! Forward and reverse answers share selected-environment query obligations.
+//! They describe query scope and never demote a selected binding (#7362).
 pub(super) mod super_context;
 
 use super::demand_closure::*;
@@ -40,6 +40,32 @@ use crate::analyzer::resolution::{DemandReferenceKey, EndpointSignature, Resolut
 use crate::analyzer::store::python_binding_rows::{BindingEvent, PythonBindingRows};
 use crate::analyzer::store::selected_read_memo::RequestReadCache;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBindingEventKind;
+
+use crate::analyzer::resolution::query_obligations::{NodeQueryObligations, QueryNode};
+use crate::analyzer::resolution::{QueryObligation, QueryObligations};
+
+/// The summary's recorded environment and placement obligations, one extraction
+/// for both query directions; labels retain the reverse contract. The
+/// dynamic-receiver obligation needs the summary-wide structural mutation
+/// inventory, so each direction adds it only where it has that inventory.
+pub(super) fn selected_environment_obligations(
+    ready: &ReadySelectedResolution<'_, '_>,
+    summary: i64,
+) -> Result<QueryObligations> {
+    let mut scope = QueryObligations::empty();
+    let mut statement = ready.inventory.connection().prepare_cached(
+        "SELECT gap_kind,subject,json(detail) FROM resolution_unit_summary_gaps WHERE summary_id=?1 AND gap_kind IN ('python_environment_open','python_unknown_placement') ORDER BY gap_kind,subject")?;
+    for row in statement.query_map([summary], |row| {
+        Ok(QueryObligation::new(
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        scope.insert(row?);
+    }
+    Ok(scope)
+}
 
 type SuperContextRows =
     RequestReadCache<(i64, Option<u32>), Option<super_context::SuperContextRow>>;
@@ -67,6 +93,10 @@ pub(super) struct PythonRank {
 pub(super) struct PythonRules<'a, 'store, 'input> {
     pub ready: &'a ReadySelectedResolution<'store, 'input>,
     pub summary: i64,
+    selected_query_obligations: QueryObligations,
+    // Filled on the first dynamic-receiver record, so only mutation-sensitive
+    // reads pay for the summary-wide structural inventory.
+    dynamic_receiver_obligation: std::cell::OnceCell<Option<QueryObligation>>,
     pub profile: PythonBindingProfile,
     /// Declared minimum Python version, not an exact interpreter version. None means undeclared.
     pub python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
@@ -164,6 +194,40 @@ const MODULE_OBJECT_ATTRIBUTES: &[&str] = &[
     "__loader__",
     "__cached__",
 ];
+
+const CURATED_STAR_CHILD_PREFIX_SQL: &str = "SELECT EXISTS(
+                               SELECT 1 FROM resolution_unit_summary_members member
+                               INDEXED BY resolution_unit_summary_members_blob
+                               CROSS JOIN python_unit_summary_imports imports
+                                 ON imports.summary_id=member.summary_id AND imports.member_ordinal=member.member_ordinal
+                               CROSS JOIN python_unit_summary_providers parent
+                                 ON parent.summary_id=imports.summary_id AND parent.container_path=imports.target_container
+                               CROSS JOIN python_unit_summary_surfaces surface
+                                 ON surface.summary_id=parent.summary_id AND surface.container_path=parent.container_path
+                                  AND surface.surface='wildcard' AND surface.policy='curated'
+                               CROSS JOIN python_unit_summary_export_names exported
+                                 ON exported.summary_id=surface.summary_id AND exported.container_path=surface.container_path
+                                  AND exported.surface=surface.surface AND exported.name=?5 AND exported.slot_site IS NULL
+                               CROSS JOIN python_unit_summary_providers child INDEXED BY python_unit_summary_providers_module
+                                 ON child.summary_id=parent.summary_id AND child.module_name=parent.module_name || '.' || ?5
+                                  AND child.root_slot=parent.root_slot AND child.state='selected' AND child.kind IN ('module','package')
+                               CROSS JOIN resolution_unit_summary_members child_member
+                                 ON child_member.summary_id=child.summary_id AND child_member.member_ordinal=child.member_ordinal
+                               CROSS JOIN selected_resolution_mounts mounted
+                                 ON mounted.storage_language='python' AND mounted.persisted_relative_path=child_member.rel_path
+                                  AND mounted.blob_id=child_member.blob_id
+                               WHERE member.blob_id=?3 AND member.summary_id=?1 AND member.rel_path=?2
+                                 AND imports.import_site=?4 AND imports.form='star' AND imports.state='activation_open'
+                                 AND parent.kind='package' AND parent.state='selected'
+                                 AND NOT EXISTS(SELECT 1 FROM python_unit_summary_imports other
+                                   WHERE other.summary_id=imports.summary_id AND other.member_ordinal=imports.member_ordinal
+                                     AND other.import_site=imports.import_site AND other.target_container<>imports.target_container)
+                                 AND NOT EXISTS(SELECT 1 FROM python_unit_summary_providers other
+                                   WHERE other.summary_id=child.summary_id AND other.module_name=child.module_name
+                                     AND other.state IN ('alternative','open'))
+                                 AND NOT EXISTS(SELECT 1 FROM python_unit_summary_export_names hook
+                                   WHERE hook.summary_id=parent.summary_id AND hook.container_path=parent.container_path
+                                     AND hook.surface='module' AND hook.name='__getattr__'))";
 
 /// These runtime names cannot be disproved by a closed source-binding inventory.
 /// A child provider can become a package attribute through module loading without
@@ -296,6 +360,7 @@ struct UniverseMutationInputs {
 /// Owned data for one suspended typed group. The rules borrow it only while
 /// polling; no context borrows its containing provider.
 struct PythonQualifiedInputs {
+    query_obligations: RefCell<NodeQueryObligations>,
     rows: std::sync::Arc<PythonBindingRows>,
     blob: i64,
     lookup: ResolutionLookupSemanticRecipe,
@@ -314,9 +379,15 @@ impl PythonQualifiedInputs {
         rules: &'a PythonRules<'a, 'store, 'input>,
         reference: DemandReferenceKey,
     ) -> super::python_members::PythonMemberContext<'a, 'store, 'input> {
+        self.references.record_query_obligations(
+            self.query_obligations
+                .borrow_mut()
+                .node(QueryNode::Reference(reference.reference)),
+        );
         super::python_members::PythonMemberContext {
             rules,
             reference: reference.reference,
+            query_obligations: &self.query_obligations,
             environment: reference.environment,
             rows: &self.rows,
             blob: self.blob,
@@ -566,7 +637,12 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
             let prefix = if input.values.is_empty() {
                 match self.root_prefix(mount.blob_id(), input.reference.reference)? {
                     Some(prefix) => {
-                        let take = match self.prefix_has_import(&rows, &prefix)? {
+                        let take = match self.prefix_has_import(
+                            &rows,
+                            &prefix,
+                            mount.persisted_relative_path(),
+                            mount.blob_id(),
+                        )? {
                             Read::Ready { value, .. } => value,
                             Read::Cancelled(completion) => {
                                 return Ok(CloseProgress::Cancelled(completion));
@@ -610,6 +686,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
                     }),
             );
             let context = PythonQualifiedInputs {
+                query_obligations: RefCell::new(NodeQueryObligations::empty()),
                 rows,
                 blob: mount.blob_id(),
                 lookup,
@@ -744,7 +821,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
             selection,
             provenance,
         };
-        let progress = slot.access.poll(
+        let mut progress = slot.access.poll(
             id,
             selection,
             provenance,
@@ -771,6 +848,13 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
                 )))
             },
         )?;
+        if let crate::analyzer::resolution::CloseProgress::Ready(Read::Ready { value, .. }) =
+            &mut progress
+        {
+            value
+                .query_obligations
+                .union(&slot.context.query_obligations.borrow().published());
+        }
         self.qualified_members.insert(id, slot);
         Ok(progress)
     }
@@ -793,7 +877,13 @@ pub(super) struct PythonTarget {
     scope: Option<ResolutionScopeId>,
 }
 
+struct PythonModuleBindingSelection {
+    locations: Vec<RouteLocation>,
+    selected_binding: bool,
+}
+
 pub(super) struct PythonHalf<'a, 'store, 'input> {
+    query_obligations: std::rc::Rc<RefCell<NodeQueryObligations>>,
     pub(super) rules: &'a PythonRules<'a, 'store, 'input>,
     pub(super) source: &'a SourceHalf,
     placements: Vec<PythonPlacement>,
@@ -816,6 +906,8 @@ pub(super) struct PythonHalf<'a, 'store, 'input> {
 }
 
 struct PythonHalfInputs {
+    query_obligations: std::rc::Rc<RefCell<NodeQueryObligations>>,
+    requesting_path: String,
     conditional_imports: Vec<u32>,
     activation_reasons: Vec<SemanticId>,
     endpoint_completion: ResolutionCompletion,
@@ -840,7 +932,10 @@ impl PythonHalfInputs {
         source: &'a SourceHalf,
         completion: ResolutionCompletion,
     ) -> PythonHalf<'a, 'store, 'input> {
+        // This is the consuming accessor, reached for both memo hits and misses.
+        rules.record_unplaced_scope(source.token, &self.query_obligations, &self.requesting_path);
         PythonHalf {
+            query_obligations: std::rc::Rc::clone(&self.query_obligations),
             rules,
             source,
             placements: self
@@ -934,6 +1029,68 @@ pub(super) fn import_route_obligation(
 type PythonModuleBindings = (u32, i64, std::sync::Arc<PythonBindingRows>);
 
 impl PythonRules<'_, '_, '_> {
+    pub(super) fn record_query_scope(
+        &self,
+        reference: SemanticId,
+        scope: &RefCell<NodeQueryObligations>,
+        kind: &str,
+    ) {
+        debug_assert_ne!(
+            kind, "python_dynamic_receiver_mutation_open",
+            "dynamic-receiver scope is recorded lazily by record_dynamic_receiver_scope"
+        );
+        // The served node is explicit even when its memo was filled by another root.
+        for obligation in self
+            .selected_query_obligations
+            .iter()
+            .filter(|obligation| obligation.kind == kind)
+        {
+            scope
+                .borrow_mut()
+                .node(QueryNode::Reference(reference))
+                .insert(obligation.clone());
+        }
+    }
+    pub(super) fn record_dynamic_receiver_scope(
+        &self,
+        reference: SemanticId,
+        scope: &RefCell<NodeQueryObligations>,
+    ) -> Result<()> {
+        let obligation = match self.dynamic_receiver_obligation.get() {
+            Some(obligation) => obligation,
+            None => {
+                let obligation =
+                    super::python_members::operations::dynamic_receiver_query_obligation(
+                        &self.structural_inventory()?,
+                    );
+                self.dynamic_receiver_obligation.get_or_init(|| obligation)
+            }
+        };
+        // The served node is explicit even when its memo was filled by another root.
+        if let Some(obligation) = obligation {
+            scope
+                .borrow_mut()
+                .node(QueryNode::Reference(reference))
+                .insert(obligation.clone());
+        }
+        Ok(())
+    }
+    pub(super) fn record_unplaced_scope(
+        &self,
+        reference: SemanticId,
+        scope: &RefCell<NodeQueryObligations>,
+        path: &str,
+    ) {
+        for obligation in self.selected_query_obligations.iter().filter(|obligation| {
+            obligation.kind == "python_unknown_placement" && obligation.subject == path
+        }) {
+            scope
+                .borrow_mut()
+                .node(QueryNode::Reference(reference))
+                .insert(obligation.clone());
+        }
+    }
+
     pub(super) fn structural_inventory(
         &self,
     ) -> Result<std::cell::Ref<'_, Vec<super::python_members::operations::StructuralMutation>>>
@@ -995,6 +1152,8 @@ impl PythonRules<'_, '_, '_> {
         &self,
         rows: &PythonBindingRows,
         prefix: &PythonRootPrefix,
+        caller: &str,
+        blob: i64,
     ) -> Result<Read<bool>> {
         let Some(state) = python_lexical::lexical_selection(
             rows,
@@ -1006,6 +1165,12 @@ impl PythonRules<'_, '_, '_> {
             return Ok(Read::ready(false));
         };
         let start = ResolutionScopeId::new(state.start_scope);
+        let point = rows
+            .observations
+            .iter()
+            .find(|observation| observation.reference.get() == prefix.site)
+            .expect("selected prefix has a binding observation")
+            .point_byte;
         let state = RefCell::new(state);
         let imports = std::cell::Cell::new(false);
         let selected = select_lexical_route_starts::<u32, (), _>(
@@ -1046,6 +1211,34 @@ impl PythonRules<'_, '_, '_> {
                                     && event.kind == ResolutionBindingEventKind::Import
                             }),
                     );
+                } else if state.selection.selected.len() == before
+                    && !MODULE_OBJECT_ATTRIBUTES.contains(&prefix.name.as_str())
+                {
+                    // A star has no named binding event. Request the prefix
+                    // only for a placed curated child, so an unrelated star
+                    // cannot create a prerequisite cycle for local values.
+                    for (site, owner, commit) in &rows.import_positions {
+                        if *owner != scope.get()
+                            || *commit > point
+                            || !python_lexical::unconditional_import(rows, *site)
+                            || !rows.imports.iter().any(|import| {
+                                import.import_site.get() == *site
+                                    && import.form
+                                        == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::Star
+                            })
+                        {
+                            continue;
+                        }
+                        let child: bool = self.ready.inventory.connection().query_row(
+                            CURATED_STAR_CHILD_PREFIX_SQL,
+                            rusqlite::params![self.summary, caller, blob, site, prefix.name],
+                            |row| row.get(0),
+                        )?;
+                        if child {
+                            imports.set(true);
+                            break;
+                        }
+                    }
                 }
                 Ok(Read::ready(vec![Ok(RankedLexicalTier {
                     rank: 0,
@@ -1681,6 +1874,18 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
             });
         };
         let mut frame = RootFrame::positioned(endpoint, source, halves);
+        let requesting =
+            self.ready
+                .inventory
+                .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(
+                    source.fragment.ordinal(),
+                ))?;
+        for obligation in self.selected_query_obligations.iter().filter(|obligation| {
+            obligation.kind == "python_unknown_placement"
+                && obligation.subject == requesting.persisted_relative_path()
+        }) {
+            frame.query_obligations.insert(obligation.clone());
+        }
         frame.context = Some(ContextId(0));
         frame.completion = completion;
         Ok(Read::ready(Admission::SourceOwned(frame)))
@@ -1741,6 +1946,17 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 );
                 reference
             };
+            let mount = self.ready.inventory.mount_record_by_ordinal(
+                SelectedResolutionMountOrdinal::new(
+                    reference.ordinal().expect("source reference mount"),
+                ),
+            )?;
+            for obligation in self.selected_query_obligations.iter().filter(|obligation| {
+                obligation.kind == "python_unknown_placement"
+                    && obligation.subject == mount.persisted_relative_path()
+            }) {
+                frame.query_obligations.insert(obligation.clone());
+            }
             if !self.universe_mutations.borrow().contains_key(identity) {
                 let ordinal = reference.ordinal().expect("source reference mount");
                 let mount = self
@@ -2237,6 +2453,8 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
             )?);
         }
         let prepared = PythonHalfInputs {
+            requesting_path: mount.persisted_relative_path().to_owned(),
+            query_obligations: std::rc::Rc::new(RefCell::new(NodeQueryObligations::empty())),
             conditional_imports,
             activation_reasons,
             endpoint_completion,
@@ -2300,12 +2518,19 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         facts: &ClosureFacts<'_>,
     ) -> Result<Read<ClosurePolicy>> {
         let mut activation_reasons = Vec::new();
+        let mut query_obligations = frame.query_obligations.clone();
+        if let Some(module) = self.module_import_inputs.get(&frame.endpoint) {
+            module
+                .references
+                .record_query_obligations(&mut query_obligations);
+        }
         // Binding rows survive publication: selection changes cannot alter a blob's facts.
         for half in &frame.halves {
             match half {
                 SelectedRootPathHalf::Reference { identity, .. }
                 | SelectedRootPathHalf::Import { identity, .. } => {
                     if let Some(prepared) = self.source_inputs.borrow_mut().remove(identity) {
+                        query_obligations.union(&prepared.query_obligations.borrow().published());
                         activation_reasons.extend(prepared.activation_reasons);
                     }
                     self.prepared_references.borrow_mut().remove(identity);
@@ -2316,25 +2541,43 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 SelectedRootPathHalf::Export { .. } => unreachable!("source frame"),
             }
         }
-        Ok(Read::ready(ClosurePolicy::new(
-            ResolutionCompletion::Complete,
-            BaseEligibility::Exclude,
-            DemandClosureDischarges::exact(activation_reasons),
-            facts
-                .generated
-                .iter()
-                .map(|(candidate, source)| GeneratedContinuation {
-                    candidate: *candidate,
-                    source: *source,
-                    base: BaseEligibility::Exclude,
-                })
-                .collect(),
-        )))
+        Ok(Read::ready(
+            ClosurePolicy::new(
+                ResolutionCompletion::Complete,
+                BaseEligibility::Exclude,
+                DemandClosureDischarges::exact(activation_reasons),
+                facts
+                    .generated
+                    .iter()
+                    .map(|(candidate, source)| GeneratedContinuation {
+                        candidate: *candidate,
+                        source: *source,
+                        base: BaseEligibility::Exclude,
+                    })
+                    .collect(),
+            )
+            .with_query_scope(crate::analyzer::resolution::ClosedQueryScope {
+                query_obligations,
+                ..Default::default()
+            }),
+        ))
     }
 }
 
 impl PythonHalf<'_, '_, '_> {
+    fn record_environment(&self, reference: SemanticId) {
+        self.rules.record_query_scope(
+            reference,
+            &self.query_obligations,
+            "python_environment_open",
+        );
+    }
+    fn record_mutation(&self, reference: SemanticId) -> Result<()> {
+        self.rules
+            .record_dynamic_receiver_scope(reference, &self.query_obligations)
+    }
     fn import_route_completion(&self, site: u32) -> Result<ResolutionCompletion> {
+        self.record_environment(self.source.token);
         let mount = self.rules.ready.inventory.mount_record_by_ordinal(
             SelectedResolutionMountOrdinal::new(self.fragment.ordinal()),
         )?;
@@ -2521,6 +2764,7 @@ impl PythonHalf<'_, '_, '_> {
     // Regular packages/modules have one selected provider. Namespace portions
     // are closed only when every retained portion belongs to analysis roots.
     fn provider_completion(&self, container: &str) -> Result<ResolutionCompletion> {
+        self.record_environment(self.source.token);
         if container.is_empty() {
             return Ok(ResolutionCompletion::Complete);
         }
@@ -2556,6 +2800,8 @@ impl PythonHalf<'_, '_, '_> {
                 ]));
             }
             let (kind, state, path, root, mounted) = row?;
+            self.rules
+                .record_unplaced_scope(self.source.token, &self.query_obligations, &path);
             found = true;
             closed &= state != "open"
                 && match kind.as_str() {
@@ -2580,6 +2826,7 @@ impl PythonHalf<'_, '_, '_> {
             .borrow()
             .get(container)
             .copied();
+        self.record_environment(self.source.token);
         let (policy_closed, public_names) = if let Some(cached) = cached {
             cached
         } else {
@@ -2620,6 +2867,8 @@ impl PythonHalf<'_, '_, '_> {
 
     fn module_attribute_space(&self, container: &str) -> Result<ResolutionCompletion> {
         let cached = self.rules.module_spaces.borrow().get(container).cloned();
+        self.record_environment(self.source.token);
+        self.record_mutation(self.source.token)?;
         let static_completion = if let Some(cached) = cached {
             cached
         } else {
@@ -2736,6 +2985,7 @@ impl PythonHalf<'_, '_, '_> {
     }
 
     fn module_locations(&self, container: &str, name: &str) -> Result<Read<Vec<RouteLocation>>> {
+        self.record_environment(self.source.token);
         let mut read = self.module_binding_locations(container, name)?;
         if let Read::Ready { value, completion } = &mut read
             && value.is_empty()
@@ -2757,13 +3007,31 @@ impl PythonHalf<'_, '_, '_> {
         container: &str,
         name: &str,
     ) -> Result<Read<Vec<RouteLocation>>> {
+        Ok(match self.module_binding_selection(container, name)? {
+            Read::Ready { value, completion } => Read::Ready {
+                value: value.locations,
+                completion,
+            },
+            Read::Cancelled(completion) => Read::Cancelled(completion),
+            Read::Unavailable { reason, completion } => Read::Unavailable { reason, completion },
+        })
+    }
+
+    fn module_binding_selection(
+        &self,
+        container: &str,
+        name: &str,
+    ) -> Result<Read<PythonModuleBindingSelection>> {
         let (ordinal, _, rows) = match self.rules.module_bindings(container)? {
             Read::Ready {
                 value: Some(value), ..
             } => value,
             Read::Ready { value: None, .. } => {
                 return Ok(Read::Ready {
-                    value: Vec::new(),
+                    value: PythonModuleBindingSelection {
+                        locations: Vec::new(),
+                        selected_binding: false,
+                    },
                     completion: self.provider_completion(container)?,
                 });
             }
@@ -2774,7 +3042,10 @@ impl PythonHalf<'_, '_, '_> {
         };
         let Some(root) = rows.scopes.iter().find(|scope| scope.parent.is_none()) else {
             return Ok(Read::Ready {
-                value: Vec::new(),
+                value: PythonModuleBindingSelection {
+                    locations: Vec::new(),
+                    selected_binding: false,
+                },
                 completion: open(self.source.token),
             });
         };
@@ -2841,7 +3112,13 @@ impl PythonHalf<'_, '_, '_> {
         completion = completion.combine(&self.module_attribute_space(container)?);
         value.sort();
         value.dedup();
-        Ok(Read::Ready { value, completion })
+        Ok(Read::Ready {
+            value: PythonModuleBindingSelection {
+                locations: value,
+                selected_binding: !state.selection.selected.is_empty(),
+            },
+            completion,
+        })
     }
     /// Mutation authority is the retained operation inventory, confirmed only
     /// through the shared prefix prerequisites. Lexical source events remain
@@ -2890,6 +3167,7 @@ impl PythonHalf<'_, '_, '_> {
         super::python_members::PythonMemberContext {
             rules: self.rules,
             reference: self.source.token,
+            query_obligations: &self.query_obligations,
             environment: crate::analyzer::resolution::CALLER_ENVIRONMENT,
             rows: &self.rows,
             blob: self.blob,
@@ -3216,6 +3494,14 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
     ) -> Result<Read<Self::LexicalTiers>> {
         let mut state = placement.lexical.borrow_mut();
         let state = state.as_mut().expect("selected lexical state");
+        let module_tier = self
+            .rows
+            .scopes
+            .iter()
+            .any(|row| row.scope == scope.get() && row.parent.is_none());
+        if module_tier {
+            self.record_mutation(self.source.token)?;
+        }
         let before = state.selection.selected.len();
         python_lexical::lexical_tier(
             state,
@@ -3226,7 +3512,15 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                 cancellation: self.rules.cancellation,
             },
         );
+        if module_tier
+            && state.selection.selected.is_empty()
+            && !state.selection.residual.is_empty()
+        {
+            self.record_environment(self.source.token);
+        }
         if state.builtin_fallback {
+            self.record_environment(self.source.token);
+            self.record_mutation(self.source.token)?;
             let detail = format!(
                 "builtins.{} may be selected before the sole module-cell writer runs",
                 lookup.spelling()
@@ -3264,6 +3558,8 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                 == brokk_bifrost_python::intrinsics::Availability::Present
             && self.builtin_inventory_closed()
         {
+            self.record_environment(self.source.token);
+            self.record_mutation(self.source.token)?;
             let entry = crate::analyzer::resolution::universe_lookup(
                 Language::Python,
                 ResolutionNamespace::Value,
@@ -3298,6 +3594,8 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
             && brokk_bifrost_python::intrinsics::builtin(lookup.spelling()).is_none()
             && self.builtin_inventory_closed()
         {
+            self.record_environment(self.source.token);
+            self.record_mutation(self.source.token)?;
             state.selection.residual.clear();
         }
         self.stopped.set(state.selection.stopped.is_some());
@@ -3904,6 +4202,47 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
             && providers
                 .iter()
                 .any(|(_, _, _, kind, _, _)| matches!(kind.as_str(), "module" | "package"));
+        // A curated star import reads the package attribute first and imports
+        // a missing name as a child. Identify this particular lexical route;
+        // ordinary module reads and public-name stars retain their open proof.
+        let curated_star = cursor.consumed_prefix_segments == 0
+            && self
+                .placement
+                .lexical
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| {
+                    state.selection.selected.len() == 1
+                        && self
+                            .placement
+                            .stars
+                            .borrow()
+                            .get(&state.selection.selected[0].occurrence)
+                            .is_some_and(|starts| {
+                                starts.iter().any(|(location, head)| {
+                                    location == &cursor.location
+                                        && head.spelling() == segment.spelling()
+                                })
+                            })
+                })
+            && self
+                .half
+                .rules
+                .wildcard_inventories
+                .borrow()
+                .get(container)
+                .is_some_and(|(closed, public_names)| *closed && !*public_names);
+        let star_child_owner = if curated_star
+            && !MODULE_OBJECT_ATTRIBUTES.contains(&segment.spelling())
+            && providers.len() == 1
+            && matches!(providers[0].3.as_str(), "module" | "package")
+            && providers[0].5 == "selected"
+            && self.half.provider_completion(&providers[0].0)? == ResolutionCompletion::Complete
+        {
+            self.half.module_owner(&providers[0].0)?
+        } else {
+            None
+        };
         let mut edges: Vec<_> = providers
             .into_iter()
             .map(|(container, ..)| RouteLocation::Container {
@@ -3913,7 +4252,46 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
             .collect();
         let mut coverage = self.half.provider_completion(container)?;
         if !container.is_empty() {
-            let locations = if from_import_child {
+            let locations = if let Some(child_owner) = star_child_owner {
+                match self
+                    .half
+                    .module_binding_selection(container, segment.spelling())?
+                {
+                    Read::Ready { value, completion }
+                        if completion == ResolutionCompletion::Complete
+                            && !value.selected_binding =>
+                    {
+                        debug_assert!(value.locations.is_empty());
+                        // The module definition is the namespace identity. Its
+                        // own dynamic attributes do not make that identity open.
+                        edges.clear();
+                        edges.push(child_owner);
+                        Read::Ready {
+                            value: Vec::new(),
+                            completion,
+                        }
+                    }
+                    Read::Ready { value, completion }
+                        if completion == ResolutionCompletion::Complete
+                            && !value.locations.is_empty() =>
+                    {
+                        debug_assert!(value.selected_binding);
+                        // A package attribute wins over a same-name child.
+                        edges.clear();
+                        Read::Ready {
+                            value: value.locations,
+                            completion,
+                        }
+                    }
+                    Read::Ready { .. } => {
+                        self.half.module_locations(container, segment.spelling())?
+                    }
+                    Read::Cancelled(completion) => Read::Cancelled(completion),
+                    Read::Unavailable { reason, completion } => {
+                        Read::Unavailable { reason, completion }
+                    }
+                }
+            } else if from_import_child {
                 self.half
                     .module_binding_locations(container, segment.spelling())?
             } else {
@@ -4267,6 +4645,7 @@ impl SelectedResolutionOperation<'_, '_> {
             "typing" => PythonBindingProfile::Typing,
             _ => return Err(StoreError::corrupt("invalid Python observation profile")),
         };
+        let selected_query_obligations = selected_environment_obligations(&self.ready, summary)?;
         let typed = self.ready.typed_source().with_implicit_environment(
             summary,
             python_version.map(|version| (version.major, version.minor)),
@@ -4279,6 +4658,8 @@ impl SelectedResolutionOperation<'_, '_> {
             PythonRules {
                 ready: &self.ready,
                 summary,
+                selected_query_obligations,
+                dynamic_receiver_obligation: std::cell::OnceCell::new(),
                 placement_unit: brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
                     b"bifrost-python-placement-unit-v1",
                     &summary.to_le_bytes(),
@@ -4458,6 +4839,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         session,
                     )?;
                     Ok(Ok(SelectedNativeReferenceUnits {
+                        query_obligations: answer.query_obligations.clone(),
                         answer,
                         definitions,
                         named_reasons,
@@ -4694,6 +5076,9 @@ impl SelectedResolutionOperation<'_, '_> {
                         named_reason_details(&self.ready, answer.binding().completion())?,
                     )
                     .expect("String write");
+                    if !answer.query_obligations.is_empty() {
+                        writeln!(output, "  query-obligations={:?}", answer.query_obligations.iter().map(ToString::to_string).collect::<Vec<_>>()).expect("String write");
+                    }
                     for observation in observations.borrow_mut().drain(..) {
                         writeln!(output, "  {observation}").expect("String write");
                     }
@@ -4701,5 +5086,106 @@ impl SelectedResolutionOperation<'_, '_> {
                 Ok(output)
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod curated_star_prefix_plan_tests {
+    use super::CURATED_STAR_CHILD_PREFIX_SQL;
+    use crate::analyzer::store::AnalyzerStore;
+    use crate::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context;
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+    use rusqlite::params;
+
+    #[test]
+    fn curated_star_prefix_seeks_populated_relations() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store.conn.execute(|conn| {
+            prepare_pin_context(conn);
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            for index in 1..=80_i64 {
+                let importer = index * 3;
+                let parent = importer + 1;
+                let child = importer + 2;
+                let package = format!("pkg{index}");
+                let caller = format!("caller-{index}.py");
+                let parent_path = format!("{package}/__init__.py");
+                let child_path = format!("{package}/child.py");
+                for (ordinal, path) in [
+                    (importer, &caller),
+                    (parent, &parent_path),
+                    (child, &child_path),
+                ] {
+                    conn.execute(
+                        "INSERT INTO resolution_unit_summary_members VALUES(1,?1,?1,?2,'source')",
+                        params![ordinal, path],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO temp.selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path) VALUES(?1,?1,'python',?2)",
+                        params![ordinal, path],
+                    )
+                    .unwrap();
+                }
+                let parent_container = format!("parent-{index}");
+                let child_container = format!("child-{index}");
+                for (container, module, parent_module, kind, path, ordinal) in [
+                    (&parent_container, package.clone(), String::new(), "package", &parent_path, parent),
+                    (&child_container, format!("{package}.child"), package.clone(), "module", &child_path, child),
+                ] {
+                    conn.execute(
+                        "INSERT INTO python_unit_summary_providers VALUES(1,?1,?2,?3,0,?4,'selected',?5,?6,zeroblob(32))",
+                        params![container, module, parent_module, kind, path, ordinal],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO python_unit_summary_imports VALUES(1,?1,0,?2,?3,?4,0,'','','star','activation_open')",
+                    params![importer, format!("importer-{index}"), parent_container, package],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO python_unit_summary_surfaces VALUES(1,?1,'wildcard','curated')",
+                    [&parent_container],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO python_unit_summary_export_names VALUES(1,?1,'wildcard','child',NULL)",
+                    [&parent_container],
+                )
+                .unwrap();
+            }
+            for state in PlannerStatisticsState::BOTH {
+                state.install(conn);
+                let bindings = params![1, "caller-1.py", 3, 0, "child"];
+                let selected: bool = conn
+                    .query_row(CURATED_STAR_CHILD_PREFIX_SQL, bindings, |row| row.get(0))
+                    .unwrap();
+                assert!(selected, "{state}: the placed child must be selected");
+                let mut statement = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {CURATED_STAR_CHILD_PREFIX_SQL}"))
+                    .unwrap();
+                let plan = statement
+                    .query_map(params![1, "caller-1.py", 3, 0, "child"], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                for table in [
+                    "member", "imports", "parent", "surface", "exported", "child",
+                    "child_member", "mounted",
+                ] {
+                    assert!(
+                        plan.iter().any(|step| step.starts_with(&format!("SEARCH {table} "))),
+                        "{state}: {table} must be sought: {plan:?}"
+                    );
+                }
+                assert!(
+                    plan.iter().all(|step| !step.contains("AUTOMATIC")),
+                    "{state}: no automatic indexes: {plan:?}"
+                );
+            }
+        });
     }
 }

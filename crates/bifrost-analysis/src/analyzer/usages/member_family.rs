@@ -547,9 +547,14 @@ fn forward_edges(walk: &mut FamilyWalk<'_>, member: &CodeUnit) -> ForwardStep {
     // the same chain are reached transitively through that one's own edges.
     let mut edges: Vec<MemberFamilyEdge> = Vec::new();
     let mut unread_ancestors = Vec::new();
+    let mut hierarchy_incomplete = false;
     let mut seen = vec![owner.clone()];
     let mut frontier = VecDeque::from([(owner.clone(), 0_usize)]);
     while let Some((type_unit, depth)) = frontier.pop_front() {
+        hierarchy_incomplete |= !walk
+            .hierarchy
+            .get_direct_ancestors(&type_unit)
+            .is_complete();
         let ancestors = walk.hierarchy.member_family_ancestors(&type_unit);
         for ancestor in ancestors.unread {
             if ancestor.inventory.is_none_or(|inventory| {
@@ -598,7 +603,8 @@ fn forward_edges(walk: &mut FamilyWalk<'_>, member: &CodeUnit) -> ForwardStep {
     }
     unread_ancestors.sort();
     unread_ancestors.dedup();
-    if !unread_ancestors.is_empty()
+    if hierarchy_incomplete
+        || !unread_ancestors.is_empty()
         || (edges.is_empty()
             && facts.override_modifier() == Some(CallableOverrideModifier::Override))
     {
@@ -719,7 +725,11 @@ fn inverse_edges(
     let mut seen = vec![owner.clone()];
     let mut frontier = VecDeque::from([owner]);
     while let Some(type_unit) = frontier.pop_front() {
-        for descendant in walk.hierarchy.get_direct_descendants(&type_unit) {
+        let descendants = walk.hierarchy.get_direct_descendants(&type_unit);
+        if !descendants.is_complete() {
+            return Err(MemberFamilyReason::HierarchyTruncated);
+        }
+        for descendant in descendants.edges {
             if seen.contains(&descendant) {
                 continue;
             }
@@ -795,8 +805,18 @@ pub fn member_family_id(analyzer: &dyn IAnalyzer, answer: &MemberFamilyAnswer) -
             .as_bytes(),
     );
     for root in &answer.roots {
-        let identity = crate::analyzer::structural::canonical_identity_of(analyzer, root);
-        digest.push(&serde_json::to_vec(&identity).expect("canonical identity serializes"));
+        use crate::analyzer::structural::identity_routes::{
+            canonical_member_digest_from_identity, canonical_member_identity,
+        };
+        let (identity, discriminator) = canonical_member_identity(analyzer, root);
+        if let Some(discriminator) = discriminator {
+            digest.push(
+                canonical_member_digest_from_identity(&identity, Some(&discriminator)).as_bytes(),
+            );
+        } else {
+            // Languages without overload discriminators retain their established family ids.
+            digest.push(&serde_json::to_vec(&identity).expect("canonical identity serializes"));
+        }
     }
     Some(digest.finish().to_string())
 }

@@ -532,6 +532,10 @@ pub fn scala_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     // Climb out of any qualified-name chain this token terminates. A token in
     // a scope position is a path segment however deep the chain runs; which
     // child spells the chain node's own segment comes from `SCALA_PATH_CHAIN`.
+    if crate::type_parameters::is_name(node, brokk_bifrost_core::analyzer::Language::Scala) {
+        return Some(OccurrenceRole::DeclarationName);
+    }
+
     let mut anchor = node;
     let mut parent = anchor.parent()?;
     while let Some(&(_, name_field)) = SCALA_PATH_CHAIN
@@ -933,6 +937,14 @@ impl StructuralSpec for ScalaStructuralSpec {
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {
         &NO_IDENTITY_ROUTE_SUPPORT
+    }
+
+    fn type_parameter_owner<'tree>(&self, name: Node<'tree>) -> Option<Node<'tree>> {
+        crate::type_parameters::owner(name, brokk_bifrost_core::analyzer::Language::Scala)
+    }
+
+    fn type_parameter_scope_barrier(&self, owner: Node<'_>) -> bool {
+        crate::type_parameters::barrier(owner, brokk_bifrost_core::analyzer::Language::Scala)
     }
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {

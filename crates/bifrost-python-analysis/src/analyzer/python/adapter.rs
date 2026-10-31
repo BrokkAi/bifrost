@@ -65,6 +65,78 @@ impl PythonAdapter {
     }
 }
 
+impl PythonAdapter {
+    fn module_components_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Vec<String>> {
+        if let Some(name) = self.project().selected_module_name_with_conn(conn, file)? {
+            return brokk_bifrost_python::declarations::python_module_components_from_name(
+                file, &name,
+            )
+            .ok_or_else(|| {
+                brokk_bifrost_analysis::analyzer::store::StoreError::corrupt(format!(
+                    "published Python module {name:?} is not a suffix of its mounted path {:?}",
+                    file.rel_path()
+                ))
+            });
+        }
+        // Empty package files and unpublished mounts still need the selected
+        // packaging inputs. Both paths must use the caller's existing read.
+        struct Inputs<'a> {
+            project: &'a dyn brokk_bifrost_core::analyzer::project::Project,
+            conn: &'a rusqlite::Connection,
+        }
+        impl brokk_bifrost_python::declarations::PythonImportRootInputs for Inputs<'_> {
+            fn contains(&self, path: &std::path::Path) -> bool {
+                self.project.file_by_rel_path(path).is_some()
+            }
+            fn configuration_source(
+                &self,
+                path: &std::path::Path,
+            ) -> std::io::Result<Option<std::borrow::Cow<'_, str>>> {
+                self.project
+                    .configuration_source_with_conn(self.conn, path)
+                    .map(|source| source.map(std::borrow::Cow::Owned))
+            }
+        }
+        Ok(
+            brokk_bifrost_python::declarations::python_module_components_with_inputs(
+                file,
+                &Inputs {
+                    project: self.project(),
+                    conn,
+                },
+            )?,
+        )
+    }
+    fn synthesize_module(
+        source: &str,
+        state: &mut brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
+        module: Option<CodeUnit>,
+    ) {
+        let Some(module) = module else {
+            return;
+        };
+        state.top_level_declarations.insert(0, module.clone());
+        state.declarations.insert(module.clone());
+        state.ranges.entry(module.clone()).or_default().push(
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::full_source_range(source),
+        );
+        let module_children: Vec<_> = state
+            .top_level_declarations
+            .iter()
+            .filter(|unit| !unit.is_module() && !unit.is_file_scope())
+            .filter(|unit| !unit.short_name().contains(['.', '$']))
+            .cloned()
+            .collect();
+        if !module_children.is_empty() {
+            state.children.insert(module, module_children);
+        }
+    }
+}
+
 impl LanguageAdapter for PythonAdapter {
     fn for_project(
         &self,
@@ -168,6 +240,14 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PythonAda
             .selected_module_name(file)?
             .unwrap_or_else(|| python_module_name(self.project(), file)))
     }
+    fn hydrate_content_qualifier_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        _content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<String> {
+        Ok(self.module_components_with_conn(conn, file)?.join("."))
+    }
     fn hydrate_package_anchor(
         &self,
         anchor: brokk_bifrost_core::analyzer::model::PackageAnchor,
@@ -184,6 +264,23 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PythonAda
                     .ok_or_else(|| brokk_bifrost_analysis::analyzer::store::StoreError::corrupt(
                         format!("published Python module {name:?} is not a suffix of its mounted path {:?}", file.rel_path()),
                     ))?;
+            return Ok(Some(
+                brokk_bifrost_core::analyzer::fq_name::FqName::from_package_components(&components),
+            ));
+        }
+        Ok(self.resolve_package_anchor(anchor, qualifier, file))
+    }
+    fn hydrate_package_anchor_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        anchor: brokk_bifrost_core::analyzer::model::PackageAnchor,
+        qualifier: &str,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Option<brokk_bifrost_core::analyzer::fq_name::FqName>,
+    > {
+        if anchor == (brokk_bifrost_core::analyzer::model::PackageAnchor::OwnModule { pop: 0 }) {
+            let components = self.module_components_with_conn(conn, file)?;
             return Ok(Some(
                 brokk_bifrost_core::analyzer::fq_name::FqName::from_package_components(&components),
             ));
@@ -215,24 +312,22 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PythonAda
         source: &str,
         state: &mut brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
     ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
-        let Some(module) = self.hydrate_path_synthetic_module_unit(file)? else {
-            return Ok(());
-        };
-        state.top_level_declarations.insert(0, module.clone());
-        state.declarations.insert(module.clone());
-        state.ranges.entry(module.clone()).or_default().push(
-            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::full_source_range(source),
+        Self::synthesize_module(
+            source,
+            state,
+            self.hydrate_path_synthetic_module_unit(file)?,
         );
-        let module_children: Vec<_> = state
-            .top_level_declarations
-            .iter()
-            .filter(|unit| !unit.is_module() && !unit.is_file_scope())
-            .filter(|unit| !unit.short_name().contains(['.', '$']))
-            .cloned()
-            .collect();
-        if !module_children.is_empty() {
-            state.children.insert(module, module_children);
-        }
+        Ok(())
+    }
+    fn synthesize_hydrated_units_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        let module = self.hydrate_path_synthetic_module_unit_with_conn(conn, file)?;
+        Self::synthesize_module(source, state, module);
         Ok(())
     }
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
@@ -260,6 +355,14 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PythonAda
             Some(name) => self.path_synthetic_module_from_published_name(file, &name),
             None => Ok(module_code_unit(self.project(), file)),
         }
+    }
+    fn hydrate_path_synthetic_module_unit_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<CodeUnit>> {
+        let components = self.module_components_with_conn(conn, file)?;
+        Ok(brokk_bifrost_python::declarations::module_code_unit_from_components(file, &components))
     }
     fn has_path_synthetic_module_units(&self) -> bool {
         true
@@ -350,6 +453,283 @@ mod published_module_read_tests {
             assert!(scope.store_error().is_none(), "{:?}", scope.store_error());
             assert!(scope.captured_read_incompleteness().is_empty());
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7347: Python hydration hooks nested a read on the single connection store"
+    )]
+    fn python_store_hydration_reuses_single_connection() {
+        use super::super::PythonAnalyzer;
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
+        use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+        use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_store;
+        use brokk_bifrost_core::hash::HashMap;
+
+        let source =
+            "from .other import value\nclass Widget:\n    def render(self): return value\n";
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "pyproject.toml",
+                "[tool.setuptools.packages.find]\nwhere = ['src']\n",
+            )
+            .file("src/pkg/__init__.py", "")
+            .file("src/pkg/tool.py", source)
+            .file("src/pkg/other.py", "value = 1\n")
+            .file("src/pkg/empty/__init__.py", "")
+            .file("src/__init__.py", "")
+            .build();
+        let context = store_context_from_store(
+            project.project_dyn().as_ref(),
+            AnalyzerStore::open_in_memory_single_connection().unwrap(),
+            false,
+        );
+        let store = context.store.clone();
+        let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+            project.project_dyn(),
+            Default::default(),
+            context,
+        )
+        .unwrap();
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+        let adapter = python.inner.adapter();
+        let file = project.file("src/pkg/tool.py");
+        let oid = python.inner.resolve_live_oid_for_file(&file).unwrap();
+        let generation = store.current_generation("python").unwrap();
+        let entries = [(file.clone(), oid)];
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python");
+        let keyed = [(file.clone(), key.clone())];
+        let generations = HashMap::from_iter([("python".to_owned(), generation)]);
+        let sources = HashMap::from_iter([(file.clone(), source.to_owned())]);
+        let disk_root = tempfile::tempdir().unwrap();
+        let disk_context = store_context_from_store(
+            project.project_dyn().as_ref(),
+            AnalyzerStore::open_persistent(&disk_root.path().join("control.db")).unwrap(),
+            false,
+        );
+        let disk_store = disk_context.store.clone();
+        assert!(!disk_store.uses_single_connection_reads());
+        let disk_workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+            project.project_dyn(),
+            Default::default(),
+            disk_context,
+        )
+        .unwrap();
+        let disk_python = resolve_analyzer::<PythonAnalyzer>(disk_workspace.analyzer()).unwrap();
+        let disk_generation = disk_store.current_generation("python").unwrap();
+        let disk_imports = disk_store
+            .hydrate_import_facts_by_key(
+                &keyed,
+                &HashMap::from_iter([("python".to_owned(), disk_generation)]),
+                disk_python.inner.adapter(),
+            )
+            .unwrap();
+        for imports in [
+            store
+                .hydrate_import_facts_by_key(&keyed, &generations, adapter)
+                .unwrap(),
+            store
+                .hydrate_canonical_import_facts_by_key(&keyed, &generations, adapter)
+                .unwrap(),
+        ] {
+            assert_eq!(
+                imports[&file].package_name,
+                disk_imports[&file].package_name
+            );
+            assert_eq!(imports[&file].package_name, "pkg.tool");
+            assert_eq!(imports[&file].imports.len(), 1);
+        }
+        let single = store
+            .hydrate_file_state_with_source(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                generation,
+                adapter,
+                &file,
+                source,
+            )
+            .unwrap()
+            .unwrap();
+        let bulk = store
+            .hydrate_file_states(&entries, &key, adapter, &sources)
+            .unwrap();
+        let keyed_states = store
+            .hydrate_file_states_by_key(&keyed, &generations, adapter, &sources)
+            .unwrap();
+        for state in [&single, &bulk[&file], &keyed_states[&file]] {
+            assert_eq!(state.package_name, "pkg.tool");
+            assert!(
+                state
+                    .declarations
+                    .iter()
+                    .any(|unit| unit.fq_name() == "pkg.tool.Widget.render")
+            );
+            assert!(
+                state
+                    .declarations
+                    .iter()
+                    .any(|unit| unit.is_module() && unit.fq_name() == "pkg.tool")
+            );
+        }
+        // Point and set queries hydrate both content declarations and path-only
+        // module units while their relational read transaction is open.
+        use brokk_bifrost_analysis::analyzer::store::relational_query::RelationalStoreOutcome;
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalDefinitionQuery, RelationalDefinitionRequest,
+            RelationalDefinitionValue,
+        };
+        let targets = [
+            single
+                .declarations
+                .iter()
+                .find(|unit| unit.is_module())
+                .unwrap(),
+            single
+                .declarations
+                .iter()
+                .find(|unit| unit.fq_name() == "pkg.tool.Widget.render")
+                .unwrap(),
+        ];
+        let requests = (0..128)
+            .map(|ordinal| RelationalDefinitionRequest {
+                ordinal,
+                language_scope: DefinitionLanguageScope::Language(Language::Python),
+                name: python.inner.relational_name_for_unit(targets[ordinal % 2]),
+                query: RelationalDefinitionQuery::ExactName,
+            })
+            .collect::<Vec<_>>();
+        for requests in [&requests[..2], &requests[..]] {
+            let outcome = store
+                .relational_definition_values(
+                    adapter,
+                    project.root(),
+                    &generations,
+                    &["python".to_owned()],
+                    python.inner.selected_workspace_snapshots().as_ref(),
+                    requests,
+                    &brokk_bifrost_core::CancellationToken::default(),
+                    |_| {},
+                )
+                .unwrap();
+            let RelationalStoreOutcome::Complete(values) = outcome else {
+                panic!("uncancelled definition hydration must complete");
+            };
+            assert_eq!(values.len(), requests.len());
+            for (index, value) in values.iter().enumerate() {
+                let RelationalDefinitionValue::Definitions(units) = value else {
+                    panic!("exact-name lookup must return definitions");
+                };
+                assert_eq!(units, &[targets[index % 2].clone()]);
+            }
+        }
+        // Hydrate a mount without a published anchor after the disk config has
+        // changed. The selected revision must still name it from retained src.
+        project
+            .file("pyproject.toml")
+            .write("[tool.setuptools.packages.find]\nwhere = ['.']\n")
+            .unwrap();
+        let unpublished = project.file("src/pkg/unpublished.py");
+        let mounted = store
+            .hydrate_file_state_with_source(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                generation,
+                adapter,
+                &unpublished,
+                source,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(mounted.package_name, "pkg.unpublished");
+        assert!(
+            mounted
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "pkg.unpublished.Widget.render")
+        );
+        for (path, name) in [
+            ("src/pkg/empty/__init__.py", "pkg.empty"),
+            ("src/__init__.py", "__init__"),
+        ] {
+            let empty = project.file(path);
+            let empty_oid = python.inner.resolve_live_oid_for_file(&empty).unwrap();
+            let empty_state = store
+                .hydrate_file_state_with_source(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(empty_oid, "python"),
+                    generation,
+                    adapter,
+                    &empty,
+                    "",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(empty_state.package_name, name);
+            assert!(
+                empty_state
+                    .declarations
+                    .iter()
+                    .any(|unit| unit.is_module() && unit.fq_name() == name)
+            );
+        }
+        let summary = store
+            .summary_file_projection(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                generation,
+                adapter,
+                &file,
+                source,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            summary
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "pkg.tool.Widget.render")
+        );
+        let enclosing = store
+            .enclosing_declarations_for_file(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                generation,
+                adapter,
+                &file,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            enclosing
+                .iter()
+                .any(|(unit, _)| unit.fq_name() == "pkg.tool.Widget.render")
+        );
+        assert!(
+            store
+                .type_aliases_for_file(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                    generation,
+                    adapter,
+                    &file
+                )
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        let units = store
+            .read_source_transaction("python", generation, |conn| {
+                brokk_bifrost_analysis::analyzer::store::read_source_unit_map(
+                    conn,
+                    &key,
+                    adapter,
+                    &file,
+                    &|| true,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            units
+                .values()
+                .any(|unit| unit.fq_name() == "pkg.tool.Widget.render")
+        );
     }
 
     #[test]

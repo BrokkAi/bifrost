@@ -1,6 +1,7 @@
 use super::source_admission::{AdmissionStop, SourceAdmissionPolicy, SourceAdmissionRefusal};
 use crate::analyzer::read_ledger::reason as derivation_reason;
 use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
+use brokk_bifrost_core::gitblob::BlobKey;
 // The traversal primitives and the two byte-range readers below them are pure
 // tree-sitter node arithmetic, so they live in `brokk-bifrost-core` and are
 // re-exported here at the paths every caller already uses. The budgeted walk
@@ -420,7 +421,14 @@ pub fn prepare_exact_syntax_tree<A: LanguageAdapter + ?Sized>(
         return PreparedSyntaxPreparation::Refused(reason);
     }
     let mut parser = Parser::new();
-    if !set_parser_for_file(&mut parser, adapter, file, source.source()) {
+    let preprocessor = adapter.preprocess(file, source.source());
+    if !set_parser_for_file_preprocessed(
+        &mut parser,
+        adapter,
+        file,
+        source.source(),
+        preprocessor.as_deref(),
+    ) {
         return PreparedSyntaxPreparation::Complete(None);
     }
     let exact_source = source.source();
@@ -438,14 +446,17 @@ pub fn prepare_exact_syntax_tree<A: LanguageAdapter + ?Sized>(
         return PreparedSyntaxPreparation::Cancelled;
     }
     let line_starts = compute_line_starts(exact_source);
-    PreparedSyntaxPreparation::Complete(Some(Arc::new(PreparedSyntaxTree::new(
-        source,
-        tree,
-        line_starts,
-        LanguageDialect::for_path(adapter.language(), file.rel_path()),
-        origin,
-        overlay_revision,
-    ))))
+    PreparedSyntaxPreparation::Complete(Some(Arc::new(
+        PreparedSyntaxTree::new(
+            source,
+            tree,
+            line_starts,
+            LanguageDialect::for_path(adapter.language(), file.rel_path()),
+            origin,
+            overlay_revision,
+        )
+        .with_preprocessor(preprocessor),
+    )))
 }
 
 /// Point `parser` at `file`'s grammar and, when the language restricts what the
@@ -460,14 +471,26 @@ pub fn set_parser_for_file<A: LanguageAdapter + ?Sized>(
     file: &ProjectFile,
     source: &str,
 ) -> bool {
+    let preprocessor = adapter.preprocess(file, source);
+    set_parser_for_file_preprocessed(parser, adapter, file, source, preprocessor.as_deref())
+}
+
+pub fn set_parser_for_file_preprocessed<A: LanguageAdapter + ?Sized>(
+    parser: &mut Parser,
+    adapter: &A,
+    file: &ProjectFile,
+    _source: &str,
+    preprocessor: Option<&dyn brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor>,
+) -> bool {
     if parser
         .set_language(&adapter.parser_language_for_file(file))
         .is_err()
     {
         return false;
     }
-    match adapter.parser_included_ranges(file, source) {
-        Some(ranges) => parser.set_included_ranges(&ranges).is_ok(),
+    let ranges = preprocessor.and_then(|p| p.included_ranges());
+    match ranges {
+        Some(ranges) => parser.set_included_ranges(ranges).is_ok(),
         // A parser is reused across files, so an earlier file's ranges must be
         // cleared rather than left in place.
         None => parser.set_included_ranges(&[]).is_ok(),
@@ -1081,18 +1104,17 @@ impl RevisionBlobIdentities {
 /// The content key one file's structural facts are both memoized and
 /// persisted under.
 ///
-/// The three parts are everything the facts depend on: the blob oid of the
-/// exact source bytes, the storage language key that fixes which grammar and
+/// The blob key and generation are everything the facts depend on: the blob oid of the
+/// exact source bytes, the parse variant, the storage language key that fixes which grammar and
 /// structural spec produced them, and that language's epoch generation, which
 /// rotates whenever the store's epoch salt changes. Nothing else about the
 /// file -- its path above all -- takes part, so the same bytes analyzed under
 /// the same epoch are the same facts wherever they appear.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[doc(hidden)]
 pub struct StructuralSnapshotKey {
     #[doc(hidden)]
-    pub oid: Oid,
-    lang: &'static str,
+    pub blob: BlobKey,
     generation: GenerationId,
 }
 
@@ -1102,8 +1124,10 @@ impl StructuralSnapshotKey {
     #[doc(hidden)]
     pub fn for_test(source: &str, lang: &'static str) -> Self {
         Self {
-            oid: Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("hash test source"),
-            lang,
+            blob: BlobKey::unvaried(
+                Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("hash test source"),
+                lang,
+            ),
             generation: GenerationId::BOOTSTRAP,
         }
     }
@@ -1394,6 +1418,15 @@ pub trait LanguageAdapter:
     ) -> Option<Vec<tree_sitter::Range>> {
         None
     }
+    fn preprocess(
+        &self,
+        _file: &ProjectFile,
+        _source: &str,
+    ) -> Option<std::sync::Arc<dyn brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor>>
+    {
+        None
+    }
+
     /// Included ranges discovered structurally in an initial full parse.
     ///
     /// C++ uses the existing tree to find comments inside function-like macro
@@ -1654,6 +1687,18 @@ pub trait LanguageAdapter:
     ) -> (ParsedFile, Vec<(&'static str, ParsedFile)>) {
         (self.parse_file(file, source, tree), Vec::new())
     }
+    fn parse_file_preprocessed(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        _preprocessor: Option<
+            &dyn brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor,
+        >,
+    ) -> (ParsedFile, Vec<(&'static str, ParsedFile)>) {
+        self.parse_file_with_projections(file, source, tree)
+    }
+
     fn definition_priority(&self, _code_unit: &CodeUnit) -> i32 {
         0
     }
@@ -2268,8 +2313,7 @@ enum PreparedAnalysis {
 
 struct PreparedAnalysisTarget {
     file: ProjectFile,
-    oid: Oid,
-    storage_language: String,
+    key: BlobKey,
     generation: GenerationId,
     required_existing_additional_storage_languages: Vec<String>,
     independently_owned_additional_storage_languages: Vec<String>,
@@ -2451,7 +2495,10 @@ pub trait ByteBounded {
 
 impl ByteBounded for Arc<PreparedSyntaxTree> {
     fn estimated_bytes(&self) -> usize {
-        prepared_syntax_retained_bytes(self.source().len())
+        prepared_syntax_retained_bytes(self.source().len()).saturating_add(
+            self.preprocessor()
+                .map_or(0, |p| p.estimated_retained_bytes()),
+        )
     }
 }
 
@@ -4140,7 +4187,10 @@ where
     ) -> crate::analyzer::store::Result<
         Option<Arc<crate::analyzer::store::dependency_file_evidence::ScopedDependencyEvidence>>,
     > {
-        if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        if !matches!(
+            language,
+            Language::JavaScript | Language::TypeScript | Language::CSharp
+        ) {
             return Ok(None);
         }
         crate::analyzer::store::dependency_file_evidence::publish_overlay(
@@ -4782,8 +4832,7 @@ where
         let lang = self.adapter.storage_language_key_for_file(file);
         let generation = self.store_context.generations.get(lang).copied()?;
         Some(StructuralSnapshotKey {
-            oid,
-            lang,
+            blob: BlobKey::unvaried(oid, lang),
             generation,
         })
     }
@@ -4808,8 +4857,7 @@ where
         cancellation: Option<&CancellationToken>,
     ) -> Result<crate::analyzer::store::StructuralFactRowsRead, StoreError> {
         self.store_context.store.load_structural_facts_rows_limited(
-            key.oid,
-            key.lang,
+            &key.blob,
             key.generation,
             facts_version,
             max_work_items,
@@ -5432,7 +5480,14 @@ where
         {
             return None;
         }
-        if !set_parser_for_file(parser, adapter, file, source.as_str()) {
+        let preprocessor = adapter.preprocess(file, &source);
+        if !set_parser_for_file_preprocessed(
+            parser,
+            adapter,
+            file,
+            source.as_str(),
+            preprocessor.as_deref(),
+        ) {
             return None;
         }
         // One deadline for the parse and for any repair that follows it, so the
@@ -5461,7 +5516,28 @@ where
         // added: `add_file_scope` contributes the identical module unit to
         // every reading, so an implementor comparing its readings against each
         // other compares only what the language walk itself produced.
-        let (mut parsed, projections) = adapter.parse_file_with_projections(file, &source, &tree);
+        let (mut parsed, projections) =
+            adapter.parse_file_preprocessed(file, &source, &tree, preprocessor.as_deref());
+        // Validate freshly produced metadata, never values read from persisted rows.
+        // Synthetic lambdas without signature metadata have no row to validate.
+        for (language, declarations) in
+            std::iter::once((adapter.storage_language_key_for_file(file), &parsed)).chain(
+                projections
+                    .iter()
+                    .map(|(language, parsed)| (*language, parsed)),
+            )
+        {
+            debug_assert!(
+                declarations.signature_metadata.iter().all(|(unit, rows)| {
+                    !brokk_bifrost_core::analyzer::model::requires_overload_discriminator(
+                        language, unit,
+                    ) || rows
+                        .iter()
+                        .all(|metadata| metadata.overload_discriminator().is_some())
+                }),
+                "produced callable metadata lacks its overload discriminator: {declarations:?}"
+            );
+        }
         parsed.add_file_scope(file, &source);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
         let parse_errors = {
@@ -5528,14 +5604,17 @@ where
         // subtracts it again before `blob_payload_costs` is written.
         // The tree the walk read, handed to blob preparation so the source is
         // not parsed twice. The state keeps the source for the rest of the build.
-        let syntax = Arc::new(PreparedSyntaxTree::new(
-            PreparedSyntaxSource::Exact(Arc::<str>::from(source.as_str())),
-            tree,
-            compute_line_starts(&source),
-            LanguageDialect::for_path(adapter.language(), file.rel_path()),
-            PreparedSourceOrigin::Disk,
-            None,
-        ));
+        let syntax = Arc::new(
+            PreparedSyntaxTree::new(
+                PreparedSyntaxSource::Exact(Arc::<str>::from(source.as_str())),
+                tree,
+                compute_line_starts(&source),
+                LanguageDialect::for_path(adapter.language(), file.rel_path()),
+                PreparedSourceOrigin::Disk,
+                None,
+            )
+            .with_preprocessor(preprocessor),
+        );
         let mut state =
             Self::file_state_from_parsed(source, parsed, contains_tests, parse_errors, true);
         state.additional_projections = additional_projections;
@@ -5661,6 +5740,8 @@ where
         progress: Option<BuildProgress>,
         store_context: &AnalyzerStoreContext,
     ) -> Vec<(ProjectFile, Option<AnalyzedSource>)> {
+        let carried_context =
+            brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         let _scope = profiling::scope(format!(
             "TreeSitterAnalyzer::{:?}::analyze_files[{}]",
             adapter.language(),
@@ -5681,24 +5762,26 @@ where
             files
                 .into_par_iter()
                 .map_init(
-                    || Self::build_parser(language.clone()),
+                    || carried_context.run(|| Self::build_parser(language.clone())),
                     |parser, file| {
-                        without_project_reads(|| {
-                            store_context
-                                .build_tier_access
-                                .record_tier_access(InformationTier::Syntax);
-                            let state = Self::analyze_file(parser, adapter, project, &file);
-                            if let Some(progress) = progress.as_ref() {
-                                let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                progress(BuildProgressEvent::new(
-                                    adapter.language(),
-                                    BuildProgressPhase::Parse,
-                                    current,
-                                    total,
-                                    Some(file.clone()),
-                                ));
-                            }
-                            (file, state)
+                        carried_context.run(|| {
+                            without_project_reads(|| {
+                                store_context
+                                    .build_tier_access
+                                    .record_tier_access(InformationTier::Syntax);
+                                let state = Self::analyze_file(parser, adapter, project, &file);
+                                if let Some(progress) = progress.as_ref() {
+                                    let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                    progress(BuildProgressEvent::new(
+                                        adapter.language(),
+                                        BuildProgressPhase::Parse,
+                                        current,
+                                        total,
+                                        Some(file.clone()),
+                                    ));
+                                }
+                                (file, state)
+                            })
                         })
                     },
                 )
@@ -5717,6 +5800,8 @@ where
         store_context: &AnalyzerStoreContext,
         mut on_outcome: impl FnMut(ProjectFile, PreparedPersistenceOutcome),
     ) -> PersistBatchStats {
+        let carried_context =
+            brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         const PREPARED_CHANNEL_CAPACITY: usize = 8;
         if targets.is_empty() {
             return PersistBatchStats::default();
@@ -5775,18 +5860,19 @@ where
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     pool.install(|| {
                         targets.into_par_iter().for_each_init(
-                            || Self::build_parser(language.clone()),
-                            |parser, target| without_project_reads(|| {
+                            || carried_context.run(|| Self::build_parser(language.clone())),
+                            |parser, target| carried_context.run(|| without_project_reads(|| {
                                 let PreparedAnalysisTarget {
                                     file,
-                                    oid,
-                                    storage_language: storage_key,
+                                    key,
                                     generation,
                                     required_existing_additional_storage_languages:
                                         required_projections,
                                     independently_owned_additional_storage_languages:
                                         independent_projections,
                                 } = target;
+                                let oid = key.oid;
+                                let storage_key = key.lang.clone();
                                 let current_started = started.fetch_add(1, Ordering::SeqCst) + 1;
                                 if current_started == total {
                                     producer_tx
@@ -5903,9 +5989,7 @@ where
                                             );
                                             match AnalyzerStore::prepare_parsed_blob_at_generations(
                                                 &file,
-                                                &syntax,
-                                                oid,
-                                                &storage_key,
+                                                &syntax,&key,
                                                 store_context.generations.as_ref(),
                                                 adapter,
                                                 Arc::clone(&state),
@@ -5973,7 +6057,7 @@ where
                                     send_start.elapsed().as_nanos() as usize,
                                     Ordering::Relaxed,
                                 );
-                            }),
+                            })),
                         );
                     });
                 }));
@@ -5995,7 +6079,7 @@ where
             let mut persist_completed = 0usize;
             let mut tail_mode = false;
             let flush = |pending: &mut Vec<PreparedParsedBlob>,
-                         pending_files: &mut HashMap<(Oid, String), (ProjectFile, Vec<String>)>,
+                         pending_files: &mut HashMap<BlobKey, (ProjectFile, Vec<String>)>,
                          pending_rows: &mut usize,
                          pending_bytes: &mut usize,
                          stats: &mut PersistBatchStats,
@@ -6045,7 +6129,7 @@ where
                         .lock()
                         .expect("prepared in-flight mutex poisoned")
                         .remove(outcome.prepared.mutation_payload_bytes());
-                    let key = (outcome.prepared.oid(), outcome.prepared.lang().to_string());
+                    let key = outcome.prepared.key.clone();
                     let (file, required_existing_additional_storage_languages) = pending_files
                         .remove(&key)
                         .expect("prepared outcome must retain its file envelope");
@@ -6065,47 +6149,46 @@ where
                 }
             };
 
-            let add_ready =
-                |file: ProjectFile,
-                 prepared: Box<PreparedParsedBlob>,
-                 required_existing_additional_storage_languages: Vec<String>,
-                 pending: &mut Vec<PreparedParsedBlob>,
-                 pending_files: &mut HashMap<(Oid, String), (ProjectFile, Vec<String>)>,
-                 pending_rows: &mut usize,
-                 pending_bytes: &mut usize| {
-                    let key = (prepared.oid(), prepared.lang().to_string());
-                    if pending_files
-                        .insert(key, (file, required_existing_additional_storage_languages))
-                        .is_some()
-                    {
-                        panic!("duplicate prepared blob key in reconcile batch");
-                    }
-                    let rows = prepared.logical_rows();
-                    let bytes = prepared.payload_bytes();
-                    pending.push(*prepared);
-                    *pending_rows = pending_rows.saturating_add(rows);
-                    *pending_bytes = pending_bytes.saturating_add(bytes);
-                    // The totals only stay correct while every drain resets
-                    // them, so debug builds pay for the fold this replaced and
-                    // compare, rather than trusting the invariant silently.
-                    debug_assert_eq!(
-                        *pending_rows,
-                        pending.iter().fold(0usize, |total, blob| {
-                            total.saturating_add(blob.logical_rows())
-                        }),
-                        "pending row total drifted from the pending batch"
-                    );
-                    debug_assert_eq!(
-                        *pending_bytes,
-                        pending.iter().fold(0usize, |total, blob| {
-                            total.saturating_add(blob.payload_bytes())
-                        }),
-                        "pending payload byte total drifted from the pending batch"
-                    );
-                    pending.len() >= limits.max_blobs
-                        || *pending_rows >= limits.max_rows
-                        || *pending_bytes >= limits.max_payload_bytes
-                };
+            let add_ready = |file: ProjectFile,
+                             prepared: Box<PreparedParsedBlob>,
+                             required_existing_additional_storage_languages: Vec<String>,
+                             pending: &mut Vec<PreparedParsedBlob>,
+                             pending_files: &mut HashMap<BlobKey, (ProjectFile, Vec<String>)>,
+                             pending_rows: &mut usize,
+                             pending_bytes: &mut usize| {
+                let key = prepared.key.clone();
+                if pending_files
+                    .insert(key, (file, required_existing_additional_storage_languages))
+                    .is_some()
+                {
+                    panic!("duplicate prepared blob key in reconcile batch");
+                }
+                let rows = prepared.logical_rows();
+                let bytes = prepared.payload_bytes();
+                pending.push(*prepared);
+                *pending_rows = pending_rows.saturating_add(rows);
+                *pending_bytes = pending_bytes.saturating_add(bytes);
+                // The totals only stay correct while every drain resets
+                // them, so debug builds pay for the fold this replaced and
+                // compare, rather than trusting the invariant silently.
+                debug_assert_eq!(
+                    *pending_rows,
+                    pending.iter().fold(0usize, |total, blob| {
+                        total.saturating_add(blob.logical_rows())
+                    }),
+                    "pending row total drifted from the pending batch"
+                );
+                debug_assert_eq!(
+                    *pending_bytes,
+                    pending.iter().fold(0usize, |total, blob| {
+                        total.saturating_add(blob.payload_bytes())
+                    }),
+                    "pending payload byte total drifted from the pending batch"
+                );
+                pending.len() >= limits.max_blobs
+                    || *pending_rows >= limits.max_rows
+                    || *pending_bytes >= limits.max_payload_bytes
+            };
 
             let mut deferred = None;
             loop {
@@ -6538,17 +6621,23 @@ where
             // threads per reconcile, which an incremental update pays repeatedly
             // (#2115); the shared pool is also off the global pool, so the burst
             // does not park interactive requests behind it.
+            let carried_context =
+                brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             let plan_parallel = |subset: &[ProjectFile]| -> Vec<Result<PlannedLiveOid, String>> {
                 if subset.len() <= 1 {
                     return subset
                         .iter()
-                        .map(|file| without_project_reads(|| plan_one(file)))
+                        .map(|file| {
+                            carried_context.run(|| without_project_reads(|| plan_one(file)))
+                        })
                         .collect();
                 }
                 install_on_dedicated_build_pool(|| {
                     subset
                         .par_iter()
-                        .map(|file| without_project_reads(|| plan_one(file)))
+                        .map(|file| {
+                            carried_context.run(|| without_project_reads(|| plan_one(file)))
+                        })
                         .collect()
                 })
             };
@@ -6861,42 +6950,75 @@ where
             adapter.language(),
             &mut inputs,
         )?;
-        inputs
-            .iter()
-            .map(|file| {
-                // Python roots and marker evidence are selected from the
-                // project snapshot, including unsaved configuration. Retain
-                // those exact inputs with the existing workspace relation.
-                if adapter.language() == Language::Python {
-                    return project.read_source(file).map(|source| {
-                        Some(WorkspaceConfigurationInput::new(
-                            crate::path_utils::rel_path_string(file),
-                            source.into_bytes().into_boxed_slice(),
-                        ))
-                    });
-                }
-                match std::fs::read(file.abs_path()) {
-                    Ok(bytes) => Ok(Some(WorkspaceConfigurationInput::new(
+        let support = crate::analyzer::store::store_language_support_for_hook(
+            adapter.language(),
+            "retains_absent_configuration_input",
+        );
+        let capture = |file: &ProjectFile| {
+            // Python roots and marker evidence are selected from the
+            // project snapshot, including unsaved configuration. Retain
+            // those exact inputs with the existing workspace relation.
+            if adapter.language() == Language::Python {
+                return project.read_source(file).map(|source| {
+                    Some(WorkspaceConfigurationInput::new(
                         crate::path_utils::rel_path_string(file),
-                        bytes.into_boxed_slice(),
-                    ))),
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::NotFound
-                            && project.has_overlay(file) =>
-                    {
-                        // An unsaved configuration file has no filesystem
-                        // identity to publish. The request's transient
-                        // selection handles its overlay separately.
-                        Ok(None)
-                    }
-                    Err(error) => Err(std::io::Error::new(
-                        error.kind(),
-                        format!("reading {}: {error}", file.rel_path().display()),
-                    )),
+                        source.into_bytes().into_boxed_slice(),
+                    ))
+                });
+            }
+            match std::fs::read(file.abs_path()) {
+                Ok(bytes) => Ok(Some(WorkspaceConfigurationInput::new(
+                    crate::path_utils::rel_path_string(file),
+                    bytes.into_boxed_slice(),
+                ))),
+                // Languages can retain an absent input as empty bytes.
+                // Its later appearance changes the OID and configuration
+                // input digest.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && support.is_some_and(|support| {
+                            support.retains_absent_configuration_input(file.rel_path())
+                        }) =>
+                {
+                    Ok(Some(WorkspaceConfigurationInput::new(
+                        crate::path_utils::rel_path_string(file),
+                        Box::new([]),
+                    )))
                 }
-            })
-            .collect::<std::io::Result<Vec<_>>>()
-            .map(|inputs| inputs.into_iter().flatten().collect())
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && project.has_overlay(file) =>
+                {
+                    // An unsaved configuration file has no filesystem
+                    // identity to publish. The request's transient
+                    // selection handles its overlay separately.
+                    Ok(None)
+                }
+                Err(error) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!("reading {}: {error}", file.rel_path().display()),
+                )),
+            }
+        };
+        let mut captured = inputs
+            .iter()
+            .map(&capture)
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if let Some(support) = support {
+            for path in support.configuration_paths_from_retained_inputs(&captured) {
+                let file = ProjectFile::new(project.root(), path);
+                if inputs.insert(file.clone())
+                    && let Some(input) = capture(&file)?
+                {
+                    captured.push(input);
+                }
+            }
+        }
+        captured.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+        Ok(captured)
     }
 
     /// Compare exact configuration inputs with the placement this analyzer
@@ -6967,7 +7089,7 @@ where
             let key = Self::transient_cache_key(oid, file);
             match state.dirty_imports(&key) {
                 Some(imports) => out.push((file.clone(), imports)),
-                None => entries.push((file.clone(), oid, storage_key.to_string())),
+                None => entries.push((file.clone(), BlobKey::unvaried(oid, storage_key))),
             }
         }
         if entries.is_empty() {
@@ -7373,7 +7495,7 @@ where
                 continue;
             };
             let storage_language = adapter.storage_language_key_for_file(file).to_string();
-            publication_keys.push((blob_oid, storage_language.clone()));
+            publication_keys.push(BlobKey::unvaried(blob_oid, storage_language.clone()));
             live_files.push((file, blob_oid, storage_language));
         }
         let mut inventory = WorkspaceInventoryCompleteness::COMPLETE;
@@ -7388,7 +7510,7 @@ where
             }
         };
         for (file, blob_oid, storage_language) in live_files {
-            if !published.contains(&(blob_oid, storage_language.clone())) {
+            if !published.contains(&BlobKey::unvaried(blob_oid, storage_language.clone())) {
                 match classify_unpublished_source(project, adapter, file, blob_oid) {
                     UnpublishedSource::Admitted => inventory.mark_incomplete(),
                     UnpublishedSource::Refused(reason) => {
@@ -7448,7 +7570,7 @@ where
                 .collect::<Vec<_>>();
             let blob_oids = files.iter().map(|file| file.blob_oid).collect::<Vec<_>>();
             let relations = store_context.store.workspace_content_package_facts(
-                &lang,
+                &BlobKey::unvaried(Oid::zero(), &lang),
                 store_context.generations[&lang],
                 &blob_oids,
                 adapter.workspace_file_package_anchor(),
@@ -7493,10 +7615,11 @@ where
             // the producer's row beside the retained dirty source until both
             // inputs are usable through the ready-only live views.
             dirty.extend(entries.into_iter().filter_map(|(file, source, row)| {
-                (!persisted || !published.contains(&(source.blob_oid, lang.clone())))
-                    .then_some(row)
-                    .flatten()
-                    .map(|row| (file, (lang.clone(), row)))
+                (!persisted
+                    || !published.contains(&BlobKey::unvaried(source.blob_oid, lang.clone())))
+                .then_some(row)
+                .flatten()
+                .map(|row| (file, (lang.clone(), row)))
             }));
         }
         (dirty, inventory)
@@ -7627,7 +7750,7 @@ where
             .filter_map(|file| {
                 snapshot
                     .validated_oid_for_path(file)
-                    .map(|oid| (oid, adapter.storage_language_key_for_file(file).to_string()))
+                    .map(|oid| BlobKey::unvaried(oid, adapter.storage_language_key_for_file(file)))
             })
             .collect::<Vec<_>>();
         let published = match store_context
@@ -7649,7 +7772,7 @@ where
             // source is recorded, never selected, and the omission of a source
             // whose admission did not finish leaves the inventory incomplete.
             let live_oid = snapshot.validated_oid_for_path(file).filter(|&oid| {
-                if published.contains(&(oid, storage_language.to_string())) {
+                if published.contains(&BlobKey::unvaried(oid, storage_language.to_string())) {
                     return true;
                 }
                 match classify_unpublished_source(project, adapter, file, oid) {
@@ -7689,7 +7812,7 @@ where
                 store_context
                     .store
                     .workspace_content_package_facts(
-                        lang,
+                        &BlobKey::unvaried(Oid::zero(), lang),
                         generations[lang],
                         &[blob_oid],
                         adapter.workspace_file_package_anchor(),
@@ -7728,7 +7851,8 @@ where
                 }
             }
             if let Some((lang, row)) = replacement
-                && (!persisted || !published.contains(&(row.blob_oid, lang.to_string())))
+                && (!persisted
+                    || !published.contains(&BlobKey::unvaried(row.blob_oid, lang.to_string())))
             {
                 dirty.insert(file.clone(), (lang.to_string(), row));
             }
@@ -7784,7 +7908,7 @@ where
                     let Some(oid) = file_oids.get(file).copied() else {
                         continue;
                     };
-                    let key = (oid, adapter.storage_language_key_for_file(file).to_owned());
+                    let key = BlobKey::unvaried(oid, adapter.storage_language_key_for_file(file));
                     let mut possible_additional = adapter
                         .possible_additional_storage_language_keys_for_file(file)
                         .iter()
@@ -7794,7 +7918,7 @@ where
                     possible_additional.dedup();
                     assert!(
                         possible_additional.iter().all(|additional| {
-                            additional != &key.1 && served_keys.contains(additional)
+                            additional != &key.lang && served_keys.contains(additional)
                         }),
                         "possible projections must be distinct adapter-owned storage keys"
                     );
@@ -7836,15 +7960,12 @@ where
                         "one deterministic representative must cover every possible projection for its blob key"
                     );
                     representative_by_blob_key.insert(key.clone(), representative);
-                    analysis_requests.push(CompleteAnalysisBlobRequest::new(
-                        key.0,
-                        key.1,
-                        possible_additional,
-                    ));
+                    analysis_requests
+                        .push(CompleteAnalysisBlobRequest::new(key, possible_additional));
                 }
                 let all_blob_keys = analysis_requests
                     .iter()
-                    .map(|request| (request.oid(), request.storage_language().to_owned()))
+                    .map(|request| request.key().clone())
                     .collect::<Vec<_>>();
                 let independent_primary_keys =
                     all_blob_keys.iter().cloned().collect::<HashSet<_>>();
@@ -7852,7 +7973,7 @@ where
                     .iter()
                     .map(|request| {
                         (
-                            (request.oid(), request.storage_language().to_owned()),
+                            request.key().clone(),
                             request.possible_additional_storage_languages().to_vec(),
                         )
                     })
@@ -7878,15 +7999,13 @@ where
                         all_blob_keys
                             .into_iter()
                             .filter(|key| seen.insert(key.clone()))
-                            .map(|(oid, storage_language)| {
-                                MissingCompleteAnalysisBlob::primary_only(oid, storage_language)
-                            })
+                            .map(MissingCompleteAnalysisBlob::primary_only)
                             .collect()
                     }
                 };
-                let missing_blob_keys: HashSet<(Oid, String)> = missing
+                let missing_blob_keys: HashSet<BlobKey> = missing
                     .iter()
-                    .map(|missing| (missing.oid(), missing.storage_language().to_owned()))
+                    .map(|missing| missing.key().clone())
                     .collect();
                 drop(_missing_scope);
 
@@ -7906,24 +8025,24 @@ where
                         let oid = missing.oid();
                         let storage_key = missing.storage_language();
                         let file = representative_by_blob_key
-                            .get(&(oid, storage_key.to_owned()))
+                            .get(&BlobKey::unvaried(oid, storage_key.to_owned()))
                             .expect("every missing blob key must have a representative")
                             .clone();
                         let generation = store_context.generations[storage_key];
                         let independently_owned_additional_storage_languages =
                             possible_additional_by_blob_key
-                                .get(&(oid, storage_key.to_owned()))
+                                .get(&BlobKey::unvaried(oid, storage_key.to_owned()))
                                 .expect("every missing blob key retains its projection capability")
                                 .iter()
                                 .filter(|projection| {
-                                    independent_primary_keys.contains(&(oid, (*projection).clone()))
+                                    independent_primary_keys
+                                        .contains(&BlobKey::unvaried(oid, (*projection).clone()))
                                 })
                                 .cloned()
                                 .collect();
                         PreparedAnalysisTarget {
                             file,
-                            oid,
-                            storage_language: storage_key.to_owned(),
+                            key: missing.key().clone(),
                             generation,
                             required_existing_additional_storage_languages: missing
                                 .required_existing_additional_storage_languages()
@@ -7959,8 +8078,10 @@ where
                                 } else {
                                     RepresentativeBlobOutcome::Persisted
                                 };
-                                representative_blob_outcomes
-                                    .insert((oid, storage_key.to_string()), blob_outcome);
+                                representative_blob_outcomes.insert(
+                                    BlobKey::unvaried(oid, storage_key.to_string()),
+                                    blob_outcome,
+                                );
                                 let key = Self::transient_cache_key(oid, &file);
                                 match error {
                                     Some(error) => {
@@ -7996,7 +8117,7 @@ where
                                 // a recorded refusal, or an incomplete inventory.
                                 workspace_inventory.mark_unindexed();
                                 representative_blob_outcomes.insert(
-                                    (oid, storage_key.to_string()),
+                                    BlobKey::unvaried(oid, storage_key.to_string()),
                                     RepresentativeBlobOutcome::Unparseable,
                                 );
                             }
@@ -8030,7 +8151,7 @@ where
                         continue;
                     };
                     let storage_key = adapter.storage_language_key_for_file(file);
-                    let blob_key = (oid, storage_key.to_string());
+                    let blob_key = BlobKey::unvaried(oid, storage_key.to_string());
                     if !missing_blob_keys.contains(&blob_key) {
                         continue;
                     }
@@ -8329,8 +8450,7 @@ where
             let prepared = AnalyzerStore::prepare_parsed_blob_at_generations(
                 file,
                 syntax,
-                oid,
-                storage_key,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, storage_key),
                 store_context.generations.as_ref(),
                 adapter,
                 Arc::new(state.clone()),
@@ -8497,8 +8617,7 @@ where
         let repair = AnalyzerStore::prepare_parsed_blob_at_generations(
             &file,
             &syntax,
-            key.oid,
-            storage_key,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(key.oid, storage_key),
             generations.as_ref(),
             self.adapter.as_ref(),
             Arc::clone(&state),
@@ -8770,8 +8889,7 @@ where
         self.store_query_or_record(
             |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.hydrate_file_state_with_source(
-                oid,
-                storage_key,
+                &BlobKey::unvaried(oid, storage_key),
                 generation,
                 self.adapter.as_ref(),
                 file,
@@ -9103,14 +9221,17 @@ where
             ..prepared_key.clone()
         };
         let prepared = if let Some(indexed) = self.cached_prepared_syntax(&indexed_key) {
-            Some(Arc::new(PreparedSyntaxTree::new(
-                PreparedSyntaxSource::Exact(resolved.snapshot.into_source()),
-                indexed.tree().clone(),
-                indexed.line_starts().to_vec(),
-                indexed.dialect(),
-                origin,
-                overlay_revision,
-            )))
+            Some(Arc::new(
+                PreparedSyntaxTree::new(
+                    PreparedSyntaxSource::Exact(resolved.snapshot.into_source()),
+                    indexed.tree().clone(),
+                    indexed.line_starts().to_vec(),
+                    indexed.dialect(),
+                    origin,
+                    overlay_revision,
+                )
+                .with_preprocessor(indexed.preprocessor().cloned()),
+            ))
         } else {
             match self.prepare_exact_syntax_cancellable(
                 file,
@@ -9290,14 +9411,17 @@ where
             flavor: PreparedSyntaxCacheFlavor::ExactSource,
         };
         if let Some(exact) = self.cached_prepared_syntax(&exact_key) {
-            return Some(Arc::new(PreparedSyntaxTree::new(
-                PreparedSyntaxSource::Indexed(file_state),
-                exact.tree().clone(),
-                exact.line_starts().to_vec(),
-                exact.dialect(),
-                origin,
-                overlay_revision,
-            )));
+            return Some(Arc::new(
+                PreparedSyntaxTree::new(
+                    PreparedSyntaxSource::Indexed(file_state),
+                    exact.tree().clone(),
+                    exact.line_starts().to_vec(),
+                    exact.dialect(),
+                    origin,
+                    overlay_revision,
+                )
+                .with_preprocessor(exact.preprocessor().cloned()),
+            ));
         }
         match self.prepare_syntax_from_source_cancellable(
             file,
@@ -9642,7 +9766,7 @@ where
                 // SQL-first while preserving that bounded overlay state.
                 out.insert(file, (key, state.as_ref().clone()));
             } else {
-                clean_entries.push((file, oid, storage_key.to_string()));
+                clean_entries.push((file, BlobKey::unvaried(oid, storage_key)));
             }
         }
         let entries = clean_entries;
@@ -9652,8 +9776,8 @@ where
 
         let mut source_by_file = HashMap::default();
         if source_mode == BulkFileStateSource::Include {
-            for (file, oid, _) in &entries {
-                if let Some(source) = self.source_for_oid(file, *oid) {
+            for (file, blob) in &entries {
+                if let Some(source) = self.source_for_oid(file, blob.oid) {
                     source_by_file.insert(file.clone(), source);
                 }
             }
@@ -9662,8 +9786,8 @@ where
         let mut states = self
             .store_query_or_record(
                 |sink| {
-                    for (file, oid, _) in &entries {
-                        sink.push(self.file_read_key(file, *oid));
+                    for (file, blob) in &entries {
+                        sink.push(self.file_read_key(file, blob.oid));
                     }
                 },
                 self.store_context.store.hydrate_file_states_by_key(
@@ -9677,7 +9801,8 @@ where
             .unwrap_or_default();
         self.bulk_hydration_count
             .fetch_add(states.len(), Ordering::Relaxed);
-        for (file, oid, _) in entries {
+        for (file, blob) in entries {
+            let oid = blob.oid;
             let key = Self::transient_cache_key(oid, &file);
             let state = states.remove(&file).or_else(|| {
                 self.source_for_oid(&file, oid)
@@ -9811,7 +9936,7 @@ where
                     },
                 );
             } else {
-                clean_entries.push((file, oid, storage_key.to_string()));
+                clean_entries.push((file, BlobKey::unvaried(oid, storage_key)));
             }
         }
         let entries = clean_entries;
@@ -9836,8 +9961,8 @@ where
         let mut facts: HashMap<ProjectFile, ImportFileFacts> = self
             .store_query_or_record(
                 |sink| {
-                    for (file, oid, _) in &entries {
-                        sink.push(self.file_read_key(file, *oid));
+                    for (file, blob) in &entries {
+                        sink.push(self.file_read_key(file, blob.oid));
                     }
                 },
                 hydrated,
@@ -9858,7 +9983,8 @@ where
             .collect();
         self.bulk_hydration_count
             .fetch_add(facts.len(), Ordering::Relaxed);
-        for (file, oid, _) in entries {
+        for (file, blob) in entries {
+            let oid = blob.oid;
             if !canonical
                 && !facts.contains_key(&file)
                 && let Some(source) = self.source_for_oid(&file, oid)
@@ -10054,7 +10180,7 @@ where
             if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
                 out.insert(file, state.type_identifiers.clone());
             } else {
-                clean_entries.push((file, oid, storage_key));
+                clean_entries.push((file, BlobKey::unvaried(oid, storage_key)));
             }
         }
         if clean_entries.is_empty() {
@@ -10063,8 +10189,8 @@ where
         let hydrated = self
             .store_query_or_record(
                 |sink| {
-                    for (file, oid, _) in &clean_entries {
-                        sink.push(self.file_read_key(file, *oid));
+                    for (file, blob) in &clean_entries {
+                        sink.push(self.file_read_key(file, blob.oid));
                     }
                 },
                 self.store_context.store.hydrate_type_identifiers_by_key(
@@ -10108,7 +10234,11 @@ where
         {
             let cached = cached.replay(self);
             if let (Some(source), Some(max_source_bytes)) = (&cached, max_source_bytes)
-                && source.snapshot.source().len() > max_source_bytes
+                && !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    source.snapshot.source().len(),
+                    max_source_bytes,
+                )
+                .allows(0)
             {
                 return Err(PreparedSourceFailure::Exceeded(
                     PreparedSyntaxLimitExceeded {
@@ -10127,6 +10257,10 @@ where
         let snapshot = match snapshot {
             Ok(Some(snapshot)) => Some(snapshot),
             Ok(None) => {
+                let limit =
+                    max_source_bytes.expect("only a bounded source read returns no snapshot");
+                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(limit, limit)
+                    .allows(1);
                 return Err(PreparedSourceFailure::Exceeded(
                     PreparedSyntaxLimitExceeded {
                         minimum_source_bytes: max_source_bytes
@@ -10536,7 +10670,7 @@ where
                 else {
                     continue;
                 };
-                if !claimed.insert((oid, storage_key)) {
+                if !claimed.insert(BlobKey::unvaried(oid, storage_key)) {
                     continue;
                 }
                 targets.push((file.clone(), oid, storage_key.to_string(), generation));
@@ -10546,7 +10680,9 @@ where
             }
             let independent_primary_keys = targets
                 .iter()
-                .map(|(_, oid, storage_language, _)| (*oid, storage_language.clone()))
+                .map(|(_, oid, storage_language, _)| {
+                    BlobKey::unvaried(*oid, storage_language.clone())
+                })
                 .collect::<HashSet<_>>();
             let targets = targets
                 .into_iter()
@@ -10556,14 +10692,14 @@ where
                         .possible_additional_storage_language_keys_for_file(&file)
                         .iter()
                         .filter(|projection| {
-                            independent_primary_keys.contains(&(oid, (**projection).to_owned()))
+                            independent_primary_keys
+                                .contains(&BlobKey::unvaried(oid, (**projection).to_owned()))
                         })
                         .map(|projection| (**projection).to_owned())
                         .collect();
                     PreparedAnalysisTarget {
                         file,
-                        oid,
-                        storage_language,
+                        key: BlobKey::unvaried(oid, storage_language),
                         generation,
                         required_existing_additional_storage_languages: Vec::new(),
                         independently_owned_additional_storage_languages,
@@ -10846,7 +10982,7 @@ where
         }
         let keys = persisted_candidates
             .iter()
-            .map(|(_, oid, storage_key)| (*oid, storage_key.to_string()))
+            .map(|(_, oid, storage_key)| BlobKey::unvaried(*oid, storage_key.to_string()))
             .collect::<Vec<_>>();
         let present = {
             // The key set is the language's whole candidate list, so this one
@@ -10870,7 +11006,7 @@ where
             .unwrap_or_default()
         };
         for (project_file, oid, storage_key) in persisted_candidates {
-            if present.contains(&(oid, storage_key.to_string())) {
+            if present.contains(&BlobKey::unvaried(oid, storage_key.to_string())) {
                 files.push(project_file);
             }
         }
@@ -11024,7 +11160,8 @@ where
                 let Some(file) = self.rebase_live_file_to_project_root(file) else {
                     continue;
                 };
-                if self.adapter.storage_language_key_for_file(&file) != row.lang
+                if row.variant != brokk_bifrost_core::gitblob::ParseVariant::Empty
+                    || self.adapter.storage_language_key_for_file(&file) != row.lang
                     || snapshot.validated_oid_for_path(&file) != Some(row.blob_oid)
                 {
                     continue;
@@ -11496,7 +11633,7 @@ where
         } else {
             let keys = dirty_symbols
                 .values()
-                .map(|(lang, row)| (row.blob_oid, lang.clone()))
+                .map(|(lang, row)| BlobKey::unvaried(row.blob_oid, lang.clone()))
                 .collect::<Vec<_>>();
             self.store_context
                 .store
@@ -11527,7 +11664,7 @@ where
             if let Some((dirty_lang, row)) = dirty_symbols.get(&file)
                 && dirty_lang == &lang
                 && row.blob_oid == oid
-                && !published_dirty.contains(&(oid, lang.clone()))
+                && !published_dirty.contains(&BlobKey::unvaried(oid, &lang))
                 && let Some(dirty) = dirty_states.get(&Self::transient_cache_key(oid, &file))
                 && dirty.state.parse_complete
                 && dirty.generations.get(&lang) == self.store_context.generations.get(&lang)
@@ -11536,11 +11673,17 @@ where
                 // for this request, not a publication usable at another head.
                 dirty_modules.push((lang.clone(), row.clone(), !dirty.state.imports.is_empty()));
             } else {
-                keys.push((oid, lang.clone()));
+                keys.push(BlobKey::unvaried(oid, &lang));
             }
             paths.insert((lang, crate::path_utils::rel_path_string(&file)), oid);
         }
-        keys.sort();
+        keys.sort_by(|a, b| {
+            (&a.lang, a.oid.as_bytes(), a.variant.as_bytes()).cmp(&(
+                &b.lang,
+                b.oid.as_bytes(),
+                b.variant.as_bytes(),
+            ))
+        });
         keys.dedup();
         let rows = self
             .store_context
@@ -11569,7 +11712,7 @@ where
         let rows = rows
             .into_iter()
             .map(|(lang, row)| {
-                let has_imports = imports.contains(&(row.blob_oid, lang.clone()));
+                let has_imports = imports.contains(&BlobKey::unvaried(row.blob_oid, lang.clone()));
                 (lang, row, has_imports)
             })
             .chain(dirty_modules);
@@ -12326,8 +12469,7 @@ where
             .store_query_or_record(
                 |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.direct_children_for_unit_limited(
-                    oid,
-                    &storage_key,
+                    &BlobKey::unvaried(oid, &storage_key),
                     generation,
                     owner,
                     limit,
@@ -12443,8 +12585,7 @@ where
             |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.write_parsed_blob_at_generation(
                 file,
-                oid,
-                storage_key,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, storage_key),
                 self.store_context.generations[storage_key],
                 self.adapter.as_ref(),
                 &state,
@@ -12703,9 +12844,9 @@ where
             let cached = self.store_context.store.admit_cached_selected_content(
                 owner,
                 &path,
-                oid,
+                &BlobKey::unvaried(oid, self.adapter.storage_language_key_for_file(&file)),
                 &ResolutionContentInput::Parsed {
-                    content_oid: oid,
+                    key: BlobKey::unvaried(oid, self.adapter.storage_language_key_for_file(&file)),
                     semantic_language: language,
                 },
                 cancellation,
@@ -12836,8 +12977,7 @@ where
         let prepared = match AnalyzerStore::prepare_parsed_blob_at_generations(
             file,
             &syntax,
-            oid,
-            &owner.lang,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, &owner.lang),
             &generations,
             self.adapter.as_ref(),
             state,
@@ -12882,9 +13022,9 @@ where
         let cached = self.store_context.store.admit_cached_selected_content(
             owner,
             &path,
-            oid,
+            &BlobKey::unvaried(oid, self.adapter.storage_language_key_for_file(file)),
             &ResolutionContentInput::Parsed {
-                content_oid: oid,
+                key: BlobKey::unvaried(oid, self.adapter.storage_language_key_for_file(file)),
                 semantic_language: Language::Rust,
             },
             cancellation,
@@ -12997,8 +13137,11 @@ where
         let mut facts = resolver
             .resolve_rows_with_payload(rows.into_iter().map(|row| {
                 let storage_key = HierarchyStorageKey {
-                    blob_oid: row.candidate.blob_oid,
-                    lang: row.candidate.lang.clone(),
+                    blob: BlobKey {
+                        oid: row.candidate.blob_oid,
+                        lang: row.candidate.lang.clone(),
+                        variant: row.candidate.variant,
+                    },
                     unit_key: row.candidate.unit_key,
                 };
                 (
@@ -14714,12 +14857,15 @@ where
     fn active_search_blob(
         &self,
         snapshot: &LiveSnapshot,
-        oid: Oid,
+        key: BlobKey,
         per_pattern: &[Vec<String>],
     ) -> ActiveSearchBlob {
         let mut package_literals = String::new();
         let mut prefilter_exempt = false;
-        for file in snapshot.paths_for_oid(oid) {
+        for file in snapshot.paths_for_oid(key.oid) {
+            if self.adapter.storage_language_key_for_file(file) != key.lang {
+                continue;
+            }
             let package = self
                 .store_query_or_record(
                     |sink| sink.push(self.scope_read_key()),
@@ -14751,7 +14897,7 @@ where
             }
         }
         ActiveSearchBlob {
-            oid,
+            key,
             package_literals,
             prefilter_exempt,
         }
@@ -14792,9 +14938,10 @@ where
             let _scope = profiling::scope("search_symbols.candidates.active_blobs");
             live_snapshot
                 .oids()
-                .map(|oid| match required_literals {
-                    Some(per_pattern) => self.active_search_blob(&live_snapshot, oid, per_pattern),
-                    None => ActiveSearchBlob::unfiltered(oid),
+                .flat_map(|oid| langs.iter().map(move |lang| BlobKey::unvaried(oid, lang)))
+                .map(|key| match required_literals {
+                    Some(per_pattern) => self.active_search_blob(&live_snapshot, key, per_pattern),
+                    None => ActiveSearchBlob::unfiltered(key),
                 })
                 .collect::<Vec<_>>()
         };
@@ -14857,9 +15004,17 @@ where
         };
         complete &= matched.complete;
         let mut seen_keys = HashSet::default();
-        matched
-            .rows
-            .retain(|key| seen_keys.insert((key.lang_index, key.blob_oid, key.unit_key)));
+        matched.rows.retain(|key| {
+            seen_keys.insert((
+                key.lang_index,
+                BlobKey {
+                    oid: key.blob_oid,
+                    lang: langs[key.lang_index].clone(),
+                    variant: key.variant,
+                },
+                key.unit_key,
+            ))
+        });
         let rows = {
             let _scope = profiling::scope("search_symbols.candidates.hydrate_rows");
             self.store_query_or_record(
@@ -15032,7 +15187,7 @@ where
             |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context
                 .store
-                .content_package(oid, &storage_key, generation),
+                .content_package(&BlobKey::unvaried(oid, &storage_key), generation),
             format!("querying the content qualifier for `{file}`"),
         )
         .flatten()
@@ -15099,9 +15254,11 @@ where
         };
         let content_qualifier = self.store_query_or_record(
             |sink| sink.push(self.file_read_key(file, oid)),
-            self.store_context
-                .store
-                .content_package_limited(oid, &storage_key, generation, limit),
+            self.store_context.store.content_package_limited(
+                &BlobKey::unvaried(oid, &storage_key),
+                generation,
+                limit,
+            ),
             format!("querying the bounded namespace qualifier for `{file}`"),
         );
         let Some(content_qualifier) = content_qualifier else {
@@ -15125,8 +15282,7 @@ where
             self.store_context
                 .store
                 .first_declaration_content_qualifier_for_key_limited(
-                    oid,
-                    &storage_key,
+                    &BlobKey::unvaried(oid, &storage_key),
                     generation,
                     limit - inspected,
                 ),
@@ -15197,8 +15353,7 @@ where
             self.store_context
                 .store
                 .ruby_method_dispatch_modes_for_unit_limited(
-                    oid,
-                    &storage_key,
+                    &BlobKey::unvaried(oid, &storage_key),
                     generation,
                     code_unit,
                     limit,
@@ -15257,7 +15412,7 @@ where
             .store_query_or_record(
                 |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.hydrate_import_infos_by_key(
-                    &[(file.clone(), oid, storage_key.to_string())],
+                    &[(file.clone(), BlobKey::unvaried(oid, storage_key))],
                     self.store_context.generations.as_ref(),
                     self.adapter.as_ref(),
                 ),
@@ -15314,7 +15469,7 @@ where
                 self.store_context
                     .store
                     .hydrate_canonical_import_facts_by_key(
-                        &[(file.clone(), oid, storage_key.to_string())],
+                        &[(file.clone(), BlobKey::unvaried(oid, storage_key))],
                         self.store_context.generations.as_ref(),
                         self.adapter.as_ref(),
                     ),
@@ -15490,8 +15645,7 @@ where
         self.store_query_or_record(
             |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.import_infos_for_key_limited(
-                oid,
-                &storage_key,
+                &BlobKey::unvaried(oid, &storage_key),
                 generation,
                 limit,
             ),
@@ -15616,8 +15770,7 @@ where
                 sink.push(ReadKey::index(IndexFamily::Supertype, code_unit.fq_name()));
             },
             self.store_context.store.raw_supertypes_for_unit_limited(
-                oid,
-                &storage_key,
+                &BlobKey::unvaried(oid, &storage_key),
                 generation,
                 code_unit,
                 limit,
@@ -15671,8 +15824,7 @@ where
             self.store_context
                 .store
                 .supertype_lookup_paths_for_unit_limited(
-                    oid,
-                    &storage_key,
+                    &BlobKey::unvaried(oid, &storage_key),
                     generation,
                     code_unit,
                     limit,
@@ -15937,8 +16089,7 @@ where
             .store_query_or_record(
                 |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.type_aliases_for_file(
-                    oid,
-                    &storage_key,
+                    &BlobKey::unvaried(oid, &storage_key),
                     generation,
                     self.adapter.as_ref(),
                     file,
@@ -16012,8 +16163,7 @@ where
             .store_query_or_record(
                 |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.enclosing_declarations_for_file(
-                    oid,
-                    &storage_key,
+                    &BlobKey::unvaried(oid, &storage_key),
                     generation,
                     self.adapter.as_ref(),
                     file,
@@ -16139,8 +16289,7 @@ where
         self.store_query_or_record(
             |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.signatures_for_unit_limited(
-                oid,
-                &storage_key,
+                &BlobKey::unvaried(oid, &storage_key),
                 generation,
                 code_unit,
                 limit,
@@ -16173,8 +16322,7 @@ where
         self.store_query_or_record(
             |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.signature_metadata_for_unit(
-                oid,
-                &storage_key,
+                &BlobKey::unvaried(oid, &storage_key),
                 generation,
                 code_unit,
             ),
@@ -16243,8 +16391,7 @@ where
             self.store_context
                 .store
                 .signature_metadata_for_unit_limited(
-                    oid,
-                    &storage_key,
+                    &BlobKey::unvaried(oid, &storage_key),
                     generation,
                     code_unit,
                     limit,
@@ -16292,8 +16439,7 @@ where
         self.store_query_or_record(
             |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.ranges_for_unit_limited(
-                oid,
-                &storage_key,
+                &BlobKey::unvaried(oid, &storage_key),
                 generation,
                 code_unit,
                 limit,
@@ -16993,8 +17139,7 @@ where
             .store_query_or_record(
                 |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.summary_file_projection(
-                    oid,
-                    storage_key,
+                    &BlobKey::unvaried(oid, storage_key),
                     generation,
                     self.adapter.as_ref(),
                     file,
@@ -17045,8 +17190,7 @@ where
                     .store_query_or_record(
                         |sink| sink.push(self.file_read_key(file, oid)),
                         self.store_context.store.contains_parsed_blob_at_generation(
-                            oid,
-                            storage_key,
+                            &BlobKey::unvaried(oid, storage_key),
                             self.store_context.generations[storage_key],
                         ),
                         format!("checking whether `{file}` is analyzed"),
@@ -17105,7 +17249,7 @@ where
         }
         let keys = persisted_candidates
             .iter()
-            .map(|(_, oid, storage_key)| (*oid, storage_key.to_string()))
+            .map(|(_, oid, storage_key)| BlobKey::unvaried(*oid, storage_key.to_string()))
             .collect::<Vec<_>>();
         let present = self
             .store_query_or_record(
@@ -17122,7 +17266,7 @@ where
             )
             .unwrap_or_default();
         for (candidate, oid, storage_key) in persisted_candidates {
-            if present.contains(&(oid, storage_key.to_string())) {
+            if present.contains(&BlobKey::unvaried(oid, storage_key.to_string())) {
                 analyzed.push(candidate.clone());
             }
         }
@@ -17678,7 +17822,7 @@ where
     {
         if !matches!(
             self.adapter.language(),
-            Language::Rust | Language::JavaScript | Language::TypeScript
+            Language::Rust | Language::JavaScript | Language::TypeScript | Language::CSharp
         ) {
             return Err(crate::analyzer::store::StoreError::new(
                 "static dependency publication is unavailable for this language adapter",
@@ -17971,6 +18115,14 @@ where
 
     fn record_query_failure(&self, error: StoreError) {
         TreeSitterAnalyzer::record_store_error(self, error);
+    }
+
+    fn current_query_read_completion(&self) -> Result<(), QueryReadIncomplete> {
+        crate::analyzer::i_analyzer::current_query_context_value(
+            &self.query_read_cache_lock().contexts,
+            |context| context.read_completion().err(),
+        )
+        .map_or(Ok(()), Err)
     }
 
     fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
@@ -18766,7 +18918,7 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
         &self,
         file: &ProjectFile,
         blob: Oid,
-    ) -> Option<Vec<(crate::analyzer::read_ledger::IndexFamily, Box<[u8]>)>> {
+    ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>> {
         let state = self.fetch_file_state(file)?;
         self.index_keys_of_state(file, blob, state)
     }
@@ -18776,15 +18928,14 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
         file: &ProjectFile,
         blob: Oid,
         source: &str,
-    ) -> Option<Vec<(crate::analyzer::read_ledger::IndexFamily, Box<[u8]>)>> {
+    ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>> {
         let storage_key = self.adapter.storage_language_key_for_file(file);
         let generation = self.store_context.generations.get(storage_key).copied()?;
         let state = self
             .store_context
             .store
             .hydrate_file_state_with_source(
-                blob,
-                storage_key,
+                &BlobKey::unvaried(blob, storage_key),
                 generation,
                 self.adapter.as_ref(),
                 file,
@@ -18824,7 +18975,7 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
         file: &ProjectFile,
         blob: Oid,
         state: Arc<FileState>,
-    ) -> Option<Vec<(crate::analyzer::read_ledger::IndexFamily, Box<[u8]>)>> {
+    ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>> {
         use crate::analyzer::read_ledger::IndexFamily;
 
         if self.store_context.build_abort.cancellation().is_cancelled()
@@ -18838,34 +18989,12 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
         let generation = self.store_context.generations.get(storage_key).copied()?;
-        let mut keys = Vec::new();
-        crate::analyzer::store::file_state_index_keys(
-            self.adapter.as_ref(),
-            &state,
-            &mut |family, key| keys.push((family, Box::from(key))),
-        );
-        for unit in state.raw_supertypes.keys() {
-            keys.push((IndexFamily::Supertype, Box::from(unit.fq_name().as_bytes())));
-        }
-        for unit in state.supertype_lookup_paths.keys() {
-            keys.push((
-                IndexFamily::SupertypeLookupPath,
-                Box::from(unit.fq_name().as_bytes()),
-            ));
-        }
         let path_symbol = Self::path_symbol_row(&self.adapter, file, blob);
-        if let Some(row) = &path_symbol {
-            keys.push((IndexFamily::PathSymbol, Box::from(row.exact_fqn.as_bytes())));
-            keys.push((
-                IndexFamily::PathSymbol,
-                Box::from(row.normalized_fqn.as_bytes()),
-            ));
-        }
         let facts = self
             .store_context
             .store
             .workspace_content_package_facts(
-                storage_key,
+                &BlobKey::unvaried(Oid::zero(), storage_key),
                 generation,
                 &[blob],
                 self.adapter.workspace_file_package_anchor(),
@@ -18880,19 +19009,78 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
                 rel_path: crate::path_utils::rel_path_string(file),
                 blob_oid: blob,
             },
-            path_symbol,
+            path_symbol.clone(),
         );
-        let (packages, _, _, _) =
+        let (packages, package_files, package_edges, _) =
             Self::workspace_snapshot_relations(&self.adapter, &[entry], &facts.facts).ok()?;
-        for package in packages {
-            keys.push((
-                IndexFamily::PackageMembership,
-                Box::from(package.as_bytes()),
-            ));
+        let mut combined: crate::hash::HashMap<
+            (IndexFamily, Box<[u8]>),
+            crate::analyzer::canonical_hash::CanonicalHasher,
+        > = crate::hash::HashMap::default();
+        for (lang, projection) in std::iter::once((storage_key, state.as_ref())).chain(
+            state
+                .additional_projections
+                .iter()
+                .map(|(lang, projection)| (*lang, projection.as_ref())),
+        ) {
+            let generation = self.store_context.generations.get(lang).copied()?;
+            let entries = self
+                .store_context
+                .store
+                .file_state_index_digests(
+                    self.adapter.as_ref(),
+                    projection,
+                    blob,
+                    lang,
+                    generation,
+                    path_symbol.as_ref(),
+                    &packages,
+                )
+                .ok()??;
+            for (family, key, digest) in entries {
+                let hash = combined.entry((family, key.clone())).or_insert_with(|| {
+                    crate::analyzer::canonical_hash::CanonicalHasher::new(
+                        b"bifrost:index-projections:v1",
+                    )
+                });
+                hash.value(lang.as_bytes());
+                hash.value(digest.as_bytes());
+                if family == IndexFamily::PackageMembership {
+                    // Package relation readers observe direct file membership
+                    // and transitive children as well as declaration rows.
+                    let mut reachable = crate::hash::HashSet::default();
+                    reachable.insert(key.to_vec());
+                    loop {
+                        let before = reachable.len();
+                        for edge in &package_edges {
+                            if reachable.contains(edge.parent_package_name.as_bytes()) {
+                                reachable.insert(edge.child_package_name.as_bytes().to_vec());
+                            }
+                        }
+                        if before == reachable.len() {
+                            break;
+                        }
+                    }
+                    for file in &package_files {
+                        if file.package_name.as_bytes() == key.as_ref() {
+                            hash.field("package_file", file.rel_path.as_bytes());
+                        }
+                    }
+                    for edge in &package_edges {
+                        if reachable.contains(edge.parent_package_name.as_bytes()) {
+                            hash.field("parent", edge.parent_package_name.as_bytes());
+                            hash.field("child", edge.child_package_name.as_bytes());
+                        }
+                    }
+                }
+            }
         }
-        keys.sort();
-        keys.dedup();
-        Some(keys)
+        let mut entries = combined
+            .into_iter()
+            .map(|((family, key), hash)| (family, key, StableDigest::from_array(hash.finish())))
+            .collect::<Vec<_>>();
+        entries.sort();
+        Some(entries)
     }
 }
 

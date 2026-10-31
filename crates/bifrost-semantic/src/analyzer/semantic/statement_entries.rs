@@ -75,8 +75,10 @@ impl StatementEntryIndex {
         prepared: &PreparedSyntaxTree,
     ) -> Result<Self, StatementEntryOpen> {
         let key = procedure.artifact().key();
-        let path = WorkspaceRelativePath::try_from_path(file.rel_path())
-            .map_err(|_| StatementEntryOpen::SourceSnapshotMismatch)?;
+        let path = WorkspaceRelativePath::try_from_path(file.rel_path()).map_err(|_| {
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+            StatementEntryOpen::SourceSnapshotMismatch
+        })?;
         let content =
             ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
         let revision_matches = match (key.revision(), prepared.origin()) {
@@ -102,6 +104,7 @@ impl StatementEntryIndex {
             || key.language() != prepared.dialect()
             || !revision_matches
         {
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
             return Err(StatementEntryOpen::SourceSnapshotMismatch);
         }
 

@@ -2787,7 +2787,8 @@ fn csharp_single_target_write<'tree>(
     }
 }
 
-fn csharp_is_update_expression(node: Node<'_>) -> bool {
+#[doc(hidden)]
+pub fn csharp_is_update_expression(node: Node<'_>) -> bool {
     if !matches!(
         node.kind(),
         "prefix_unary_expression" | "postfix_unary_expression"

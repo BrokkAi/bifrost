@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::structural::execution::plan::StepOutputCap;
+
 use crate::analyzer::semantic::{
     RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadKeyKind,
     RuntimeKeyedReadResult, SemanticOutcome,
@@ -79,7 +81,10 @@ impl PythonFactDiagnostics {
         );
         self.record_site(
             analyzer,
-            (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
+            (
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                value.incompleteness,
+            ),
             value.row.language,
             message,
             source,
@@ -114,11 +119,7 @@ impl PythonFactDiagnostics {
             analyzer,
             (
                 CodeQueryDiagnosticCode::PythonHierarchyDerivationIncomplete,
-                match value.reason {
-                    Some("cancelled") => Some(DerivationExecutionCause::Cancelled),
-                    Some("visit_limit") => Some(DerivationExecutionCause::Budget),
-                    _ => None,
-                },
+                value.incompleteness,
             ),
             "python",
             format!(
@@ -133,31 +134,31 @@ impl PythonFactDiagnostics {
     fn record_site(
         &mut self,
         analyzer: &dyn IAnalyzer,
-        (code, cause): (CodeQueryDiagnosticCode, Option<DerivationExecutionCause>),
+        (code, incompleteness): (CodeQueryDiagnosticCode, Incompleteness),
         language: &'static str,
         message: String,
         source: CodeQuerySourceSpan,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) {
-        if self
-            .sites
-            .insert((code, language, message.clone(), source.clone()))
-        {
-            diagnostics.push(super::QueryExecutionState::diagnostic(
-                analyzer,
-                CodeQueryDiagnostic {
-                    related: Vec::new(),
-                    source: Some(source),
-                    code,
-                    impact: CodeQueryDiagnosticImpact::Incomplete,
-                    branch: Vec::new(),
-                    language,
-                    message,
-                    exhausted_roots: Vec::new(),
-                    withheld_rows_path: None,
-                },
-                cause,
-            ));
+        let site = (code, language, message.clone(), source.clone());
+        let diagnostic = super::QueryExecutionState::diagnostic(
+            analyzer,
+            CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness,
+                related: Vec::new(),
+                source: Some(source),
+                code,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language,
+                message,
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            }),
+            incompleteness.execution_cause(),
+        );
+        if self.sites.insert(site) {
+            diagnostics.push(diagnostic);
         }
     }
 }
@@ -169,7 +170,6 @@ fn result_contract_artifact_file(value: &PipelineValue) -> Option<&ProjectFile> 
         PipelineValue::CallShape(shape) => Some(&shape.report.outcome.file),
         PipelineValue::CallResultContract(contract) => Some(contract.file()),
         PipelineValue::CallResultObligation(obligation) => Some(obligation.file()),
-        PipelineValue::ResultSubjectUse(result_use) => Some(&result_use.file),
         PipelineValue::ResultContractUse(result_use) => Some(result_use.file()),
         PipelineValue::ResultContractFailureUse(result_use) => Some(result_use.file()),
         _ => None,
@@ -242,13 +242,6 @@ fn semantic_artifact_window_file<'a>(
     value: &'a PipelineValue,
     step: &QueryStep,
 ) -> Option<&'a ProjectFile> {
-    if matches!(step, QueryStep::ProcedureOf | QueryStep::ProgramPointOf) {
-        return match value {
-            PipelineValue::StructuralMatch(seed) => Some(&seed.file),
-            PipelineValue::Declaration(declaration) => Some(declaration.unit.source()),
-            _ => None,
-        };
-    }
     if matches!(
         step,
         QueryStep::DecoratorBindings(_)
@@ -337,10 +330,11 @@ fn resolved_call_identity_matches(value: &CallBindingValue, identity: &CallIdent
             &value.site.model_aliases,
             expected,
         ),
-        CallIdentity::Qualified {
-            resolved: Some(resolved),
-            ..
-        } => match resolved.kind {
+        CallIdentity::Qualified { resolved, .. } => match resolved
+            .as_ref()
+            .expect("effective qualified identity is resolved")
+            .kind
+        {
             ResolvedCallIdentityKind::WorkspaceDeclaration => value
                 .site
                 .target
@@ -350,7 +344,6 @@ fn resolved_call_identity_matches(value: &CallBindingValue, identity: &CallIdent
                 value.site.model_callable_id.as_deref() == Some(expected)
             }
         },
-        CallIdentity::Qualified { resolved: None, .. } => false,
     }
 }
 
@@ -467,7 +460,8 @@ fn call_argument_filter_matches(value: &CallBindingValue, selector: &CallArgumen
 fn formal_name_unrecorded_diagnostic(value: &CallBindingValue, name: &str) -> CodeQueryDiagnostic {
     let report = &value.site.report;
     let path = rel_path_string(&report.file);
-    CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -489,7 +483,7 @@ fn formal_name_unrecorded_diagnostic(value: &CallBindingValue, name: &str) -> Co
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: Some(path),
-    }
+    })
 }
 
 fn row_literal_matches(actual: CodeQueryRowScalarRef<'_>, literal: &QueryRowLiteral) -> bool {
@@ -739,7 +733,7 @@ pub(super) fn apply_plan_step(
     rows: Vec<PipelineRow>,
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
-    max_step_outputs: usize,
+    step_output_cap: StepOutputCap,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     instrumentation: Option<&mut QueryStepInstrumentation>,
 ) -> PlanExecution {
@@ -1353,6 +1347,10 @@ pub(super) fn apply_plan_step(
             );
         }
     }
+    let max_step_outputs = match step_output_cap {
+        StepOutputCap::PipelineRows => PipelineOutputLimit::Budget(limits.max_pipeline_rows),
+        StepOutputCap::Terminal(cap) => PipelineOutputLimit::Authored(cap),
+    };
     let import_access = if use_persisted_imports {
         persisted_import_adjacency
             .as_ref()
@@ -1431,7 +1429,8 @@ pub(super) fn apply_plan_step(
         state.direct_import_layer_content = None;
         state.import_graph = None;
         state.import_graph_content = None;
-        diagnostics.push(super::QueryExecutionState::diagnostic(state.analyzer, CodeQueryDiagnostic {
+        diagnostics.push(super::QueryExecutionState::diagnostic(state.analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -1441,7 +1440,7 @@ pub(super) fn apply_plan_step(
             message: "workspace content changed during direct import relation replay; retry the query for a coherent snapshot".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }, Some(DerivationExecutionCause::Snapshot)));
+        }), Some(DerivationExecutionCause::Snapshot)));
         if state.access_mode == StructuralAccessMode::IndexedRequired {
             state.access_failure.get_or_insert_with(|| {
                 "direct import topology became stale during replay".to_string()
@@ -1468,8 +1467,16 @@ pub(super) fn apply_plan_step(
     }
     if exhausted {
         truncated = true;
-        if state.budget.pipeline_rows >= limits.max_pipeline_rows
-            || state.budget.provenance_steps >= limits.max_pipeline_rows
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            state.budget.pipeline_rows,
+            limits.max_pipeline_rows,
+        )
+        .allows(1)
+            || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                state.budget.provenance_steps,
+                limits.max_pipeline_rows,
+            )
+            .allows(1)
         {
             push_pipeline_budget_diagnostic(diagnostics, &state.budget);
         }
@@ -1669,17 +1676,22 @@ pub(super) fn invalid_plan_result(
         results: Vec::new(),
         truncated: false,
         session_subset,
-        diagnostics: normalize_query_diagnostics(vec![CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code: CodeQueryDiagnosticCode::InvalidPlan,
-            impact: CodeQueryDiagnosticImpact::Invalid,
-            branch: Vec::new(),
-            language: "workspace",
-            message: error.to_string(),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        }]),
+        diagnostics: normalize_query_diagnostics(vec![CodeQueryDiagnostic::new(
+            CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                    brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                ),
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::InvalidPlan,
+                impact: CodeQueryDiagnosticImpact::Invalid,
+                branch: Vec::new(),
+                language: "workspace",
+                message: error.to_string(),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+        )]),
     }
 }
 
@@ -1932,17 +1944,22 @@ pub(super) fn query_analysis_context_error_result(
         results: Vec::new(),
         truncated: true,
         session_subset,
-        diagnostics: normalize_query_diagnostics(vec![CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "workspace",
-            message: error.to_string(),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        }]),
+        diagnostics: normalize_query_diagnostics(vec![CodeQueryDiagnostic::new(
+            CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                    brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                ),
+                related: Vec::new(),
+                source: None,
+                code,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message: error.to_string(),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+        )]),
     }
 }
 
@@ -1957,7 +1974,8 @@ pub(super) fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnosti
     {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::Cancelled,
@@ -1967,11 +1985,11 @@ pub(super) fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnosti
         message: "query_code cancelled; any already-produced results are partial".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn apply_pipeline_step<'a>(
+fn apply_pipeline_step<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
     workspace: Option<&'a WorkspaceAnalyzer>,
@@ -2023,7 +2041,7 @@ pub(super) fn apply_pipeline_step<'a>(
     budget: &mut CodeQueryExecutionBudget,
     access_failure: &mut Option<String>,
     limits: CodeQueryExecutionLimits,
-    max_step_outputs: usize,
+    max_step_outputs: PipelineOutputLimit,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
@@ -2150,6 +2168,34 @@ pub(super) fn apply_pipeline_step<'a>(
     )
 }
 
+#[derive(Clone, Copy)]
+enum PipelineOutputLimit {
+    Authored(usize),
+    Budget(usize),
+}
+
+impl PipelineOutputLimit {
+    fn maximum(self) -> usize {
+        match self {
+            Self::Authored(maximum) | Self::Budget(maximum) => maximum,
+        }
+    }
+
+    fn saturating_sub(self, used: usize) -> usize {
+        self.maximum().saturating_sub(used)
+    }
+
+    fn allows_next(self, used: usize) -> bool {
+        match self {
+            Self::Authored(maximum) => used < maximum,
+            Self::Budget(maximum) => {
+                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(used, maximum)
+                    .allows(1)
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_call_bindings_pipeline_step(
     analyzer: &dyn IAnalyzer,
@@ -2163,7 +2209,7 @@ fn apply_call_bindings_pipeline_step(
     semantic: &mut Option<SemanticQueryContext<'_>>,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
-    max_step_outputs: usize,
+    max_step_outputs: PipelineOutputLimit,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     instrumentation: Option<&mut QueryStepInstrumentation>,
@@ -2189,7 +2235,8 @@ fn apply_call_bindings_pipeline_step(
                 service.prefetch_call_bindings(memo, candidates)
             })
         {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticProviderFailed,
@@ -2199,7 +2246,7 @@ fn apply_call_bindings_pipeline_step(
                 message: format!("call-target prefetch failed: {error}"),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
             return (Vec::new(), true, false);
         }
     }
@@ -2212,7 +2259,7 @@ fn apply_call_bindings_pipeline_step(
     let mut indexed_declarations = indexed_declarations;
 
     'rows: for row in rows {
-        if output.len() >= max_step_outputs {
+        if !max_step_outputs.allows_next(output.len()) {
             break;
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -2227,7 +2274,8 @@ fn apply_call_bindings_pipeline_step(
                 diagnostic.code == CodeQueryDiagnosticCode::SemanticWorkspaceRequired
             })
         {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticWorkspaceRequired,
@@ -2238,7 +2286,7 @@ fn apply_call_bindings_pipeline_step(
                     .to_string(),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
         let indexed = indexed_declarations
             .as_deref_mut()
@@ -2270,7 +2318,13 @@ fn apply_call_bindings_pipeline_step(
             .is_some_and(|service| service.work().budget_exhausted);
 
         for expansion in expansions {
-            if !expansion.budgeted && budget.pipeline_rows >= max_pipeline_rows {
+            if !expansion.budgeted
+                && !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    budget.pipeline_rows,
+                    max_pipeline_rows,
+                )
+                .allows(1)
+            {
                 exhausted = true;
                 break 'rows;
             }
@@ -2360,7 +2414,7 @@ fn apply_pipeline_step_general<'a>(
     budget: &mut CodeQueryExecutionBudget,
     access_failure: &mut Option<String>,
     limits: CodeQueryExecutionLimits,
-    max_step_outputs: usize,
+    max_step_outputs: PipelineOutputLimit,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
@@ -2427,7 +2481,8 @@ fn apply_pipeline_step_general<'a>(
             .iter()
             .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticWorkspaceRequired)
         {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticWorkspaceRequired,
@@ -2440,7 +2495,7 @@ fn apply_pipeline_step_general<'a>(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
         return (Vec::new(), true, false);
     }
@@ -2451,7 +2506,8 @@ fn apply_pipeline_step_general<'a>(
                 .as_ref()
                 .is_some_and(|receiver| !resolved_call_receiver_is_resolved(receiver)))
     {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::InvalidPlan,
@@ -2462,14 +2518,17 @@ fn apply_pipeline_step_general<'a>(
                 .to_owned(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
         return (Vec::new(), true, false);
     }
     if let QueryStep::ResolvedValue(filter) = step
         && (filter.resolves_to.effective_identity().is_none()
             || filter.proof != ResolvedCallProof::Exact)
     {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+            ),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::InvalidPlan,
@@ -2479,7 +2538,7 @@ fn apply_pipeline_step_general<'a>(
             message: "resolved_value requires a loaded-policy identity and exact proof".to_owned(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
         return (Vec::new(), true, false);
     }
     let window_result_contract_artifacts = matches!(
@@ -2535,7 +2594,7 @@ fn apply_pipeline_step_general<'a>(
     // Grouping may visit a later input before an earlier one in another file.
     // Apply the authored output cap after restoring the original row order.
     let max_step_outputs = if window_procedure_artifacts {
-        max_pipeline_rows
+        PipelineOutputLimit::Budget(max_pipeline_rows)
     } else {
         max_step_outputs
     };
@@ -2580,7 +2639,9 @@ fn apply_pipeline_step_general<'a>(
     // from every procedure root have merged below.
     let merge_absent_member_findings_before_filter = matches!(step, QueryStep::AbsentMember(_));
     'rows: while let Some(mut row) = rows.next() {
-        if output.len() >= max_step_outputs && !merge_absent_member_findings_before_filter {
+        if !merge_absent_member_findings_before_filter
+            && !max_step_outputs.allows_next(output.len())
+        {
             break;
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -2665,7 +2726,12 @@ fn apply_pipeline_step_general<'a>(
                 })
                 .collect();
             record_row_local_step(&mut row, step);
-            if budget.pipeline_rows >= max_pipeline_rows {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                budget.pipeline_rows,
+                max_pipeline_rows,
+            )
+            .allows(1)
+            {
                 exhausted = true;
                 break;
             }
@@ -2679,7 +2745,8 @@ fn apply_pipeline_step_general<'a>(
                 Ok(true) => {}
                 Err(message) => {
                     exhausted = true;
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -2689,12 +2756,17 @@ fn apply_pipeline_step_general<'a>(
                         message: format!("filter could not read typed row evidence: {message}"),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                     continue;
                 }
             }
             record_row_local_step(&mut row, step);
-            if budget.pipeline_rows >= max_pipeline_rows {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                budget.pipeline_rows,
+                max_pipeline_rows,
+            )
+            .allows(1)
+            {
                 exhausted = true;
                 break;
             }
@@ -2872,7 +2944,8 @@ fn apply_pipeline_step_general<'a>(
             };
             let (result, interrupted) = match semantic.as_mut() {
                 None => {
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::SemanticWorkspaceRequired,
@@ -2884,7 +2957,7 @@ fn apply_pipeline_step_general<'a>(
                                 .to_owned(),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                     (RuntimeKeyedReadResult::default(), true)
                 }
                 Some(semantic) => {
@@ -2909,7 +2982,8 @@ fn apply_pipeline_step_general<'a>(
                             // route the typed failure through the normal diagnostic and
                             // truncation plumbing so it cannot be mistaken for a clean
                             // empty keyed-read relation.
-                            diagnostics.push(CodeQueryDiagnostic {
+                            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                                 related: Vec::new(),
                                 source: None,
                                 code: CodeQueryDiagnosticCode::SemanticProviderFailed,
@@ -2919,7 +2993,7 @@ fn apply_pipeline_step_general<'a>(
                                 message: format!("runtime keyed-read analysis failed: {error}"),
                                 exhausted_roots: Vec::new(),
                                 withheld_rows_path: None,
-                            });
+                            }));
                             (RuntimeKeyedReadResult::default(), true)
                         }
                     }
@@ -2969,11 +3043,16 @@ fn apply_pipeline_step_general<'a>(
                 // source observation; allowing it to bypass either cap
                 // makes a policy query appear complete after exhausting the
                 // shared pipeline budget.
-                if output.len() >= max_step_outputs {
+                if !max_step_outputs.allows_next(output.len()) {
                     exhausted = true;
                     break 'rows;
                 }
-                if budget.pipeline_rows >= max_pipeline_rows {
+                if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    budget.pipeline_rows,
+                    max_pipeline_rows,
+                )
+                .allows(1)
+                {
                     exhausted = true;
                     break 'rows;
                 }
@@ -3007,7 +3086,7 @@ fn apply_pipeline_step_general<'a>(
         {
             let operation = receiver_operation(step);
             for trace in &row.traces {
-                if output.len() >= max_step_outputs {
+                if !max_step_outputs.allows_next(output.len()) {
                     break;
                 }
                 let (ranges, input) =
@@ -3111,6 +3190,8 @@ fn apply_pipeline_step_general<'a>(
                     token,
                     seed,
                     *kind,
+                    cancellation,
+                    diagnostics,
                 )
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::PythonImportSite) => {
@@ -3982,7 +4063,7 @@ fn apply_pipeline_step_general<'a>(
                     reference_cache,
                     budget,
                     limits,
-                    max_step_outputs,
+                    max_step_outputs.maximum(),
                     cancellation,
                     diagnostics,
                     cache_profile,
@@ -4007,7 +4088,7 @@ fn apply_pipeline_step_general<'a>(
                     call_cache,
                     budget,
                     limits,
-                    max_step_outputs,
+                    max_step_outputs.maximum(),
                     cancellation,
                     diagnostics,
                     cache_profile,
@@ -4028,7 +4109,7 @@ fn apply_pipeline_step_general<'a>(
                     call_cache,
                     budget,
                     limits,
-                    max_step_outputs,
+                    max_step_outputs.maximum(),
                     cancellation,
                     diagnostics,
                     cache_profile,
@@ -4459,7 +4540,8 @@ fn apply_pipeline_step_general<'a>(
                         && diagnostic.language == seed.language.config_label()
                         && diagnostic.message == "decorator_bindings retained one or more parameter rows whose decorator binding or parameter-port identity is incomplete"
                 }) {
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete,
@@ -4469,7 +4551,7 @@ fn apply_pipeline_step_general<'a>(
                         message: "decorator_bindings retained one or more parameter rows whose decorator binding or parameter-port identity is incomplete".to_string(),
                     exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                 }
                 expansions
             }
@@ -4663,7 +4745,20 @@ fn apply_pipeline_step_general<'a>(
                                     && diagnostic.language == row.language
                                     && diagnostic.message == message
                             }) {
-                                diagnostics.push(CodeQueryDiagnostic {
+                                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                                    incompleteness: match row.outcome {
+                                        CodeQueryResultSubjectOutcome::Cancelled => {
+                                            Incompleteness::Operational(
+                                                DerivationExecutionCause::Cancelled,
+                                            )
+                                        }
+                                        CodeQueryResultSubjectOutcome::BudgetExhausted => {
+                                            Incompleteness::Operational(
+                                                DerivationExecutionCause::Budget,
+                                            )
+                                        }
+                                        _ => Incompleteness::Content,
+                                    },
                                     related: Vec::new(),
                                     source: None,
                                     code,
@@ -4673,7 +4768,7 @@ fn apply_pipeline_step_general<'a>(
                                     message,
                                     exhausted_roots: Vec::new(),
                                     withheld_rows_path: None,
-                                });
+                                }));
                             }
                         }
                         pipeline_expansion(PipelineValue::ResultSubjectUse(Box::new(
@@ -6170,7 +6265,13 @@ fn apply_pipeline_step_general<'a>(
         }
 
         for (expansion_index, expansion) in expansions.into_iter().enumerate() {
-            if !expansion.budgeted && budget.pipeline_rows >= max_pipeline_rows {
+            if !expansion.budgeted
+                && !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    budget.pipeline_rows,
+                    max_pipeline_rows,
+                )
+                .allows(1)
+            {
                 exhausted = true;
                 break 'rows;
             }
@@ -6273,11 +6374,11 @@ fn apply_pipeline_step_general<'a>(
                 AbsentMemberProofFilter::Any => true,
             }
         });
-        output.truncate(max_step_outputs);
+        output.truncate(max_step_outputs.maximum());
     }
 
     if window_procedure_artifacts {
-        output.truncate(requested_step_outputs);
+        output.truncate(requested_step_outputs.maximum());
         for row in &mut output {
             for trace in &mut row.traces {
                 trace.window_order = None;
@@ -6286,7 +6387,8 @@ fn apply_pipeline_step_general<'a>(
     }
 
     if filter_witnessed_candidate && !filter_selected_candidate {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::CallBindingSelectorRejected,
@@ -6299,7 +6401,7 @@ fn apply_pipeline_step_general<'a>(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
 
     if step == &QueryStep::ImportersOf
@@ -6309,7 +6411,8 @@ fn apply_pipeline_step_general<'a>(
     }
 
     for language in unsupported_languages {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedImportAnalysis,
@@ -6323,7 +6426,7 @@ fn apply_pipeline_step_general<'a>(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     if matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) && has_input_rows {
         let seed_files = dynamic_import_seed_files.as_deref();
@@ -6336,7 +6439,8 @@ fn apply_pipeline_step_general<'a>(
                 for (language, mut paths) in by_language {
                     paths.sort_unstable();
                     paths.dedup();
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::DynamicImportTarget,
@@ -6351,7 +6455,7 @@ fn apply_pipeline_step_general<'a>(
                         ),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                 }
             }
             Err(error) => {
@@ -6373,7 +6477,11 @@ fn apply_pipeline_step_general<'a>(
         };
         diagnostics.push(super::QueryExecutionState::diagnostic(
             analyzer,
-            CodeQueryDiagnostic {
+            CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: match cause {
+                    Some(cause) => brokk_bifrost_rql::Incompleteness::Operational(cause),
+                    None => brokk_bifrost_rql::Incompleteness::Content,
+                },
                 related: Vec::new(),
                 source: None,
                 code,
@@ -6383,7 +6491,7 @@ fn apply_pipeline_step_general<'a>(
                 message,
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            },
+            }),
             cause,
         ));
     }

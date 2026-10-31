@@ -329,6 +329,42 @@ pub enum ProjectSourceOrigin {
     Overlay(OverlayRevision),
 }
 
+/// Immutable raw file bytes, content identity and origin from one read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFileSnapshot {
+    bytes: Vec<u8>,
+    oid: Oid,
+    origin: ProjectSourceOrigin,
+}
+
+impl ProjectFileSnapshot {
+    pub fn disk(bytes: Vec<u8>) -> Self {
+        Self {
+            oid: Oid::hash_object(ObjectType::Blob, &bytes).expect("hashing project file bytes"),
+            bytes,
+            origin: ProjectSourceOrigin::Disk,
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub const fn oid(&self) -> Oid {
+        self.oid
+    }
+    pub const fn origin(&self) -> ProjectSourceOrigin {
+        self.origin
+    }
+
+    pub fn decode(self) -> io::Result<ProjectSourceSnapshot> {
+        Ok(ProjectSourceSnapshot {
+            source: decode_source_bytes(self.bytes)?.into(),
+            oid: self.oid,
+            origin: self.origin,
+        })
+    }
+}
+
 /// Immutable decoded source, original content identity, and origin from one read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectSourceSnapshot {
@@ -458,6 +494,29 @@ pub trait Project: AsProject + Send + Sync {
     /// Raw projects return None while building the initial file projection.
     fn selected_module_name(&self, _file: &ProjectFile) -> io::Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Resolve a published module using the caller's existing store read.
+    /// Implementations backed by the analyzer store must reuse this connection.
+    fn selected_module_name_with_conn(
+        &self,
+        _conn: &rusqlite::Connection,
+        file: &ProjectFile,
+    ) -> io::Result<Option<String>> {
+        self.selected_module_name(file)
+    }
+
+    /// Read optional configuration using an existing store read. Store-backed
+    /// projects select retained bytes through this connection, including absence.
+    fn configuration_source_with_conn(
+        &self,
+        _conn: &rusqlite::Connection,
+        relative_path: &Path,
+    ) -> io::Result<Option<String>> {
+        let Some(file) = self.file_by_rel_path(relative_path) else {
+            return Ok(None);
+        };
+        self.read_source(&file).map(Some)
     }
 
     /// How much of the workspace under [`Project::root`] this project exposes.
@@ -635,6 +694,13 @@ pub trait Project: AsProject + Send + Sync {
         }
     }
 
+    /// Capture raw bytes without source decoding. Custom text readers retain
+    /// their supplied UTF-8 identity by default.
+    fn read_file_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectFileSnapshot> {
+        self.read_source(file)
+            .map(|source| ProjectFileSnapshot::disk(source.into_bytes()))
+    }
+
     /// Capture source text and its disk/overlay identity in one read.
     ///
     /// The default preserves custom `read_source` implementations and hashes
@@ -642,7 +708,7 @@ pub trait Project: AsProject + Send + Sync {
     /// the raw byte identity before decoding. Overlay projects capture their
     /// text and opaque revision under the same read lock.
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
-        self.read_source(file).map(ProjectSourceSnapshot::disk)
+        self.read_file_snapshot(file)?.decode()
     }
 
     /// Capture one source snapshot only when it fits in `max_bytes`.
@@ -696,10 +762,14 @@ pub trait Project: AsProject + Send + Sync {
     }
 }
 
-fn read_disk_source_snapshot(file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+fn read_disk_file_snapshot(file: &ProjectFile) -> io::Result<ProjectFileSnapshot> {
     #[cfg(any(test, feature = "test-support"))]
     super::project_reads::count_project_io(super::project_reads::ProjectIo::Source);
-    ProjectSourceSnapshot::disk_bytes(std::fs::read(file.abs_path())?)
+    std::fs::read(file.abs_path()).map(ProjectFileSnapshot::disk)
+}
+
+fn read_disk_source_snapshot(file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+    read_disk_file_snapshot(file)?.decode()
 }
 
 fn read_disk_source_snapshot_limited(
@@ -844,13 +914,17 @@ impl Project for TestProject {
         self.project_reads.install(capability);
         true
     }
-    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+    fn read_file_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectFileSnapshot> {
         self.project_reads.source(
             self.as_project(),
             file,
-            || read_disk_source_snapshot(file),
-            |source| Some(source.oid()),
+            || read_disk_file_snapshot(file),
+            |snapshot| Some(snapshot.oid()),
         )
+    }
+
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        self.read_file_snapshot(file)?.decode()
     }
 
     fn read_source_snapshot_limited(
@@ -1313,13 +1387,17 @@ impl Project for FilesystemProject {
         self.project_reads.install(capability);
         true
     }
-    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+    fn read_file_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectFileSnapshot> {
         self.project_reads.source(
             self.as_project(),
             file,
-            || read_disk_source_snapshot(file),
-            |source| Some(source.oid()),
+            || read_disk_file_snapshot(file),
+            |snapshot| Some(snapshot.oid()),
         )
+    }
+
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        self.read_file_snapshot(file)?.decode()
     }
 
     fn read_source_snapshot_limited(
@@ -1589,13 +1667,17 @@ impl Project for FileSetProject {
         self.project_reads.install(capability);
         true
     }
-    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+    fn read_file_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectFileSnapshot> {
         self.project_reads.source(
             self.as_project(),
             file,
-            || read_disk_source_snapshot(file),
-            |source| Some(source.oid()),
+            || read_disk_file_snapshot(file),
+            |snapshot| Some(snapshot.oid()),
         )
+    }
+
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        self.read_file_snapshot(file)?.decode()
     }
 
     fn read_source_snapshot_limited(
@@ -1789,13 +1871,17 @@ impl Project for MultiRootProject {
         self.project_reads.install(capability);
         true
     }
-    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+    fn read_file_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectFileSnapshot> {
         self.project_reads.source(
             self.as_project(),
             file,
-            || read_disk_source_snapshot(file),
-            |source| Some(source.oid()),
+            || read_disk_file_snapshot(file),
+            |snapshot| Some(snapshot.oid()),
         )
+    }
+
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        self.read_file_snapshot(file)?.decode()
     }
 
     fn read_source_snapshot_limited(
@@ -2651,13 +2737,32 @@ impl Project for OverlayProject {
             .map(|snapshot| snapshot.map(|snapshot| snapshot.source().to_owned()))
     }
 
+    fn read_file_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectFileSnapshot> {
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || {
+                if let Some(entry) = self.overlay_entry(file) {
+                    return Ok(ProjectFileSnapshot {
+                        bytes: entry.source.as_bytes().to_vec(),
+                        oid: entry.blob_id,
+                        origin: ProjectSourceOrigin::Overlay(entry.revision),
+                    });
+                }
+                self.delegate.read_file_snapshot(file)
+            },
+            |snapshot| Some(snapshot.oid()),
+        )
+    }
+
+    // Overlay source reads share the entry's source allocation (the atomic
+    // overlay reuse contract); only authority keys need the raw-bytes path.
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
         self.project_reads.source(
             self.as_project(),
             file,
             || {
-                let entry = self.overlay_entry(file);
-                if let Some(entry) = entry {
+                if let Some(entry) = self.overlay_entry(file) {
                     return Ok(entry.snapshot());
                 }
                 self.delegate.read_source_snapshot(file)
@@ -3662,6 +3767,7 @@ mod tests {
         let overlay = OverlayProject::new(delegate);
 
         let disk = overlay.read_source_snapshot(&file).unwrap();
+        assert_eq!(disk.oid(), overlay.read_file_snapshot(&file).unwrap().oid());
         assert_eq!(disk.source(), disk_source);
         assert_eq!(disk.origin(), ProjectSourceOrigin::Disk);
         assert_eq!(
@@ -3685,6 +3791,10 @@ mod tests {
         let repeated_source = "fn repeated() {}\n";
         assert!(overlay.set(file.abs_path(), repeated_source.to_owned()));
         let first = overlay.read_source_snapshot(&file).unwrap();
+        assert_eq!(
+            first.oid(),
+            overlay.read_file_snapshot(&file).unwrap().oid()
+        );
         let ProjectSourceOrigin::Overlay(first_revision) = first.origin() else {
             panic!("accepted overlay snapshot must carry an overlay revision");
         };

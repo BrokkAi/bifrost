@@ -318,17 +318,5 @@ fn lexical_type(node: Node<'_>, name: &str, source: &str) -> Option<Vec<String>>
 use crate::analyzer::scala::syntax::compilation_unit;
 
 fn subtree_has_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut stack = vec![node];
-    let mut examined = 0_usize;
-    while let Some(current) = stack.pop() {
-        examined += 1;
-        if examined > 64 {
-            return false;
-        }
-        if current.kind() == kind {
-            return true;
-        }
-        stack.extend(named_children(current));
-    }
-    false
+    crate::analyzer::scala::syntax::subtree_has_kind(node, kind, 64)
 }

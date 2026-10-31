@@ -1104,6 +1104,10 @@ impl ScalaVisitor<'_, '_> {
                 declaration,
                 constructor,
                 scala_class_signature_metadata(signature, node, self.source)
+                    .with_overload_discriminator(Some(scala_overload_discriminator(
+                        &scala_class_parameter_lists(node),
+                        self.source,
+                    )))
                     // The synthetic primary constructor is a constructor, and
                     // saying so is what keeps it out of method families
                     // (#1721) as a proven exclusion rather than as a member
@@ -1386,7 +1390,7 @@ impl ScalaVisitor<'_, '_> {
     }
 
     fn visit_function(&mut self, node: Node<'_>, package_name: &str, parent: Option<CodeUnit>) {
-        self.visit_function_with_signature(node, package_name, parent, None, None);
+        self.visit_function_with_signature(node, package_name, parent, None, None, None);
     }
 
     fn visit_extension_function(
@@ -1407,6 +1411,7 @@ impl ScalaVisitor<'_, '_> {
                 self.source,
             )),
             receiver_type,
+            receiver_parameters,
         );
     }
 
@@ -1417,6 +1422,7 @@ impl ScalaVisitor<'_, '_> {
         parent: Option<CodeUnit>,
         signature: Option<String>,
         extension_receiver_type: Option<Node<'_>>,
+        receiver_parameters: Option<Node<'_>>,
     ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -1481,24 +1487,27 @@ impl ScalaVisitor<'_, '_> {
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent, None);
         let signature = signature.unwrap_or_else(|| scala_function_signature(node, self.source));
-        let metadata =
-            scala_function_signature_metadata(signature, node, self.source, dispatch_extensibility)
-                .with_callable_modifiers(
-                    owner_is_object,
-                    is_constructor,
-                    scala_declared_visibility(node),
-                )
-                .with_callable_override_modifier(scala_override_modifier(node))
-                .with_extension_receiver_type(extension_receiver_type.map(|receiver_type| {
-                    scala_node_text(receiver_type, self.source)
-                        .trim()
-                        .to_string()
-                }))
-                .with_extension_receiver_type_identity(extension_receiver_type.and_then(
-                    |receiver_type| {
-                        scala_structured_type_identity(receiver_type, self.source, node)
-                    },
-                ));
+        let metadata = scala_function_signature_metadata(
+            signature,
+            node,
+            self.source,
+            dispatch_extensibility,
+            receiver_parameters,
+        )
+        .with_callable_modifiers(
+            owner_is_object,
+            is_constructor,
+            scala_declared_visibility(node),
+        )
+        .with_callable_override_modifier(scala_override_modifier(node))
+        .with_extension_receiver_type(extension_receiver_type.map(|receiver_type| {
+            scala_node_text(receiver_type, self.source)
+                .trim()
+                .to_string()
+        }))
+        .with_extension_receiver_type_identity(extension_receiver_type.and_then(|receiver_type| {
+            scala_structured_type_identity(receiver_type, self.source, node)
+        }));
         self.metadata(declaration, code_unit, metadata);
     }
 
@@ -1841,6 +1850,7 @@ fn scala_function_signature_metadata(
     node: Node<'_>,
     source: &str,
     dispatch_extensibility: DispatchExtensibility,
+    receiver_parameters: Option<Node<'_>>,
 ) -> SignatureMetadata {
     let mut parameter_nodes = Vec::new();
     let mut cursor = node.walk();
@@ -1866,7 +1876,12 @@ fn scala_function_signature_metadata(
                     .any(|parameter| parameter == &name.path()[0])
         })
         .map(|name| name.path()[0].clone());
+    let overload_lists: Vec<_> = receiver_parameters
+        .into_iter()
+        .chain(parameter_nodes.iter().copied())
+        .collect();
     scala_signature_metadata_for_parameter_nodes(signature, &parameter_nodes, source)
+        .with_overload_discriminator(Some(scala_overload_discriminator(&overload_lists, source)))
         .with_return_type_text(return_type)
         .with_return_type_identity(return_type_identity)
         .with_type_parameters(type_parameters)
@@ -2385,6 +2400,31 @@ fn strip_declaration_indent(text: &str, declaration_indent: usize) -> String {
         normalized.push(trimmed);
     }
     normalized.join("\n")
+}
+
+fn scala_overload_discriminator(lists: &[Node<'_>], source: &str) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::tree_walk::{
+        overload_discriminator, overload_parameter_tokens,
+    };
+    let mut tokens = Vec::new();
+    let mut parameter_count = 0;
+    for list in lists {
+        tokens.push("<clause>".to_owned());
+        let mut cursor = list.walk();
+        for parameter in list.named_children(&mut cursor) {
+            if matches!(parameter.kind(), "parameter" | "class_parameter") {
+                parameter_count += 1;
+                tokens.extend(overload_parameter_tokens(
+                    parameter.child_by_field_name("type"),
+                    source,
+                ));
+            }
+        }
+    }
+    if parameter_count == 0 {
+        tokens.clear();
+    }
+    overload_discriminator(tokens)
 }
 
 #[cfg(test)]

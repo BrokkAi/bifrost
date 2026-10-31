@@ -322,6 +322,11 @@ pub mod reason {
         // Selected C# configuration is neither a demonstrated unit-key dimension
         // nor a ledgered read, so compilation disagreement is operational.
         CSHARP_COMPILATION_ACCESS_UNKNOWN = "csharp-compilation-access-unknown" => Some(DerivationExecutionCause::Provider),
+        // The unmodeled tier includes compilation-wide usings, whose selected
+        // extent is not yet ledgered. Preserve provider uncertainty.
+        CSHARP_USING_TIER_UNMODELED = "csharp_using_tier_unmodeled" => Some(DerivationExecutionCause::Provider),
+        CSHARP_EXTERNAL_UNINDEXED = "csharp_external_unindexed" => Some(DerivationExecutionCause::Provider),
+        CSHARP_INHERITED_TYPES_UNMODELED = "csharp_inherited_types_unmodeled" => Some(DerivationExecutionCause::Provider),
         OPEN_BOUNDARY = "OpenBoundary" => Some(DerivationExecutionCause::Provider),
         EXTERNAL_DECLARED_UNINDEXED = "external_declared_unindexed" => Some(DerivationExecutionCause::Provider),
         // A Go import is incomplete when its package rows are missing or
@@ -376,6 +381,7 @@ pub mod reason {
         STALE_SOURCE = "stale_source" => Some(DerivationExecutionCause::Snapshot),
         SYNTAX_RECOVERY = "syntax_recovery" => None,
         SYNTAX_UNAVAILABLE = "syntax_unavailable" => Some(DerivationExecutionCause::Provider),
+        TARGET_RECEIVER_READ_UNAVAILABLE = "target_receiver_read_unavailable" => Some(DerivationExecutionCause::Provider),
         UNKNOWN = "unknown" => Some(DerivationExecutionCause::Provider),
         UNPROVEN_ACTIVATION = "unproven_activation" => None,
         UNSUPPORTED_CALLABLE_KIND = "unsupported_callable_kind" => None,

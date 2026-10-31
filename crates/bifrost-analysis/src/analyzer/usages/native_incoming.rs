@@ -35,17 +35,21 @@ pub struct IncomingFileBudget<'a> {
 
 impl IncomingFileBudget<'_> {
     pub fn file_capacity_exhausted(&mut self) -> bool {
-        let exhausted = self.work.scanned_files >= self.limits.max_files;
+        let exhausted = !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            self.work.scanned_files,
+            self.limits.max_files,
+        )
+        .allows(1);
         *self.truncated |= exhausted;
         exhausted
     }
 
     pub fn source_fits(&mut self, bytes: usize) -> bool {
-        let fits = bytes
-            <= self
-                .limits
-                .max_source_bytes
-                .saturating_sub(self.work.scanned_source_bytes);
+        let fits = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            self.work.scanned_source_bytes,
+            self.limits.max_source_bytes,
+        )
+        .allows(bytes);
         *self.truncated |= !fits;
         fits
     }

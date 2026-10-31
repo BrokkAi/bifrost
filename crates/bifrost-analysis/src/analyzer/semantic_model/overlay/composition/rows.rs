@@ -215,7 +215,7 @@ impl<'a> RowCompositionReads<'a> {
         Ok(rows.into_iter().map(|(_, _, record)| record).collect())
     }
 
-    fn types(
+    pub(in crate::analyzer::semantic_model::overlay) fn types(
         &self,
         statement: &str,
         params: &[(&str, &dyn ToSql)],

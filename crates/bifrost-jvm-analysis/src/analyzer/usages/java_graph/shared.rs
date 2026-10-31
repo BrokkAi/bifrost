@@ -414,6 +414,20 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
+        self.build_closed_domain_edges(analyzer, nodes, keep_file)
+    }
+
+    fn build_closed_domain_edges<Output, F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> Output
+    where
+        Output:
+            brokk_bifrost_analysis::analyzer::usages::inverted_edges::UsageEdgeBuildOutput<String>,
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
         let selected_files =
             brokk_bifrost_analysis::analyzer::usages::common::select_usage_graph_files(
                 &self.files,
@@ -468,21 +482,6 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files =
-            brokk_bifrost_analysis::analyzer::usages::common::select_usage_graph_files(
-                &self.files,
-                &keep_file,
-            );
-        let file_states = self
-            .java
-            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
-        build_java_edges(
-            analyzer,
-            self.java,
-            &self.files,
-            &file_states,
-            EdgeNodeDomain::Closed(nodes),
-            keep_file,
-        )
+        self.build_closed_domain_edges(analyzer, nodes, keep_file)
     }
 }

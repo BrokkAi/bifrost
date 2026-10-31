@@ -98,6 +98,10 @@ fn report_open(
         analyzer,
         super::incomplete_diagnostic(
             code,
+            match cause {
+                Some(cause) => brokk_bifrost_rql::Incompleteness::Operational(cause),
+                None => brokk_bifrost_rql::Incompleteness::Content,
+            },
             procedure
                 .handle
                 .artifact()

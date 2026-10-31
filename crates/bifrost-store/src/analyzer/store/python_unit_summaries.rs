@@ -182,14 +182,14 @@ DELETE FROM temp.py_env_candidates; DELETE FROM temp.py_env_roots; DELETE FROM t
 
 pub(crate) const SELECT_FILES: &str = "SELECT f.rel_path,f.blob_oid,b.id,s.format
 FROM workspace_file_versions AS f
-LEFT JOIN blobs AS b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.generation=f.generation
+LEFT JOIN blobs AS b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.parse_variant=x'' AND b.generation=f.generation
 LEFT JOIN python_binding_source AS s ON s.blob_id=b.id
 WHERE f.workspace_id=?1 AND f.lang='python' AND f.generation=?2 AND f.input_kind='source'
  AND f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until)
 ORDER BY f.rel_path";
 pub(crate) const STAGE_FILES: &str = "INSERT INTO temp.py_env_files
 SELECT f.rel_path,b.id,f.blob_oid,0 FROM workspace_file_versions AS f
-CROSS JOIN blobs AS b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.generation=f.generation
+CROSS JOIN blobs AS b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.parse_variant=x'' AND b.generation=f.generation
 WHERE f.workspace_id=?1 AND f.lang='python' AND f.generation=?2 AND f.input_kind='source'
  AND f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until)";
 // row_batch completes these prefixes with VALUES tuples; they are not

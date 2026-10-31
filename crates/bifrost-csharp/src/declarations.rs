@@ -76,16 +76,12 @@ pub fn parse_csharp_file_with_native_facts(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
+    scan: &crate::preprocessor::PreprocessorScan,
 ) -> ParsedFile {
     parse_csharp_file_with_step(file, source, tree, |parsed, collector| {
         let mut bridges = crate::resolution::SourceBridges::default();
-        parsed.resolution_facts = crate::resolution::produce(
-            tree,
-            source,
-            &crate::preprocessor::scan_preprocessor(source),
-            collector,
-            &mut bridges,
-        );
+        parsed.resolution_facts =
+            crate::resolution::produce(tree, source, scan, collector, &mut bridges);
         bridges
     })
 }
@@ -1447,6 +1443,7 @@ fn csharp_signature_metadata<'tree>(
             .collect()
     });
     let metadata = SignatureMetadata::new(signature, parameters)
+        .with_overload_discriminator(Some(csharp_overload_discriminator(node, source)))
         .with_callable_arity(callable_arity)
         .with_callable_parameter_types(parameter_types)
         .with_type_parameters(type_parameters)
@@ -2016,6 +2013,46 @@ fn csharp_literal_initializer(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 use brokk_bifrost_core::analyzer::tree_walk::last_named_child;
+
+fn csharp_overload_discriminator(node: Node<'_>, source: &str) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::tree_walk::{
+        canonical_type_tokens, overload_discriminator, overload_parameter_tokens,
+    };
+    let mut tokens = Vec::new();
+    if let Some(list) = csharp_parameter_list_node(node) {
+        let mut cursor = list.walk();
+        for parameter in list.named_children(&mut cursor) {
+            if parameter.kind() != "parameter" {
+                continue;
+            }
+            tokens.extend(overload_parameter_tokens(
+                parameter.child_by_field_name("type"),
+                source,
+            ));
+            let mut cursor = parameter.walk();
+            for child in parameter.children(&mut cursor) {
+                if matches!(
+                    child.kind(),
+                    "ref" | "out" | "in" | "params" | "parameter_modifier" | "modifier"
+                ) {
+                    for mode in canonical_type_tokens(child, source) {
+                        if matches!(mode.as_str(), "ref" | "out" | "in" | "params") {
+                            tokens.push(format!("<passing:{mode}>"));
+                        }
+                    }
+                }
+            }
+        }
+        if csharp_parameter_list_has_params(list) {
+            tokens.extend(overload_parameter_tokens(
+                list.child_by_field_name("type"),
+                source,
+            ));
+            tokens.push("<passing:params>".to_owned());
+        }
+    }
+    overload_discriminator(tokens)
+}
 
 #[cfg(test)]
 mod primary_source_tests {

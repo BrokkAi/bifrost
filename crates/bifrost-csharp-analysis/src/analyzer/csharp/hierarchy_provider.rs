@@ -12,15 +12,12 @@ use brokk_bifrost_core::analyzer::model::CodeUnit;
 
 use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
 
-use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+use brokk_bifrost_core::analyzer::capabilities::{HierarchyAnswer, TypeHierarchyProvider};
 
 use brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index;
 
-use brokk_bifrost_core::analyzer::capabilities::descendants_from_variant_index;
-
 use brokk_bifrost_core::cancellation::CancellationToken;
 
-use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_csharp::hierarchy::logical_direct_ancestors;
 use std::sync::Arc;
 
@@ -31,7 +28,7 @@ use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
 impl TypeHierarchyProvider for CSharpAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
@@ -52,37 +49,32 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
                 }))
             })
             .expect("ancestor memo build is infallible");
-        (**ancestors).clone()
+        HierarchyAnswer::complete((**ancestors).clone())
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let uncancelled = CancellationToken::default();
         self.get_direct_descendants_within(
             code_unit,
             &DescendantIndexScope::whole_workspace(&uncancelled),
         )
-        .expect("a descendant index that cannot stop always completes")
+        .expect("an uncancelled descendant query cannot be cancelled")
     }
     fn get_direct_descendants_within(
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         self.memo_caches.direct_descendant_index.read(
             &memo_attribution(self),
             |direct_descendant_index_memo| {
-                descendants_from_variant_index(
-                    direct_descendant_index_memo,
+                brokk_bifrost_analysis::analyzer::common::complete_descendant_query(
+                    self,
                     scope,
                     code_unit,
-                    || {
-                        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
-                            self,
-                            || build_direct_descendant_index(self, self, scope),
-                        )
-                        .ok()
-                        .flatten()
-                    },
+                    direct_descendant_index_memo,
+                    || build_direct_descendant_index(self, self, scope),
+                    |_| {},
                 )
             },
             |_| AuthorityInputs::SourceOf(&[brokk_bifrost_core::analyzer::model::Language::CSharp]),

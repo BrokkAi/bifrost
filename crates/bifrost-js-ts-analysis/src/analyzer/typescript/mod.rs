@@ -556,11 +556,17 @@ impl TypeAliasProvider for TypescriptAnalyzer {
 impl TestDetectionProvider for TypescriptAnalyzer {}
 
 impl TypeHierarchyProvider for TypescriptAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
         providers::get_direct_ancestors(self, code_unit)
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
         providers::get_direct_descendants(self, code_unit)
     }
 
@@ -568,7 +574,10 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
         &self,
         code_unit: &CodeUnit,
         scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<
+        brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+        brokk_bifrost_core::analyzer::capabilities::Cancelled,
+    > {
         providers::get_direct_descendants_within(self, code_unit, scope)
     }
 }

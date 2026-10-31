@@ -389,7 +389,7 @@ fn inherited_member_candidates(
     let mut hierarchy = JsTsMemberHierarchy::default();
     let mut seen = HashSet::default();
     seen.insert(receiver.clone());
-    let mut level = provider.get_direct_ancestors(receiver);
+    let mut level = provider.get_direct_ancestors(receiver).definite().to_vec();
     let mut depth = 0usize;
     let mut visited = 0usize;
     let mut candidates = Vec::new();
@@ -462,7 +462,7 @@ fn inherited_member_candidates(
                 continue;
             }
 
-            for next in provider.get_direct_ancestors(&owner) {
+            for next in provider.get_direct_ancestors(&owner).definite().to_vec() {
                 hierarchy
                     .parents
                     .entry(next.clone())

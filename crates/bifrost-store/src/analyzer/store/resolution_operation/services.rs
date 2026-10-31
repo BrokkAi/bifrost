@@ -20,6 +20,16 @@ pub trait SelectedAnalyzerServices: Send + Sync {
 }
 
 pub trait SelectedModelAuthority {
+    /// Active-set declarations matching the caller's fixed simple-name vocabulary.
+    fn model_declared_types_named(
+        &self,
+        language: &str,
+        names: &[&str],
+    ) -> Result<
+        std::sync::Arc<std::collections::HashSet<(String, String)>>,
+        SemanticModelOverlayBuildError,
+    >;
+
     /// The activated set from which this authority was composed.
     fn active_models(&self) -> Option<Arc<ResolvedActiveSemanticModels>>;
 

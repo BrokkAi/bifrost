@@ -2279,7 +2279,7 @@ fn python_class_hierarchy_member_unshadowed_bounded(
     member: &str,
 ) -> Option<bool> {
     let mut owners = vec![owner.clone()];
-    owners.extend(python.get_ancestors(owner));
+    owners.extend(python.get_ancestors(owner).definite().to_vec());
     for owner in owners {
         match python_class_member_shadowed_bounded(python, &owner, member) {
             Some(false) => {}
@@ -2952,7 +2952,7 @@ fn python_class_hierarchy_has_abstract_members(python: &PythonAnalyzer, class: &
                     std::collections::hash_map::Entry::Occupied(_) => {}
                 }
             }
-            next.extend(python.get_direct_ancestors(&owner));
+            next.extend(python.get_direct_ancestors(&owner).definite().to_vec());
         }
         frontier = next;
         distance += 1;
@@ -3330,7 +3330,7 @@ pub(crate) fn python_receiver_method_dispatch_may_be_bypassed(
     python: &PythonAnalyzer,
     receiver_class: &CodeUnit,
 ) -> bool {
-    let workspace_ancestors = python.get_ancestors(receiver_class);
+    let workspace_ancestors = python.get_ancestors(receiver_class).definite().to_vec();
     if std::iter::once(receiver_class)
         .chain(workspace_ancestors.iter())
         .any(|owner| {
@@ -3349,7 +3349,7 @@ pub(crate) fn python_receiver_method_dispatch_may_be_bypassed(
     let mut external_cache = ExternalClassCache::default();
     let mut checked_external = HashSet::<Box<str>>::default();
     for owner in std::iter::once(receiver_class).chain(workspace_ancestors.iter()) {
-        let direct = python.get_direct_ancestors(owner);
+        let direct = python.get_direct_ancestors(owner).definite().to_vec();
         for raw in python.inner.raw_supertypes_of(owner) {
             if direct
                 .iter()
@@ -5215,7 +5215,7 @@ impl PythonTypeFlowAdapter {
         unit: &CodeUnit,
         member: &str,
     ) -> MemberLookup {
-        let ancestors = python.get_ancestors(unit);
+        let ancestors = python.get_ancestors(unit).definite().to_vec();
         // A dynamic-attribute hook anywhere on the hierarchy means no static
         // member list is complete. A declared `__new__` says the same about
         // instance creation: it chooses what to return and may install
@@ -5237,7 +5237,7 @@ impl PythonTypeFlowAdapter {
         let mut cache = ExternalClassCache::default();
         let mut external_bases = Vec::new();
         for owner in std::iter::once(unit).chain(ancestors.iter()) {
-            let direct = python.get_direct_ancestors(owner);
+            let direct = python.get_direct_ancestors(owner).definite().to_vec();
             for raw in python.inner.raw_supertypes_of(owner) {
                 let resolved = direct.iter().any(|ancestor| {
                     ancestor.terminal_name() == raw || ancestor.fq_name_str() == raw
@@ -5391,7 +5391,7 @@ pub(crate) fn python_external_value_member_on_workspace_class(
     overlay: &SemanticModelOverlay,
 ) -> Option<Arc<SemanticModelSymbol>> {
     let mut cache = ExternalClassCache::default();
-    let ancestors = python.get_ancestors(receiver_class);
+    let ancestors = python.get_ancestors(receiver_class).definite().to_vec();
     for owner in std::iter::once(receiver_class).chain(ancestors.iter()) {
         if owner.is_synthetic() {
             continue;
@@ -5404,7 +5404,7 @@ pub(crate) fn python_external_value_member_on_workspace_class(
         }) {
             return None;
         }
-        let workspace_bases = python.get_direct_ancestors(owner);
+        let workspace_bases = python.get_direct_ancestors(owner).definite().to_vec();
         for raw in python.inner.raw_supertypes_of(owner) {
             if workspace_bases.iter().any(|base| {
                 !base.is_synthetic() && (base.terminal_name() == raw || base.fq_name_str() == raw)
@@ -6888,27 +6888,29 @@ fn python_exact_result_origin_for_value_in_query(
     if !calls.is_empty() {
         return None;
     }
-    let loads = semantics
-        .points()
-        .iter()
-        .flat_map(|point| {
-            point
-                .events
-                .iter()
-                .enumerate()
-                .filter_map(move |(event_index, event)| {
-                    let SemanticEffect::MemoryLoad {
-                        location,
-                        result: found,
-                        ..
-                    } = event.effect
-                    else {
-                        return None;
-                    };
-                    (found == result).then_some((point.id, event_index, location, event.source))
-                })
-        })
-        .collect::<Vec<_>>();
+    let loads =
+        semantics
+            .points()
+            .iter()
+            .flat_map(|point| {
+                point
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(event_index, event)| {
+                        let SemanticEffect::MemoryLoad {
+                            location,
+                            result: found,
+                            ..
+                        } = event.effect
+                        else {
+                            return None;
+                        };
+                        (found == result && !is_module_global_load(semantics, location))
+                            .then_some((point.id, event_index, location, event.source))
+                    })
+            })
+            .collect::<Vec<_>>();
     let [(point, _event_index, location, source)] = loads.as_slice() else {
         return None;
     };
@@ -8195,6 +8197,19 @@ fn python_exact_imported_call_result_classes(
     Some(classes)
 }
 
+/// Whether a load reads a module-global slot. The Python lowering emits a
+/// static load only for a callable's read of a module namespace import
+/// binding, and that value is still resolved from the reading name, so exact
+/// value walks look through the load as if the name had no producer.
+fn is_module_global_load(
+    semantics: &brokk_bifrost_analysis::analyzer::semantic::ProcedureSemantics,
+    location: brokk_bifrost_analysis::analyzer::semantic::MemoryLocationId,
+) -> bool {
+    semantics
+        .memory_location(location)
+        .is_some_and(|location| matches!(location.kind, MemoryLocationKind::Static { .. }))
+}
+
 fn python_memory_load_result_class_in_query(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -8329,7 +8344,8 @@ fn python_exact_value_class_at_in_query(
                         else {
                             return None;
                         };
-                        (result == value).then_some((point.id, event_index, location, event.source))
+                        (result == value && !is_module_global_load(semantics, location))
+                            .then_some((point.id, event_index, location, event.source))
                     })
             })
             .collect::<Vec<_>>();
@@ -8795,9 +8811,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // #3488: A declared attribute-form module field value (`os.environ`)
         // seeds the exact receiver of a member call, and a workspace write to
         // that field withholds the declared class.
+        // #3800: A module namespace import read is a static load that type
+        // flow looks through, so the module value keeps its name-based seed.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-dynamic-write-name-sets-structured-dynamic-receiver-type-parameter-bounds-dynamic-type-write-bounds-nonescaping-nested-write-bounds-runtime-created-class-exclusion-loop-name-list-bounds-postponed-and-type-checking-annotation-bounds-field-slot-class-value-bounds-quoted-receiver-annotation-name-resolution-field-content-deletion-receivers-declared-parameter-conditional-closed-world-property-descriptor-field-slots-v82-same-name-external-class-records-external-module-value-types-exact-constructor-instance-dispatch-python-c3-class-member-replacement-scan-rql-inherited-external-member-exact-factory-and-access-return-class-sets-stable-local-multi-target-flow-dynamic-any-is-not-a-runtime-class-uncertain-constructor-call-shapes-once-bound-module-global-initializer-class-seeds-exact-partial-field-values-workspace-receiver-and-proxy-access-calls-trivia-covered-reference-sites-exact-method-result-origins-shared-direct-receiver-proof-5511-lexical-class-object-bindings-5721-bounded-local-import-bases-5738-intrinsic-root-evidence-5745-runtime-class-binding-mutation-5751-module-class-object-aliases-3488-module-field-value-receivers",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-dynamic-write-name-sets-structured-dynamic-receiver-type-parameter-bounds-dynamic-type-write-bounds-nonescaping-nested-write-bounds-runtime-created-class-exclusion-loop-name-list-bounds-postponed-and-type-checking-annotation-bounds-field-slot-class-value-bounds-quoted-receiver-annotation-name-resolution-field-content-deletion-receivers-declared-parameter-conditional-closed-world-property-descriptor-field-slots-v82-same-name-external-class-records-external-module-value-types-exact-constructor-instance-dispatch-python-c3-class-member-replacement-scan-rql-inherited-external-member-exact-factory-and-access-return-class-sets-stable-local-multi-target-flow-dynamic-any-is-not-a-runtime-class-uncertain-constructor-call-shapes-once-bound-module-global-initializer-class-seeds-exact-partial-field-values-workspace-receiver-and-proxy-access-calls-trivia-covered-reference-sites-exact-method-result-origins-shared-direct-receiver-proof-5511-lexical-class-object-bindings-5721-bounded-local-import-bases-5738-intrinsic-root-evidence-5745-runtime-class-binding-mutation-5751-module-class-object-aliases-3488-module-field-value-receivers-3800-module-global-name-loads",
         )
         .expect("adapter name is non-empty")
     }
@@ -9452,7 +9470,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         }
         let python = python_analyzer(workspace);
         let mut hierarchy = vec![unit.clone()];
-        hierarchy.extend(python.get_ancestors(unit));
+        hierarchy.extend(python.get_ancestors(unit).definite().to_vec());
         let class_hierarchy = self.class_hierarchy(workspace, class);
         if hierarchy
             .iter()
@@ -9571,6 +9589,12 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             && classes
                 .iter()
                 .all(|class| matches!(class.qualified_name(), "builtins.list" | "builtins.tuple"))
+    }
+
+    fn memory_load_presents_name_read(&self, location: &MemoryLocation) -> bool {
+        // The lowering emits a static load only for a module namespace import
+        // binding's read; the module value stays classified from the name.
+        matches!(location.kind, MemoryLocationKind::Static { .. })
     }
 
     fn memory_load_supports_class_closure(&self, location: &MemoryLocation) -> bool {
@@ -9764,7 +9788,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             }
         };
         let python = python_analyzer(workspace);
-        let workspace_ancestors = python.get_ancestors(unit);
+        let workspace_ancestors = python.get_ancestors(unit).definite().to_vec();
         let mut ancestors = workspace_ancestors
             .iter()
             .cloned()
@@ -9774,7 +9798,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let overlay = workspace.analyzer().semantic_model_overlay();
         let mut external_cache = ExternalClassCache::default();
         for owner in std::iter::once(unit).chain(workspace_ancestors.iter()) {
-            let direct = python.get_direct_ancestors(owner);
+            let direct = python.get_direct_ancestors(owner).definite().to_vec();
             for raw in python.inner.raw_supertypes_of(owner) {
                 if direct.iter().any(|ancestor| {
                     ancestor.terminal_name() == raw || ancestor.fq_name_str() == raw
@@ -9796,19 +9820,28 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             }
         }
 
-        let mut descendants = Vec::new();
-        let mut seen = HashSet::default();
-        let mut pending = python
-            .get_direct_descendants(unit)
-            .into_iter()
-            .collect::<Vec<_>>();
-        while let Some(descendant) = pending.pop() {
-            if !seen.insert(descendant.clone()) {
-                continue;
+        let descendants = (|| {
+            let mut descendants = Vec::new();
+            let mut seen = HashSet::default();
+            let answer = python.get_direct_descendants(unit);
+            if !answer.is_complete() {
+                return None;
             }
-            pending.extend(python.get_direct_descendants(&descendant));
-            descendants.push(ClassIdentity::Workspace(descendant));
-        }
+            let mut pending = answer.edges;
+            while let Some(descendant) = pending.pop() {
+                if !seen.insert(descendant.clone()) {
+                    continue;
+                }
+                let answer = python.get_direct_descendants(&descendant);
+                if !answer.is_complete() {
+                    return None;
+                }
+                pending.extend(answer.edges);
+                descendants.push(ClassIdentity::Workspace(descendant));
+            }
+            descendants.sort_by(|left, right| left.qualified_name().cmp(right.qualified_name()));
+            Some(descendants)
+        })();
 
         let dynamic_attributes =
             std::iter::once(unit)
@@ -9822,10 +9855,9 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                     })
                 });
         ancestors.sort_by(|left, right| left.qualified_name().cmp(right.qualified_name()));
-        descendants.sort_by(|left, right| left.qualified_name().cmp(right.qualified_name()));
         ClassHierarchy {
             ancestors,
-            descendants: Some(descendants),
+            descendants,
             unresolved_base,
             dynamic_attributes,
         }
@@ -10836,7 +10868,7 @@ fn python_descriptor_mro(
         return vec![class.clone()];
     };
     let python = python_analyzer(workspace);
-    let workspace_ancestors = python.get_ancestors(unit);
+    let workspace_ancestors = python.get_ancestors(unit).definite().to_vec();
     let overlay = workspace.analyzer().semantic_model_overlay();
     let mut external_cache = ExternalClassCache::default();
     let mut mro = vec![class.clone()];
@@ -10847,7 +10879,7 @@ fn python_descriptor_mro(
             .map(ClassIdentity::Workspace),
     );
     for owner in std::iter::once(unit).chain(workspace_ancestors.iter()) {
-        let direct = python.get_direct_ancestors(owner);
+        let direct = python.get_direct_ancestors(owner).definite().to_vec();
         for raw in python.inner.raw_supertypes_of(owner) {
             if direct
                 .iter()

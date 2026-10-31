@@ -31,7 +31,8 @@ const CRATE_PACKAGES = [
 
 const NPM_PACKAGES = [
   "@brokkai/bifrost",
-  "@brokkai/bifrost-darwin-universal",
+  "@brokkai/bifrost-darwin-arm64",
+  "@brokkai/bifrost-darwin-x64",
   "@brokkai/bifrost-linux-x64-gnu",
   "@brokkai/bifrost-linux-arm64-gnu",
   "@brokkai/bifrost-android-arm64",
@@ -119,6 +120,8 @@ test("checks every GitHub asset and published SHA-256 sidecar", () => {
   assert.ok(requiredStart >= 0 && requiredEnd > requiredStart, "required asset loop must be present");
   const requiredAssets = workflow.slice(requiredStart, requiredEnd);
   for (const asset of [
+    "bifrost-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz",
+    "bifrost-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz",
     "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz",
     "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256",
   ]) {
@@ -193,6 +196,8 @@ test("checks PyPI and npm versions, archives, and integrity evidence", () => {
     assert.ok(workflow.includes(`        ${packageName}\n`), `missing npm package ${packageName}`);
   }
   assert.equal(workflow.includes("        @brokk/bifrost-agent\n"), false);
+  // npm refused the universal macOS tarball as too large (#8288).
+  assert.equal(workflow.includes("@brokkai/bifrost-darwin-universal"), false);
   assert.match(workflow, /npm pack[\s\S]*@brokkai\/dsh-plugin-bifrost@\$\{RELEASE_VERSION\}/u);
   assert.match(workflow, /package\/bifrost-release\.json/u);
   assert.match(workflow, /archiveSha256\["universal-apple-darwin"\]/u);
@@ -210,8 +215,11 @@ test("selects and checks the published root binary on supported runner platforms
   assert.equal((installJob.match(/^    needs: resolve$/gmu) ?? []).length, 1);
   assert.match(
     workflow,
-    /matrix:\n        os: \[ubuntu-latest, macos-latest, windows-latest\]/u,
+    /matrix:\n.*\n        os: \[ubuntu-latest, macos-latest, macos-15-intel, windows-latest\]/u,
   );
+  // Each macOS runner must select its own per-CPU package, not merely run some binary.
+  assert.ok(installJob.includes('archs="$(lipo -archs "$packages/bifrost-darwin-${cpu}/bin/bifrost")"'));
+  assert.ok(installJob.includes('test ! -e "$packages/bifrost-darwin-${other}"'));
   assert.match(workflow, /max-parallel: 2/u);
   assert.ok(
     workflow.includes('--registry https://registry.npmjs.org "@brokkai/bifrost@${RELEASE_VERSION}"'),

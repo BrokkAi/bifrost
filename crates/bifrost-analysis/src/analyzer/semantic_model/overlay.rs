@@ -61,6 +61,14 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
+type DeclaredTypeNames = HashMap<
+    String,
+    (
+        Vec<String>,
+        Arc<std::collections::HashSet<(String, String)>>,
+    ),
+>;
+
 #[derive(Debug)]
 pub struct SemanticModelOverlay {
     // Eager declaration shards also publish normalized rows. Keep their
@@ -69,6 +77,10 @@ pub struct SemanticModelOverlay {
     row_source: Option<Arc<row_entry_points::RowOverlay>>,
     selected_source: Option<Arc<row_entry_points::RowOverlay>>,
     active_model_set_hash: String,
+    // Active-set lifetime; only declarations matching the fixed caller vocabulary
+    // survive the query (normally zero), never the full declaration inventory.
+    declared_type_names: std::sync::Mutex<DeclaredTypeNames>,
+
     // Per-request results only, never an index of the selected model set.
     model_member_cache: moka::sync::Cache<ModelDeclarationRequest, Option<ModelOwnerAnswer>>,
     model_result_cache: moka::sync::Cache<ModelDeclarationRequest, Option<Vec<Option<TypeRef>>>>,
@@ -178,7 +190,68 @@ struct ModelDeclarationRequest {
     symbol: ModelSymbolRef,
 }
 
+/// One selected callable result slot. Missing signature, missing ordinal and
+/// unknown type are distinct because none proves an absent result.
+#[derive(Debug, Clone)]
+pub enum SelectedModelResult {
+    SignatureUnavailable,
+    OrdinalMissing,
+    Unknown,
+    Typed(TypeRef),
+}
+
 impl SemanticModelOverlay {
+    pub fn model_declared_types_named(
+        &self,
+        language: &str,
+        names: &[&str],
+    ) -> Result<Arc<std::collections::HashSet<(String, String)>>, SemanticModelOverlayBuildError>
+    {
+        let mut memo = self
+            .declared_type_names
+            .lock()
+            .expect("declaration memo poisoned");
+        if let Some((vocabulary, declarations)) = memo.get(language) {
+            assert!(
+                vocabulary
+                    .iter()
+                    .map(String::as_str)
+                    .eq(names.iter().copied()),
+                "active-set vocabulary is fixed"
+            );
+            return Ok(Arc::clone(declarations));
+        }
+        let hook = model_composition_language(language);
+        let declarations = if let Some(source) = &self.selected_source {
+            source.declaration_type_names()?
+        } else {
+            self.symbols
+                .iter()
+                .filter(|symbol| hook.is_type_owner_kind(symbol.kind))
+                .map(|symbol| (symbol.language.clone(), symbol.qualified_name.clone()))
+                .collect()
+        };
+        let result = Arc::new(
+            declarations
+                .into_iter()
+                .filter(|(lang, _)| lang == language)
+                .filter_map(|(_, name)| {
+                    hook.declaration_type_name_parts(&name)
+                        .filter(|(_, simple)| names.contains(simple))
+                        .map(|(package, simple)| (package.to_owned(), simple.to_owned()))
+                })
+                .collect(),
+        );
+        memo.insert(
+            language.to_owned(),
+            (
+                names.iter().map(|n| (*n).to_owned()).collect(),
+                Arc::clone(&result),
+            ),
+        );
+        Ok(result)
+    }
+
     fn model_declaration_request(
         &self,
         symbol: &ModelSymbolRef,
@@ -364,6 +437,27 @@ impl SemanticModelOverlay {
             .map_err(|error| *error)
     }
 
+    /// Query-local projection of an already selected callable; never selects
+    /// another callable from a rendered name.
+    pub fn selected_callable_result(
+        &self,
+        callable: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+        ordinal: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<SelectedModelResult, SemanticModelOverlayBuildError> {
+        Ok(
+            match self.model_callable_results(callable, selection, cancellation)? {
+                None => SelectedModelResult::SignatureUnavailable,
+                Some(results) => match results.into_iter().nth(ordinal) {
+                    None => SelectedModelResult::OrdinalMissing,
+                    Some(None) => SelectedModelResult::Unknown,
+                    Some(Some(result)) => SelectedModelResult::Typed(result),
+                },
+            },
+        )
+    }
+
     /// Declared results by ordinal, from structured_signature.returns only.
     /// An unknown result retains its ordinal as None.
     /// None is also returned for a selected callable without a structured
@@ -425,6 +519,7 @@ impl SemanticModelOverlay {
                 active_models: Some(Arc::clone(active)),
                 row_source: None,
                 selected_source: None,
+                declared_type_names: Default::default(),
                 active_model_set_hash: active.active_model_set_hash().to_string(),
                 model_member_cache: moka::sync::Cache::new(128),
                 model_result_cache: moka::sync::Cache::new(128),
@@ -676,6 +771,7 @@ impl SemanticModelOverlay {
             active_models: Some(Arc::clone(active)),
             row_source,
             selected_source,
+            declared_type_names: Default::default(),
             active_model_set_hash: active.active_model_set_hash().to_string(),
             model_member_cache: moka::sync::Cache::new(128),
             model_result_cache: moka::sync::Cache::new(128),
@@ -4799,6 +4895,35 @@ pub fn activated_type_provenance<E>(
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests {
+    #[test]
+    fn declared_type_names_are_derived_per_active_set() {
+        let first = overlay(
+            vec![
+                class("example.test/p.error", "go"),
+                class("example.test/p.Other", "go"),
+                class("example.test/p.error", "java"),
+            ],
+            Vec::new(),
+        );
+        let names = first.model_declared_types_named("go", &["error"]).unwrap();
+        assert_eq!(
+            &*names,
+            &std::collections::HashSet::from([("example.test/p".to_owned(), "error".to_owned())])
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &names,
+            &first.model_declared_types_named("go", &["error"]).unwrap()
+        ));
+        let second = overlay(vec![class("example.test/p.Other", "go")], Vec::new());
+        assert!(
+            second
+                .model_declared_types_named("go", &["error"])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(names.len(), 1);
+    }
+
     #[test]
     fn model_declarations_keep_provider_versions_and_selections_separate() {
         use super::{ModelOwnerAnswer, ModelProvider, ModelProviderSelection, ModelSymbolRef};

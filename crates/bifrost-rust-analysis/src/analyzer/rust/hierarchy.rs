@@ -5,6 +5,7 @@
 //! The index itself and every predicate it is built from live in
 //! [`brokk_bifrost_rust::hierarchy`] and [`brokk_bifrost_rust::graph_support`].
 
+use brokk_bifrost_core::analyzer::capabilities::{Cancelled, HierarchyAnswer, HierarchyOpenReason};
 use brokk_bifrost_core::analyzer::common::language_for_file;
 
 use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyCapability;
@@ -47,34 +48,25 @@ use brokk_bifrost_rust::hierarchy::{
 use crate::analyzer::rust::RustAnalyzer;
 
 impl TypeHierarchyProvider for RustAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        match self.direct_ancestors(code_unit) {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+        HierarchyAnswer::complete(match self.direct_ancestors(code_unit) {
             Ok(ancestors) => ancestors,
             Err(error) => {
                 self.record_hierarchy_error(error);
                 Vec::new()
             }
-        }
+        })
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        match self.descendant_eligible(code_unit) {
-            Ok(true) => {}
-            Ok(false) => return HashSet::default(),
-            Err(error) => {
-                self.record_hierarchy_error(error);
-                return HashSet::default();
-            }
-        }
-
-        let scope = AnalyzerQueryScope::new(self);
-        match rust_direct_descendants(self, scope.token(), code_unit, &|| true) {
-            Ok(descendants) => descendants,
-            Err(error) => {
-                self.record_hierarchy_error(error);
-                HashSet::default()
-            }
-        }
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+        let uncancelled = CancellationToken::default();
+        self.get_direct_descendants_within(
+            code_unit,
+            &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope::whole_workspace(
+                &uncancelled,
+            ),
+        )
+        .expect("an uncancelled descendant query cannot be cancelled")
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
@@ -100,45 +92,62 @@ impl TypeHierarchyProvider for RustAnalyzer {
         &self,
         code_unit: &CodeUnit,
         scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
-    ) -> Option<Vec<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, Cancelled> {
         if scope.cancellation().is_cancelled() {
-            return None;
+            return Err(Cancelled);
         }
-        match self.direct_ancestors(code_unit) {
-            Ok(ancestors) => (!scope.cancellation().is_cancelled()).then_some(ancestors),
+        let answer = match self.direct_ancestors(code_unit) {
+            Ok(edges) => HierarchyAnswer::complete(edges),
+            Err(RustCargoRouteError::Cancelled) => return Err(Cancelled),
             Err(error) => {
                 self.record_hierarchy_error(error);
-                None
+                HierarchyAnswer {
+                    open: vec![HierarchyOpenReason::MemberFamily(
+                        MemberFamilyReason::HierarchyTruncated,
+                    )],
+                    ..HierarchyAnswer::default()
+                }
             }
+        };
+        if scope.cancellation().is_cancelled() {
+            return Err(Cancelled);
         }
+        Ok(answer)
     }
 
     fn get_direct_descendants_within(
         &self,
         code_unit: &CodeUnit,
         scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, Cancelled> {
         if scope.cancellation().is_cancelled() {
-            return None;
+            return Err(Cancelled);
         }
-        match self.descendant_eligible(code_unit) {
-            Ok(true) => {}
-            Ok(false) => return Some(HashSet::default()),
-            Err(error) => {
-                self.record_hierarchy_error(error);
-                return None;
+        let descendants = (|| {
+            if !self.descendant_eligible(code_unit)? {
+                return Ok(HashSet::default());
             }
+            let query = AnalyzerQueryScope::new(self);
+            rust_direct_descendants(self, query.token(), code_unit, &|| {
+                !scope.cancellation().is_cancelled()
+            })
+        })();
+        if scope.cancellation().is_cancelled() {
+            return Err(Cancelled);
         }
-        let cancellation = scope.cancellation();
-        let query = AnalyzerQueryScope::new(self);
-        match rust_direct_descendants(self, query.token(), code_unit, &|| {
-            !cancellation.is_cancelled()
-        }) {
-            Ok(descendants) => (!cancellation.is_cancelled()).then_some(descendants),
-            Err(RustCargoRouteError::Cancelled) => None,
+        match descendants {
+            Ok(descendants) => {
+                let mut edges: Vec<_> = descendants.into_iter().collect();
+                edges.sort();
+                Ok(HierarchyAnswer::complete(edges))
+            }
+            Err(RustCargoRouteError::Cancelled) => Err(Cancelled),
             Err(error) => {
                 self.record_hierarchy_error(error);
-                None
+                Ok(HierarchyAnswer {
+                    open: vec![HierarchyOpenReason::DescendantIndexUnavailable],
+                    ..HierarchyAnswer::default()
+                })
             }
         }
     }
@@ -643,6 +652,7 @@ mod local {{
         let worker = definition(&analyzer, "worker.Worker");
         let ancestors: Vec<String> = analyzer
             .get_direct_ancestors(&worker)
+            .definite()
             .iter()
             .map(|unit| unit.fq_name())
             .collect();
@@ -656,13 +666,16 @@ mod local {{
         assert_eq!(one.source().rel_path(), std::path::Path::new("src/one.rs"));
         assert_eq!(two.source().rel_path(), std::path::Path::new("src/two.rs"));
         assert!(
-            analyzer.get_direct_descendants(&one).contains(&worker),
+            analyzer
+                .get_direct_descendants(&one)
+                .definite()
+                .contains(&worker),
             "one::Runnable is implemented by Worker"
         );
         assert!(
-            analyzer.get_direct_descendants(&two).is_empty(),
+            analyzer.get_direct_descendants(&two).definite().is_empty(),
             "two::Runnable is implemented by nothing: {:?}",
-            analyzer.get_direct_descendants(&two)
+            analyzer.get_direct_descendants(&two).definite()
         );
     }
 
@@ -1236,7 +1249,10 @@ impl Runnable for Worker {}
 
         let runnable = definition(&analyzer, "Runnable");
         let worker = definition(&analyzer, "Worker");
-        assert_eq!(analyzer.get_direct_ancestors(&worker), vec![runnable]);
+        assert_eq!(
+            analyzer.get_direct_ancestors(&worker).definite(),
+            vec![runnable]
+        );
     }
     #[test]
     #[hardwon("5b97df261c51: failed hierarchy publication is not cached as an empty family")]
@@ -1295,12 +1311,16 @@ impl Counted for Thing {
             "the impl type parameter shadows the same-named workspace type"
         );
         assert!(
-            analyzer.get_direct_ancestors(&same_named_type).is_empty(),
+            analyzer
+                .get_direct_ancestors(&same_named_type)
+                .definite()
+                .is_empty(),
             "the workspace type must not inherit a trait implemented for the blanket parameter"
         );
         assert!(
             !analyzer
                 .get_direct_descendants(&marker)
+                .definite()
                 .contains(&same_named_type),
             "the blanket parameter must not become a concrete trait descendant"
         );
@@ -1313,11 +1333,16 @@ impl Counted for Thing {
             "Counted",
         ));
         assert_eq!(
-            analyzer.get_direct_ancestors(&thing),
+            analyzer.get_direct_ancestors(&thing).definite(),
             vec![counted.clone()],
             "a concrete impl in the same file remains indexed"
         );
-        assert!(analyzer.get_direct_descendants(&counted).contains(&thing));
+        assert!(
+            analyzer
+                .get_direct_descendants(&counted)
+                .definite()
+                .contains(&thing)
+        );
 
         let mark = definition(&analyzer, "Marker.mark");
         let family = analyzer.member_family(&mark, None);
@@ -1425,7 +1450,12 @@ impl<T> Contract for T { fn run(&self) {} }
 "#,
         )]);
         let concrete = definition(&analyzer, "T");
-        assert!(analyzer.get_direct_ancestors(&concrete).is_empty());
+        assert!(
+            analyzer
+                .get_direct_ancestors(&concrete)
+                .definite()
+                .is_empty()
+        );
         for name in ["Contract.run", "T.run"] {
             let answer = analyzer.member_family(&definition(&analyzer, name), None);
             assert_eq!(answer.outcome, MemberFamilyOutcome::Incomplete, "{name}");
@@ -1442,6 +1472,7 @@ impl<T> Contract for T { fn run(&self) {} }
         assert!(
             analyzer
                 .get_direct_ancestors(&definition(&analyzer, "Item"))
+                .definite()
                 .is_empty()
         );
         let answer = analyzer.member_family(&definition(&analyzer, "Contract.run"), None);
@@ -1584,6 +1615,7 @@ impl<'a, T> Contract for &'a T { fn run(&self) {} }
         assert!(
             analyzer
                 .get_direct_ancestors(&definition(&analyzer, "T"))
+                .definite()
                 .is_empty()
         );
         let answer = analyzer.member_family(&definition(&analyzer, "Contract.run"), None);
@@ -1603,6 +1635,7 @@ impl<T> Contract for T::Assoc { fn run(&self) {} }
         assert!(
             analyzer
                 .get_direct_ancestors(&definition(&analyzer, "T.Assoc"))
+                .definite()
                 .is_empty()
         );
         let answer = analyzer.member_family(&definition(&analyzer, "Contract.run"), None);
@@ -1623,7 +1656,9 @@ impl Contract for Item { fn run(&self) {} }
 "#,
         )]);
         assert_eq!(
-            analyzer.get_direct_ancestors(&definition(&analyzer, "Item")),
+            analyzer
+                .get_direct_ancestors(&definition(&analyzer, "Item"))
+                .definite(),
             vec![definition(&analyzer, "Contract")]
         );
         for name in ["Contract.run", "Item.run"] {
@@ -1646,7 +1681,9 @@ impl Contract for Item {
 "#,
         )]);
         assert_eq!(
-            analyzer.get_direct_ancestors(&definition(&analyzer, "Item")),
+            analyzer
+                .get_direct_ancestors(&definition(&analyzer, "Item"))
+                .definite(),
             vec![definition(&analyzer, "Contract")],
             "the malformed body does not erase the structurally valid head"
         );

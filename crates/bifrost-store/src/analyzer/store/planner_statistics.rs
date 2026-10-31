@@ -1465,6 +1465,7 @@ pub mod pinned_plans {
             vec![
                 text("5555555555555555555555555555555555555555"),
                 text("rust"),
+                Value::Blob(Vec::new()),
             ],
         ));
         #[cfg(test)]
@@ -2476,10 +2477,10 @@ pub mod pinned_plans {
                 "SELECT keys.blob_oid, metadata.unit_key, {metadata_columns}
                  FROM blobs AS keys
                  JOIN unit_signature_metadata_values AS metadata ON metadata.blob_id = keys.id
-                 WHERE keys.lang = ? AND keys.blob_oid IN (?, ?)
+                 WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN (?, ?)
                  ORDER BY keys.blob_oid, metadata.unit_key, metadata.ordinal"
             ),
-            vec![text("java"), text(OID), text(OID)],
+            vec![text("java"), Value::Blob(Vec::new()), text(OID), text(OID)],
         ));
         queries.push(pin(
             "signature_metadata_for_unit_limited",
@@ -2487,6 +2488,7 @@ pub mod pinned_plans {
             vec![
                 text(OID),
                 text("java"),
+                Value::Blob(Vec::new()),
                 text("a.B"),
                 text("1"),
                 text("B"),
@@ -2498,7 +2500,7 @@ pub mod pinned_plans {
         queries.push(pin(
             "enclosing_declarations_for_file",
             enclosing_declarations_for_file_sql(),
-            vec![text(OID), text("rust")],
+            vec![text(OID), text("rust"), Value::Blob(Vec::new())],
         ));
 
         // The manifest lookup is the hydration path's only statement that
@@ -2506,7 +2508,7 @@ pub mod pinned_plans {
         queries.push(pin(
             "structural_fact_manifest",
             structural_fact_manifest_sql(),
-            vec![text(OID), text("java"), integer(1)],
+            vec![text(OID), text("java"), Value::Blob(Vec::new()), integer(1)],
         ));
 
         let langs = vec!["rust".to_string(), "python".to_string()];
@@ -2547,26 +2549,23 @@ pub mod pinned_plans {
         queries.push(pin(
             "search_candidate_key_set",
             search_candidate_key_set_sql(1),
-            vec![text("java"), text(OID), integer(0)],
+            vec![text("java"), text(OID), Value::Blob(Vec::new()), integer(0)],
         ));
 
         queries.push(pin(
             "read_path_parsed_blob_membership",
             parsed_blob_keys_sql(2, "", read_path_parsed_blob_condition()),
-            vec![Value::Null; 4],
+            vec![Value::Null; 6],
         ));
 
         let chunk = ["a".to_string(), "b".to_string()];
         queries.push(pin(
             "ranges_bulk",
             ranges_bulk_sql(&chunk_placeholders(&chunk)),
-            chunk_params("rust", &chunk)
-                .into_iter()
-                .map(|value| match value {
-                    Some(text_value) => Value::Text(text_value),
-                    None => Value::Null,
-                })
-                .collect(),
+            chunk_params(
+                &super::super::BlobKey::unvaried(git2::Oid::from_str(OID).unwrap(), "rust"),
+                &chunk,
+            ),
         ));
 
         for (label, sql) in [
@@ -2786,6 +2785,13 @@ pub mod pinned_plans {
                 integer(1),
             ],
         ));
+        // Configuration rows are compilation-keyed, separate from per-blob
+        // tier-one resolution families. Exercise every new stored column.
+        queries.push(pin(
+            "csharp_compilation_symbol_environment",
+            "SELECT c.configuration, c.target_framework, c.symbols_closed, c.open_reason, c.symbol_set_digest, s.symbol, s.source FROM csharp_compilations c LEFT JOIN csharp_compilation_symbols s ON s.compilation_id = c.compilation_id WHERE c.compilation_id = ?1",
+            vec![integer(1)],
+        ));
         queries.push(pin(
             "csharp_implicit_compilation",
             super::super::csharp_compilation::IMPLICIT_COMPILATION_SQL,
@@ -2845,21 +2851,24 @@ pub mod pinned_plans {
             vec![
                 text(OID),
                 text("java"),
+                Value::Blob(Vec::new()),
                 text(OID),
                 text("java"),
+                Value::Blob(Vec::new()),
                 text(OID),
                 text("java"),
+                Value::Blob(Vec::new()),
             ],
         ));
         queries.push(pin(
             "persisted_blob_mutation_cost_fallback",
             persisted_blob_mutation_cost_fallback_sql(),
-            vec![text(OID), text("java")],
+            vec![text(OID), text("java"), Value::Blob(Vec::new())],
         ));
         queries.push(pin(
             "class_set_summary_cascade_costs",
             stored_blob_cascade_costs_sql(1),
-            vec![text(OID), text("python")],
+            vec![text(OID), text("python"), Value::Blob(Vec::new())],
         ));
 
         for (name, sql, params) in [
@@ -3035,19 +3044,25 @@ pub mod pinned_plans {
             queries.push(pin(
                 format!("candidate_fq_segments_{arity}"),
                 candidate_fq_segments_sql(arity),
-                vec![Value::Null; arity * 4],
+                vec![Value::Null; arity * 5],
             ));
         }
         queries.push(pin(
             "raw_unit_fq_segments",
             raw_unit_fq_segments_sql("?, ?"),
-            vec![text("java"), text(OID), text(OID)],
+            vec![text("java"), Value::Blob(Vec::new()), text(OID), text(OID)],
         ));
 
         queries.push(pin(
             "limited_identifier_candidate_for_blob",
-            format!("{} LIMIT ?4", limited_identifier_candidate_for_blob_sql()),
-            vec![text("rust"), text("Widget"), text(OID), integer(16)],
+            format!("{} LIMIT ?5", limited_identifier_candidate_for_blob_sql()),
+            vec![
+                text("rust"),
+                text("Widget"),
+                text(OID),
+                Value::Blob(Vec::new()),
+                integer(16),
+            ],
         ));
         queries.push(pin(
             "limited_identifier_candidate",
@@ -3126,6 +3141,7 @@ pub mod pinned_plans {
             vec![
                 text(OID),
                 text("scala"),
+                Value::Blob(Vec::new()),
                 text("app.Child"),
                 integer(0),
                 text("Child"),
@@ -3155,16 +3171,76 @@ pub mod pinned_plans {
             "import_statements_per_blob",
             format!(
                 "SELECT {} FROM source_import_statements
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3)
                  ORDER BY ordinal",
                 super::super::IMPORT_STATEMENT_COLUMNS
             ),
-            vec![text(OID), text("rust")],
+            vec![text(OID), text("rust"), Value::Blob(Vec::new())],
+        ));
+        queries.push(pin(
+            "index_digest_blob",
+            super::super::INDEX_DIGEST_BLOB_SQL,
+            vec![text(OID), text("java"), integer(0)],
+        ));
+        queries.push(pin(
+            "index_digest_units",
+            super::super::INDEX_DIGEST_UNITS_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_segments",
+            super::super::INDEX_DIGEST_SEGMENTS_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_ranges",
+            super::super::INDEX_DIGEST_RANGES_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_children",
+            super::super::INDEX_DIGEST_CHILDREN_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_supertypes",
+            super::super::INDEX_DIGEST_SUPERTYPES_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_imports",
+            super::super::INDEX_DIGEST_IMPORTS_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_import_partitions",
+            super::super::INDEX_DIGEST_IMPORT_PARTITIONS_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_signatures",
+            super::super::INDEX_DIGEST_SIGNATURES_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_metadata",
+            super::super::INDEX_DIGEST_METADATA_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_pairings",
+            super::super::INDEX_DIGEST_PAIRINGS_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "index_digest_readiness",
+            super::super::INDEX_DIGEST_READINESS_SQL,
+            vec![integer(1)],
         ));
         queries.push(pin(
             "workspace_content_package_facts",
             workspace_content_package_facts_sql(2),
-            vec![text("java"), text(OID), text(OID)],
+            vec![text("java"), Value::Blob(Vec::new()), text(OID), text(OID)],
         ));
         for (label, sql) in [
             (
@@ -3620,7 +3696,7 @@ pub mod pinned_plans {
         queries.push(pin(
             "unit_summary_withdraw_replaced_blob",
             super::super::unit_summaries::WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL,
-            vec![text(OID), text("go")],
+            vec![text(OID), text("go"), Value::Blob(Vec::new())],
         ));
         queries
     }
@@ -3839,6 +3915,7 @@ pub mod tests {
                 super::super::PARSED_BLOB_COMPLETE_CONDITION,
             );
         let parameters = std::iter::once(rusqlite::types::Value::Text("javascript".into()))
+            .chain(std::iter::once(rusqlite::types::Value::Blob(Vec::new())))
             .chain((1..=900).map(|id| rusqlite::types::Value::Text(format!("{id:040x}"))))
             .collect::<Vec<_>>();
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -3895,13 +3972,14 @@ pub mod tests {
             assert!(
                 plan.iter()
                     .any(|line| line.starts_with("SEARCH candidates USING")
-                        && line.contains("blob_oid=?")),
+                        && line.contains("blob_oid=? AND lang=? AND parse_variant=?")),
                 "{state}: candidate lookup must seek the bound OIDs: {plan:#?}"
             );
             assert!(
                 plan.iter()
                     .any(|line| line.starts_with("SEARCH blobs USING")
-                        && line.contains("blob_oid=?")),
+                        && (line.contains("blob_oid=?")
+                            || line.contains("INTEGER PRIMARY KEY (rowid=?)"))),
                 "{state}: blob lookup must use its index: {plan:#?}"
             );
             assert!(
@@ -7144,6 +7222,7 @@ pub mod tests {
             .expect("workspace selection views");
         prepare_pin_context(&conn);
         let mut opened_any = false;
+        let mut opened_compilation_symbols = false;
         for query in pinned_queries() {
             let mut statement = conn
                 .prepare(&format!("EXPLAIN {}", query.sql))
@@ -7178,6 +7257,12 @@ pub mod tests {
                     )
                     .ok();
                 let Some(table) = table else { continue };
+                if table == "csharp_compilation_symbols" {
+                    opened_compilation_symbols = true;
+                    let columns = conn.prepare("SELECT name FROM pragma_table_info('csharp_compilation_symbols') ORDER BY cid").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                    assert_eq!(columns, ["compilation_id", "symbol", "source"]);
+                    continue;
+                }
                 if !table.starts_with("resolution_")
                     && !table.starts_with("python_member_operation")
                 {
@@ -7195,6 +7280,10 @@ pub mod tests {
                 );
             }
         }
+        assert!(
+            opened_compilation_symbols,
+            "the pinned configuration projection must actually read symbol rows"
+        );
         assert!(
             opened_any,
             "the registry must contain at least one resolution reader for this pin to mean anything"

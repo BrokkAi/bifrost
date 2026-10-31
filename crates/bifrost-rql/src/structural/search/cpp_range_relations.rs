@@ -17,6 +17,7 @@ fn report_incomplete(
     file: &ProjectFile,
     rule: &'static str,
     reason: &'static str,
+    incompleteness: Incompleteness,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
     let language = crate::analyzer::common::language_for_file(file).config_label();
@@ -31,7 +32,8 @@ fn report_incomplete(
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -41,28 +43,46 @@ fn report_incomplete(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 fn retain_structural_match_for_binding(
-    outcome: CppRangeFactOutcome,
+    outcome: Result<CppRangeFactOutcome, DerivationExecutionCause>,
     value: &CallBindingValue,
     rule: &'static str,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     match outcome {
-        CppRangeFactOutcome::Proven(_) => vec![pipeline_expansion(PipelineValue::StructuralMatch(
-            value
-                .site
-                .shape
-                .seed
-                .as_ref()
-                .expect("source call bindings retain their structural seed")
-                .clone(),
-        ))],
-        CppRangeFactOutcome::NotApplicable => Vec::new(),
-        CppRangeFactOutcome::Incomplete(reason) => {
-            report_incomplete(value.file(), rule, reason, diagnostics);
+        Ok(CppRangeFactOutcome::Proven(_)) => {
+            vec![pipeline_expansion(PipelineValue::StructuralMatch(
+                value
+                    .site
+                    .shape
+                    .seed
+                    .as_ref()
+                    .expect("source call bindings retain their structural seed")
+                    .clone(),
+            ))]
+        }
+        Ok(CppRangeFactOutcome::NotApplicable) => Vec::new(),
+        Ok(CppRangeFactOutcome::Incomplete(reason)) => {
+            report_incomplete(
+                value.file(),
+                rule,
+                reason,
+                Incompleteness::Content,
+                diagnostics,
+            );
+            Vec::new()
+        }
+        Err(cause) => {
+            report_incomplete(
+                value.file(),
+                rule,
+                "cpp_syntax_unavailable",
+                Incompleteness::Operational(cause),
+                diagnostics,
+            );
             Vec::new()
         }
     }
@@ -113,20 +133,36 @@ pub(super) fn network_to_host_function_as_array_bound_expansions(
 }
 
 fn retain_structural_match(
-    outcome: CppRangeFactOutcome,
+    outcome: Result<CppRangeFactOutcome, DerivationExecutionCause>,
     seed: &Arc<SeedMatch>,
     rule: &'static str,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     match outcome {
-        CppRangeFactOutcome::Proven(_) => {
+        Ok(CppRangeFactOutcome::Proven(_)) => {
             vec![pipeline_expansion(PipelineValue::StructuralMatch(
                 seed.clone(),
             ))]
         }
-        CppRangeFactOutcome::NotApplicable => Vec::new(),
-        CppRangeFactOutcome::Incomplete(reason) => {
-            report_incomplete(&seed.file, rule, reason, diagnostics);
+        Ok(CppRangeFactOutcome::NotApplicable) => Vec::new(),
+        Ok(CppRangeFactOutcome::Incomplete(reason)) => {
+            report_incomplete(
+                &seed.file,
+                rule,
+                reason,
+                Incompleteness::Content,
+                diagnostics,
+            );
+            Vec::new()
+        }
+        Err(cause) => {
+            report_incomplete(
+                &seed.file,
+                rule,
+                "cpp_syntax_unavailable",
+                Incompleteness::Operational(cause),
+                diagnostics,
+            );
             Vec::new()
         }
     }

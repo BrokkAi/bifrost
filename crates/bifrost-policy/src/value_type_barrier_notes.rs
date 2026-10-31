@@ -36,20 +36,8 @@ impl ValueTypeBarrierNote {
     pub fn predicate(&self) -> ValueTypePredicate {
         self.predicate
     }
-    pub fn reason(&self) -> ValueTypeBarrierReason {
-        self.reason
-    }
     pub fn location(&self) -> &PolicySourceLocation {
         &self.location
-    }
-    pub fn procedure(&self) -> &str {
-        &self.procedure
-    }
-    pub fn value_id(&self) -> u32 {
-        self.value_id
-    }
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
     }
 
     pub(crate) fn from_check(

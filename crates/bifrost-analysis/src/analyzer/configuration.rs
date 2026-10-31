@@ -34,6 +34,8 @@ pub enum ConfigurationIngestionOutcome {
     /// the size of the other outcomes; the query layer moves it into an `Arc`
     /// once per document.
     Facts(Box<ConfigurationDocumentFacts>),
+    /// `format` names a registered format that has no adapter yet; `None`
+    /// means the path is not a registered configuration document at all.
     Unsupported {
         format: Option<ConfigurationFormat>,
     },
@@ -67,18 +69,27 @@ pub fn ingest_configuration_document(path: &Path, bytes: &[u8]) -> Configuration
             return ConfigurationIngestionOutcome::Unsupported { format: None };
         }
     };
+    let ingest = match format {
+        ConfigurationFormat::Json => ingest_json,
+        ConfigurationFormat::Properties => ingest_properties,
+        ConfigurationFormat::Toml => ingest_toml,
+        ConfigurationFormat::Xml => ingest_xml,
+        ConfigurationFormat::Yaml => ingest_yaml,
+        // No maintained HOCON parser reports source ranges, and every fact
+        // carries exact evidence, so HOCON documents are discovered but not
+        // read.
+        ConfigurationFormat::Hocon => {
+            return ConfigurationIngestionOutcome::Unsupported {
+                format: Some(format),
+            };
+        }
+    };
     let Ok(source) = std::str::from_utf8(bytes) else {
         return ConfigurationIngestionOutcome::Incomplete {
             reason: ConfigurationIngestionError::InvalidUtf8,
         };
     };
-    let result = match format {
-        ConfigurationFormat::Json => ingest_json(source),
-        ConfigurationFormat::Properties => ingest_properties(source),
-        ConfigurationFormat::Toml => ingest_toml(source),
-        ConfigurationFormat::Xml => ingest_xml(source),
-        ConfigurationFormat::Yaml => ingest_yaml(source),
-    };
+    let result = ingest(source);
     match result {
         Ok(facts) => ConfigurationIngestionOutcome::Facts(Box::new(facts)),
         Err(error) => ConfigurationIngestionOutcome::Incomplete { reason: error },
@@ -3227,15 +3238,25 @@ caf\\u00e9.mode=on\n";
     fn every_discovery_extension_reaches_its_format_adapter() {
         // The canonical registry's discovery extensions and the ingestion
         // dispatch are one contract: a path the registry discovers must reach
-        // the adapter of the same format, never an unclassified rejection.
+        // the adapter of the same format, or name that format as one without
+        // an adapter, never an unclassified rejection.
         for format in ConfigurationFormat::ALL {
             for extension in format.discovery_extensions() {
                 let path = PathBuf::from("conf").join(format!("candidate.{extension}"));
-                match ingest_configuration_document(&path, b"") {
-                    ConfigurationIngestionOutcome::Facts(facts) => {
+                match (format, ingest_configuration_document(&path, b"")) {
+                    (
+                        ConfigurationFormat::Hocon,
+                        ConfigurationIngestionOutcome::Unsupported {
+                            format: Some(ConfigurationFormat::Hocon),
+                        },
+                    ) => {}
+                    (ConfigurationFormat::Hocon, other) => {
+                        panic!("{path:?} must report HOCON as unread: {other:?}")
+                    }
+                    (_, ConfigurationIngestionOutcome::Facts(facts)) => {
                         assert_eq!(facts.format(), format, "{path:?}");
                     }
-                    other => panic!("{path:?} did not reach its adapter: {other:?}"),
+                    (_, other) => panic!("{path:?} did not reach its adapter: {other:?}"),
                 }
             }
         }

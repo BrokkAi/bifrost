@@ -52,6 +52,10 @@ impl CallApplicabilityAdapter for KotlinCallApplicabilityAdapter {
         Some(ImplicitReceiverLookup::FirstApplicable)
     }
 
+    fn implicit_receiver_value_lookup(&self) -> bool {
+        true
+    }
+
     fn implicit_receiver_scope_kind(
         &self,
         kind: ResolutionScopeKind,

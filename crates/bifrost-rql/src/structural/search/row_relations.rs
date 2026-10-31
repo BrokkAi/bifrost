@@ -392,7 +392,8 @@ pub(super) fn binding_identity_for_range(
         })
         .any(|target_identity| target_identity == identity);
     if reassigned {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete,
@@ -405,7 +406,7 @@ pub(super) fn binding_identity_for_range(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
         return None;
     }
     Some(identity)
@@ -544,7 +545,8 @@ pub(super) fn binding_uses_expansions(
             diagnostic.code == CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
                 && diagnostic.message == message
         }) {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete,
@@ -554,7 +556,7 @@ pub(super) fn binding_uses_expansions(
                 message,
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
     }
     let binding_id = value.id();
@@ -851,7 +853,8 @@ pub(super) fn selected_property_relation_expansions(
     let file = point.file();
     let public_point = point.public();
     if let Some(reason) = point.exact_selection_incomplete_reason() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -865,11 +868,12 @@ pub(super) fn selected_property_relation_expansions(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
         return Vec::new();
     }
     let Some(outcome) = semantic.materialized_outcome(file) else {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -883,7 +887,7 @@ pub(super) fn selected_property_relation_expansions(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
         return Vec::new();
     };
 
@@ -905,6 +909,7 @@ pub(super) fn selected_property_relation_expansions(
         cancellation,
     );
     report_selected_property_completeness(
+        workspace.analyzer(),
         &diagnostic_procedure,
         &public_point.id,
         &scoped,
@@ -951,6 +956,7 @@ pub(super) fn selected_property_relation_expansions(
 }
 
 fn report_selected_property_completeness(
+    analyzer: &dyn IAnalyzer,
     procedure: &SemanticProcedureValue,
     point_id: &str,
     scoped: &super::super::flow_state::FileFlowState,
@@ -969,7 +975,11 @@ fn report_selected_property_completeness(
         return;
     }
 
-    diagnostics.push(CodeQueryDiagnostic {
+    let cause = reasons
+        .iter()
+        .find_map(|reason| flow_state::classify_reason(reason).2);
+    diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: procedure.related_flow_reasons(&reasons),
         source: procedure.diagnostic_source(),
         code: CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
@@ -983,7 +993,7 @@ fn report_selected_property_completeness(
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }), cause));
 }
 
 /// The flow relations incident to one state event: seeded from an event, an
@@ -1094,6 +1104,7 @@ pub(super) fn binding_initializer_call_expansions(
     if language != Language::Rust {
         binding_initializer_incomplete(
             diagnostics,
+            Incompleteness::Content,
             file,
             language.config_label(),
             "only Rust binding initializers have an exact structured result/receiver relation",
@@ -1103,6 +1114,7 @@ pub(super) fn binding_initializer_call_expansions(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         binding_initializer_incomplete(
             diagnostics,
+            Incompleteness::Operational(DerivationExecutionCause::Cancelled),
             file,
             language.config_label(),
             "initializer projection was cancelled",
@@ -1119,6 +1131,7 @@ pub(super) fn binding_initializer_call_expansions(
     else {
         binding_initializer_incomplete(
             diagnostics,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             file,
             language.config_label(),
             "Rust structural facts for the establishing event are unavailable",
@@ -1129,6 +1142,7 @@ pub(super) fn binding_initializer_call_expansions(
     let Some(event_ast_id) = state.site.ast_id.as_deref() else {
         binding_initializer_incomplete(
             diagnostics,
+            Incompleteness::Content,
             file,
             language.config_label(),
             "establishing event has no exact structural AST identity",
@@ -1145,6 +1159,7 @@ pub(super) fn binding_initializer_call_expansions(
     let [establishment_node] = matching_nodes.as_slice() else {
         binding_initializer_incomplete(
             diagnostics,
+            Incompleteness::Content,
             file,
             language.config_label(),
             &format!(
@@ -1175,6 +1190,7 @@ pub(super) fn binding_initializer_call_expansions(
         }
         binding_initializer_incomplete(
             diagnostics,
+            Incompleteness::Content,
             file,
             language.config_label(),
             &format!(
@@ -1214,7 +1230,13 @@ pub(super) fn binding_initializer_call_expansions(
         match exact_initializer_call(&facts, current_node, &calls_by_span, state.value, None) {
             Ok(call) => call,
             Err(reason) => {
-                binding_initializer_incomplete(diagnostics, file, language.config_label(), reason);
+                binding_initializer_incomplete(
+                    diagnostics,
+                    Incompleteness::Content,
+                    file,
+                    language.config_label(),
+                    reason,
+                );
                 return Vec::new();
             }
         };
@@ -1238,6 +1260,7 @@ pub(super) fn binding_initializer_call_expansions(
             _ => {
                 binding_initializer_incomplete(
                     diagnostics,
+                    Incompleteness::Content,
                     file,
                     language.config_label(),
                     &format!(
@@ -1258,7 +1281,13 @@ pub(super) fn binding_initializer_call_expansions(
         ) {
             Ok(call) => call,
             Err(reason) => {
-                binding_initializer_incomplete(diagnostics, file, language.config_label(), reason);
+                binding_initializer_incomplete(
+                    diagnostics,
+                    Incompleteness::Content,
+                    file,
+                    language.config_label(),
+                    reason,
+                );
                 return Vec::new();
             }
         };
@@ -1353,11 +1382,15 @@ fn binding_initializer_call_id(
 
 fn binding_initializer_incomplete(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    incompleteness: Incompleteness,
     file: &ProjectFile,
     language: &'static str,
     reason: &str,
 ) {
-    let message = format!("binding_initializer_calls_of: {reason}");
+    let message = format!(
+        "{}: binding_initializer_calls_of: {reason}",
+        rel_path_string(file)
+    );
     if diagnostics.iter().any(|diagnostic| {
         diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
             && diagnostic.language == language
@@ -1365,17 +1398,18 @@ fn binding_initializer_incomplete(
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language,
-        message: format!("{}: {message}", rel_path_string(file)),
+        message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 /// Derive one seed procedure's file, locate the seed inside it, and report the
@@ -1645,7 +1679,8 @@ pub(super) fn edge_row_expansions(
     }
     if omitted > 0 {
         let language = omitted_language.expect("an omitted edge names its language");
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::EdgeDerivationIncomplete,
@@ -1658,7 +1693,7 @@ pub(super) fn edge_row_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     expansions
 }

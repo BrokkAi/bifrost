@@ -101,6 +101,7 @@ fn make_value(
     reason: Option<&'static str>,
     csharp_facts: Option<&brokk_bifrost_csharp_analysis::CSharpCatchFacts>,
 ) -> FailureHandlerStateValue {
+    let is_throw = seed.facts.node(seed.fact_match.node).kind == NormalizedKind::Throw;
     let id = format!(
         "failure_handler_state:{}:{catch_ast_id}",
         rel_path_string(&seed.file)
@@ -115,7 +116,11 @@ fn make_value(
             path: rel_path_string(&seed.file),
             language: seed.language.config_label(),
             range: super::render::public_range(&seed.facts, anchor),
-            catch_ast_id,
+            catch_ast_id: if is_throw {
+                String::new()
+            } else {
+                catch_ast_id
+            },
             body_range: body.map(|body| super::render::public_range(&seed.facts, body)),
             verdict,
             proof: if reason.is_some() { "unknown" } else { "exact" },
@@ -129,6 +134,7 @@ fn make_value(
             caught_type_relation: csharp_facts.map(|facts| facts.caught_type_relation.label()),
             has_filter: csharp_facts.map(|facts| facts.has_filter),
             rethrow_kind: csharp_facts.map(|facts| facts.rethrow.label()),
+            throw_relation: (seed.language == Language::CSharp && is_throw).then_some("unknown"),
         },
         file: seed.file.clone(),
         anchor,
@@ -187,7 +193,8 @@ fn expansion_at(
     {
         diagnostics.push(super::QueryExecutionState::diagnostic(
             analyzer,
-            CodeQueryDiagnostic {
+            CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete,
@@ -200,7 +207,7 @@ fn expansion_at(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            },
+            }),
             CodeQueryDiagnosticCode::from_execution_reason(
                 CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete,
                 reason,
@@ -230,8 +237,20 @@ pub(super) fn failure_handler_state_expansions(
         _ => None,
     };
     let native_seed = native_hook.is_some() && seed_kind.satisfies(NormalizedKind::Callable);
-    if !native_seed && seed_kind != NormalizedKind::Catch {
+    let throw_seed = seed_kind == NormalizedKind::Throw;
+    if !native_seed && seed_kind != NormalizedKind::Catch && !throw_seed {
         return Vec::new();
+    }
+    if throw_seed && seed.language != Language::CSharp {
+        return expansion(
+            analyzer,
+            cache,
+            seed,
+            None,
+            "unknown",
+            Some(derivation_reason::UNSUPPORTED_LANGUAGE),
+            diagnostics,
+        );
     }
     // Rust's native branches are selected below from callable seeds. A stale
     // or hand-written Catch query must not reintroduce the shared vocabulary
@@ -356,6 +375,93 @@ pub(super) fn failure_handler_state_expansions(
         }
     };
     let handler_seed = seed.facts.node(seed.fact_match.node).range;
+    if throw_seed {
+        // Throw expressions share the normalized kind, but this relation is
+        // defined only for statements (matching CodeQL ThrowStmt).
+        if syntax
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(handler_seed.start_byte, handler_seed.end_byte)
+            .is_some_and(|node| node.kind() == "throw_expression")
+        {
+            return Vec::new();
+        }
+        let Some((owner, relation)) =
+            brokk_bifrost_analysis::analyzer::structural::failure_handlers::csharp_throw_facts(
+                &syntax,
+                handler_seed,
+            )
+        else {
+            return expansion(
+                analyzer,
+                cache,
+                seed,
+                None,
+                "unknown",
+                Some(derivation_reason::SYNTAX_RECOVERY),
+                diagnostics,
+            );
+        };
+        let body = owner.map(|owner| {
+            let node = syntax
+                .tree()
+                .root_node()
+                .named_descendant_for_byte_range(owner.start_byte, owner.end_byte)
+                .expect("owning catch was selected from this syntax tree");
+            node.child_by_field_name("body")
+                .map(brokk_bifrost_core::analyzer::tree_walk::node_range)
+                .expect("owner walk requires a catch body")
+        });
+        let catch_ast_id = match owner {
+            Some(owner) => {
+                let Some(id) = seed
+                    .facts
+                    .nodes()
+                    .iter()
+                    .position(|node| node.range == owner)
+                else {
+                    return expansion(
+                        analyzer,
+                        cache,
+                        seed,
+                        None,
+                        "unknown",
+                        Some(derivation_reason::SYNTAX_RECOVERY),
+                        diagnostics,
+                    );
+                };
+                crate::analyzer::structural::occurrence_rows::ast_id(
+                    seed.facts.source_identity(),
+                    id as u32,
+                )
+            }
+            None => String::new(),
+        };
+        let throw_ast_id = crate::analyzer::structural::occurrence_rows::ast_id(
+            seed.facts.source_identity(),
+            seed.fact_match.node,
+        );
+        // Without an owner, body state is unknown while ownership proof stays exact.
+        let mut value = make_value(
+            seed,
+            handler_seed,
+            throw_ast_id,
+            body,
+            if owner.is_some() {
+                "nonempty"
+            } else {
+                "unknown"
+            },
+            None,
+            None,
+        );
+        value.row.throw_relation = Some(relation.label());
+        value.row.catch_ast_id = catch_ast_id;
+        // Capture provenance only after installing the owning catch identity.
+        return vec![pipeline_expansion(PipelineValue::FailureHandlerState(
+            Box::new(value),
+        ))];
+    }
     if native_seed {
         let workspace = workspace.expect("native failure-handler hooks require a workspace");
         let cancellation = cancellation.unwrap_or(&cache.uncancelled);
@@ -490,12 +596,9 @@ pub(super) fn failure_handler_state_expansions(
         let facts = cache
             .regions
             .read_mut(&memo_attribution(analyzer), |regions| {
-                let regions = regions.entry(seed.file.clone()).or_insert_with(|| {
-                    brokk_bifrost_analysis::analyzer::languages::language_knowledge(seed.language)
-                        .expect("handler language is registered")
-                        .structural_spec()
-                        .conditional_regions(syntax.tree().root_node(), syntax.source())
-                });
+                let regions = regions
+                    .entry(seed.file.clone())
+                    .or_insert_with(|| syntax.conditional_regions());
                 csharp_catch_facts(
                     csharp,
                     scope.token(),

@@ -213,6 +213,7 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
     JOIN main.blobs AS blob
       ON blob.blob_oid=version.blob_oid
      AND blob.lang=version.lang
+     AND blob.parse_variant=x''
      AND blob.generation=version.generation
     JOIN main.source_go_manifests AS facts ON facts.blob_id=blob.id
     WHERE inventory_selection.workspace_id=selection.workspace_id

@@ -191,16 +191,20 @@ mod rust_departing_tests_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
-                oid_for(rust_file.read_to_string().unwrap().as_bytes()),
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid_for(rust_file.read_to_string().unwrap().as_bytes()),
+                    "rust",
+                ),
                 &RustAdapter,
                 &parse_state(&RustAdapter, &rust_file),
             )
             .unwrap();
         store
             .write_parsed_blob(
-                oid_for(java_file.read_to_string().unwrap().as_bytes()),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid_for(java_file.read_to_string().unwrap().as_bytes()),
+                    "java",
+                ),
                 &JavaAdapter,
                 &parse_state(&JavaAdapter, &java_file),
             )
@@ -362,16 +366,14 @@ fn main() {}
         let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
         store
             .write_parsed_blob(
-                java_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(java_oid, "java"),
                 &JavaAdapter,
                 &parse_state(&JavaAdapter, &java_file),
             )
             .unwrap();
         store
             .write_parsed_blob(
-                rust_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(rust_oid, "rust"),
                 &RustAdapter,
                 &parse_state(&RustAdapter, &rust_file),
             )
@@ -387,8 +389,12 @@ fn main() {}
                 &languages,
                 &generations,
                 &[
-                    ActiveSearchBlob::unfiltered(java_oid),
-                    ActiveSearchBlob::unfiltered(rust_oid),
+                    ActiveSearchBlob::unfiltered(brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        java_oid, "java",
+                    )),
+                    ActiveSearchBlob::unfiltered(brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        rust_oid, "rust",
+                    )),
                 ],
                 Some(&[vec!["run".to_string()], vec!["Service".to_string()]]),
                 None,
@@ -432,24 +438,21 @@ fn main() {}
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
-                java_alpha_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(java_alpha_oid, "java"),
                 &JavaAdapter,
                 &parse_state(&JavaAdapter, &java_alpha),
             )
             .unwrap();
         store
             .write_parsed_blob(
-                java_beta_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(java_beta_oid, "java"),
                 &JavaAdapter,
                 &parse_state(&JavaAdapter, &java_beta),
             )
             .unwrap();
         store
             .write_parsed_blob(
-                rust_gamma_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(rust_gamma_oid, "rust"),
                 &RustAdapter,
                 &parse_state(&RustAdapter, &rust_gamma),
             )
@@ -488,16 +491,19 @@ fn main() {}
 
         let requested = vec![
             SearchCandidateKey {
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 lang_index: 0,
                 blob_oid: java_alpha_oid,
                 unit_key: alpha.candidate.unit_key,
             },
             SearchCandidateKey {
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 lang_index: 0,
                 blob_oid: java_beta_oid,
                 unit_key: beta.candidate.unit_key,
             },
             SearchCandidateKey {
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 lang_index: 1,
                 blob_oid: rust_gamma_oid,
                 unit_key: gamma.candidate.unit_key,
@@ -505,11 +511,13 @@ fn main() {}
             // A valid unit key from another blob must not cross the blob
             // boundary, and a nonexistent key must remain a near miss.
             SearchCandidateKey {
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 lang_index: 0,
                 blob_oid: java_alpha_oid,
                 unit_key: beta_only_unit_key,
             },
             SearchCandidateKey {
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 lang_index: 0,
                 blob_oid: java_alpha_oid,
                 unit_key: i64::MAX,
@@ -517,6 +525,7 @@ fn main() {}
             // The OID exists, but only for Rust; the language scope must
             // prevent this request from reaching the Rust declaration.
             SearchCandidateKey {
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 lang_index: 0,
                 blob_oid: rust_gamma_oid,
                 unit_key: gamma.candidate.unit_key,
@@ -527,6 +536,7 @@ fn main() {}
         // ensure near misses do not cause declaration-range over-reading.
         let mut requested = requested;
         requested.extend((0..401).map(|index| SearchCandidateKey {
+            variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
             lang_index: 0,
             blob_oid: java_alpha_oid,
             unit_key: i64::MIN + i64::from(index),
@@ -621,26 +631,35 @@ fn main() {}
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 prior_generation,
                 &RustAdapter,
                 state.as_ref(),
             )
             .unwrap();
-        assert!(store.contains_parsed_blob(oid, "rust").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap()
+        );
 
         let current_generation = store
             .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
             .unwrap();
 
         assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "rust").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap()
+        );
         assert_eq!(
             store
-                .missing_parsed_blob_keys(&[(oid, "rust".to_string())])
+                .missing_parsed_blob_keys(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "rust"
+                )])
                 .unwrap(),
-            vec![(oid, "rust".to_string())]
+            vec![brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust")]
         );
     }
 
@@ -691,7 +710,11 @@ fn main() {}
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let workspace_files = [&file_a, &file_b]
             .into_iter()
@@ -732,11 +755,19 @@ fn main() {}
             )
             .unwrap();
         let hydrated_a = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_a)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &file_a,
+            )
             .unwrap()
             .unwrap();
         let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &file_b,
+            )
             .unwrap()
             .unwrap();
 
@@ -815,14 +846,26 @@ fn main() {}
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let hydrated_a = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_a)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &file_a,
+            )
             .unwrap()
             .unwrap();
         let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &file_b,
+            )
             .unwrap()
             .unwrap();
 
@@ -890,10 +933,18 @@ fn main() {}
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &file_b,
+            )
             .unwrap()
             .unwrap();
         assert!(
@@ -932,10 +983,18 @@ fn main() {}
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &file_b,
+            )
             .unwrap()
             .unwrap();
         let member = hydrated_b
@@ -968,10 +1027,18 @@ fn main() {}
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &file_b,
+            )
             .unwrap()
             .unwrap();
         assert!(
@@ -1005,10 +1072,18 @@ fn main() {}
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let hydrated = store
-            .hydrate_file_state(oid, "rust", &adapter, &file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &adapter,
+                &file,
+            )
             .unwrap()
             .unwrap();
         assert!(
@@ -1047,10 +1122,18 @@ fn main() {}
         assert_eq!(state.imports, imports);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let mut hydrated = read_import_infos(&conn, &oid.to_string(), "rust").unwrap();
+        let mut hydrated = read_import_infos(
+            &conn,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+        )
+        .unwrap();
         assert_eq!(hydrated, imports);
         let mut binder = brokk_bifrost_core::analyzer::usages::model::ImportBinder::empty();
         for import in &mut hydrated {
@@ -1074,7 +1157,9 @@ fn main() {}
     fn rust_fact_tables_record_exports_imports_modules_and_occurrences() {
         let temp = tempfile::TempDir::new().unwrap();
         let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
-        let facts = store.rust_usage_facts(oid, "rust").unwrap();
+        let facts = store
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+            .unwrap();
 
         let exports: Vec<_> = facts
             .exports
@@ -1292,13 +1377,22 @@ fn main() {}
             .ensure_language_epoch_value("rust", "canonical-import-location-test")
             .unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let requested = [0, 1, 2, 3, 4, 132].into_iter().collect();
         let cancellation = CancellationToken::new();
         let check_locations = |store: &AnalyzerStore| {
             let locations = store
-                .load_rust_import_source_locations(oid, generation, &requested, &cancellation)
+                .load_rust_import_source_locations(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &requested,
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap();
             // The projection carries the path's target token only. An `as`
@@ -1311,7 +1405,9 @@ fn main() {}
             assert!(!locations[&3].root_owned);
             assert!(!locations[&4].root_owned);
             assert_eq!(locations[&132].target.unwrap().text(&source), "Thing");
-            let facts = store.rust_usage_facts(oid, "rust").unwrap();
+            let facts = store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap();
             assert_eq!(facts.import_targets, state.rust_usage_facts.import_targets);
         };
         check_locations(&store);
@@ -1323,14 +1419,24 @@ fn main() {}
         let absent = [1000].into_iter().collect();
         assert!(
             reopened
-                .load_rust_import_source_locations(oid, generation, &absent, &cancellation)
+                .load_rust_import_source_locations(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &absent,
+                    &cancellation
+                )
                 .unwrap()
                 .is_none()
         );
         cancellation.cancel();
         assert!(
             reopened
-                .load_rust_import_source_locations(oid, generation, &requested, &cancellation)
+                .load_rust_import_source_locations(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &requested,
+                    &cancellation
+                )
                 .unwrap()
                 .is_none()
         );
@@ -1400,13 +1506,20 @@ pub(crate) mod inline { mod nested; }
         let path = fixture.root().join("primary-module-properties.db");
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         drop(state);
         drop(store);
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap().module_routes,
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap()
+                .module_routes,
             expected
         );
         let persisted = store
@@ -1538,17 +1651,27 @@ mod primary;
         let path = fixture.root().join("shared-embedded-modules.db");
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         drop(state);
         drop(store);
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap().modules,
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap()
+                .modules,
             inventory
         );
         assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap().module_routes,
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap()
+                .module_routes,
             routes
         );
         let conn = store.read_conn().unwrap();
@@ -1634,44 +1757,90 @@ mod primary;
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("rust").unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let mut missing = state.clone();
         missing.source_facts.as_mut().unwrap().rust_modules = None;
         let error = store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &missing)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &missing,
+            )
             .unwrap_err();
         assert!(
             error.to_string().contains("canonical module source facts"),
             "{error}"
         );
-        assert_eq!(store.rust_usage_facts(oid, "rust").unwrap(), expected);
+        assert_eq!(
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap(),
+            expected
+        );
         store.delete_rust_facts_for_test("rust");
         assert!(
             store
-                .blobs_with_rust_facts("rust", generation, &[oid])
+                .blobs_with_rust_facts(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &[oid]
+                )
                 .unwrap()
                 .is_empty()
         );
-        assert!(store.rust_usage_facts(oid, "rust").is_err());
+        assert!(
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .is_err()
+        );
         {
             let conn = store.read_conn().unwrap();
-            assert!(read_rust_usage_facts_bulk(&conn, "rust", &[oid.to_string()]).is_err());
+            assert!(
+                read_rust_usage_facts_bulk(
+                    &conn,
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                    &[oid.to_string()]
+                )
+                .is_err()
+            );
         }
         assert!(
             store
-                .rust_module_route_facts_while("rust", generation, &[oid], &|| true)
+                .rust_module_route_facts_while(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                    generation,
+                    &[oid],
+                    &|| true
+                )
                 .unwrap()
                 .unwrap()
                 .is_empty()
         );
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
-        assert_eq!(store.rust_usage_facts(oid, "rust").unwrap(), expected);
         assert_eq!(
             store
-                .blobs_with_rust_facts("rust", generation, &[oid])
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            store
+                .blobs_with_rust_facts(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &[oid]
+                )
                 .unwrap(),
             [oid].into_iter().collect()
         );
@@ -1729,7 +1898,11 @@ mod primary;
             brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId::new(u32::MAX);
         assert!(
             store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &invalid)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    &RustAdapter,
+                    &invalid
+                )
                 .is_err()
         );
         assert_eq!(
@@ -1747,14 +1920,18 @@ mod primary;
         );
         drop(invalid);
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         drop(state);
         drop(store);
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         assert_eq!(
             store
-                .rust_usage_facts(oid, "rust")
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
                 .unwrap()
                 .module_routes
                 .item_macros,
@@ -1762,7 +1939,12 @@ mod primary;
         );
         let generation = store.current_generation("rust").unwrap();
         let routes = store
-            .rust_module_route_facts_while("rust", generation, &[oid], &|| true)
+            .rust_module_route_facts_while(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                generation,
+                &[oid],
+                &|| true,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(routes[&oid].item_macros, expected);
@@ -1790,11 +1972,21 @@ mod primary;
                  UPDATE source_rust_declaration_properties SET declaration_kind = NULL, macro_exported = NULL;",
             ).unwrap();
         });
-        assert!(store.rust_usage_facts(oid, "rust").is_err());
+        assert!(
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .is_err()
+        );
         let generation = store.current_generation("rust").unwrap();
         assert!(
             store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
+                .rust_declaration_properties(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &RustAdapter,
+                    &file,
+                    &|| true
+                )
                 .is_err()
         );
     }
@@ -1815,7 +2007,11 @@ mod primary;
         let oid = oid_for(source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         store.conn.execute(|conn| {
             conn.execute_batch(
@@ -1824,19 +2020,32 @@ mod primary;
             )
             .unwrap();
         });
-        assert!(store.rust_usage_facts(oid, "rust").is_err());
+        assert!(
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .is_err()
+        );
         let generation = store.current_generation("rust").unwrap();
         assert!(
             store
-                .rust_module_route_facts_while("rust", generation, &[oid], &|| true)
+                .rust_module_route_facts_while(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                    generation,
+                    &[oid],
+                    &|| true
+                )
                 .is_err()
         );
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         assert_eq!(
             store
-                .rust_usage_facts(oid, "rust")
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
                 .unwrap()
                 .module_routes
                 .item_macros,
@@ -1907,7 +2116,11 @@ replay! {
         invalid_property.nearest_declaration_boundary = RustDeclarationBoundary::Impl;
         assert!(
             store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &invalid)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    &RustAdapter,
+                    &invalid
+                )
                 .is_err()
         );
         assert_eq!(
@@ -1925,7 +2138,11 @@ replay! {
         );
         drop(invalid);
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         drop(state);
         drop(store);
@@ -1933,7 +2150,13 @@ replay! {
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         let read = || {
             store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
+                .rust_declaration_properties(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &RustAdapter,
+                    &file,
+                    &|| true,
+                )
                 .unwrap()
                 .unwrap()
         };
@@ -1960,8 +2183,7 @@ replay! {
             assert!(
                 read_unit_rows_while(
                     &conn,
-                    &oid.to_string(),
-                    "rust",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                     &RustAdapter,
                     &file,
                     &|| {
@@ -1979,8 +2201,7 @@ replay! {
                 assert!(
                     read_unit_rows_while(
                         &conn,
-                        &oid.to_string(),
-                        "rust",
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                         &RustAdapter,
                         &file,
                         &|| {
@@ -2052,7 +2273,7 @@ replay! {
         );
         let remounted = store
             .rust_declaration_properties(
-                oid,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 generation,
                 &RustAdapter,
                 &fixture.file("src/copied.rs"),
@@ -2066,17 +2287,29 @@ replay! {
         }
         assert!(
             store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| false)
+                .rust_declaration_properties(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &RustAdapter,
+                    &file,
+                    &|| false
+                )
                 .unwrap()
                 .is_none()
         );
         let steps = std::cell::Cell::new(0);
         assert!(
             store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| {
-                    steps.set(steps.get() + 1);
-                    steps.get() < 3
-                })
+                .rust_declaration_properties(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &RustAdapter,
+                    &file,
+                    &|| {
+                        steps.set(steps.get() + 1);
+                        steps.get() < 3
+                    }
+                )
                 .unwrap()
                 .is_none()
         );
@@ -2094,12 +2327,22 @@ replay! {
         });
         assert!(
             store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
+                .rust_declaration_properties(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &RustAdapter,
+                    &file,
+                    &|| true
+                )
                 .is_err()
         );
         let repaired = parse_state(&RustAdapter, &file);
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &repaired)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &repaired,
+            )
             .unwrap();
         assert_eq!(read(), expected);
         store.conn.execute(|conn| {
@@ -2118,12 +2361,22 @@ replay! {
             });
             assert!(
                 store
-                    .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
+                    .rust_declaration_properties(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                        generation,
+                        &RustAdapter,
+                        &file,
+                        &|| true
+                    )
                     .is_err(),
                 "legacy NULL {column} must remain unavailable"
             );
             store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &repaired)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    &RustAdapter,
+                    &repaired,
+                )
                 .unwrap();
             assert_eq!(read(), expected);
         }
@@ -2132,7 +2385,13 @@ replay! {
             .unwrap();
         assert!(
             store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
+                .rust_declaration_properties(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &RustAdapter,
+                    &file,
+                    &|| true
+                )
                 .is_err()
         );
     }
@@ -2165,7 +2424,11 @@ replay! {
         let path = fixture.root().join("embedded-declarations.db");
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         drop(state);
         drop(store);
@@ -2210,7 +2473,11 @@ replay! {
         let path = fixture.root().join("bridged-macro-items.db");
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         drop(state);
         let conn = store.read_conn().unwrap();
@@ -2399,7 +2666,11 @@ helper::wrap! {
         let path = fixture.root().join("raw-embedded-imports.db");
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         drop(state);
         drop(store);
@@ -2502,11 +2773,17 @@ helper::wrap! {
         assert!(persisted_export_ids.is_empty());
         drop(conn);
         assert_eq!(
-            read_import_infos(&reopened.read_conn().unwrap(), &oid.to_string(), "rust").unwrap(),
+            read_import_infos(
+                &reopened.read_conn().unwrap(),
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust")
+            )
+            .unwrap(),
             expected_generic
         );
         assert_eq!(
-            reopened.rust_usage_facts(oid, "rust").unwrap(),
+            reopened
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap(),
             expected_usage
         );
     }
@@ -2524,15 +2801,21 @@ helper::wrap! {
             .ensure_language_epoch_value("rust", "missing-import-scope")
             .unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
-        let facts = store.rust_usage_facts(oid, "rust").unwrap();
+        let facts = store
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+            .unwrap();
         assert_eq!(facts.import_targets, state.rust_usage_facts.import_targets);
         assert_eq!(facts.import_targets.len(), 1);
         assert!(facts.import_targets[0].local_extent.is_some());
         let locations = store
             .load_rust_import_source_locations(
-                oid,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 generation,
                 &[0].into_iter().collect(),
                 &CancellationToken::new(),
@@ -2589,7 +2872,11 @@ helper::wrap! {
         let oid = oid_for(b"use crate::model::Thing as Local;\n");
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         {
             // Deliberate damaged-cache input, impossible through the sealed writer.
@@ -2599,7 +2886,9 @@ helper::wrap! {
             conn.execute("DELETE FROM source_import_segments", [])
                 .unwrap();
         }
-        let error = store.rust_usage_facts(oid, "rust").unwrap_err();
+        let error = store
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+            .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2607,10 +2896,16 @@ helper::wrap! {
             "{error}"
         );
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap(),
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap(),
             state.rust_usage_facts
         );
     }
@@ -2683,16 +2978,26 @@ helper::wrap! {
         let oid = oid_for(source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let conn = store.read_conn().unwrap();
         assert_eq!(
-            read_import_infos(&conn, &oid.to_string(), "rust").unwrap(),
+            read_import_infos(
+                &conn,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust")
+            )
+            .unwrap(),
             expected
         );
         drop(conn);
         assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap(),
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap(),
             expected_rust_facts,
             "Rust projections are rehydrated from canonical source-import properties"
         );
@@ -3063,8 +3368,7 @@ helper::wrap! {
             .iter()
             .map(|oid| {
                 AnalyzerStore::prepare_parsed_blob(
-                    *oid,
-                    "rust",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(*oid, "rust"),
                     generation,
                     &RustAdapter,
                     Arc::new(state.clone()),
@@ -3126,7 +3430,12 @@ helper::wrap! {
 
         let check = |store: &AnalyzerStore| {
             let routes = store
-                .rust_module_route_facts_while("rust", generation, &oids[..400], &|| true)
+                .rust_module_route_facts_while(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                    generation,
+                    &oids[..400],
+                    &|| true,
+                )
                 .unwrap()
                 .unwrap();
             assert_eq!(routes.len(), 400);
@@ -3136,7 +3445,13 @@ helper::wrap! {
                     .all(|route| route.item_macros.len() == 1 && route.item_macros[0].exported)
             );
             let properties = store
-                .rust_declaration_properties(oids[0], generation, &RustAdapter, &file, &|| true)
+                .rust_declaration_properties(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oids[0], "rust"),
+                    generation,
+                    &RustAdapter,
+                    &file,
+                    &|| true,
+                )
                 .unwrap()
                 .unwrap();
             assert_eq!(properties.len(), 5);
@@ -3155,7 +3470,7 @@ helper::wrap! {
             let conn = store.read_conn().unwrap();
             let blob_id: i64 = conn
                 .query_row(
-                    "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
+                    "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust' AND parse_variant = x''",
                     [&requested[0]],
                     |row| row.get(0),
                 )
@@ -3202,7 +3517,8 @@ helper::wrap! {
                     params![
                         requested[0],
                         generation.get(),
-                        source_facts::SOURCE_FACTS_VERSION
+                        source_facts::SOURCE_FACTS_VERSION,
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty
                     ],
                     |row| row.get::<_, String>(3),
                 )
@@ -3215,7 +3531,12 @@ helper::wrap! {
                     .all(|line| !line.starts_with("SCAN ") && !line.contains("MATERIALIZE")),
                 "declaration publication must seek populated rows: {property_manifest_plan:?}"
             );
-            let hydrated = read_import_infos_bulk(&conn, "rust", &requested).unwrap();
+            let hydrated = read_import_infos_bulk(
+                &conn,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                &requested,
+            )
+            .unwrap();
             assert_eq!(hydrated.len(), requested.len());
             assert!(hydrated.values().all(|imports| {
                 imports.len() == 1
@@ -3224,7 +3545,12 @@ helper::wrap! {
                         .as_ref()
                         .is_some_and(|path| path.lexical_scopes.len() == 1)
             }));
-            let rust_facts = read_rust_usage_facts_bulk(&conn, "rust", &requested).unwrap();
+            let rust_facts = read_rust_usage_facts_bulk(
+                &conn,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                &requested,
+            )
+            .unwrap();
             assert_eq!(rust_facts.len(), requested.len());
             assert!(rust_facts.values().all(|facts| {
                 facts.import_targets.len() == 1
@@ -3233,12 +3559,15 @@ helper::wrap! {
                     && facts.import_targets[0].source_import_id.is_some()
             }));
 
-            let params = chunk_params("rust", &requested);
+            let params = chunk_params(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                &requested,
+            );
             let readiness_plan = conn
                 .prepare(&format!(
                     "EXPLAIN QUERY PLAN SELECT keys.blob_oid FROM blobs AS keys
                  JOIN blob_meta AS meta ON meta.blob_id = keys.id
-                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
                    AND NOT EXISTS (SELECT 1 FROM rust_published_fact_blobs AS ready
                                    WHERE ready.blob_id = keys.id)"
                 ))
@@ -3261,7 +3590,7 @@ helper::wrap! {
                     facts.scope_start, facts.scope_end, facts.passthrough,
                     facts.exported, facts.declaration_id
                  FROM blobs AS keys JOIN rust_item_macros AS facts ON facts.blob_id = keys.id
-                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
                  ORDER BY keys.blob_oid, facts.ordinal"
             ))
                 .unwrap()
@@ -3310,7 +3639,7 @@ helper::wrap! {
                      facts.scope_start, facts.scope_end, facts.passthrough, facts.exported, facts.declaration_id
                  FROM rust_published_fact_blobs AS keys
                  JOIN rust_item_macros AS facts ON facts.blob_id = keys.blob_id AND facts.lang = keys.lang
-                 WHERE keys.lang = ?1 AND keys.generation = ?2 AND keys.blob_oid IN ({route_placeholders})
+                 WHERE keys.lang = ?1 AND keys.parse_variant = x'' AND keys.generation = ?2 AND keys.blob_oid IN ({route_placeholders})
                  ORDER BY keys.blob_oid, facts.ordinal"
             )).unwrap().query_map(params_from_iter(route_params.iter()), |row| row.get::<_, String>(3))
                 .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
@@ -3353,7 +3682,7 @@ helper::wrap! {
                 let sql = format!(
                     "SELECT keys.blob_oid, {fields} FROM rust_published_fact_blobs AS keys
                      JOIN {table} AS facts ON facts.blob_id = keys.blob_id AND facts.lang = keys.lang
-                     WHERE keys.lang = ?1 AND keys.generation = ?2 AND keys.blob_oid IN ({route_placeholders})
+                     WHERE keys.lang = ?1 AND keys.parse_variant = x'' AND keys.generation = ?2 AND keys.blob_oid IN ({route_placeholders})
                      ORDER BY keys.blob_oid, {order}"
                 );
                 let plan = conn
@@ -3391,7 +3720,12 @@ helper::wrap! {
                 ))
                 .unwrap()
                 .query_map(
-                    params![requested[0], 0, source_facts::SOURCE_FACTS_VERSION],
+                    params![
+                        requested[0],
+                        0,
+                        source_facts::SOURCE_FACTS_VERSION,
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty
+                    ],
                     |row| row.get::<_, String>(3),
                 )
                 .unwrap()
@@ -3556,8 +3890,7 @@ helper::wrap! {
             .iter()
             .map(|oid| {
                 AnalyzerStore::prepare_parsed_blob(
-                    *oid,
-                    "rust",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(*oid, "rust"),
                     generation,
                     &RustAdapter,
                     Arc::clone(&state),
@@ -3574,7 +3907,10 @@ helper::wrap! {
         let check = || {
             let conn = store.read_conn().unwrap();
             let sql = rust_import_module_segments_sql(&chunk_placeholders(&requested));
-            let params = chunk_params("rust", &requested);
+            let params = chunk_params(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                &requested,
+            );
             let plan = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                 .unwrap()
@@ -3593,7 +3929,12 @@ helper::wrap! {
                 !plan.iter().any(|detail| detail.starts_with("SCAN ")),
                 "{plan:?}"
             );
-            let rows = read_rust_usage_facts_bulk(&conn, "rust", &requested).unwrap();
+            let rows = read_rust_usage_facts_bulk(
+                &conn,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                &requested,
+            )
+            .unwrap();
             assert_eq!(rows.len(), requested.len());
             for oid in &requested {
                 assert_eq!(
@@ -3629,10 +3970,16 @@ helper::wrap! {
         let oid = oid_for(SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &parse_state(&RustAdapter, &file),
+            )
             .unwrap();
 
-        let facts = store.rust_usage_facts(oid, "rust").unwrap();
+        let facts = store
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+            .unwrap();
         assert_eq!(
             facts
                 .import_targets
@@ -3769,7 +4116,9 @@ helper::wrap! {
     fn rust_fact_rows_are_stable_across_a_re_analysis_of_the_same_content() {
         let temp = tempfile::TempDir::new().unwrap();
         let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
-        let first = store.rust_usage_facts(oid, "rust").unwrap();
+        let first = store
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+            .unwrap();
 
         // Same bytes at a different path: the content key is unchanged, so the
         // second analysis must produce byte-identical rows. Nothing persisted
@@ -3777,13 +4126,14 @@ helper::wrap! {
         let moved = write_file(temp.path(), "src/other/lib.rs", RUST_USAGE_FACT_FIXTURE);
         store
             .write_parsed_blob(
-                oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 &RustAdapter,
                 &parse_state(&RustAdapter, &moved),
             )
             .unwrap();
-        let second = store.rust_usage_facts(oid, "rust").unwrap();
+        let second = store
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+            .unwrap();
 
         assert_eq!(first, second);
 
@@ -3791,14 +4141,15 @@ helper::wrap! {
         let route_oid = oid_for(RUST_MODULE_ROUTE_FIXTURE.as_bytes());
         store
             .write_parsed_blob(
-                route_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(route_oid, "rust"),
                 &RustAdapter,
                 &parse_state(&RustAdapter, &route_file),
             )
             .unwrap();
         let first_routes = store
-            .rust_usage_facts(route_oid, "rust")
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                route_oid, "rust",
+            ))
             .unwrap()
             .module_routes;
         assert!(
@@ -3813,15 +4164,16 @@ helper::wrap! {
         );
         store
             .write_parsed_blob(
-                route_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(route_oid, "rust"),
                 &RustAdapter,
                 &parse_state(&RustAdapter, &moved_route_file),
             )
             .unwrap();
         assert_eq!(
             store
-                .rust_usage_facts(route_oid, "rust")
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    route_oid, "rust"
+                ))
                 .unwrap()
                 .module_routes,
             first_routes
@@ -3832,7 +4184,10 @@ helper::wrap! {
     fn rust_module_route_tables_record_scopes_routes_gates_and_item_macros() {
         let temp = tempfile::TempDir::new().unwrap();
         let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
-        let routes = store.rust_usage_facts(oid, "rust").unwrap().module_routes;
+        let routes = store
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+            .unwrap()
+            .module_routes;
 
         let scopes: Vec<_> = routes
             .scopes
@@ -4009,8 +4364,7 @@ helper::wrap! {
         let other_oid = oid_for(b"mod leaf;\n");
         store
             .write_parsed_blob(
-                other_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(other_oid, "rust"),
                 &RustAdapter,
                 &parse_state(&RustAdapter, &other),
             )
@@ -4019,32 +4373,54 @@ helper::wrap! {
         let generation = store.current_generation("rust").unwrap();
 
         let batched = store
-            .rust_module_route_facts_while("rust", generation, &[oid, other_oid, absent], &|| true)
+            .rust_module_route_facts_while(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                generation,
+                &[oid, other_oid, absent],
+                &|| true,
+            )
             .unwrap()
             .expect("uninterrupted route read");
 
         assert_eq!(batched.len(), 2, "an unanalyzed blob contributes no entry");
         let checkpoints = std::cell::Cell::new(0);
         let cancelled = store
-            .rust_module_route_facts_while("rust", generation, &[oid, other_oid, absent], &|| {
-                let visited = checkpoints.get();
-                checkpoints.set(visited + 1);
-                visited < 2
-            })
+            .rust_module_route_facts_while(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                generation,
+                &[oid, other_oid, absent],
+                &|| {
+                    let visited = checkpoints.get();
+                    checkpoints.set(visited + 1);
+                    visited < 2
+                },
+            )
             .unwrap();
         assert!(
             cancelled.is_none(),
             "cancelled route rows must not escape as a partial map"
         );
         let retried = store
-            .rust_module_route_facts_while("rust", generation, &[oid, other_oid, absent], &|| true)
+            .rust_module_route_facts_while(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                generation,
+                &[oid, other_oid, absent],
+                &|| true,
+            )
             .unwrap()
             .expect("retry after dropping the cancelled read transaction");
         assert_eq!(retried, batched);
         for key in [oid, other_oid] {
             assert_eq!(
                 batched.get(&key),
-                Some(&store.rust_usage_facts(key, "rust").unwrap().module_routes),
+                Some(
+                    &store
+                        .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                            key, "rust"
+                        ))
+                        .unwrap()
+                        .module_routes
+                ),
                 "batched and per-blob reads disagree for {key}"
             );
         }
@@ -4066,18 +4442,31 @@ helper::wrap! {
         let first_state = parse_state(&RustAdapter, &first_file);
         let expected_first = first_state.rust_usage_facts.clone();
         store
-            .write_parsed_blob(first_oid, "rust", &RustAdapter, &first_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(first_oid, "rust"),
+                &RustAdapter,
+                &first_state,
+            )
             .unwrap();
         let route_state = parse_state(&RustAdapter, &route_file);
         let expected_route = route_state.rust_usage_facts.clone();
         store
-            .write_parsed_blob(route_oid, "rust", &RustAdapter, &route_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(route_oid, "rust"),
+                &RustAdapter,
+                &route_state,
+            )
             .unwrap();
 
         let empty_oid = oid_for(b"a registered Rust blob with no fact rows");
         let generation = store.current_generation("rust").unwrap();
         store
-            .register_blobs(&[empty_oid], "rust", generation)
+            .register_blobs(
+                &[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    empty_oid, "rust",
+                )],
+                generation,
+            )
             .unwrap();
 
         let requested = [
@@ -4086,12 +4475,21 @@ helper::wrap! {
             empty_oid.to_string(),
         ];
         let conn = store.conn.lock().unwrap();
-        let bulk = read_rust_usage_facts_bulk(&conn, "rust", &requested).unwrap();
+        let bulk = read_rust_usage_facts_bulk(
+            &conn,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+            &requested,
+        )
+        .unwrap();
         assert_eq!(bulk.get(&first_oid.to_string()), Some(&expected_first));
         assert_eq!(bulk.get(&route_oid.to_string()), Some(&expected_route));
         assert!(!bulk.contains_key(&empty_oid.to_string()));
         assert_eq!(
-            read_rust_usage_facts(&conn, &empty_oid.to_string(), "rust").unwrap(),
+            read_rust_usage_facts(
+                &conn,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(empty_oid, "rust")
+            )
+            .unwrap(),
             RustUsageFacts::default(),
             "a zero-row blob must hydrate as the empty fact value"
         );
@@ -4102,7 +4500,12 @@ helper::wrap! {
             route_oid.to_string(),
             empty_oid.to_string(),
         ];
-        let repeated_bulk = read_rust_usage_facts_bulk(&conn, "rust", &repeated).unwrap();
+        let repeated_bulk = read_rust_usage_facts_bulk(
+            &conn,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+            &repeated,
+        )
+        .unwrap();
         assert_eq!(
             repeated_bulk, bulk,
             "duplicate OIDs must not duplicate facts"
@@ -4116,7 +4519,11 @@ helper::wrap! {
         let oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &parse_state(&RustAdapter, &file),
+            )
             .unwrap();
 
         let requested = [oid.to_string()];
@@ -4128,9 +4535,13 @@ helper::wrap! {
             },
             None,
         );
-        let stopped =
-            read_rust_usage_facts_bulk_with_session(&conn, "rust", &requested, Some(&session))
-                .unwrap();
+        let stopped = read_rust_usage_facts_bulk_with_session(
+            &conn,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+            &requested,
+            Some(&session),
+        )
+        .unwrap();
         assert!(
             stopped.is_none(),
             "a stopped bulk read must expose no partial map"
@@ -4193,7 +4604,11 @@ replay! { mod replayed; }
         let oid = oid_for(fixture.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &parse_state(&RustAdapter, &file),
+            )
             .unwrap();
         (store, oid)
     }
@@ -4213,8 +4628,7 @@ replay! { mod replayed; }
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                lang,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
                 generation,
                 adapter,
                 &state,

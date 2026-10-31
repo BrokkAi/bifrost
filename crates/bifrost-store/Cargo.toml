@@ -8,6 +8,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 publish = true
+exclude = ["tests/**"]
 rust-version.workspace = true
 description = "SQLite-backed analyzer store and resolution support for brokk-bifrost"
 

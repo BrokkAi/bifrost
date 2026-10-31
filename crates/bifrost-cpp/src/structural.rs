@@ -856,6 +856,17 @@ fn loop_variable<'tree>(loop_node: Node<'tree>, source: &'tree str) -> Option<&'
 impl brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSyntax
     for CppStructuralSpec
 {
+    fn supports_kind(
+        &self,
+        kind: brokk_bifrost_core::analyzer::statement_facts::StatementFactKind,
+    ) -> bool {
+        use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
+        !matches!(
+            kind,
+            StatementFactKind::NestedIfStatements | StatementFactKind::MisleadingIndentation
+        )
+    }
+
     fn roles<'tree>(&self, node: Node<'tree>, role: Role) -> Vec<Node<'tree>> {
         let target = match role {
             Role::Test if node.kind() == "case_statement" => node.child_by_field_name("value"),

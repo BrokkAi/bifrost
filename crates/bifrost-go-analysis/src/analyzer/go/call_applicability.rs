@@ -51,6 +51,14 @@ impl CallApplicabilityAdapter for GoCallApplicabilityAdapter {
         evaluation.go_receiver_binding_completion(candidate, call, signature)
     }
 
+    fn has_multivalued_call_arguments(&self) -> bool {
+        true
+    }
+
+    fn accepts_modeled_argument_results(&self, count: Option<usize>) -> bool {
+        count == Some(1)
+    }
+
     fn map_arguments(
         &self,
         call: &LoweredCallApplicabilityObligation,

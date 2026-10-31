@@ -4471,10 +4471,14 @@ func f(p string) {
                         native.answer
                     );
                     for frontier in native.answer.projected_frontiers() {
-                        assert!(
-                            matches!(frontier.completion(), ResolutionCompletion::Incomplete(_)),
-                            "modeled={modeled} {identifier}: {frontier:?}"
-                        );
+                        if modeled {
+                            assert_eq!(frontier.completion(), &ResolutionCompletion::Complete,
+                                "modeled={modeled} {identifier}: {frontier:?}");
+                            assert!(!frontier.possible_values().is_empty(), "{frontier:?}");
+                        } else {
+                            assert!(matches!(frontier.completion(), ResolutionCompletion::Incomplete(_)),
+                                "modeled={modeled} {identifier}: {frontier:?}");
+                        }
                         assert!(
                             !frontier.unindexed_external().is_empty(),
                             "modeled={modeled} {identifier}: {frontier:?}"

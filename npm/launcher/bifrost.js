@@ -18,8 +18,8 @@ export function platformPackageName(
   libc = platform === "linux" ? linuxLibc() : undefined,
 ) {
   const packages = {
-    "darwin-arm64": "@brokkai/bifrost-darwin-universal",
-    "darwin-x64": "@brokkai/bifrost-darwin-universal",
+    "darwin-arm64": "@brokkai/bifrost-darwin-arm64",
+    "darwin-x64": "@brokkai/bifrost-darwin-x64",
     "linux-arm64-gnu": "@brokkai/bifrost-linux-arm64-gnu",
     "linux-x64-gnu": "@brokkai/bifrost-linux-x64-gnu",
     "android-arm64": "@brokkai/bifrost-android-arm64",

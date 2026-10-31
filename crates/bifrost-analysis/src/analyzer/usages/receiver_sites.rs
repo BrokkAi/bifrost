@@ -167,7 +167,12 @@ impl ReceiverSiteIndex {
             if is_cancelled(cancellation) {
                 return ReceiverSiteSelection::Cancelled { inspected_sites };
             }
-            if inspected_sites >= limit.max_inspected_sites {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                inspected_sites,
+                limit.max_inspected_sites,
+            )
+            .allows(1)
+            {
                 return ReceiverSiteSelection::Exceeded { inspected_sites };
             }
             inspected_sites += 1;
@@ -270,7 +275,12 @@ pub(crate) fn build_receiver_site_index(
         if is_cancelled(cancellation) {
             return ReceiverSiteIndexBuild::Cancelled { inspected_work };
         }
-        if inspected_work >= limit.max_work_items {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            inspected_work,
+            limit.max_work_items,
+        )
+        .allows(1)
+        {
             return ReceiverSiteIndexBuild::Exceeded { inspected_work };
         }
         inspected_work += 1;
@@ -299,7 +309,12 @@ pub(crate) fn build_receiver_site_index(
             if is_cancelled(cancellation) {
                 return ReceiverSiteIndexBuild::Cancelled { inspected_work };
             }
-            if inspected_work >= limit.max_work_items {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                inspected_work,
+                limit.max_work_items,
+            )
+            .allows(1)
+            {
                 return ReceiverSiteIndexBuild::Exceeded { inspected_work };
             }
             inspected_work += 1;

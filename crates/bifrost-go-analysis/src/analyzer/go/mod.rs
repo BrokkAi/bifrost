@@ -1449,19 +1449,32 @@ impl GoAnalyzer {
 }
 
 impl TypeHierarchyProvider for GoAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.hierarchy_index(&code_unit.fq_name())
+    fn get_direct_ancestors(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+        let edges = self
+            .hierarchy_index(&code_unit.fq_name())
             .map(|index| index.direct_ancestors(code_unit))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
     }
 
     fn get_direct_descendants(
         &self,
         code_unit: &CodeUnit,
-    ) -> brokk_bifrost_core::hash::HashSet<CodeUnit> {
-        self.hierarchy_index(&code_unit.fq_name())
-            .map(|index| index.direct_descendants(code_unit))
-            .unwrap_or_default()
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+        match self.hierarchy_index(&code_unit.fq_name()) {
+            Ok(index) => {
+                let mut edges: Vec<_> = index.direct_descendants(code_unit).into_iter().collect();
+                edges.sort();
+                brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
+            }
+            Err(_) => brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+                open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable],
+                ..brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::default()
+            },
+        }
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
@@ -4501,31 +4514,7 @@ mod selector_calls {
             );
             return;
         }
-        let legacy_reasons = lookup
-            .native_resolution
-            .as_ref()
-            .map(|native| {
-                super::model_receiver::legacy_model_reasons(
-                    lookup.model_member_selection.as_deref(),
-                    &native.completion,
-                    &native.identities,
-                )
-            })
-            .unwrap_or_default();
-        let target = if !lookup.truncated
-            && !lookup.budget_exhausted
-            && !lookup.cancelled
-            && !legacy_reasons.is_empty()
-        {
-            let session = brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(query.budget, cancellation);
-            let target = crate::analyzer::usages::get_definition::go::go_g1b_legacy_model_receiver(
-                query,
-                &session,
-                &legacy_reasons,
-            );
-            session.finish(target)
-        } else {
-            go_typed_selector_target(
+        let target = go_typed_selector_target(
             analyzer,
             token,
             file,
@@ -4537,8 +4526,7 @@ mod selector_calls {
             receiver.start_byte(),
             brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
             cancellation,
-        )
-        };
+        );
         match target {
             BoundedResolution::Complete {
                 value: Some(target),

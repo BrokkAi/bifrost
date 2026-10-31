@@ -158,7 +158,8 @@ fn report_unsupported(
     if !reported.insert((language, relation.clone())) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -171,7 +172,7 @@ fn report_unsupported(
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 /// The source files whose language adapters can contribute rows to a plan.

@@ -4970,10 +4970,10 @@ pub(super) fn validate_dependency_configuration_relation(
             "owner must be a nonempty exact topology identity of at most 1024 bytes",
         ));
     }
-    if !["npm", "cargo"].contains(&relation.ecosystem.as_str()) {
+    if !["npm", "cargo", "nuget"].contains(&relation.ecosystem.as_str()) {
         return Err(QueryError::new(
             child_query_path(path, "ecosystem"),
-            "dependency_configuration supports exactly npm or cargo",
+            "dependency_configuration supports exactly npm, cargo or nuget",
         ));
     }
     if relation.version_ranges.is_empty() || relation.version_ranges.len() > 32 {

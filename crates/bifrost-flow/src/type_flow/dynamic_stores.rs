@@ -1552,3 +1552,120 @@ fn open_global(effect: &mut ScopedDynamicWrite, reason: UnknownReason) {
     effect.global = true;
     effect.evidence.reason = Some(reason);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{AnalyzerConfig, Language, Range};
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn overloaded_write_retains_reverse_caller_roots() {
+        for (case, source) in [
+            (
+                "exact control",
+                "class C { public void Write(object rhs) {} public void Write(C rhs) {} public void Caller(object rhs) { Write(rhs); } }",
+            ),
+            (
+                "ambiguous overload",
+                "class Outer { class C { public void Write(object rhs) {} public void Write(C rhs) {} public void Caller(object rhs) { Write((C)rhs); } } }",
+            ),
+        ] {
+            let project = InlineTestProject::with_language(Language::CSharp)
+                .file("P.cs", source)
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let file = project.file("P.cs");
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("materialize C# control")
+                .available_value()
+                .cloned()
+                .expect("C# semantics");
+            let procedures = artifact
+                .procedures()
+                .iter()
+                .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
+                .collect::<Vec<_>>();
+            let named = |procedure: &&ProcedureHandle, name: &str| {
+                procedure
+                    .semantics()
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            };
+            let caller = procedures
+                .iter()
+                .find(|procedure| named(procedure, "Caller"))
+                .expect("caller procedure");
+            let target = procedures
+                .iter()
+                .find(|procedure| {
+                    if !named(procedure, "Write") {
+                        return false;
+                    }
+                    let span = procedure.semantics().locator().anchor().span();
+                    workspace
+                        .analyzer()
+                        .enclosing_code_unit(
+                            &file,
+                            &Range {
+                                start_byte: span.start_byte() as usize,
+                                end_byte: span.end_byte() as usize,
+                                start_line: span.start().line() as usize,
+                                end_line: span.end().line() as usize,
+                            },
+                        )
+                        .is_some_and(|unit| unit.signature() == Some("(object)"))
+                })
+                .expect("object overload procedure");
+            let caller = SemanticProcedureReference::of(caller);
+            // Feed the real reverse-caller prepass a write owned by this
+            // overload; C# itself does not publish arbitrary-name writes.
+            let write = PendingDynamicWrite {
+                procedure: SemanticProcedureReference::of(target),
+                names: DynamicFieldNameSet::Any,
+                site: SourceSite {
+                    file,
+                    span: target.semantics().locator().anchor().span(),
+                    kind: SourceSiteKind::Unknown,
+                },
+                // Receiver preparation is not read by the caller prepass.
+                prepared: PreparedWrite {
+                    structural: StructuralWriteReceiverBound::NotApplicable,
+                    receiver_field: None,
+                    interference: StructuralWriteReceiverBound::NotApplicable,
+                    explicitly_unbounded: false,
+                    receiver_bound: None,
+                    observation: None,
+                },
+            };
+            let result = candidate_roots(
+                &workspace,
+                std::slice::from_ref(&caller),
+                &[write],
+                &cancellation,
+            )
+            .expect("reverse-caller prepass");
+            println!(
+                "{case}: caller_retained={} unbounded={:?}",
+                result.roots.contains(&caller),
+                result.unbounded
+            );
+            assert!(
+                result.unbounded.is_empty(),
+                "{case}: {:?}",
+                result.unbounded
+            );
+            assert!(result.roots.contains(&caller), "{case}: {:?}", result.roots);
+        }
+    }
+}

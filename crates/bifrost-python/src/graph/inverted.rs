@@ -897,6 +897,8 @@ fn handle_attribute(
             let inherited = ctx.graph.hierarchy.map_or_else(Vec::new, |provider| {
                 provider
                     .get_ancestors(&class)
+                    .definite()
+                    .to_vec()
                     .into_iter()
                     .map(|ancestor| format!("{}.{attribute_text}", ancestor.fq_name()))
                     .collect()

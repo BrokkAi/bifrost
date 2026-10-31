@@ -73,55 +73,75 @@ mod python_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
-                python_oid,
-                "python",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(python_oid, "python"),
                 &PythonAdapter::for_test_file(&python_file),
                 &parse_state(&PythonAdapter::for_test_file(&python_file), &python_file),
             )
             .unwrap();
         store
             .write_parsed_blob(
-                java_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(java_oid, "java"),
                 &JavaAdapter,
                 &parse_state(&JavaAdapter, &java_file),
             )
             .unwrap();
         store
-            .register_blobs(&[incomplete_oid], "rust", GenerationId::BOOTSTRAP)
+            .register_blobs(
+                &[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    incomplete_oid,
+                    "rust",
+                )],
+                GenerationId::BOOTSTRAP,
+            )
             .unwrap();
 
         let mut entries = vec![
-            (python_oid, "python".to_string()),
-            (python_oid, "java".to_string()),
-            (java_oid, "java".to_string()),
-            (incomplete_oid, "rust".to_string()),
-            (missing_oid, "python".to_string()),
-            (python_oid, "python".to_string()),
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(python_oid, "python"),
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(python_oid, "java"),
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(java_oid, "java"),
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(incomplete_oid, "rust"),
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(missing_oid, "python"),
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(python_oid, "python"),
         ];
         let bulk_missing = (0..405)
             .map(|index| oid_for(format!("bulk missing {index}").as_bytes()))
             .collect::<Vec<_>>();
-        entries.extend(bulk_missing.iter().map(|oid| (*oid, "python".to_string())));
+        entries.extend(
+            bulk_missing
+                .iter()
+                .map(|oid| brokk_bifrost_core::gitblob::BlobKey::unvaried(*oid, "python")),
+        );
         assert_eq!(
             store.parsed_blob_keys(&entries).unwrap(),
             [
-                (python_oid, "python".to_string()),
-                (java_oid, "java".to_string()),
+                brokk_bifrost_core::gitblob::BlobKey::unvaried(python_oid, "python"),
+                brokk_bifrost_core::gitblob::BlobKey::unvaried(java_oid, "java"),
             ]
             .into_iter()
             .collect::<HashSet<_>>()
         );
         let missing = store.missing_parsed_blob_keys(&entries).unwrap();
         assert_eq!(missing.len(), 408);
-        assert!(missing.contains(&(python_oid, "java".to_string())));
-        assert!(missing.contains(&(incomplete_oid, "rust".to_string())));
-        assert!(missing.contains(&(missing_oid, "python".to_string())));
         assert!(
-            bulk_missing
-                .iter()
-                .all(|oid| missing.contains(&(*oid, "python".to_string())))
+            missing.contains(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                python_oid, "java"
+            ))
         );
+        assert!(
+            missing.contains(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                incomplete_oid,
+                "rust"
+            ))
+        );
+        assert!(
+            missing.contains(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                missing_oid,
+                "python"
+            ))
+        );
+        assert!(bulk_missing.iter().all(|oid| missing.contains(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(*oid, "python")
+        )));
     }
     #[test]
     fn metadata_unit_count_mismatch_is_treated_as_incomplete() {
@@ -134,7 +154,11 @@ mod python_extraction_tests {
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "python", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &state,
+            )
             .unwrap();
 
         {
@@ -156,10 +180,20 @@ mod python_extraction_tests {
             .unwrap();
         }
 
-        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "python"
+                ))
+                .unwrap()
+        );
         assert!(
             store
-                .hydrate_file_state(oid, "python", &adapter, &file)
+                .hydrate_file_state(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                    &adapter,
+                    &file
+                )
                 .unwrap()
                 .is_none()
         );
@@ -173,8 +207,7 @@ mod python_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
-                oid,
-                "python",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
                 &PythonAdapter::for_test_file(&file),
                 &parse_state(&PythonAdapter::for_test_file(&file), &file),
             )
@@ -193,9 +226,19 @@ mod python_extraction_tests {
             .unwrap();
         }
 
-        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "python"
+                ))
+                .unwrap()
+        );
         let error = store
-            .hydrate_file_state(oid, "python", &PythonAdapter::for_test_file(&file), &file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &PythonAdapter::for_test_file(&file),
+                &file,
+            )
             .unwrap_err();
         assert!(error.to_string().contains("unknown optional analyzer fact"));
     }
@@ -236,18 +279,34 @@ mod python_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
 
         store
-            .write_parsed_blob(oid, "python", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &state,
+            )
             .unwrap();
 
-        assert!(store.contains_parsed_blob(oid, "python").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "python"
+                ))
+                .unwrap()
+        );
         assert_eq!(
             store
-                .missing_parsed_blob_keys(&[(oid, "python".to_string())])
+                .missing_parsed_blob_keys(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "python"
+                )])
                 .unwrap(),
-            Vec::<(Oid, String)>::new()
+            Vec::<brokk_bifrost_core::gitblob::BlobKey>::new()
         );
         let hydrated = store
-            .hydrate_file_state(oid, "python", &adapter, &file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &file,
+            )
             .unwrap()
             .unwrap();
         assert_file_state_equivalent(&state, &hydrated);
@@ -263,8 +322,7 @@ mod python_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 a,
                 &JavaAdapter,
                 &state,
@@ -409,8 +467,7 @@ mod python_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                python_oid,
-                "python",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(python_oid, "python"),
                 python_generation,
                 &python_adapter,
                 &parse_state(&python_adapter, &python_file),
@@ -531,8 +588,7 @@ mod python_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                current_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(current_oid, "java"),
                 b,
                 &JavaAdapter,
                 &parse_state(&JavaAdapter, &current_file),
@@ -600,7 +656,11 @@ mod python_extraction_tests {
             let oid = oid_for(file.read_to_string().unwrap().as_bytes());
             let store = AnalyzerStore::open_ephemeral().unwrap();
             store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    &RustAdapter,
+                    &parse_state(&RustAdapter, &file),
+                )
                 .unwrap();
 
             let conn = store.conn.lock().expect("store mutex");
@@ -646,11 +706,19 @@ mod python_extraction_tests {
         let parsed = parse_state(&adapter, &python_file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "python", &adapter, &parsed)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &parsed,
+            )
             .unwrap();
 
         let hydrated = store
-            .hydrate_file_state(oid, "python", &adapter, &python_file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &python_file,
+            )
             .unwrap()
             .unwrap();
         assert_file_state_equivalent(&parsed, &hydrated);
@@ -681,20 +749,47 @@ mod python_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
 
         store
-            .write_parsed_blob(oid, "python", &adapter, &state_a)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &state_a,
+            )
             .unwrap();
-        let first_count = store.content_row_count(oid, "python").unwrap();
+        let first_count = store
+            .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "python",
+            ))
+            .unwrap();
         store
-            .write_parsed_blob(oid, "python", &adapter, &state_b)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &state_b,
+            )
             .unwrap();
-        assert_eq!(store.content_row_count(oid, "python").unwrap(), first_count);
+        assert_eq!(
+            store
+                .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "python"
+                ))
+                .unwrap(),
+            first_count
+        );
 
         let hydrated_a = store
-            .hydrate_file_state(oid, "python", &adapter, &file_a)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &file_a,
+            )
             .unwrap()
             .unwrap();
         let hydrated_b = store
-            .hydrate_file_state(oid, "python", &adapter, &file_b)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &adapter,
+                &file_b,
+            )
             .unwrap()
             .unwrap();
         assert_file_state_equivalent(&state_a, &hydrated_a);
@@ -741,7 +836,11 @@ mod python_extraction_tests {
         let canonical_oid = oid_for(canonical_state.source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(canonical_oid, "java", &JavaAdapter, &canonical_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(canonical_oid, "java"),
+                &JavaAdapter,
+                &canonical_state,
+            )
             .unwrap();
         let generation = store.current_generation("java").unwrap();
         let canonical_distractor_oids: Vec<_> = (0..900)
@@ -751,8 +850,7 @@ mod python_extraction_tests {
             .iter()
             .map(|oid| {
                 AnalyzerStore::prepare_parsed_blob(
-                    *oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(*oid, "java"),
                     generation,
                     &JavaAdapter,
                     Arc::new(distractor_state.clone()),

@@ -150,6 +150,7 @@ pub(crate) struct MemberAccessEvidence {
     pub(super) outcome: AccessOutcome,
 }
 pub(crate) struct MemberAccessResult {
+    pub query_obligations: crate::analyzer::resolution::QueryObligations,
     pub targets: Vec<SelectedMemberRouteTarget>,
     pub evidence: MemberAccessEvidence,
     pub completion: ResolutionCompletion,
@@ -739,6 +740,7 @@ impl MemberAccessReduction {
             }
         }
         MemberAccessResult {
+            query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
             targets,
             evidence: MemberAccessEvidence {
                 bindings,
@@ -1236,6 +1238,7 @@ pub(super) struct QualifiedReferenceInputs {
         DemandReferenceKey,
     )>,
     pub completion: ResolutionCompletion,
+    query_obligations: crate::analyzer::resolution::QueryObligations,
 }
 impl QualifiedReferenceInputs {
     pub fn new(keys: impl IntoIterator<Item = DemandReferenceKey>) -> Self {
@@ -1246,7 +1249,14 @@ impl QualifiedReferenceInputs {
             answers: Vec::new(),
             outstanding: None,
             completion: ResolutionCompletion::Complete,
+            query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
         }
+    }
+    pub fn record_query_obligations(
+        &self,
+        scope: &mut crate::analyzer::resolution::QueryObligations,
+    ) {
+        scope.union(&self.query_obligations);
     }
     pub fn answers(&self) -> impl Iterator<Item = (DemandReferenceKey, &FactResolutionAnswer)> {
         self.answers
@@ -1280,6 +1290,7 @@ impl QualifiedReferenceInputs {
                 );
                 continuation.assert_current(provenance);
                 assert_eq!(self.keys[self.cursor], key);
+                self.query_obligations.union(&answer.query_obligations);
                 self.completion = self.completion.combine(answer.completion());
                 let Some(answer) = answer.clone_with_poll(&mut || {
                     !closer_step(session, cancellation, CloserWork::CandidateClassification)
@@ -1326,6 +1337,7 @@ pub(super) struct QualifiedMemberAccessSlot<Row> {
     providers: ProviderObservationStore,
     completion: ResolutionCompletion,
     cancellation_evidence: ResolutionCompletion,
+    query_obligations: crate::analyzer::resolution::QueryObligations,
     continuation: Option<crate::analyzer::resolution::CloseContinuationId>,
 }
 impl<Context, Row> QualifiedMemberSlot<Context, Row> {
@@ -1338,6 +1350,7 @@ impl<Context, Row> QualifiedMemberSlot<Context, Row> {
                 providers: ProviderObservationStore::default(),
                 completion: ResolutionCompletion::Complete,
                 cancellation_evidence: ResolutionCompletion::Complete,
+                query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
                 continuation: None,
             },
         }
@@ -1382,6 +1395,7 @@ impl<Row> QualifiedMemberAccessSlot<Row> {
                 key,
                 answer,
             } => {
+                self.query_obligations.union(&answer.query_obligations);
                 assert_eq!(self.continuation.take(), Some(continuation));
                 continuation.assert_current(provenance);
                 match self
@@ -1426,12 +1440,15 @@ impl<Row> QualifiedMemberAccessSlot<Row> {
             observations,
         )? {
             Read::Ready {
-                value: MemberAccessProgress::Ready(result),
+                value: MemberAccessProgress::Ready(mut result),
                 completion,
-            } => Ok(CloseProgress::Ready(Read::Ready {
-                value: result,
-                completion,
-            })),
+            } => {
+                result.query_obligations.union(&self.query_obligations);
+                Ok(CloseProgress::Ready(Read::Ready {
+                    value: result,
+                    completion,
+                }))
+            }
             Read::Ready {
                 value: MemberAccessProgress::Awaiting(request),
                 completion,

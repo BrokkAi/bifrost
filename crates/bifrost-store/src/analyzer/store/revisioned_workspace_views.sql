@@ -25,7 +25,7 @@ FROM selected_workspace_revisions;
 CREATE TEMP VIEW IF NOT EXISTS selected_workspace_file_versions AS
 SELECT selected.workspace_id, selected.revision,
        versions.file_version_id, versions.lang, versions.generation,
-       versions.rel_path, versions.blob_oid, versions.projection_digest,
+       versions.rel_path, versions.blob_oid, x'' AS parse_variant, versions.projection_digest,
        versions.valid_from
 FROM main.workspace_file_versions AS versions
 JOIN selected_workspace_revisions AS selected
@@ -37,7 +37,7 @@ WHERE versions.input_kind = 'source'
   AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until);
 
 CREATE TEMP VIEW IF NOT EXISTS workspace_files AS
-SELECT file_version_id AS file_id, lang, generation, rel_path, blob_oid
+SELECT file_version_id AS file_id, lang, generation, rel_path, blob_oid, parse_variant
 FROM selected_workspace_file_versions;
 
 CREATE TEMP VIEW IF NOT EXISTS workspace_package_files AS
@@ -69,11 +69,12 @@ JOIN workspace_files AS files ON files.file_id = rows.file_version_id;
 
 CREATE TEMP VIEW IF NOT EXISTS live_workspace_files AS
 SELECT files.file_id, files.lang, files.generation, files.rel_path,
-       files.blob_oid, live.blob_id
+       files.blob_oid, live.blob_id, files.parse_variant
 FROM workspace_files AS files
 LEFT JOIN main.analysis_epochs AS epochs ON epochs.lang = files.lang
 JOIN main.live_parsed_blobs AS live
   ON live.lang = files.lang AND live.blob_oid = files.blob_oid
+ AND live.parse_variant = files.parse_variant
 WHERE files.generation = COALESCE(epochs.generation, 0);
 
 -- Callable-facts lookup needs to distinguish "no callable has this name" from
@@ -105,6 +106,7 @@ CROSS JOIN main.workspace_file_versions AS files
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = blobs.blob_oid
+ AND blobs.parse_variant = x''
 LEFT JOIN main.analysis_epochs AS epochs
   ON epochs.lang = files.lang
 LEFT JOIN main.source_fact_readiness AS visibility
@@ -134,7 +136,7 @@ CROSS JOIN selected_workspace_revisions AS selected
  AND selected.lang = files.lang
  AND selected.generation = files.generation
 CROSS JOIN main.blobs AS blobs
-  ON blobs.lang = files.lang AND blobs.blob_oid = files.blob_oid
+  ON blobs.lang = files.lang AND blobs.blob_oid = files.blob_oid AND blobs.parse_variant = x''
 CROSS JOIN main.blob_meta AS meta
   ON meta.blob_id = blobs.id
 CROSS JOIN main.code_units AS units INDEXED BY idx_code_units_anchored_parent_identifier
@@ -412,6 +414,7 @@ SELECT names.lang, names.generation, names.rel_path, names.blob_oid,
        metadata.type_parameters_recorded, metadata.result_type_identities,
        metadata.parameter_type_identities,
        metadata.callable_override_modifier,
+       metadata.overload_discriminator,
        metadata.java_constructor_shape, metadata.java_constructor_arity_required,
        metadata.java_constructor_arity_total, metadata.java_constructor_arity_repeated,
        metadata.class_like_kind, metadata.metadata_available,

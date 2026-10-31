@@ -123,9 +123,10 @@ fn real_collector_root_seeks_have_constant_vm_work_across_history_sizes() {
                     "EXPLAIN QUERY PLAN {DELETE_ANALYZER_CANDIDATE_SQL}"
                 ))
                 .unwrap()
-                .query_map(rusqlite::params![OID, "java", 1], |row| {
-                    row.get::<_, String>(3)
-                })
+                .query_map(
+                    rusqlite::params![OID, "java", 1, ParseVariant::Empty],
+                    |row| row.get::<_, String>(3),
+                )
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
@@ -137,7 +138,9 @@ fn real_collector_root_seeks_have_constant_vm_work_across_history_sizes() {
             );
             let mut delete = conn.prepare(DELETE_ANALYZER_CANDIDATE_SQL).unwrap();
             assert_eq!(
-                delete.execute(rusqlite::params![OID, "java", 1]).unwrap(),
+                delete
+                    .execute(rusqlite::params![OID, "java", 1, ParseVariant::Empty])
+                    .unwrap(),
                 0
             );
             let vm = delete.get_status(rusqlite::StatementStatus::VmStep);

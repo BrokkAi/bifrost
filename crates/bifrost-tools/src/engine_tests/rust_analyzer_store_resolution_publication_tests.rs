@@ -68,8 +68,7 @@ mod rust_departing_root_tests {
     fn prepared(snapshot: &WorkspaceSnapshotId) -> PreparedParsedBlob {
         let state = parsed_fixture_state(&RustAdapter, HOST, SOURCE);
         AnalyzerStore::prepare_parsed_blob(
-            oid(SOURCE.as_bytes()),
-            "rust",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(SOURCE.as_bytes()), "rust"),
             snapshot.generation,
             &RustAdapter,
             state,
@@ -122,7 +121,10 @@ mod rust_departing_root_tests {
                 .admit_cached_selected_content(
                     &snapshot,
                     HOST,
-                    witness.blob_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        witness.blob_oid(),
+                        snapshot.lang.as_str(),
+                    ),
                     witness.input(),
                     &CancellationToken::default(),
                 )
@@ -192,7 +194,10 @@ mod rust_departing_root_tests {
                 .admit_cached_selected_content(
                     &second,
                     HOST,
-                    witness.blob_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        witness.blob_oid(),
+                        second.lang.as_str(),
+                    ),
                     witness.input(),
                     &CancellationToken::default(),
                 )
@@ -220,7 +225,10 @@ mod rust_departing_root_tests {
                 .admit_cached_selected_content(
                     &later,
                     HOST,
-                    witness.blob_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        witness.blob_oid(),
+                        later.lang.as_str(),
+                    ),
                     witness.input(),
                     &CancellationToken::default(),
                 )
@@ -270,7 +278,10 @@ mod rust_departing_root_tests {
                 .admit_cached_selected_content(
                     &snapshot,
                     HOST,
-                    witness.blob_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        witness.blob_oid(),
+                        snapshot.lang.as_str()
+                    ),
                     witness.input(),
                     &CancellationToken::default()
                 )
@@ -287,7 +298,10 @@ mod rust_departing_root_tests {
                 .admit_cached_selected_content(
                     &snapshot,
                     HOST,
-                    witness.blob_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        witness.blob_oid(),
+                        snapshot.lang.as_str()
+                    ),
                     witness.input(),
                     &CancellationToken::default()
                 )
@@ -309,7 +323,7 @@ mod rust_departing_root_tests {
         let snapshot = owner(&store, 'f');
         let witness = publish(&store, &snapshot).into_parts().0;
         let wrong = ResolutionContentInput::Parsed {
-            content_oid: witness.blob_oid(),
+            key: brokk_bifrost_core::gitblob::BlobKey::unvaried(witness.blob_oid(), "rust"),
             semantic_language: Language::Java,
         };
         assert!(matches!(
@@ -317,7 +331,10 @@ mod rust_departing_root_tests {
                 .admit_cached_selected_content(
                     &snapshot,
                     HOST,
-                    witness.blob_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        witness.blob_oid(),
+                        snapshot.lang.as_str()
+                    ),
                     &wrong,
                     &CancellationToken::default()
                 )
@@ -364,7 +381,10 @@ mod rust_departing_root_tests {
                 .admit_cached_selected_content(
                     &snapshot,
                     HOST,
-                    witness.blob_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        witness.blob_oid(),
+                        snapshot.lang.as_str()
+                    ),
                     witness.input(),
                     &cancelled
                 )
@@ -384,7 +404,10 @@ mod rust_departing_root_tests {
                 .admit_cached_selected_content(
                     &snapshot,
                     HOST,
-                    witness.blob_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        witness.blob_oid(),
+                        snapshot.lang.as_str(),
+                    ),
                     witness.input(),
                     &CancellationToken::default(),
                 )
@@ -451,8 +474,14 @@ mod rust_departing_root_tests {
             let mut statement = conn
                 .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
                 .unwrap();
-            persisted_blob_mutation_cost_fallback_statement(&mut statement, &raw_oid, "rust")
-                .unwrap()
+            persisted_blob_mutation_cost_fallback_statement(
+                &mut statement,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    git2::Oid::from_str(&raw_oid).unwrap(),
+                    "rust",
+                ),
+            )
+            .unwrap()
         });
         assert_eq!(
             fallback.logical_rows + 1,
@@ -491,8 +520,7 @@ mod rust_departing_root_tests {
         let state = parsed_fixture_state(&RustAdapter, HOST, source);
         let oid = oid(source.as_bytes());
         let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "rust",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
             snapshot.generation,
             &RustAdapter,
             state,
@@ -593,7 +621,7 @@ mod rust_departing_root_tests {
             let blob_oid = git2::Oid::from_str(&captured("BIFROST_RP_CHILD_OID")).unwrap();
             assert_eq!(captured("BIFROST_RP_CHILD_SEMANTIC_LANGUAGE"), "rust");
             let input = ResolutionContentInput::Parsed {
-                content_oid: blob_oid,
+                key: brokk_bifrost_core::gitblob::BlobKey::unvaried(blob_oid, "rust"),
                 semantic_language: Language::Rust,
             };
             ready(
@@ -601,7 +629,10 @@ mod rust_departing_root_tests {
                     .admit_cached_selected_content(
                         &snapshot,
                         &captured("BIFROST_RP_CHILD_HOST"),
-                        blob_oid,
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                            blob_oid,
+                            snapshot.lang.as_str(),
+                        ),
                         &input,
                         &CancellationToken::default(),
                     )
@@ -636,7 +667,7 @@ mod rust_departing_root_tests {
         let result = collector.gc_with(move |candidate| {
         assert_eq!(candidate, witness.blob_oid().to_string());
         assert_eq!(witness.input(), &ResolutionContentInput::Parsed {
-            content_oid: witness.blob_oid(), semantic_language: Language::Rust,
+            key: brokk_bifrost_core::gitblob::BlobKey::unvaried(witness.blob_oid(), "rust"), semantic_language: Language::Rust,
         });
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "engine_tests::rust_analyzer_store_resolution_publication_tests::rust_departing_root_tests::collector_snapshot_cannot_delete_an_externally_admitted_cached_blob", "--nocapture"])
@@ -702,7 +733,10 @@ mod rust_departing_root_tests {
                     .admit_cached_selected_content(
                         &snapshot,
                         HOST,
-                        witness.blob_oid(),
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                            witness.blob_oid(),
+                            snapshot.lang.as_str(),
+                        ),
                         witness.input(),
                         &CancellationToken::default(),
                     )
@@ -919,8 +953,7 @@ mod rust_departing_root_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let snapshot = owner(&store, 'a');
         let parsed = AnalyzerStore::prepare_parsed_blob(
-            oid(SOURCE.as_bytes()),
-            "rust",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(SOURCE.as_bytes()), "rust"),
             snapshot.generation,
             &RustAdapter,
             parsed_fixture_state(&RustAdapter, HOST, SOURCE),
@@ -969,8 +1002,8 @@ mod rust_departing_root_tests {
         }
         assert_eq!(projection_rows,expected_projection_rows);
         assert_eq!(projection_bytes,expected_projection_bytes);
-        let fast: (usize,usize)=conn.query_row(&stored_blob_cascade_costs_sql(1),params![raw_oid,"rust"],|row|Ok((row.get(3)?,row.get(4)?))).unwrap();
-        let fallback=persisted_blob_mutation_cost_fallback_statement(&mut conn.prepare_cached(persisted_blob_mutation_cost_fallback_sql()).unwrap(),&raw_oid,"rust").unwrap();
+        let fast: (usize,usize)=conn.query_row(&stored_blob_cascade_costs_sql(1),params![raw_oid,"rust",brokk_bifrost_core::gitblob::ParseVariant::Empty],|row|Ok((row.get(3)?,row.get(4)?))).unwrap();
+        let fallback=persisted_blob_mutation_cost_fallback_statement(&mut conn.prepare_cached(persisted_blob_mutation_cost_fallback_sql()).unwrap(),&brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::from_str(&raw_oid).unwrap(), "rust")).unwrap();
         assert_eq!(fast,(fallback.logical_rows,fallback.payload_bytes));
         let measured: (usize,usize)=conn.query_row(&format!("SELECT {}, {}",rust_projection_cascade_rows_sql(&blob_id.to_string()),rust_projection_cascade_payload_bytes_sql(&blob_id.to_string())),[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(measured,(projection_rows,projection_bytes));
@@ -981,7 +1014,7 @@ mod rust_departing_root_tests {
         let fq_segments: usize=tx.query_row("SELECT count(*) FROM code_unit_fq_segments WHERE blob_id=?1",[blob_id],|row|row.get(0)).unwrap();
         eprintln!("RP Rust projection previously omitted FQ segments={fq_segments}");
         assert_eq!(fq_segments,2,"the actual stored family explains stale460 versus deletion462");
-        let stale: usize=tx.query_row(stale_generation_blob_costs_sql(),[],|row|row.get(2)).unwrap();
+        let stale: usize=tx.query_row(stale_generation_blob_costs_sql(),[],|row|row.get(3)).unwrap();
         let before=counted_logical_store_rows(&tx,&tables);
         tx.execute("DELETE FROM blobs WHERE id=?1",[blob_id]).unwrap();
         let deleted=before-counted_logical_store_rows(&tx,&tables);

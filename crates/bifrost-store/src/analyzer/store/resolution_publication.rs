@@ -120,7 +120,7 @@ impl ResolutionCapsuleKey {
 #[doc(hidden)]
 pub enum ResolutionContentInput {
     Parsed {
-        content_oid: Oid,
+        key: super::BlobKey,
         semantic_language: super::Language,
     },
     Capsule {
@@ -138,7 +138,7 @@ pub struct ResolutionContentWitness {
     #[doc(hidden)]
     pub blob_id: i64,
     #[doc(hidden)]
-    pub blob_oid: Oid,
+    pub key: super::BlobKey,
     #[doc(hidden)]
     pub manifest_digest: [u8; 32],
     manifest_counts: ResolutionManifestCounts,
@@ -162,7 +162,7 @@ impl ResolutionContentWitness {
     }
     #[doc(hidden)]
     pub const fn blob_oid(&self) -> Oid {
-        self.blob_oid
+        self.key.oid
     }
     #[doc(hidden)]
     pub const fn manifest_digest(&self) -> [u8; 32] {
@@ -263,8 +263,7 @@ pub struct PreparedResolutionCapsule {
 /// keys are deferred. Capture all extant owners of this one blob before DELETE.
 pub(super) fn repair_owners_tx(
     tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
+    key: &super::BlobKey,
     generation: super::GenerationId,
     cancellation: &CancellationToken,
 ) -> Result<Option<Vec<WorkspaceSnapshotId>>> {
@@ -276,18 +275,21 @@ pub(super) fn repair_owners_tx(
            ON revision.workspace_id = roots.workspace_id AND revision.lang = roots.lang
           AND revision.generation = roots.generation AND revision.revision = roots.revision
          LEFT JOIN analysis_epochs AS epoch ON epoch.lang = blob.lang
-         WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.generation = ?3
+         WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.generation = ?3 AND blob.parse_variant = ?4
            AND roots.lang = blob.lang AND roots.generation = blob.generation
            AND COALESCE(epoch.generation, 0) = blob.generation",
     )?;
-    let rows = statement.query_map(params![oid, lang, generation.0], |row| {
-        Ok(WorkspaceSnapshotId {
-            workspace_id: super::WorkspaceId(row.get(0)?),
-            lang: row.get(1)?,
-            generation: super::GenerationId(row.get(2)?),
-            revision: row.get(3)?,
-        })
-    })?;
+    let rows = statement.query_map(
+        params![key.oid.to_string(), key.lang, generation.0, key.variant],
+        |row| {
+            Ok(WorkspaceSnapshotId {
+                workspace_id: super::WorkspaceId(row.get(0)?),
+                lang: row.get(1)?,
+                generation: super::GenerationId(row.get(2)?),
+                revision: row.get(3)?,
+            })
+        },
+    )?;
     let mut owners = Vec::new();
     for row in rows {
         if cancellation.is_cancelled() {
@@ -378,7 +380,7 @@ fn publication_receipt_tx(
     tx: &Transaction<'_>,
     owner: &WorkspaceSnapshotId,
     blob_id: i64,
-    blob_oid: Oid,
+    key: super::BlobKey,
     input: ResolutionContentInput,
     cancellation: &CancellationToken,
 ) -> Result<Option<PublishedResolutionContent>> {
@@ -395,7 +397,7 @@ fn publication_receipt_tx(
         Ok(ResolutionContentWitness {
             owner: owner.clone(),
             blob_id,
-            blob_oid,
+            key,
             manifest_digest: row.get(0)?,
             producer_epoch: row.get(1)?,
             logical_rows: row.get(2)?,
@@ -451,7 +453,7 @@ impl AnalyzerStore {
                     {
                         return Ok(outcome);
                     }
-                    if prepared.generation != owner.generation || prepared.lang != owner.lang {
+                    if prepared.generation != owner.generation || prepared.key.lang != owner.lang {
                         return Ok(ResolutionContentPublicationOutcome::Stale(
                             SelectedResolutionStale::AnalysisGeneration {
                                 storage_language: owner.lang,
@@ -466,7 +468,7 @@ impl AnalyzerStore {
                             },
                         ));
                     }
-                    let oid = prepared.oid;
+                    let oid = prepared.key.oid;
                     let write = super::write_prepared_blob_rows_tx(
                         &tx,
                         &prepared,
@@ -479,8 +481,8 @@ impl AnalyzerStore {
                     }
                     write?;
                     let blob_id = tx.query_row(
-                        "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
-                        params![oid.to_string(), owner.lang],
+                        "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
+                        params![oid.to_string(), owner.lang, prepared.key.variant],
                         |row| row.get(0),
                     )?;
                     if let Some(support) =
@@ -498,9 +500,9 @@ impl AnalyzerStore {
                         &tx,
                         &owner,
                         blob_id,
-                        oid,
+                        prepared.key.clone(),
                         ResolutionContentInput::Parsed {
-                            content_oid: oid,
+                            key: prepared.key.clone(),
                             semantic_language: prepared.resolution.semantic_language(),
                         },
                         &cancellation,
@@ -546,11 +548,17 @@ impl AnalyzerStore {
         &self,
         owner: &WorkspaceSnapshotId,
         persisted_relative_path: &str,
-        content_oid: Oid,
+        key: &super::BlobKey,
         expected_input: &ResolutionContentInput,
         cancellation: &CancellationToken,
     ) -> Result<ResolutionContentPublicationOutcome> {
+        assert_eq!(
+            key.lang, owner.lang,
+            "cached parse key must match its owner storage language"
+        );
         let owner = owner.clone();
+        let key = key.clone();
+        let content_oid = key.oid;
         let path = persisted_relative_path.to_owned();
         let input = expected_input.clone();
         let cancellation = cancellation.clone();
@@ -559,8 +567,8 @@ impl AnalyzerStore {
             if cancellation.is_cancelled() { return Ok(ResolutionContentPublicationOutcome::Cancelled); }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let expected_epoch = match &input {
-                ResolutionContentInput::Parsed { content_oid: expected, semantic_language } => {
-                    assert_eq!(*expected, content_oid, "cached parsed input has its source OID");
+                ResolutionContentInput::Parsed { key: expected, semantic_language } => {
+                    assert_eq!(expected, &key, "cached parsed input has its parse identity");
                     super::resolution::resolution_bundle_epoch(*semantic_language)
                 }
                 ResolutionContentInput::Capsule { key, .. } => {
@@ -570,8 +578,8 @@ impl AnalyzerStore {
             };
             if let Some(outcome) = validate_owner_conn(&tx, &owner, expected_epoch)? { return Ok(outcome); }
             let blob: Option<(i64, i64)> = tx.query_row(
-                "SELECT id, generation FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
-                params![content_oid.to_string(), owner.lang], |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT id, generation FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
+                params![content_oid.to_string(), owner.lang, key.variant], |row| Ok((row.get(0)?, row.get(1)?)),
             ).optional()?;
             let Some((blob_id, generation)) = blob else {
                 return Ok(ResolutionContentPublicationOutcome::Unavailable(
@@ -649,7 +657,7 @@ impl AnalyzerStore {
                 }
             }
             root_content_tx(&tx, &owner, blob_id)?;
-            let receipt = publication_receipt_tx(&tx, &owner, blob_id, content_oid, input, &cancellation)?;
+            let receipt = publication_receipt_tx(&tx, &owner, blob_id, key, input, &cancellation)?;
             let Some(receipt) = receipt else {
                 tx.rollback()?;
                 return Ok(ResolutionContentPublicationOutcome::Cancelled);
@@ -1215,7 +1223,7 @@ pub(super) fn publish_resolution_capsule_on(
                  FROM blobs AS blob
                  JOIN resolution_fragment_interiors AS manifest ON manifest.blob_id = blob.id
                  JOIN resolution_capsule_inputs AS input ON input.blob_id = blob.id
-                 WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.generation = ?3
+                 WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.parse_variant = x'' AND blob.generation = ?3
                    AND manifest.publication_state = 'complete' AND manifest.producer_epoch = ?4",
             params![
                 oid_text,
@@ -1244,8 +1252,14 @@ pub(super) fn publish_resolution_capsule_on(
             ));
         }
         root_content_tx(&tx, &owner, blob_id)?;
-        let Some(receipt) =
-            publication_receipt_tx(&tx, &owner, blob_id, oid, prepared.input, cancellation)?
+        let Some(receipt) = publication_receipt_tx(
+            &tx,
+            &owner,
+            blob_id,
+            super::BlobKey::unvaried(oid, &owner.lang),
+            prepared.input,
+            cancellation,
+        )?
         else {
             return Ok(ResolutionContentPublicationOutcome::Cancelled);
         };
@@ -1272,7 +1286,7 @@ pub(super) fn publish_resolution_capsule_on(
                          JOIN resolution_semantic_catalog AS catalog ON catalog.blob_id = host.id
                          JOIN resolution_semantic_sites AS site ON site.blob_id = host.id
                            AND site.semantic_key = catalog.local_key AND site.semantic_role = 'definition'
-                         WHERE host.blob_oid = ?1 AND host.lang = ?2 AND host.generation = ?3
+                         WHERE host.blob_oid = ?1 AND host.lang = ?2 AND host.generation = ?3 AND host.parse_variant = x''
                            AND catalog.local_key = ?4 AND catalog.identity_digest IS NOT NULL)",
                         params![key.host_content_oid.to_string(), owner.lang, owner.generation.0, local.get()],
                         |row| row.get(0),
@@ -1287,14 +1301,18 @@ pub(super) fn publish_resolution_capsule_on(
             }
         }
     }
-    let Some(previous_owners) =
-        repair_owners_tx(&tx, &oid_text, &owner.lang, owner.generation, cancellation)?
+    let Some(previous_owners) = repair_owners_tx(
+        &tx,
+        &super::BlobKey::unvaried(oid, &owner.lang),
+        owner.generation,
+        cancellation,
+    )?
     else {
         return Ok(ResolutionContentPublicationOutcome::Cancelled);
     };
     tx.execute(
-        "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
-        params![oid_text, owner.lang],
+        "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
+        params![oid_text, owner.lang, super::ParseVariant::Empty],
     )?;
     tx.execute(
         "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,?2,?3)",
@@ -1317,7 +1335,14 @@ pub(super) fn publish_resolution_capsule_on(
         root_content_tx(&tx, previous, blob_id)?;
     }
     root_content_tx(&tx, &owner, blob_id)?;
-    let receipt = publication_receipt_tx(&tx, &owner, blob_id, oid, prepared.input, cancellation)?;
+    let receipt = publication_receipt_tx(
+        &tx,
+        &owner,
+        blob_id,
+        super::BlobKey::unvaried(oid, &owner.lang),
+        prepared.input,
+        cancellation,
+    )?;
     let Some(receipt) = receipt else {
         tx.rollback()?;
         return Ok(ResolutionContentPublicationOutcome::Cancelled);

@@ -545,8 +545,7 @@ fn execute_plan_node(
                     limits,
                     plan.logical_node(node_id)
                         .operator()
-                        .step_output_cap(terminal_cap)
-                        .resolve(limits.max_pipeline_rows),
+                        .step_output_cap(terminal_cap),
                     diagnostics,
                     instrumentation.as_mut(),
                 );

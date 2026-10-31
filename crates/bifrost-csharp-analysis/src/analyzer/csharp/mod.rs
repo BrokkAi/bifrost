@@ -31,12 +31,14 @@ use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
 
 #[doc(hidden)]
 pub mod adapter;
+mod attribute_type;
 mod cache;
 mod call_conversion;
 mod catch_facts;
 mod clones;
 mod compilation;
 mod dependency_discovery;
+pub mod dependency_evidence;
 pub(crate) mod diagnostics;
 pub mod external;
 mod hierarchy_provider;
@@ -200,6 +202,10 @@ use crate::analyzer::csharp::external::CSharpExternalDeclarations;
 
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 
+pub use crate::analyzer::csharp::attribute_type::{
+    CSharpAttributeTypeResolution, CSharpAttributeTypeStatus, resolve_csharp_attribute_type,
+};
+
 pub use crate::analyzer::csharp::catch_facts::CSharpCatchFacts;
 
 pub use crate::analyzer::csharp::catch_facts::CSharpCatchTypeRelation;
@@ -299,8 +305,17 @@ impl CSharpAnalyzer {
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let csharp_config = config.csharp.clone();
+        let inner = TreeSitterAnalyzer::new_with_config(project, CSharpAdapter, config);
+        Self::from_inner(inner, csharp_config, memo_budget)
+    }
+
+    fn from_inner(
+        inner: TreeSitterAnalyzer<CSharpAdapter>,
+        csharp_config: CSharpAnalyzerConfig,
+        memo_budget: u64,
+    ) -> Self {
         Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, CSharpAdapter, config),
+            inner,
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
             csharp_config,
             external_index: Self::empty_external_index(),
@@ -322,12 +337,7 @@ impl CSharpAnalyzer {
             store_context,
             progress,
         )?;
-        Ok(Self {
-            inner,
-            memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
-            csharp_config,
-            external_index: Self::empty_external_index(),
-        })
+        Ok(Self::from_inner(inner, csharp_config, memo_budget))
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -1596,12 +1606,30 @@ impl CodeUnitIndex for CSharpAnalyzer {
 impl IAnalyzer for CSharpAnalyzer {
     brokk_bifrost_analysis::forward_query_read_ledger!();
 
+    fn dependency_file_evidence(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence,
+    > {
+        self.inner.dependency_file_evidence()
+    }
+
+    fn dependency_file_locations(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(
+            String,
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidenceLocation,
+        )>,
+    > {
+        self.inner.dependency_file_locations()
+    }
+
     fn statement_source_facts(
         &self,
         file: &ProjectFile,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
         use brokk_bifrost_core::analyzer::statement_facts::producer::capture_statement_facts;
-        use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
         use brokk_bifrost_csharp::structural::CSHARP_STRUCTURAL_SPEC;
         let snapshot = brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk(
             self.inner.file_source(file)?,
@@ -1622,20 +1650,14 @@ impl IAnalyzer for CSharpAnalyzer {
                             snapshot.oid(),
                         ),
                     );
-                    let mut parser = tree_sitter::Parser::new();
-                    parser
-                        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-                        .expect("C# grammar");
-                    if let Some(ranges) = CSHARP_STRUCTURAL_SPEC.parser_included_ranges(source) {
-                        parser
-                            .set_included_ranges(&ranges)
-                            .expect("C# preprocessor included ranges");
-                    }
-                    let tree = parser.parse(source, None).ok_or(())?;
+                    let (tree, scan) =
+                        brokk_bifrost_csharp::preprocessor::parse_csharp_scanned(source)
+                            .ok_or(())?;
                     let rows = Arc::new(capture_statement_facts(
                         &CSHARP_STRUCTURAL_SPEC,
                         tree.root_node(),
                         source,
+                        &scan.conditional_regions(source),
                     ));
                     let bytes = rows.estimated_retained_bytes();
                     Ok((rows, bytes))
@@ -2032,6 +2054,66 @@ fn csharp_branch_reference_site(
 }
 
 impl LanguageSupport for CSharpSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn trial_definition(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution>
+    {
+        use brokk_bifrost_analysis::analyzer::native_points::{
+            NativePointContext, resolve_native_definition_bounded, unavailable_definition,
+        };
+        use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+            cancelled, exceeded_budget,
+        };
+        if !trial_native_csharp_selected() {
+            return None;
+        }
+        let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(query.analyzer) else {
+            return Some(
+                unavailable_definition(
+                    query.site,
+                    "csharp_analyzer_unavailable",
+                    "C# analyzer unavailable".into(),
+                )
+                .into(),
+            );
+        };
+        let result = resolve_native_definition_bounded(
+            &csharp.inner,
+            query,
+            None,
+            |operation, _, cancellation| {
+                Ok(if cancellation.is_cancelled() {
+                    NativePointContext::Cancelled
+                } else {
+                    NativePointContext::Ready {
+                        context: Box::new(
+                            operation.empty_contexts(&ResolutionCompletion::Complete)?,
+                        ),
+                        selected_import_model: None,
+                    }
+                })
+            },
+            || {},
+        );
+        Some(match result {
+            BoundedResolution::Complete { value, .. } => value.into(),
+            BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
+                limit,
+                format!(
+                    "C# definition resolution exceeded its {} budget",
+                    limit.as_str()
+                ),
+            )
+            .into(),
+            BoundedResolution::Cancelled { .. } => {
+                cancelled("C# definition resolution was cancelled").into()
+            }
+        })
+    }
+
     fn workspace_fact_answer(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -2244,7 +2326,9 @@ impl LanguageSupport for CSharpSupport {
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
-        resolve_analyzer::<CSharpAnalyzer>(analyzer).map(|value| value as _)
+        brokk_bifrost_analysis::analyzer::multi_analyzer::forward_query_provider::<CSharpAnalyzer>(
+            analyzer,
+        )
     }
 
     fn ecosystem(&self) -> UsageEcosystem {
@@ -2613,6 +2697,16 @@ mod dependency_packs {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for CSharpSupport {
+    // C# native demand is a trial; without test-support the trait default
+    // (no installer) keeps C# on the plain operation.
+    #[cfg(any(test, feature = "test-support"))]
+    fn demand_installer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::store::resolution_operation::NativeDemandInstaller>
+    {
+        Some(brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_demand::CSHARP_DEMAND_INSTALLER)
+    }
+
     fn precedence_rules(
         &self,
     ) -> &'static dyn brokk_bifrost_analysis::analyzer::resolution::precedence::PrecedenceRules
@@ -2623,13 +2717,61 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for CSharpSup
     /// MSBuild project, props and targets files decide compilation membership,
     /// so each revision retains their exact bytes.
     fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                ["csproj", "props", "targets"]
-                    .iter()
-                    .any(|expected| extension.eq_ignore_ascii_case(expected))
+        dependency_evidence::is_nuget_evidence_input(path)
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    ["csproj", "props", "targets"]
+                        .iter()
+                        .any(|expected| extension.eq_ignore_ascii_case(expected))
+                })
+    }
+
+    fn selected_dependency_file_evidence(
+        &self,
+        _root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
+        )],
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        dependency_evidence::csharp_selected_dependency_file_evidence(selected, limits)
+    }
+
+    fn retains_absent_configuration_input(&self, path: &std::path::Path) -> bool {
+        // Restore paths are probed before restore. Empty retained bytes encode
+        // the absent/empty (unrestored) state until restore changes their OIDs.
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "Directory.Build.props"
+                        | "Directory.Build.targets"
+                        | "Directory.Packages.props"
+                ) || name == "project.assets.json"
+                    || name.ends_with(".nuget.g.props")
+                    || name.ends_with(".nuget.g.targets")
             })
+    }
+
+    fn include_native_metadata_paths(
+        &self,
+        project: &dyn Project,
+        files: &std::collections::BTreeSet<ProjectFile>,
+        inputs: &mut std::collections::BTreeSet<ProjectFile>,
+    ) -> std::io::Result<()> {
+        compilation::capture_ancestor_configuration_paths(project, files, inputs);
+        Ok(())
+    }
+
+    fn configuration_paths_from_retained_inputs(
+        &self,
+        inputs: &[brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput],
+    ) -> Vec<std::path::PathBuf> {
+        compilation::restore_paths_from_retained_inputs(inputs)
     }
 
     fn csharp_compilation_facts(

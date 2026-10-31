@@ -1243,8 +1243,11 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _file: &crate::analyzer::ProjectFile,
         _source: &str,
         _cancellation: Option<&crate::cancellation::CancellationToken>,
-    ) -> Option<crate::analyzer::usages::get_definition::ResolvedValueIdentity> {
-        None
+    ) -> Result<
+        Option<crate::analyzer::usages::get_definition::ResolvedValueIdentity>,
+        crate::analyzer::read_ledger::DerivationExecutionCause,
+    > {
+        Ok(None)
     }
 
     fn release_definition_file(

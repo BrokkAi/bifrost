@@ -491,7 +491,11 @@ wrap! { pub mod embedded { pub struct Embedded; } }
                 .push("std".to_owned());
             let oid = oid_for(source.as_bytes());
             store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    &RustAdapter,
+                    &state,
+                )
                 .unwrap_or_else(|error| panic!("populate Rust item plan fixture {index}: {error}"));
             oids.push(oid);
         }

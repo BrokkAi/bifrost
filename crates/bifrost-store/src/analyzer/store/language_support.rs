@@ -354,6 +354,11 @@ pub trait StoreLanguageSupport: Send + Sync {
     fn is_configuration_input_path(&self, _path: &std::path::Path) -> bool {
         false
     }
+    /// Whether capture retains an absent input as empty bytes, so its later
+    /// appearance changes the configuration identity.
+    fn retains_absent_configuration_input(&self, _path: &std::path::Path) -> bool {
+        false
+    }
     /// Add language-owned metadata inputs found beside selected source files.
     fn include_native_metadata_paths(
         &self,
@@ -362,6 +367,13 @@ pub trait StoreLanguageSupport: Send + Sync {
         _inputs: &mut std::collections::BTreeSet<ProjectFile>,
     ) -> std::io::Result<()> {
         Ok(())
+    }
+    /// Additional workspace-relative inputs selected from already retained bytes.
+    fn configuration_paths_from_retained_inputs(
+        &self,
+        _inputs: &[super::WorkspaceConfigurationInput],
+    ) -> Vec<std::path::PathBuf> {
+        Vec::new()
     }
     /// Derive C# compilation membership rules from one revision's selected
     /// MSBuild configuration inputs, ordered by path. `None` bytes mark an

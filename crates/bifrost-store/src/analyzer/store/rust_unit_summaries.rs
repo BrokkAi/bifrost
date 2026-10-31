@@ -73,7 +73,7 @@ WITH target_declarations AS (
     ON target_export.summary_id = target_member.summary_id
    AND target_export.declaration_member_ordinal = target_member.member_ordinal
    AND target_export.origin = 'declaration'
-  WHERE target_blob.blob_oid = ?1 AND target_blob.lang = 'rust'
+  WHERE target_blob.blob_oid = ?1 AND target_blob.lang = 'rust' AND target_blob.parse_variant = x''
 )
 SELECT DISTINCT importer_member.rel_path
   FROM target_declarations AS target

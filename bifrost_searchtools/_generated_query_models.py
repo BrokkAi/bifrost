@@ -1619,6 +1619,7 @@ class CodeQueryFailureHandlerState:
     range: CodeQueryRange
     reason: str | None
     rethrow_kind: str | None
+    throw_relation: str | None
     verdict: str
     provenance: list[CodeQueryProvenance]
     provenance_truncated: bool
@@ -10201,6 +10202,7 @@ def _decode_code_query_failure_handler_state(value: Any, prefix: str = 'CodeQuer
         'range',
         'reason',
         'rethrow_kind',
+        'throw_relation',
         'verdict',
         'provenance',
         'provenance_truncated',
@@ -10253,6 +10255,10 @@ def _decode_code_query_failure_handler_state(value: Any, prefix: str = 'CodeQuer
         rethrow_kind_value = _decode_defs_code_query_result_item_union_72_properties_rethrow_kind(value['rethrow_kind'], f"{prefix}.rethrow_kind")
     else:
         rethrow_kind_value = None
+    if 'throw_relation' in value:
+        throw_relation_value = _decode_defs_code_query_result_item_union_72_properties_throw_relation(value['throw_relation'], f"{prefix}.throw_relation")
+    else:
+        throw_relation_value = None
     verdict_value = _decode_string(value['verdict'], f"{prefix}.verdict")
     if 'provenance' in value:
         provenance_value = _decode_defs_code_query_result_item_union_72_properties_provenance(value['provenance'], f"{prefix}.provenance")
@@ -10276,6 +10282,7 @@ def _decode_code_query_failure_handler_state(value: Any, prefix: str = 'CodeQuer
         range=range_value,
         reason=reason_value,
         rethrow_kind=rethrow_kind_value,
+        throw_relation=throw_relation_value,
         verdict=verdict_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
@@ -30171,6 +30178,16 @@ def _decode_defs_code_query_result_item_union_72_properties_result_type(value: A
     return value
 
 def _decode_defs_code_query_result_item_union_72_properties_rethrow_kind(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_72_properties_throw_relation(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []

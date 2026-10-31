@@ -1074,7 +1074,7 @@ pub struct SelectedResolutionLexicalSource<'selection, 'store> {
     selected_interiors_validated: OnceCell<()>,
     /// Immutable SQL payloads demanded by this lexical source. Classification
     /// against mutable staged endpoints is recomputed after every lookup.
-    reference_local_path_read_memo: RefCell<ReferenceLocalPathReadMemo>,
+    reference_local_path_read_memo: std::rc::Rc<RefCell<ReferenceLocalPathReadMemo>>,
     #[doc(hidden)]
     pub ordinary_completion_suppression: RefCell<Option<OrdinaryCompletionSuppression>>,
     /// One candidate direction's unconditional completion box, forward then
@@ -2228,6 +2228,14 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         self
     }
 
+    pub(crate) fn with_reference_read_memo(
+        mut self,
+        memo: std::rc::Rc<RefCell<ReferenceLocalPathReadMemo>>,
+    ) -> Self {
+        self.reference_local_path_read_memo = memo;
+        self
+    }
+
     fn with_authority_and_read_memos(
         selection: &'selection SelectedResolutionMountInventory<'store>,
         authority: std::rc::Rc<
@@ -2249,7 +2257,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             ),
             forward_reference_fragments: None,
             selected_interiors_validated: OnceCell::new(),
-            reference_local_path_read_memo: RefCell::default(),
+            reference_local_path_read_memo: std::rc::Rc::default(),
             ordinary_completion_suppression: RefCell::new(None),
             unconditional_candidate_reasons: [OnceCell::new(), OnceCell::new()],
             unconditional_candidate_read_memo,
@@ -5554,7 +5562,7 @@ impl SelectedResolutionLexicalSource<'_, '_> {
 /// Result of the persisted-only lexical query, before interpreting endpoint
 /// namespaces. Stage changes affect classification, never these blob/site rows.
 #[derive(Clone)]
-struct RawReferenceLocalPathEvidence {
+pub(crate) struct RawReferenceLocalPathEvidence {
     metadata: FactReferenceSiteMetadata,
     local_definitions: Vec<SemanticId>,
     prefix_local_definitions: Vec<SemanticId>,
@@ -5566,8 +5574,8 @@ struct RawReferenceLocalPathEvidence {
     reaches_package_root_scope: bool,
 }
 
-type ReferenceLocalPathReadMemo = ExactReadMemo<
-    (SelectedResolutionMountOrdinal, i64, i64),
+pub(crate) type ReferenceLocalPathReadMemo = ExactReadMemo<
+    (SelectedResolutionMountOrdinal, i64, git2::Oid, i64),
     Option<RawReferenceLocalPathEvidence>,
 >;
 
@@ -5687,7 +5695,12 @@ fn read_reference_local_path_evidence(
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    let key = (ordinal, blob_id, site);
+    let key = (
+        ordinal,
+        blob_id,
+        source.mount_record(ordinal)?.blob_oid(),
+        site,
+    );
     let cached = source
         .reference_local_path_read_memo
         .borrow()
@@ -5703,7 +5716,7 @@ fn read_reference_local_path_evidence(
         source
             .reference_local_path_read_memo
             .borrow_mut()
-            .insert(key, raw.clone());
+            .insert_bounded(key, raw.clone());
         raw
     };
     let Some(RawReferenceLocalPathEvidence {

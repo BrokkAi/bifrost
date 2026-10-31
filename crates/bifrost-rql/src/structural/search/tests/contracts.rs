@@ -5,7 +5,10 @@ fn diagnostic(
     code: CodeQueryDiagnosticCode,
     impact: CodeQueryDiagnosticImpact,
 ) -> CodeQueryDiagnostic {
-    CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+            brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+        ),
         related: Vec::new(),
         source: None,
         code,
@@ -15,7 +18,7 @@ fn diagnostic(
         message: "prose deliberately carries no classification words".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    }
+    })
 }
 
 /// Issue #2523. Without a per-dimension table the executor must keep pricing
@@ -274,7 +277,8 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
         item.provenance_summary().as_deref(),
         Some("provenance: 3 paths (truncated); branches 1.0, 0")
     );
-    let diagnostic = CodeQueryDiagnostic {
+    let diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::BroadQuery,
@@ -284,7 +288,7 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
         message: "broad query".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    };
+    });
     assert_eq!(
         diagnostic.presentation_label(),
         "advisory [broad_query] [branch 1.0]"

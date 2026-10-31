@@ -89,8 +89,9 @@ use brokk_bifrost_core::hash::HashMap;
 
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_python::bindings::{
-    PythonDirectScopeBindingKind, PythonLexicalNameResolution, PythonLexicalScopeInventory,
-    python_direct_scope_bindings_bounded, python_module_or_class_scope_binds_name_bounded,
+    PythonDirectScopeBinding, PythonDirectScopeBindingKind, PythonLexicalNameResolution,
+    PythonLexicalScopeInventory, python_direct_scope_bindings_bounded,
+    python_module_or_class_scope_binds_name_bounded,
 };
 use brokk_bifrost_python::declarations::python_module_name;
 use brokk_bifrost_python::graph_support::{PythonSource, resolve_module_code_unit};
@@ -116,7 +117,7 @@ use std::sync::Arc;
 // invalidate artifacts that reached the former module-scope rule.
 // #7182: native member-operation names change on the uncached import-read path.
 // #5658: native lexical presentation changes reparsing reachable from lowering.
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v52";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v53";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -343,6 +344,9 @@ fn python_capabilities() -> SemanticCapabilities {
     for capability in [
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
+        // Partial: only reads of module namespace import bindings lower as
+        // module-global loads; other module-global names stay temporaries.
+        SemanticCapability::StaticMemory,
     ] {
         builder = builder.partial(capability);
     }
@@ -375,14 +379,17 @@ struct PythonProcedureInventory<'tree> {
 enum PythonModuleBinding<'tree> {
     Class(Node<'tree>),
     Function(Node<'tree>),
-    Import(PythonModuleImport),
+    Import(PythonModuleImport<'tree>),
     Other,
 }
 
 #[derive(Clone)]
-struct PythonModuleImport {
+struct PythonModuleImport<'tree> {
     candidates: Box<[PythonModuleImportCandidate]>,
     namespace_path: Option<Box<[Box<str>]>>,
+    /// The first binding occurrence of the imported name. A read of the name
+    /// from a callable loads the module-global storage this declares.
+    declaration: Node<'tree>,
 }
 
 #[derive(Clone)]
@@ -492,7 +499,7 @@ fn enumerate_procedures<'tree>(
                 };
                 let next = python_module_binding(
                     frame.node,
-                    binding.kind,
+                    &binding,
                     name,
                     prepared.source(),
                     file,
@@ -743,14 +750,14 @@ fn enumerate_procedures<'tree>(
 
 fn python_module_binding<'tree>(
     node: Node<'tree>,
-    kind: PythonDirectScopeBindingKind,
+    scope_binding: &PythonDirectScopeBinding<'tree>,
     local_name: &str,
     source: &str,
     file: &ProjectFile,
     python: &dyn PythonSource,
     import_binder: &ImportBinder,
 ) -> PythonModuleBinding<'tree> {
-    if kind == PythonDirectScopeBindingKind::ClassDeclaration {
+    if scope_binding.kind == PythonDirectScopeBindingKind::ClassDeclaration {
         return PythonModuleBinding::Class(node);
     }
     if node.kind() == "function_definition"
@@ -766,7 +773,7 @@ fn python_module_binding<'tree>(
     let matches = python_import_infos_from_node(node, source)
         .into_iter()
         .filter(|import| !import.is_wildcard && import.local_name() == Some(local_name));
-    let mut binding: Option<PythonModuleImport> = None;
+    let mut binding: Option<PythonModuleImport<'tree>> = None;
     for import in matches {
         let Some(path) = import.path else {
             return PythonModuleBinding::Other;
@@ -828,6 +835,7 @@ fn python_module_binding<'tree>(
                 workspace_module,
             }]),
             namespace_path,
+            declaration: scope_binding.declaration,
         };
         if let Some(binding) = binding.as_mut() {
             if !merge_python_namespace_imports(binding, next) {
@@ -840,9 +848,9 @@ fn python_module_binding<'tree>(
     binding.map_or(PythonModuleBinding::Other, PythonModuleBinding::Import)
 }
 
-fn merge_python_namespace_imports(
-    existing: &mut PythonModuleImport,
-    next: PythonModuleImport,
+fn merge_python_namespace_imports<'tree>(
+    existing: &mut PythonModuleImport<'tree>,
+    next: PythonModuleImport<'tree>,
 ) -> bool {
     let Some(namespace_path) = existing.namespace_path.as_ref() else {
         return false;
@@ -1313,6 +1321,7 @@ struct LoweringContext<'tree, 'targets> {
     call_argument_materializations: HashMap<usize, ValueId>,
     constant_index_values: HashMap<u64, ValueId>,
     field_locators: HashMap<Box<str>, SemanticLocator>,
+    module_global_locations: HashMap<Box<str>, MemoryLocationId>,
     known_list_bindings: HashSet<Box<str>>,
     known_sequence_bindings: HashSet<Box<str>>,
     failing_tuple_mutations: HashSet<SourceSpan>,
@@ -1444,6 +1453,7 @@ fn lower_procedure<'tree, 'targets>(
         call_argument_materializations: HashMap::default(),
         constant_index_values: HashMap::default(),
         field_locators: HashMap::default(),
+        module_global_locations: HashMap::default(),
         known_list_bindings: HashSet::default(),
         known_sequence_bindings: HashSet::default(),
         failing_tuple_mutations: HashSet::default(),
@@ -2860,6 +2870,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             };
             (value, kind)
         }))
+    }
+
+    /// The module-global storage a callable reads when `reference` names a
+    /// module namespace import binding of this file.
+    ///
+    /// Python looks such a name up in the module namespace on every read, so
+    /// the read is a load of that module-global slot, identified by the import
+    /// binding's declaration. Field accesses on the loaded module then share a
+    /// structured root. A name the callable binds itself, a name no import
+    /// binds, and any name in a module with a wildcard import, which can
+    /// rebind it, have no such slot and keep their previous lowering.
+    fn imported_module_global_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        reference: Node<'tree>,
+    ) -> Result<Option<MemoryLocationId>, PythonLoweringError> {
+        if self.module_has_wildcard_import {
+            return Ok(None);
+        }
+        let Some(name) = node_text(self.prepared.source(), reference) else {
+            return Ok(None);
+        };
+        if self
+            .scoped_binding_value(builder, reference, name)?
+            .is_some()
+            || !self.module_name_fallback_allowed(builder, reference, name)?
+        {
+            return Ok(None);
+        }
+        if let Some(location) = self.module_global_locations.get(name) {
+            return Ok(Some(*location));
+        }
+        let Some(PythonModuleBinding::Import(binding)) = self.module_bindings.get(name) else {
+            return Ok(None);
+        };
+        if binding.namespace_path.is_none() {
+            return Ok(None);
+        }
+        let anchor = source_anchor(binding.declaration, 0).map_err(PythonLoweringError::Invalid)?;
+        let member = self.session.locator().memory_location_at(anchor);
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Static { member },
+        )?;
+        self.module_global_locations.insert(name.into(), location);
+        Ok(Some(location))
     }
 
     /// Whether this expression names an imported module namespace.
@@ -4616,6 +4674,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result = self.expression_value(builder, node, self.expression_value_kind(node))?;
         if node.kind() == "identifier" {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
+            if let Some(location) = self.imported_module_global_location(builder, entry, node)? {
+                self.append_effect(
+                    builder,
+                    entry,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Static,
+                        location,
+                        result,
+                    },
+                )?;
+            }
             if let Some(name) = node_text(self.prepared.source(), node)
                 && self
                     .scoped_binding_value(builder, node, name)?

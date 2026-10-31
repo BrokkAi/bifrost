@@ -26,8 +26,7 @@ pub fn prepare_with_adapter<A: LanguageAdapter>(
     match AnalyzerStore::prepare_parsed_blob_at_generations(
         &file,
         &syntax,
-        oid,
-        PRIMARY,
+        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, PRIMARY),
         generations,
         adapter,
         state,

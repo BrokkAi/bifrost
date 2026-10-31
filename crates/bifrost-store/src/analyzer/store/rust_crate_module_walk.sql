@@ -33,7 +33,7 @@ WITH RECURSIVE modules(module_path, blob_id, scope_ordinal, rel_path,
          cr_parent(files.rel_path), 1, 0, NULL, NULL, NULL
   FROM selected_workspace_file_versions AS files
   LEFT JOIN blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
-            AND blobs.generation = files.generation
+            AND blobs.generation = files.generation AND blobs.parse_variant = x''
   WHERE files.rel_path = ?1 AND files.lang = 'rust'
   UNION ALL
   -- An inline module written inside item-macro invocations
@@ -131,7 +131,7 @@ WITH RECURSIVE modules(module_path, blob_id, scope_ordinal, rel_path,
       cr_join(CASE WHEN declarations.path_attribute IS NULL THEN parent.module_dir ELSE parent.path_dir END,
               COALESCE(declarations.path_attribute, declarations.module_name || '/mod.rs'))))
   LEFT JOIN blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
-                 AND blobs.generation = files.generation
+                 AND blobs.generation = files.generation AND blobs.parse_variant = x''
   WHERE parent.activation = 1 AND parent.blob_id IS NOT NULL AND parent.depth < 256
   UNION ALL
   SELECT parent.module_path, blobs.id, 0, files.rel_path, 'include',
@@ -147,7 +147,7 @@ WITH RECURSIVE modules(module_path, blob_id, scope_ordinal, rel_path,
     SELECT selected.file_version_id FROM selected_workspace_file_versions AS selected
     WHERE selected.lang = 'rust' AND selected.rel_path = cr_join(cr_parent(parent.rel_path), edge.relative_path))
   LEFT JOIN blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
-                 AND blobs.generation = files.generation
+                 AND blobs.generation = files.generation AND blobs.parse_variant = x''
   WHERE parent.activation = 1 AND parent.depth < 256
     AND (parent.scope_ordinal = 0
          OR edge.include_start BETWEEN declaration.body_start_byte AND declaration.body_end_byte - 1)

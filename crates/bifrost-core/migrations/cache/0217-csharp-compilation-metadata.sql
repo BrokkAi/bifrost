@@ -1,6 +1,11 @@
 -- Derivation v2 rebuilds these sets from retained configuration inputs.
--- Delete cascades to rules, edges and revision selections; no old row
--- receives defaulted metadata that could masquerade as a complete derivation.
+-- Foreign keys are disabled while migrations run, so delete children before
+-- their parents. No old row receives defaulted metadata that could masquerade
+-- as a complete derivation.
+DELETE FROM csharp_project_references;
+DELETE FROM csharp_compilation_items;
+DELETE FROM csharp_compilations;
+DELETE FROM csharp_compilation_selections;
 DELETE FROM csharp_compilation_sets;
 DROP TABLE csharp_compilations;
 

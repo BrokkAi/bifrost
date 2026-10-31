@@ -675,7 +675,7 @@ type RustFactCacheKey = (
 );
 type RustHierarchySourceFactsCacheKey = (
     brokk_bifrost_analysis::analyzer::store::GenerationId,
-    git2::Oid,
+    brokk_bifrost_core::gitblob::BlobKey,
     ProjectFile,
 );
 
@@ -797,7 +797,7 @@ pub struct RustAnalyzer {
     /// analyzer is replaced wholesale on `update`, so the cache retires with it.
     declaration_facts: Cache<ProjectFile, Arc<RustDeclarationFacts>>,
     declaration_source_properties: Cache<
-        (brokk_bifrost_analysis::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+        (brokk_bifrost_analysis::analyzer::store::GenerationId, brokk_bifrost_core::gitblob::BlobKey, ProjectFile),
         Arc<RustDeclarationSourceProperties>,
     >,
     /// One mounted file's canonical hierarchy inputs. The generation, blob,
@@ -977,7 +977,7 @@ impl RustAnalyzer {
         }
         let facts = self
             .analyzer_store()
-            .rust_usage_facts(oid, "rust")
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
             .map_err(|error| {
                 self.inner.record_store_error(
                     error.context(format!("reading canonical Rust usage facts for blob {oid}")),
@@ -1043,7 +1043,7 @@ impl RustAnalyzer {
     ) -> Result<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
-            git2::Oid,
+            brokk_bifrost_core::gitblob::BlobKey,
         ),
         RustCargoRouteError,
     > {
@@ -1067,7 +1067,10 @@ impl RustAnalyzer {
             }
             return Err(RustCargoRouteError::Unavailable);
         };
-        Ok((generation, oid))
+        Ok((
+            generation,
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+        ))
     }
 
     fn selected_rust_source_while(
@@ -1077,7 +1080,7 @@ impl RustAnalyzer {
     ) -> Result<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
-            git2::Oid,
+            brokk_bifrost_core::gitblob::BlobKey,
         ),
         RustCargoRouteError,
     > {
@@ -1095,13 +1098,13 @@ impl RustAnalyzer {
         let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let (generation, oid) = self.selected_rust_source_while(file, keep_going)?;
-        let key = (generation, oid, file.clone());
+        let key = (generation, oid.clone(), file.clone());
         if let Some(cached) = self.declaration_source_properties.get(&key) {
             return Ok(cached);
         }
         let load = || {
             self.analyzer_store().rust_declaration_properties(
-                oid,
+                &oid,
                 generation,
                 &RustAdapter,
                 file,
@@ -1111,17 +1114,17 @@ impl RustAnalyzer {
         let rows = match load() {
             Ok(rows) => rows,
             Err(error) if error.is_missing_required_source_facts() => {
-                self.ensure_rust_declaration_facts_published(file, generation, oid)?;
+                self.ensure_rust_declaration_facts_published(file, generation, &oid)?;
                 load().map_err(|error| {
                     self.inner.record_store_error(error.context(format!(
-                        "reading canonical Rust declaration properties after catch-up for {file:?} ({oid})"
+                        "reading canonical Rust declaration properties after catch-up for {file:?} ({oid:?})"
                     )));
                     RustCargoRouteError::Unavailable
                 })?
             }
             Err(error) => {
                 self.inner.record_store_error(error.context(format!(
-                    "reading canonical Rust declaration properties for {file:?} ({oid})"
+                    "reading canonical Rust declaration properties for {file:?} ({oid:?})"
                 )));
                 return Err(RustCargoRouteError::Unavailable);
             }
@@ -1175,10 +1178,10 @@ impl RustAnalyzer {
         }
         let facts = self
             .analyzer_store()
-            .rust_hierarchy_source_facts(*oid, *generation, &RustAdapter, file, keep_going)
+            .rust_hierarchy_source_facts(oid.oid, *generation, &RustAdapter, file, keep_going)
             .map_err(|error| {
                 self.inner.record_store_error(error.context(format!(
-                    "reading canonical Rust hierarchy source facts for {file:?} ({oid})"
+                    "reading canonical Rust hierarchy source facts for {file:?} ({oid:?})"
                 )));
                 RustCargoRouteError::Unavailable
             })?
@@ -1202,10 +1205,10 @@ impl RustAnalyzer {
         let (generation, oid) = self.selected_rust_source_while(file, keep_going)?;
         let occurrences = self
             .analyzer_store()
-            .rust_primary_occurrences_at(oid, generation, range, keep_going)
+            .rust_primary_occurrences_at(&oid, generation, range, keep_going)
             .map_err(|error| {
                 self.inner.record_store_error(error.context(format!(
-                    "reading canonical Rust primary query occurrences for {file:?} ({oid})"
+                    "reading canonical Rust primary query occurrences for {file:?} ({oid:?})"
                 )));
                 RustCargoRouteError::Unavailable
             })?
@@ -1590,7 +1593,12 @@ impl RustAnalyzer {
         let keys: Vec<_> = files.iter().map(|(_, oid)| *oid).collect();
         let stored = self
             .analyzer_store()
-            .rust_module_route_facts_while("rust", generation, &keys, &|| keep_going())
+            .rust_module_route_facts_while(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                generation,
+                &keys,
+                &|| keep_going(),
+            )
             .map_err(|error| {
                 self.inner.record_store_error(
                     error.context("reading canonical Rust Cargo-route publication"),
@@ -1946,7 +1954,7 @@ impl RustFactSource for RustAnalyzer {
         let result = self
             .analyzer_store()
             .rust_traits_implemented_by(
-                declaration.blob,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(declaration.blob, "rust"),
                 declaration.declaration,
                 &declaration.rel_path,
             )
@@ -1963,7 +1971,7 @@ impl RustFactSource for RustAnalyzer {
         let result = self
             .analyzer_store()
             .rust_types_implementing(
-                declaration.blob,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(declaration.blob, "rust"),
                 declaration.declaration,
                 &declaration.rel_path,
             )
@@ -1979,7 +1987,7 @@ impl RustFactSource for RustAnalyzer {
     ) -> Result<Vec<RustTraitImplRow>, RustCargoRouteError> {
         self.analyzer_store()
             .rust_trait_impl_rows(
-                declaration.blob,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(declaration.blob, "rust"),
                 declaration.declaration,
                 &declaration.rel_path,
             )
@@ -2013,7 +2021,11 @@ impl RustFactSource for RustAnalyzer {
     ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError> {
         let result = self
             .analyzer_store()
-            .rust_traits_of_impl(impl_item.blob, impl_item.declaration, &impl_item.rel_path)
+            .rust_traits_of_impl(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(impl_item.blob, "rust"),
+                impl_item.declaration,
+                &impl_item.rel_path,
+            )
             .map(placed_declarations);
         self.store_result_or_unavailable(result, || {
             format!("reading the Rust traits stated by impl {impl_item:?}")
@@ -2032,7 +2044,11 @@ impl RustFactSource for RustAnalyzer {
         let rel_path = brokk_bifrost_core::path_utils::rel_path_string(file);
         let snapshots = self.inner.selected_workspace_snapshots();
         self.analyzer_store()
-            .rust_item_macro_decisions(snapshots.as_ref(), blob, &rel_path)
+            .rust_item_macro_decisions(
+                snapshots.as_ref(),
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(blob, "rust"),
+                &rel_path,
+            )
             .map(|rows| {
                 rows.into_iter()
                     .map(
@@ -2085,7 +2101,7 @@ impl RustFactSource for RustAnalyzer {
         declaration: &RustPlacedDeclaration,
     ) -> Result<Vec<String>, RustCargoRouteError> {
         let result = self.analyzer_store().rust_trait_impl_spellings(
-            declaration.blob,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(declaration.blob, "rust"),
             declaration.declaration,
             &declaration.rel_path,
         );

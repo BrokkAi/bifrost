@@ -103,8 +103,11 @@ that language's previous resolver; see
 for the composition contract, and
 [compositional resolution fragments](../storage-and-cache/#compositional-resolution-fragments)
 for what is stored and what each query recomputes. Each language's switch
-requires parity with its current resolver, bounded memory, accurate
-cancellation and cap reporting, and useful reuse across linked worktrees.
+requires parity with its current resolver on complete answers and selected
+targets (a budget-limited, capped or ambiguous answer may return a different
+defensible subset as long as every returned target is correct and the
+incompleteness is reported), bounded memory, accurate cancellation and cap
+reporting, and useful reuse across linked worktrees.
 
 ### Close known semantic gaps
 

@@ -330,6 +330,7 @@ pub(crate) enum MemberSelectionOutcome {
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct MemberSelection {
+    pub(super) query_obligations: super::super::QueryObligations,
     pub(crate) order: Option<HierarchyOrderOutcomeId>,
     pub(crate) provenance: HierarchySelectionProvenance,
     pub(crate) owners: Vec<SemanticId>,
@@ -570,6 +571,8 @@ impl<'source> MemberSelectionFrame<'source> {
             None
         };
         Ok(MemberSelectionPoll::Ready(MemberSelection {
+            // Member-selection polling never begins a new evaluation round; dependency waits resume this same ledger.
+            query_obligations: evaluation.query_obligations.published(),
             order,
             provenance: HierarchyProvenanceView::new(evaluation.hierarchy)
                 .selection(self.provenance),
@@ -618,7 +621,37 @@ pub(crate) struct RootPlan {
     pub(crate) completion: ResolutionCompletion,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Query evidence is independent of provider proof authority. In particular,
+/// presence here never authorizes retiring an ordinary lookup reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClosedQueryScope {
+    pub(crate) query_obligations: super::super::QueryObligations,
+    pub(crate) pending_query_obligations:
+        Vec<super::super::query_obligations::PendingQueryObligation>,
+}
+impl Default for ClosedQueryScope {
+    fn default() -> Self {
+        Self {
+            query_obligations: super::super::QueryObligations::empty(),
+            pending_query_obligations: Vec::new(),
+        }
+    }
+}
+impl ClosedQueryScope {
+    pub(crate) fn record_query_obligations(&self, into: &mut super::super::QueryObligations) {
+        into.union(&self.query_obligations);
+    }
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.query_obligations.union(&other.query_obligations);
+        for pending in other.pending_query_obligations {
+            if !self.pending_query_obligations.contains(&pending) {
+                self.pending_query_obligations.push(pending);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct ClosureDischarges {
     pub(crate) reasons: BTreeSet<SemanticId>,
@@ -641,6 +674,12 @@ pub struct ClosureDischarges {
     pub(crate) prefix_reference: Option<SemanticId>,
     pub(crate) prefix_reasons: BTreeSet<SemanticId>,
     pub(crate) prefix_operation_local_placeholders: bool,
+}
+
+impl Default for ClosureDischarges {
+    fn default() -> Self {
+        Self::exact([])
+    }
 }
 
 impl ClosureDischarges {
@@ -916,6 +955,11 @@ pub(crate) trait RootProvider {
         unreachable!("a provider with member proofs retains them")
     }
 
+    /// Closed query evidence, independent of provider proof authority.
+    fn resolved_query_scope(&self, _endpoint: &RelationKey) -> Option<ClosedQueryScope> {
+        None
+    }
+
     /// The placeholder reasons a closed relation proved dead for the lookup it
     /// continued. `Some` says the closure answered the boundary question its
     /// endpoint asked with its own positive witness: the requesting reference's
@@ -1113,6 +1157,7 @@ struct Scheduler<'a> {
     claims: HashMap<ReferenceKey, DemandedReferenceOwner>,
     /// Placeholder reasons each closed relation retired for the lookups it
     /// continued, handed to a waiting task before its next poll.
+    query_scopes: HashMap<RelationKey, ClosedQueryScope>,
     closure_discharges: HashMap<RelationKey, ClosureDischarges>,
     evidence: CancellationEvidenceLedger,
     work: usize,
@@ -1268,6 +1313,47 @@ impl<'a> Scheduler<'a> {
         (seen, reasons, pending, unavailable)
     }
 
+    fn component_query_obligations(
+        &self,
+        nodes: &HashSet<Runnable>,
+        cancellation: &CancellationToken,
+    ) -> super::super::QueryObligations {
+        let mut scope = super::super::QueryObligations::empty();
+        for node in nodes {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match *node {
+                Runnable::Task(id) => {
+                    let task = &self.tasks[id];
+                    if let Some(answer) = &task.answer {
+                        scope.union(&answer.query_obligations);
+                    }
+                    if let Some(state) = task
+                        .frame
+                        .as_ref()
+                        .and_then(|frame| frame.evaluation.as_ref())
+                    {
+                        scope.union(&state.query_obligations.published());
+                        if state.lexical_answers.contains_key(&task.root.reference) {
+                            scope.union(
+                                &state
+                                    .query_obligations
+                                    .scope(QueryNode::Lexical(task.root.reference)),
+                            );
+                        }
+                    }
+                }
+                Runnable::Relation(id) => {
+                    if let Some(closed) = self.query_scopes.get(&self.relations[id].endpoint) {
+                        closed.record_query_obligations(&mut scope);
+                    }
+                }
+            }
+        }
+        scope
+    }
+
     /// A typed reference edge must itself close a cycle. Merely reaching an
     /// unrelated prefix cycle does not turn that cycle into a typed one.
     fn has_typed_reference_cycle(
@@ -1411,11 +1497,13 @@ impl<'a> Scheduler<'a> {
                 Ok((
                     consumer,
                     target,
-                    Box::new(incomplete_fact_resolution_answer(
-                        metadata,
-                        completion,
-                        cancellation,
-                    )),
+                    Box::new({
+                        let mut answer =
+                            incomplete_fact_resolution_answer(metadata, completion, cancellation);
+                        answer.query_obligations =
+                            self.component_query_obligations(&nodes, cancellation);
+                        answer
+                    }),
                 ))
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -1468,8 +1556,10 @@ impl<'a> Scheduler<'a> {
                 if task.answer.is_some() {
                     return Ok(None);
                 }
-                let (_, mut reasons, pending, unavailable) =
+                let (nodes, mut reasons, pending, unavailable) =
                     self.blocked_task_component(id, operation.session.cancellation);
+                let scope =
+                    self.component_query_obligations(&nodes, operation.session.cancellation);
                 if let Some(state) = task
                     .frame
                     .as_ref()
@@ -1481,7 +1571,7 @@ impl<'a> Scheduler<'a> {
                     )
                     .unwrap_or_else(incomplete_cancelled);
                 }
-                Ok(Some(if unavailable {
+                let completion = if unavailable {
                     let seed_completion = task
                         .frame
                         .as_ref()
@@ -1501,11 +1591,12 @@ impl<'a> Scheduler<'a> {
                             .into_iter()
                             .map(ResolutionIncompleteReason::CyclicPrefixDependency),
                     ))
-                }))
+                };
+                Ok(Some((completion, scope)))
             })
             .collect::<StoreResult<Vec<_>>>()?;
         for (task, completion) in self.tasks[..root_task_count].iter_mut().zip(completions) {
-            let Some(completion) = completion else {
+            let Some((completion, scope)) = completion else {
                 continue;
             };
             let state = task
@@ -1529,6 +1620,8 @@ impl<'a> Scheduler<'a> {
                 completion,
                 operation.session.cancellation,
             );
+            answer.query_obligations = scope;
+            // The fallback narrows retained evaluator state rather than reading a full carrier.
             if let Some(binding) = state.lexical_answers.get(&task.root.reference) {
                 answer.binding = ResolutionAnswer::new(
                     binding.targets().to_vec(),
@@ -1691,6 +1784,46 @@ impl<'a> Scheduler<'a> {
             self.runnable.push_back(Runnable::Relation(id));
         }
         RelationAdmission::Ready(id)
+    }
+
+    /// Replay query scope and closure discharges for a relation closed by this
+    /// scheduler or by a provider before this scheduler existed, so the two
+    /// paths cannot drift (#8290).
+    fn replay_provider_closure(
+        &mut self,
+        endpoint: &RelationKey,
+        provider: &(impl RootProvider + ?Sized),
+    ) {
+        if let Some(scope) = provider.resolved_query_scope(endpoint) {
+            self.query_scopes
+                .entry(endpoint.clone())
+                .or_default()
+                .merge(scope);
+        }
+        if let Some(discharges) = provider.resolved_closure_discharges(endpoint) {
+            self.closure_discharges
+                .entry(endpoint.clone())
+                .or_default()
+                .merge(discharges);
+        }
+    }
+
+    /// A provider's closed relation can predate this scheduler. Replay its
+    /// query scope and closure discharges when admitting it.
+    fn install_provider_relation(
+        &mut self,
+        operation: &mut Resources<'_, 'a>,
+        endpoint: RelationKey,
+        discovery: RootDiscovery,
+        provider: &(impl RootProvider + ?Sized),
+    ) -> RelationAdmission {
+        debug_assert!(
+            matches!(discovery, RootDiscovery::AlreadyReady { .. })
+                || provider.resolved_closure_discharges(&endpoint).is_none(),
+            "only a closed endpoint carries closure discharges: {endpoint:?}"
+        );
+        self.replay_provider_closure(&endpoint, provider);
+        self.install_relation(operation, endpoint, discovery)
     }
 
     /// Retain only the negative provider proofs consumed by this selection.
@@ -2012,6 +2145,7 @@ fn new_scheduler<'a>() -> Scheduler<'a> {
         qualified_dependents: HashMap::default(),
         qualified_evidence: HashMap::default(),
         claims: HashMap::default(),
+        query_scopes: HashMap::default(),
         closure_discharges: HashMap::default(),
         evidence: CancellationEvidenceLedger::default(),
         work: 0,
@@ -2188,7 +2322,33 @@ fn poll_member_consumer<'source>(
         .discharged_provider_reasons
         .extend(discharged_provider_reasons);
     match polled {
-        MemberSelectionPoll::Ready(selection) => return Ok(MemberConsumerPoll::Ready(selection)),
+        MemberSelectionPoll::Ready(selection) => {
+            match consumer {
+                MemberConsumerId::Relation(id) => {
+                    let endpoint = scheduler.relations[id].endpoint.clone();
+                    scheduler
+                        .query_scopes
+                        .entry(endpoint)
+                        .or_default()
+                        .query_obligations
+                        .union(&selection.query_obligations);
+                }
+                MemberConsumerId::QualifiedTask(id) => {
+                    let reference = scheduler.tasks[id].root.reference;
+                    scheduler.tasks[id]
+                        .frame
+                        .as_mut()
+                        .expect("held member consumer")
+                        .evaluation
+                        .as_mut()
+                        .expect("held member evaluation")
+                        .query_obligations
+                        .node(QueryNode::Hierarchy(reference))
+                        .union(&selection.query_obligations);
+                }
+            }
+            return Ok(MemberConsumerPoll::Ready(selection));
+        }
         MemberSelectionPoll::Cancelled => return Ok(MemberConsumerPoll::Cancelled),
         MemberSelectionPoll::Continue => consumer.enqueue(scheduler),
         MemberSelectionPoll::AwaitingHierarchyReferences(references) => {
@@ -2233,7 +2393,9 @@ fn poll_member_consumer<'source>(
                     dependency
                 } else {
                     let discovery = provider.discover(&endpoint)?;
-                    match scheduler.install_relation(operation, endpoint, discovery) {
+                    match scheduler
+                        .install_provider_relation(operation, endpoint, discovery, provider)
+                    {
                         RelationAdmission::Ready(id) => id,
                         RelationAdmission::Cancelled => return Ok(MemberConsumerPoll::Cancelled),
                     }
@@ -2534,6 +2696,16 @@ fn poll_qualified_member_consumer<'source>(
                     // The provider may discharge its own hierarchy evidence,
                     // but never the typed input or prerequisite obligations.
                     value.completion = value.completion.combine(&wait.completion);
+                    scheduler.tasks[task]
+                        .frame
+                        .as_mut()
+                        .expect("held member task")
+                        .evaluation
+                        .as_mut()
+                        .expect("held member evaluator")
+                        .query_obligations
+                        .node(QueryNode::Hierarchy(wait.input.reference().reference))
+                        .union(&value.query_obligations);
                     match value.into_typed_answer(
                         wait.input.reference().reference,
                         operation.session.resolution_session,
@@ -3223,13 +3395,9 @@ fn drive_scheduler_inner<'source>(
                 &discharges.discharged_provider_reasons,
             );
         }
-        if let Some(retired) = provider.resolved_closure_discharges(&relation.endpoint) {
-            scheduler
-                .closure_discharges
-                .entry(relation.endpoint.clone())
-                .or_default()
-                .merge(retired);
-        }
+        let endpoint = relation.endpoint.clone();
+        scheduler.replay_provider_closure(&endpoint, provider);
+        let relation = &mut scheduler.relations[id];
         scheduler
             .evidence
             .include(completion, cancellation, &mut scheduler.work);
@@ -3316,18 +3484,33 @@ fn poll_round<'a>(
             "G0 does not enable remote task execution"
         );
         if let Some((reference, dependency)) = scheduler.typed_references.remove(&id) {
-            let answer = scheduler.tasks[dependency]
+            let dependency_answer = scheduler.tasks[dependency]
                 .answer
                 .as_ref()
-                .expect("a resumed typed prerequisite has its selected answer")
-                .binding()
-                .clone();
+                .expect("a resumed typed prerequisite has its selected answer");
+            let scope = dependency_answer.query_obligations.clone();
+            let answer = dependency_answer.binding().clone();
+            // This path narrows the carrier to a binding; retain its closed scope first.
             scheduler.tasks[id]
                 .frame
                 .as_mut()
                 .expect("held typed task")
-                .typed_reference_answers
-                .insert(reference, Arc::new(answer));
+                .evaluation
+                .as_mut()
+                .expect("held typed evaluator")
+                .query_obligations
+                .node(QueryNode::Hierarchy(reference))
+                .union(&scope);
+            assert!(
+                scheduler.tasks[id]
+                    .frame
+                    .as_mut()
+                    .expect("held typed task")
+                    .typed_reference_answers
+                    .insert(reference, Arc::new(answer))
+                    .is_none(),
+                "typed reference answer is inserted only once"
+            );
             assert_eq!(scheduler.tasks[id].waiting, 0);
             scheduler.tasks[id].hierarchy_waits.clear();
         }
@@ -3349,6 +3532,15 @@ fn poll_round<'a>(
             .as_mut()
             .expect("runnable task is live")
             .inject_closure_discharges(&scheduler.closure_discharges, environment);
+        scheduler.tasks[id]
+            .frame
+            .as_mut()
+            .expect("runnable task is live")
+            .inject_query_scopes(
+                &scheduler.query_scopes,
+                &scheduler.closure_discharges,
+                environment,
+            );
         let cached = if let Some((memo, access, context)) = operation.completed_roots {
             let task = &mut scheduler.tasks[id];
             let evaluation = task
@@ -3762,7 +3954,9 @@ fn poll_round<'a>(
                                 return Ok(RoundOutcome::Cancelled);
                             }
                             let discovery = provider.discover(&endpoint)?;
-                            match scheduler.install_relation(operation, endpoint, discovery) {
+                            match scheduler
+                                .install_provider_relation(operation, endpoint, discovery, provider)
+                            {
                                 RelationAdmission::Ready(id) => id,
                                 RelationAdmission::Cancelled => return Ok(RoundOutcome::Cancelled),
                             }
@@ -3823,7 +4017,8 @@ fn poll_round<'a>(
                 let discovery = discovered
                     .remove(&endpoint)
                     .expect("every new pending endpoint was batch-discovered");
-                match scheduler.install_relation(operation, endpoint, discovery) {
+                match scheduler.install_provider_relation(operation, endpoint, discovery, provider)
+                {
                     RelationAdmission::Ready(id) => id,
                     RelationAdmission::Cancelled => return Ok(RoundOutcome::Cancelled),
                 }
@@ -5587,15 +5782,37 @@ mod tests {
             let gaps = [[0x51; 32], [0x52; 32]]
                 .map(|digest| SemanticId::operation_local(memo.intern_identity(digest)));
             for (key, gap) in keys.iter().zip(gaps) {
-                let answer = empty_fact_resolution_answer(
+                let mut answer = empty_fact_resolution_answer(
                     ResolutionCompletion::incomplete([
                         ResolutionIncompleteReason::UnsupportedSemantic(gap),
                     ]),
                     resources.session.cancellation,
                 );
+                answer
+                    .query_obligations
+                    .insert(crate::analyzer::resolution::QueryObligation::new(
+                        "jvm-default-import-package-open",
+                        "scala",
+                        "unacquired",
+                    ));
+                answer.binding = ResolutionAnswer::new(
+                    vec![gap],
+                    Vec::new(),
+                    answer.binding().completion().clone(),
+                );
                 memo.retain(key, &answer, resources.session);
             }
             for (key, gap) in keys.iter().zip(gaps) {
+                let warm = memo.lookup(key, resources.session).unwrap();
+                assert_eq!(
+                    warm.query_obligations.iter().next().unwrap().detail,
+                    "unacquired"
+                );
+                assert_eq!(
+                    warm.binding().targets(),
+                    &[gap],
+                    "cached fixed identity survives with its scope"
+                );
                 assert_eq!(
                     memo.lookup(key, resources.session).unwrap().completion(),
                     &ResolutionCompletion::incomplete([
@@ -6211,6 +6428,13 @@ mod tests {
                     } => {
                         continuation.assert_current(provenance);
                         assert_eq!(key, self.key);
+                        assert!(
+                            answer
+                                .query_obligations
+                                .iter()
+                                .any(|obligation| obligation.kind == "cycle-scope"),
+                            "{answer:?}"
+                        );
                         if let Some(reason) = self.incomplete_reason {
                             assert!(answer.binding().targets().is_empty());
                             assert_ne!(answer.completion(), &ResolutionCompletion::Complete);
@@ -6256,11 +6480,28 @@ mod tests {
                     panic!("root admitted");
                 };
                 let task = scheduler.admit(resources, key, None).unwrap();
+                let mut scope = crate::analyzer::resolution::QueryObligations::empty();
+                scope.insert(crate::analyzer::resolution::QueryObligation::new(
+                    "cycle-scope",
+                    "dependency",
+                    "closed-input",
+                ));
+                scheduler.tasks[task]
+                    .frame
+                    .as_mut()
+                    .unwrap()
+                    .evaluation
+                    .as_mut()
+                    .unwrap()
+                    .query_obligations
+                    .node(QueryNode::Lexical(key.reference))
+                    .union(&scope);
                 if mode == 0 {
                     let mut answer = empty_fact_resolution_answer(
                         ResolutionCompletion::Complete,
                         resources.session.cancellation,
                     );
+                    answer.query_obligations = scope;
                     answer.binding = ResolutionAnswer::new(
                         vec![SemanticId::for_test("selected-reference-target")],
                         Vec::new(),

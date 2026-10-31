@@ -721,8 +721,10 @@ fn live_owner_blob_id(
     let key = &surface.header.key;
     super::live_class_set_owner_blob_id(
         conn,
-        &surface.header.owner_blob_oid,
-        &key.owner_storage_language_key,
+        &super::BlobKey::unvaried(
+            git2::Oid::from_str(&surface.header.owner_blob_oid)?,
+            key.owner_storage_language_key.as_str(),
+        ),
     )?
     .ok_or_else(|| StoreError::new("class-set procedure surface owner blob is absent"))
 }

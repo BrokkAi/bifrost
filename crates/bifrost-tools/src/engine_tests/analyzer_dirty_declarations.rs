@@ -446,7 +446,7 @@ fn stored_blob_keys_use_the_generation_for_each_language() {
             .expect("stored index keys");
         let stable_families = |keys: Vec<_>| {
             keys.into_iter()
-                .filter(|(family, _)| {
+                .filter(|(family, _, _)| {
                     *family != brokk_bifrost_analysis::analyzer::read_ledger::IndexFamily::Supertype
                 })
                 .collect::<Vec<_>>()

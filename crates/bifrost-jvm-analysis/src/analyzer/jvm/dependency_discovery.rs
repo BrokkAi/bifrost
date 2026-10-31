@@ -307,6 +307,18 @@ pub(crate) fn is_jvm_dependency_input(file: &ProjectFile) -> bool {
 }
 
 pub(crate) fn is_jvm_dependency_input_path(path: &Path) -> bool {
+    // Forward-looking configuration keys: discovery does not read .mvn content yet.
+    if let Some(index) = path.components().position(|c| c.as_os_str() == ".mvn") {
+        let suffix: std::path::PathBuf = path.components().skip(index + 1).collect();
+        return [
+            "maven.config",
+            "jvm.config",
+            "extensions.xml",
+            "wrapper/maven-wrapper.properties",
+        ]
+        .iter()
+        .any(|candidate| suffix == Path::new(candidate));
+    }
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -333,9 +345,8 @@ pub(crate) fn is_jvm_dependency_input_path(path: &Path) -> bool {
     {
         return true;
     }
-    path.components().any(|component| {
-        matches!(component, Component::Normal(name) if name == ".mvn" || name == "buildSrc")
-    })
+    path.components()
+        .any(|component| matches!(component, Component::Normal(name) if name == "buildSrc"))
 }
 
 fn discover_maven_pom(

@@ -3266,7 +3266,7 @@ fn validate_property_value(
         super::schema::ValueShape::CaptureName => {
             unreachable!("capture names are query-step values, not pattern properties")
         }
-        super::schema::ValueShape::RegexString => validate_rql_regex(value, &child, analysis),
+        super::schema::ValueShape::RegexString => validate_rql_regex(value, analysis),
         super::schema::ValueShape::KindList => validate_kind_value(value, &child, analysis),
         super::schema::ValueShape::AssignmentSequenceKind => {
             let label = match &value.kind {
@@ -3460,15 +3460,15 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
         );
         return;
     }
-    let (label, max, reject_empty) = match property {
+    let (label, max) = match property {
         RqlProperty::Name | RqlProperty::StringValue | RqlProperty::ParameterType => {
-            ("exact string", MAX_STRING_PREDICATE_LENGTH, false)
+            ("exact string", MAX_STRING_PREDICATE_LENGTH)
         }
-        RqlProperty::LanguageRule => ("language rule label", MAX_STRING_PREDICATE_LENGTH, false),
-        RqlProperty::TypeKind => ("type-kind label", MAX_STRING_PREDICATE_LENGTH, false),
-        RqlProperty::Modifier => ("modifier label", MAX_STRING_PREDICATE_LENGTH, false),
-        RqlProperty::BodyState => ("body-state label", MAX_STRING_PREDICATE_LENGTH, false),
-        RqlProperty::BodyOwner => ("body-owner label", MAX_STRING_PREDICATE_LENGTH, false),
+        RqlProperty::LanguageRule => ("language rule label", MAX_STRING_PREDICATE_LENGTH),
+        RqlProperty::TypeKind => ("type-kind label", MAX_STRING_PREDICATE_LENGTH),
+        RqlProperty::Modifier => ("modifier label", MAX_STRING_PREDICATE_LENGTH),
+        RqlProperty::BodyState => ("body-state label", MAX_STRING_PREDICATE_LENGTH),
+        RqlProperty::BodyOwner => ("body-owner label", MAX_STRING_PREDICATE_LENGTH),
         RqlProperty::Capture => unreachable!("capture handled above"),
         RqlProperty::NameRegex
         | RqlProperty::TextRegex
@@ -3540,12 +3540,6 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
             "invalid-query",
             format!("unknown modifier label {text:?}"),
         );
-    } else if reject_empty && text.is_empty() {
-        analysis.error(
-            value.range.clone(),
-            "invalid-query",
-            format!("{label} must not be empty"),
-        );
     } else if text.len() > max {
         analysis.error(
             value.range.clone(),
@@ -3555,12 +3549,12 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
     }
 }
 
-fn validate_rql_regex(value: &Expr, path: &str, analysis: &mut Analysis) {
+fn validate_rql_regex(value: &Expr, analysis: &mut Analysis) {
     let ExprKind::String(source) = &value.kind else {
         require_string(value, analysis);
         return;
     };
-    validate_regex(source, value.range.clone(), path, analysis);
+    validate_regex(source, value.range.clone(), analysis);
 }
 
 fn validate_pattern_list(value: &Expr, path: &str, analysis: &mut Analysis) {

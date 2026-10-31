@@ -11,6 +11,33 @@ use crate::analyzer::usages::python_class_hierarchy::{
     PythonMroMembersAnswer, PythonOverrideAnswer, PythonOverrideOutcome,
 };
 
+pub(super) fn hierarchy_incompleteness(reason: Option<PythonHierarchyReason>) -> Incompleteness {
+    match reason {
+        Some(PythonHierarchyReason::Cancelled) => {
+            Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+        }
+        Some(PythonHierarchyReason::VisitLimit) => {
+            Incompleteness::Operational(DerivationExecutionCause::Budget)
+        }
+        Some(
+            PythonHierarchyReason::NotClass
+            | PythonHierarchyReason::UnresolvedBase
+            | PythonHierarchyReason::NonClassBase
+            | PythonHierarchyReason::ExternalBase
+            | PythonHierarchyReason::MissingRuntimeBases
+            | PythonHierarchyReason::ConflictingRuntimeBases
+            | PythonHierarchyReason::AmbiguousRuntimeBase
+            | PythonHierarchyReason::UnsupportedBaseExpression
+            | PythonHierarchyReason::UnknownMemberSurface
+            | PythonHierarchyReason::DuplicateBase
+            | PythonHierarchyReason::CyclicBases
+            | PythonHierarchyReason::InconsistentLinearization
+            | PythonHierarchyReason::NotEffectiveMember,
+        )
+        | None => Incompleteness::Content,
+    }
+}
+
 const PYTHON_HIERARCHY_FACT_ID_DOMAIN: &[u8] = b"bifrost.code_query.python_hierarchy_fact.v2";
 const MAX_PYTHON_BASE_BRANCH_MEMBER_VISITS: usize = 16_384;
 pub(super) const PYTHON_HIERARCHY_FACT_KIND_LABELS: &[&str] = &[
@@ -67,6 +94,7 @@ pub(super) const PYTHON_HIERARCHY_REASON_LABELS: &[&str] = &[
     "dynamic_dispatch",
     "conditional_call",
     "receiver_binding_unknown",
+    "target_receiver_read_unavailable",
     "incomplete_hierarchy",
     "unsupported_call_shape",
     "unresolved_super_binding",
@@ -78,6 +106,7 @@ pub(super) const PYTHON_HIERARCHY_COVERAGE_LABELS: &[&str] = &["complete", "open
 
 #[derive(Debug, Clone)]
 pub(super) struct PythonHierarchyFactValue {
+    pub(super) incompleteness: Incompleteness,
     pub(super) root: DeclarationValue,
     pub(super) root_id: String,
     pub(super) ancestry_basis: PythonAncestryBasis,
@@ -232,6 +261,7 @@ pub(super) fn member_premise(
     value.fact_kind = "member";
     value.outcome = answer.outcome.label();
     value.reason = answer.reason.map(PythonHierarchyReason::label);
+    value.incompleteness = hierarchy_incompleteness(answer.reason);
     value.coverage = if answer.outcome == PythonHierarchyOutcome::Complete {
         "complete"
     } else {
@@ -264,6 +294,20 @@ pub(super) fn attach_hierarchy_premises(
     expansion: &mut PipelineExpansion,
     premises: &[PythonHierarchyFactValue],
 ) {
+    let incompleteness = premises
+        .iter()
+        .fold(Incompleteness::Content, |cause, premise| {
+            cause.combine(premise.incompleteness)
+        });
+    match &mut expansion.value {
+        PipelineValue::PythonRuleFact(value) => {
+            value.incompleteness = value.incompleteness.combine(incompleteness)
+        }
+        PipelineValue::PythonHierarchyFact(value) => {
+            value.incompleteness = value.incompleteness.combine(incompleteness)
+        }
+        _ => {}
+    }
     // Preserve the terminal trace entry and its identity as the last result.
     expansion.trace.splice(
         0..0,
@@ -287,6 +331,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
         return match step {
             QueryStep::ClassHierarchy | QueryStep::MroMembers | QueryStep::ClassMro => {
                 vec![fact_expansion(
+                    Incompleteness::Content,
                     declaration,
                     &root_id,
                     "hierarchy",
@@ -305,6 +350,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
                 )]
             }
             QueryStep::ClassBases => vec![fact_expansion(
+                Incompleteness::Content,
                 declaration,
                 &root_id,
                 "base",
@@ -322,6 +368,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
                 None,
             )],
             QueryStep::PythonOverrides => vec![fact_expansion(
+                Incompleteness::Content,
                 declaration,
                 &root_id,
                 "override",
@@ -384,6 +431,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
                 .enumerate()
                 .map(|(rank, class)| {
                     fact_expansion(
+                        Incompleteness::Content,
                         declaration,
                         &root_id,
                         "mro",
@@ -420,6 +468,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
                     value.fact_kind = "member";
                     value.outcome = answer.outcome.label();
                     value.reason = answer.reason.map(PythonHierarchyReason::label);
+                    value.incompleteness = hierarchy_incompleteness(answer.reason);
                     value.coverage = "open";
                 }
                 rows.push(open);
@@ -436,7 +485,13 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
                     member,
                     base_branch_counts
                         .as_ref()
+                        .ok()
                         .map(|counts| *counts.get(&member.name).unwrap_or(&0)),
+                    base_branch_counts
+                        .as_ref()
+                        .err()
+                        .copied()
+                        .unwrap_or(Incompleteness::Content),
                     protocol_facts,
                 )
             }));
@@ -704,13 +759,6 @@ fn python_negated_equality_expression(
         && let Some(arguments) = operand.child_by_field_name("arguments")
     {
         let arguments = named_children(arguments);
-        if function
-            .child_by_field_name("attribute")
-            .and_then(|attribute| node_text(source, attribute))
-            != Some("__eq__")
-        {
-            return Some(false);
-        }
         return Some(
             function
                 .child_by_field_name("object")
@@ -729,17 +777,21 @@ fn python_negated_equality_expression(
         return None;
     }
     if operand.kind() == "comparison_operator" {
-        let operator = operand
-            .child_by_field_name("operators")
+        let shape = brokk_bifrost_python::structural::python_comparison_shape(operand);
+        if shape.operator_count != 1 {
+            return Some(false);
+        }
+        let operator = shape
+            .operator
             .and_then(|operator| node_text(source, operator))?;
         if operator != "==" {
             return Some(false);
         }
-        let direct = operand
-            .child_by_field_name("left")
+        let direct = shape
+            .left
             .is_some_and(|left| direct_identifier(left, source) == Some(receiver))
-            && operand
-                .child_by_field_name("right")
+            && shape
+                .right
                 .is_some_and(|right| direct_identifier(right, source) == Some(other));
         return direct.then_some(true);
     }
@@ -906,6 +958,7 @@ fn override_signature_fact_expansion(
     };
     pipeline_expansion(PipelineValue::PythonHierarchyFact(Box::new(
         PythonHierarchyFactValue {
+            incompleteness: hierarchy_incompleteness(answer.reason),
             root: declaration.clone(),
             root_id: root_id.to_owned(),
             ancestry_basis: answer.ancestry_basis.clone(),
@@ -943,6 +996,7 @@ fn hierarchy_outcome_fact(
     answer: &PythonClassHierarchyAnswer,
 ) -> PipelineExpansion {
     fact_expansion(
+        hierarchy_incompleteness(answer.reason),
         declaration,
         root_id,
         "hierarchy",
@@ -980,6 +1034,7 @@ fn base_fact(
         PythonBaseResolution::External => Some(PythonHierarchyReason::ExternalBase.label()),
     };
     fact_expansion(
+        hierarchy_incompleteness(hierarchy.reason),
         declaration,
         root_id,
         "base",
@@ -1012,6 +1067,7 @@ fn inference_failure_fact(
         PythonBaseResolution::Resolved | PythonBaseResolution::External => return None,
     };
     Some(fact_expansion(
+        Incompleteness::Content,
         declaration,
         root_id,
         "inference_failure",
@@ -1036,9 +1092,11 @@ fn member_fact(
     ordinal: usize,
     member: &PythonMroMember,
     base_branch_definition_count: Option<usize>,
+    incompleteness: Incompleteness,
     protocol_facts: PythonClassMemberProtocolFacts,
 ) -> PipelineExpansion {
     let mut expansion = fact_expansion(
+        Incompleteness::Content,
         declaration,
         root_id,
         "member",
@@ -1067,6 +1125,7 @@ fn member_fact(
     if base_branch_definition_count.is_none() {
         value.coverage = "open";
         value.reason = Some("base_branch_members_unavailable");
+        value.incompleteness = incompleteness;
     }
     expansion
 }
@@ -1075,30 +1134,42 @@ fn mro_base_branch_definition_counts(
     provider: &dyn PythonClassHierarchyProvider,
     answer: &PythonMroMembersAnswer,
     cancellation: Option<&CancellationToken>,
-) -> Option<HashMap<String, usize>> {
+) -> Result<HashMap<String, usize>, Incompleteness> {
     let mut declarations = HashMap::<String, Vec<CodeUnit>>::default();
     let mut visits = 0usize;
     for base in &answer.hierarchy.bases {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return None;
+            return Err(Incompleteness::Operational(
+                DerivationExecutionCause::Cancelled,
+            ));
         }
         if base.origin == PythonBaseOrigin::ImplicitObject {
             // The language-supplied object root is not a source branch.
             continue;
         }
         if base.resolution != PythonBaseResolution::Resolved {
-            return None;
+            return Err(Incompleteness::Content);
         }
         let Some(ClassIdentity::Workspace(unit)) = base.target.as_ref() else {
-            return None;
+            return Err(Incompleteness::Content);
         };
         let branch = provider.mro_members(unit, cancellation);
         if branch.outcome != PythonHierarchyOutcome::Complete {
-            return None;
+            return Err(branch.reason.map_or(
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
+                |reason| hierarchy_incompleteness(Some(reason)),
+            ));
         }
         visits = visits.saturating_add(branch.members.len());
-        if visits > MAX_PYTHON_BASE_BRANCH_MEMBER_VISITS {
-            return None;
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            visits,
+            MAX_PYTHON_BASE_BRANCH_MEMBER_VISITS,
+        )
+        .allows(0)
+        {
+            return Err(Incompleteness::Operational(
+                DerivationExecutionCause::Budget,
+            ));
         }
         for member in branch.members {
             let candidates = declarations.entry(member.name).or_default();
@@ -1107,12 +1178,10 @@ fn mro_base_branch_definition_counts(
             }
         }
     }
-    Some(
-        declarations
-            .into_iter()
-            .map(|(name, declarations)| (name, declarations.len()))
-            .collect(),
-    )
+    Ok(declarations
+        .into_iter()
+        .map(|(name, declarations)| (name, declarations.len()))
+        .collect())
 }
 
 fn override_fact(
@@ -1121,6 +1190,7 @@ fn override_fact(
     answer: &PythonOverrideAnswer,
 ) -> PipelineExpansion {
     fact_expansion(
+        hierarchy_incompleteness(answer.reason),
         declaration,
         root_id,
         "override",
@@ -1144,6 +1214,7 @@ fn override_fact(
 
 #[allow(clippy::too_many_arguments)]
 fn fact_expansion(
+    incompleteness: Incompleteness,
     declaration: &DeclarationValue,
     root_id: &str,
     fact_kind: &'static str,
@@ -1162,6 +1233,7 @@ fn fact_expansion(
 ) -> PipelineExpansion {
     pipeline_expansion(PipelineValue::PythonHierarchyFact(Box::new(
         PythonHierarchyFactValue {
+            incompleteness,
             root: declaration.clone(),
             root_id: root_id.to_owned(),
             ancestry_basis: PythonAncestryBasis::default(),

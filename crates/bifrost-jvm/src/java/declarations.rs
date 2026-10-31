@@ -48,6 +48,21 @@ pub fn java_modifier_keywords(node: Node<'_>) -> impl Iterator<Item = &'static s
     })
 }
 
+/// The explicit public, protected, or private modifier on a Java source node.
+/// Public wins over protected, which wins over private when syntax is malformed.
+pub fn explicit_java_source_visibility(node: Node<'_>) -> Option<DeclaredVisibility> {
+    let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
+    if modifiers.contains(&"public") {
+        Some(DeclaredVisibility::Public)
+    } else if modifiers.contains(&"protected") {
+        Some(DeclaredVisibility::Protected)
+    } else if modifiers.contains(&"private") {
+        Some(DeclaredVisibility::Private)
+    } else {
+        None
+    }
+}
+
 /// Java's package path is stored `.`-joined in `package_name`.
 const JAVA_PACKAGE_SEPARATOR: &str = ".";
 
@@ -643,6 +658,10 @@ fn visit_callable<'tree>(
         SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels)
             .with_callable_arity(properties.arity)
             .with_callable_modifiers(properties.is_static, properties.is_constructor, visibility)
+            .with_overload_discriminator(Some(java_overload_discriminator(
+                node.child_by_field_name("parameters"),
+                source,
+            )))
             .with_callable_parameter_types(
                 node.child_by_field_name("parameters")
                     .map(|parameters| canonical_parameter_type_texts(parameters, source))
@@ -718,6 +737,7 @@ fn visit_compact_constructor<'tree>(
         )
         .with_callable_arity(properties.arity)
         .with_callable_modifiers(properties.is_static, properties.is_constructor, visibility)
+        .with_overload_discriminator(Some(java_overload_discriminator(Some(parameters), source)))
         .with_callable_parameter_types(canonical_parameter_type_texts(parameters, source))
         .with_dispatch_extensibility(DispatchExtensibility::Closed),
         visibility,
@@ -1025,6 +1045,7 @@ fn visit_record_components(
                 .with_return_type_text(Some(ty))
                 .with_callable_arity(CallableArity::exact(0))
                 .with_callable_modifiers(false, false, DeclaredVisibility::Public)
+                .with_overload_discriminator(Some(java_overload_discriminator(None, source)))
                 .with_callable_parameter_types(Vec::new())
                 .with_dispatch_extensibility(DispatchExtensibility::Closed),
             DeclaredVisibility::Public,
@@ -2957,6 +2978,33 @@ pub fn java_source_facts_for_test(
         .join("fact-resolution-java-correctness");
     let file = ProjectFile::new(root, "src/Fixture.java");
     parse_java_file(&file, source, &tree).resolution_facts
+}
+
+fn java_overload_discriminator(parameters: Option<Node<'_>>, source: &str) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::tree_walk::{
+        canonical_type_tokens, overload_discriminator, overload_parameter_tokens,
+    };
+    let mut tokens = Vec::new();
+    if let Some(parameters) = parameters {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let ty = match parameter.kind() {
+                "formal_parameter" => parameter.child_by_field_name("type"),
+                "spread_parameter" => spread_parameter_type_node(parameter),
+                "receiver_parameter" => continue,
+                kind if brokk_bifrost_core::analyzer::tree_walk::is_comment_kind(kind) => continue,
+                _ => continue,
+            };
+            tokens.extend(overload_parameter_tokens(ty, source));
+            if let Some(dimensions) = parameter.child_by_field_name("dimensions") {
+                tokens.extend(canonical_type_tokens(dimensions, source));
+            }
+            if parameter.kind() == "spread_parameter" {
+                tokens.push("<varargs>".to_owned());
+            }
+        }
+    }
+    overload_discriminator(tokens)
 }
 
 #[cfg(test)]

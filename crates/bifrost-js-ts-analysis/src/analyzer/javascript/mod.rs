@@ -100,7 +100,7 @@ mod semantic;
 /// Shaped like the TypeScript pair (`typescript:ts` / `typescript:tsx`) and the
 /// C++ pair (`cpp` / `cpp:c`): `.jsx` is read by the TSX grammar rather than
 /// tree-sitter-javascript (#3322), so one blob has two possible projections and
-/// `blobs`/`code_units`, keyed `(blob_oid, lang)`, must not let them collide.
+/// `blobs`/`code_units`, keyed `(blob_oid, lang, parse_variant)`, must not let them collide.
 /// The plain `javascript` key keeps its spelling so `.js` rows already in a
 /// warm cache stay addressable.
 pub(crate) const JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY: &str = "javascript:jsx";
@@ -529,11 +529,17 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
 }
 
 impl TypeHierarchyProvider for JavascriptAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
         providers::get_direct_ancestors(self, code_unit)
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
         providers::get_direct_descendants(self, code_unit)
     }
 
@@ -541,7 +547,10 @@ impl TypeHierarchyProvider for JavascriptAnalyzer {
         &self,
         code_unit: &CodeUnit,
         scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<
+        brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+        brokk_bifrost_core::analyzer::capabilities::Cancelled,
+    > {
         providers::get_direct_descendants_within(self, code_unit, scope)
     }
 }

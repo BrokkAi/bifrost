@@ -109,6 +109,11 @@ impl SelectedDemandState {
         });
         if let Some(answer) = &answer {
             #[cfg(any(test, feature = "test-support"))]
+            crate::analyzer::resolution::query_obligations::replay_observations::record(
+                crate::analyzer::resolution::query_obligations::replay_observations::Path::CompletedRoot,
+                &answer.query_obligations,
+            );
+            #[cfg(any(test, feature = "test-support"))]
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug_assert!(
                 self.owns_answer(answer, session),
@@ -160,6 +165,7 @@ impl SelectedDemandState {
         // Keep this match exhaustive: adding an answer field must also decide
         // how to check any identities it carries.
         let FactResolutionAnswer {
+            query_obligations: _,
             site_metadata,
             callable_receiver_dispositions,
             callable_candidate_applicability,

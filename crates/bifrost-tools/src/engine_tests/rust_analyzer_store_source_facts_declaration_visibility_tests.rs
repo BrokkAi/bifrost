@@ -88,7 +88,11 @@ mod second { fn repeated() {} }
             })
             .expect("install native bridge publication fault");
         let error = store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect_err("missing native bridge must fail publication");
         assert!(
             error
@@ -98,7 +102,7 @@ mod second { fn repeated() {} }
         );
         assert_eq!(
             store
-                .content_row_count(oid, "rust")
+                .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
                 .expect("failed Rust publication row count"),
             0,
             "failed native bridge publication leaves no content rows"
@@ -111,7 +115,11 @@ mod second { fn repeated() {} }
             })
             .expect("remove native bridge publication fault");
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect("publish Rust native declaration bridges");
         let conn = store.read_conn().expect("read Rust source publication");
         let id = rust_blob_id(&conn, oid);
@@ -208,7 +216,11 @@ mod second { fn repeated() {} }
         let oid = oid_for(b"");
         let store = AnalyzerStore::open_ephemeral().expect("empty Rust source publication store");
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect("publish empty Rust native declaration family");
         let conn = store
             .read_conn()

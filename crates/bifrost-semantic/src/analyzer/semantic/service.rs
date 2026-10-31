@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use git2::Oid;
+use brokk_bifrost_core::gitblob::BlobKey;
 use moka::sync::Cache;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -401,7 +401,7 @@ const SOURCE_CONTENT_IDENTITY_MEMO_ENTRIES: u64 = 32_768;
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct SourceContentIdentityMemo {
-    entries: Cache<Oid, ContentIdentity>,
+    entries: Cache<BlobKey, ContentIdentity>,
 }
 
 impl Default for SourceContentIdentityMemo {
@@ -416,12 +416,12 @@ impl Default for SourceContentIdentityMemo {
 
 impl SourceContentIdentityMemo {
     #[doc(hidden)]
-    pub fn get(&self, source: Oid) -> Option<ContentIdentity> {
+    pub fn get(&self, source: BlobKey) -> Option<ContentIdentity> {
         self.entries.get(&source)
     }
 
     #[doc(hidden)]
-    pub fn record(&self, source: Oid, content: ContentIdentity) {
+    pub fn record(&self, source: BlobKey, content: ContentIdentity) {
         self.entries.insert(source, content);
     }
 }
@@ -1062,7 +1062,7 @@ fn publish(
             Ok(Publication::Artifact(artifact))
         }
         Err(SemanticArtifactBuildError::Invalid(error)) => {
-            Err(SemanticProviderError::InvalidArtifact(error))
+            Err(SemanticProviderError::invalid_artifact(error))
         }
         Err(SemanticArtifactBuildError::ExceededBudget(exceeded)) => {
             Ok(Publication::Exceeded(exceeded))

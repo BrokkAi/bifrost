@@ -463,7 +463,9 @@ impl ReceiverWorkLedger {
     pub fn charge_setup(&mut self, nodes: usize) -> Result<(), ReceiverBudgetLimit> {
         let remaining = self.remaining_budget().max_scope_nodes;
         self.work.setup_nodes = self.work.setup_nodes.saturating_add(nodes.min(remaining));
-        if nodes > remaining {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(nodes, remaining)
+            .allows(0)
+        {
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else {
             Ok(())
@@ -473,9 +475,24 @@ impl ReceiverWorkLedger {
     fn charge_analysis(&mut self, work: ReceiverAnalysisWork) -> Result<(), ReceiverBudgetLimit> {
         debug_assert_eq!(work.setup_nodes, 0);
         let remaining = self.remaining_budget();
-        let scope_exceeded = work.scope_nodes > remaining.max_scope_nodes;
-        let summaries_exceeded = work.summary_expansions > remaining.max_summary_expansions;
-        let rounds_exceeded = work.resolution_rounds > remaining.max_resolution_rounds;
+        let scope_exceeded =
+            !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                work.scope_nodes,
+                remaining.max_scope_nodes,
+            )
+            .allows(0);
+        let summaries_exceeded =
+            !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                work.summary_expansions,
+                remaining.max_summary_expansions,
+            )
+            .allows(0);
+        let rounds_exceeded =
+            !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                work.resolution_rounds,
+                remaining.max_resolution_rounds,
+            )
+            .allows(0);
         self.work.scope_nodes = self
             .work
             .scope_nodes

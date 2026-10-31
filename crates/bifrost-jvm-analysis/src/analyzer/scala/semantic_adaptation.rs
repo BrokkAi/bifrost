@@ -1440,15 +1440,6 @@ fn enclosing_template_names(node: Node<'_>, source: &str) -> Vec<String> {
         .collect()
 }
 
-fn enclosing_template(node: Node<'_>) -> Option<Node<'_>> {
-    brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(node, |kind| {
-        matches!(
-            kind,
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        )
-    })
-}
-
 fn declaring_scope(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         if matches!(
@@ -1504,7 +1495,7 @@ fn owner_encloses(owner: Option<Node<'_>>, use_site: Node<'_>) -> bool {
     false
 }
 
-use crate::analyzer::scala::syntax::compilation_unit;
+use crate::analyzer::scala::syntax::{compilation_unit, enclosing_template};
 
 fn template_name(node: Node<'_>, source: &str) -> Option<Box<str>> {
     node.child_by_field_name("name")
@@ -1519,19 +1510,7 @@ fn parameter_list_is_contextual(list: Node<'_>) -> bool {
 }
 
 fn subtree_has_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut stack = vec![node];
-    let mut examined = 0_usize;
-    while let Some(current) = stack.pop() {
-        examined += 1;
-        if examined > ADAPTATION_NODE_BUDGET {
-            return false;
-        }
-        if current.kind() == kind {
-            return true;
-        }
-        stack.extend(named_children(current));
-    }
-    false
+    crate::analyzer::scala::syntax::subtree_has_kind(node, kind, ADAPTATION_NODE_BUDGET)
 }
 
 #[cfg(test)]

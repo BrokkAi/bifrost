@@ -52,12 +52,13 @@ macro_rules! impl_jvm_realm_member {
             /// peer today: the Java and Scala hierarchy walks resolve against
             /// their own declarations only and never reach a Kotlin unit.
             fn direct_ancestor_fqns(&self, unit: &CodeUnit) -> Option<Vec<String>> {
-                (unit.source().language() == $language).then(|| {
-                    TypeHierarchyProvider::get_direct_ancestors(self, unit)
-                        .iter()
-                        .map(CodeUnit::fq_name)
-                        .collect()
-                })
+                if unit.source().language() != $language {
+                    return None;
+                }
+                let answer = TypeHierarchyProvider::get_direct_ancestors(self, unit);
+                answer
+                    .is_complete()
+                    .then(|| answer.edges.iter().map(CodeUnit::fq_name).collect())
             }
         }
     };

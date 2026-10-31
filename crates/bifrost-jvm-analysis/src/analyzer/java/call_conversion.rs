@@ -78,6 +78,7 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 use brokk_bifrost_core::analyzer::tree_walk::root_node as root_of;
+use brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression;
 use brokk_bifrost_jvm::java::declarations::node_text;
 use brokk_bifrost_jvm::java::graph::return_type::java_type_name_components;
 use brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope;
@@ -621,16 +622,10 @@ pub(crate) fn primitive_actual_type_from_syntax(
     actual: Node<'_>,
     source: &str,
 ) -> Option<JavaPrimitive> {
-    let mut expression = actual;
-    while expression.kind() == "parenthesized_expression" {
-        expression = expression.named_child(0)?;
-    }
-    if let Some(primitive) = primitive_literal(expression) {
+    if let Some(primitive) = primitive_literal_type_from_syntax(actual, source) {
         return Some(primitive);
     }
-    if let Some(primitive) = numeric_literal_type(expression, source) {
-        return Some(primitive);
-    }
+    let expression = unwrap_parenthesized_expression(actual);
     if expression.kind() == "cast_expression" {
         let target = expression.child_by_field_name("type")?;
         expression.child_by_field_name("value")?;
@@ -1257,10 +1252,7 @@ fn resolve_java_expression_operand_bounded(
 }
 
 fn primitive_literal_type_from_syntax(expression: Node<'_>, source: &str) -> Option<JavaPrimitive> {
-    let mut expression = expression;
-    while expression.kind() == "parenthesized_expression" {
-        expression = expression.named_child(0)?;
-    }
+    let expression = unwrap_parenthesized_expression(expression);
     primitive_literal(expression).or_else(|| numeric_literal_type(expression, source))
 }
 

@@ -37,12 +37,9 @@ use brokk_bifrost_core::analyzer::model::Language;
 
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 
-use brokk_bifrost_core::analyzer::capabilities::descendants_from_variant_index;
-
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_jvm::kotlin::hierarchy::{
     KotlinExternalRootHierarchyAnswer, KotlinExternalRootHierarchyIncompleteReason,
     KotlinExternalRootHierarchyStatus, build_kotlin_direct_descendant_index,
@@ -51,19 +48,20 @@ use brokk_bifrost_jvm::kotlin::hierarchy::{
 use brokk_bifrost_jvm::realm::JvmSourceRealm;
 
 use crate::analyzer::kotlin::KotlinAnalyzer;
+use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
 impl TypeHierarchyProvider for KotlinAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        self.direct_ancestors_in_realm(token, code_unit, None)
+        HierarchyAnswer::complete(self.direct_ancestors_in_realm(token, code_unit, None))
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
         let uncancelled = CancellationToken::default();
@@ -73,14 +71,14 @@ impl TypeHierarchyProvider for KotlinAnalyzer {
             None,
             &DescendantIndexScope::whole_workspace(&uncancelled),
         )
-        .expect("a descendant index that cannot stop always completes")
+        .expect("an uncancelled descendant query cannot be cancelled")
     }
 
     fn get_direct_descendants_within(
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
         self.direct_descendants_in_realm(token, code_unit, None, scope)
@@ -209,7 +207,7 @@ impl KotlinAnalyzer {
         code_unit: &CodeUnit,
         realm: Option<&JvmSourceRealm<'_>>,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         crate::analyzer::jvm::authority::source_read(self, match realm {
             Some(_) => brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinRealmDescendantIndex,
             None => brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinDescendantIndex,
@@ -218,13 +216,14 @@ impl KotlinAnalyzer {
             Some(_) => &self.realm_direct_descendant_index,
             None => &self.direct_descendant_index,
         };
-        descendants_from_variant_index(index, scope, code_unit, || {
-            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                self.build_direct_descendant_index(token, realm, scope)
-            })
-            .ok()
-            .flatten()
-        })
+        brokk_bifrost_analysis::analyzer::common::complete_descendant_query(
+            self,
+            scope,
+            code_unit,
+            index,
+            || self.build_direct_descendant_index(token, realm, scope),
+            |_| {},
+        )
     }
 
     fn build_direct_descendant_index(
@@ -237,8 +236,7 @@ impl KotlinAnalyzer {
             brokk_bifrost_core::profiling::scope("KotlinAnalyzer::build_direct_descendant_index");
         let candidates = self
             .inner
-            .hierarchy_declaration_facts_by_kind(CodeUnitType::Class)
-            .unwrap_or_default();
+            .hierarchy_declaration_facts_by_kind(CodeUnitType::Class)?;
         build_kotlin_direct_descendant_index(
             candidates.into_iter().map(JvmHierarchyFact).collect(),
             |batch| {

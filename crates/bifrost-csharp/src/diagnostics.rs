@@ -28,28 +28,37 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use brokk_bifrost_core::analyzer::model::{
-    SemanticAbsenceProof, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
-    SemanticDiagnosticReport, push_absent_diagnostic,
+    ClassLikeKind, SemanticAbsenceProof, SemanticDiagnosticDomain,
+    SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport, push_absent_diagnostic,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text, same_node};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::{
-    collect_parse_errors, push_named_children_reversed_as,
+    collect_parse_errors, node_for_exact_range, push_named_children_reversed_as,
+    single_named_child_matching,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
+use brokk_bifrost_core::analyzer::usages::resolution_session::{
+    BoundedResolution, ResolutionSession,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Tree};
 
+use crate::graph::CSharpGraphSource;
 use crate::graph::resolver::{
-    CSharpDeclaredType, member_declared_type_fq_name, type_parameter_shadows_reference,
+    CSharpDeclaredType, member_declared_type_fq_name_in_session,
+    nearest_member_candidates_for_owner_inner, resolve_type_fq_name_of_node,
+    type_parameter_shadows_reference, visible_declared_type_node,
 };
 use crate::graph_support::{
-    CSharpSource, first_logical_type_fqn, logical_type_count, visible_type_candidates,
+    CSharpLookupContext, CSharpSource, first_logical_type_fqn, logical_type_count,
+    visible_type_candidates,
 };
 use crate::imports::csharp_using_alias_from_node;
 use crate::syntax::{
+    csharp_arity_preserving_full_name, csharp_identifier_text, csharp_member_access_receiver,
     csharp_type_node_identity, csharp_using_directive_is_static, csharp_using_directive_namespace,
     csharp_using_directive_target_node, normalize_csharp_type_fragment,
 };
@@ -175,10 +184,12 @@ pub fn collect_csharp_semantic_diagnostics(
         );
         return report;
     };
-    if scan.has_inactive_regions {
-        // Index honesty: a declaration that exists only under the inactive
-        // configuration is absent from the index, so nothing this pass says
-        // about the file is a complete statement about every configuration.
+    if scan
+        .conditional_regions(source)
+        .has_uncertain_omission(0..source.len())
+    {
+        // An undecided omitted branch can contain declarations this reading
+        // never saw. Decided exclusions carry no such obligation.
         report.push_incomplete(
             None,
             vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
@@ -210,7 +221,6 @@ pub fn collect_csharp_semantic_diagnostics(
         file,
         source,
         line_starts: &line_starts,
-        file_namespace: csharp.namespace_of_file(file),
         usings: file_using_namespaces(csharp, file),
         scope_is_visible: true,
         type_parameters: Vec::new(),
@@ -245,7 +255,6 @@ struct CSharpDiagnosticCollector<'a> {
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
-    file_namespace: String,
     usings: Vec<String>,
     /// Whether every namespace this file opens is one the pass can see whole.
     /// A `using` of a namespace neither the workspace nor the index publishes
@@ -750,9 +759,11 @@ impl CSharpDiagnosticCollector<'_> {
         match self.member_owner(token, receiver, &receiver_identity) {
             Ok(MemberOwner::Namespace) => {}
             Ok(MemberOwner::Workspace { fqn }) => {
-                self.check_workspace_member(token, range, &fqn, &member)
+                self.check_workspace_member(token, node, range, &fqn, &member)
             }
-            Ok(MemberOwner::External { fqn }) => self.check_external_member(range, &fqn, &member),
+            Ok(MemberOwner::External { fqn }) => {
+                self.check_external_member(node, range, &fqn, &member)
+            }
             Err(reason) => self.report.push_incomplete(Some(range), vec![reason]),
         }
     }
@@ -764,20 +775,98 @@ impl CSharpDiagnosticCollector<'_> {
         receiver: Node<'_>,
         receiver_identity: &str,
     ) -> Result<MemberOwner, SemanticDiagnosticIncompleteReason> {
+        if matches!(
+            receiver.kind(),
+            "member_access_expression" | "parenthesized_expression"
+        ) {
+            // Follow the expression spine, not its dotted spelling. A value at
+            // the root shadows a namespace or type with the same name for the
+            // entire chain, even when a later field's type is unknown.
+            let mut root = receiver;
+            let mut members = Vec::new();
+            loop {
+                match root.kind() {
+                    "member_access_expression" => {
+                        let (Some(expression), Some(name)) = (
+                            csharp_member_access_receiver(root),
+                            root.child_by_field_name("name"),
+                        ) else {
+                            return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                                detail: "receiver member access has no complete C# structure"
+                                    .to_string(),
+                            });
+                        };
+                        members.push(name);
+                        root = expression;
+                    }
+                    "parenthesized_expression" => {
+                        let Some(inner) =
+                            single_named_child_matching(root, |child| !child.is_extra())
+                        else {
+                            return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                                detail: "parenthesized receiver has no proven C# expression"
+                                    .to_string(),
+                            });
+                        };
+                        root = inner;
+                    }
+                    _ => break,
+                }
+            }
+            let root_owner = match root.kind() {
+                "identifier" => {
+                    let symbol = csharp_identifier_text(root, self.source);
+                    self.declared_type_of_binding(token, root, symbol)?
+                        .map(|declared| self.declared_type_owner(token, root, symbol, declared))
+                        .transpose()?
+                }
+                "this" | "this_expression" => Some(self.this_owner(token, root)?),
+                _ => None,
+            };
+            if let Some(mut owner) = root_owner {
+                for name in members.into_iter().rev() {
+                    if name.kind() != "identifier" {
+                        return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                            detail: format!(
+                                "receiver member of kind `{}` has no proven C# type",
+                                name.kind()
+                            ),
+                        });
+                    }
+                    let member = csharp_identifier_text(name, self.source);
+                    owner = match owner {
+                        MemberOwner::Workspace { fqn } => {
+                            let unit = self.proved_workspace_type_unit(token, &fqn).ok_or_else(
+                                || SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                                    detail: format!(
+                                        "receiver type `{fqn}` is unavailable for member `{member}`"
+                                    ),
+                                },
+                            )?;
+                            let declared = self.workspace_value_member_type(token, &unit, member, name)?
+                                .ok_or_else(|| SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                                    detail: format!("receiver member `{member}` on `{fqn}` has no proven declared type"),
+                                })?;
+                            self.declared_type_owner(token, name, member, declared)?
+                        }
+                        MemberOwner::External { fqn } => {
+                            return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                                detail: format!(
+                                    "receiver member `{member}` on external type `{fqn}` has no proven declared type"
+                                ),
+                            });
+                        }
+                        MemberOwner::Namespace => unreachable!("a value has a type owner"),
+                    };
+                }
+                return Ok(owner);
+            }
+        }
         // `this` names the enclosing type, which is the one receiver whose type
         // needs no inference at all. The grammar spells it as the bare keyword
         // token inside a member access, and as `this_expression` elsewhere.
         if matches!(receiver.kind(), "this" | "this_expression") {
-            let Some(enclosing) = enclosing_type_name(receiver, self.source) else {
-                return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                    detail: "`this` appears outside a type declaration".to_string(),
-                });
-            };
-            return self.type_owner(token, &enclosing)?.ok_or_else(|| {
-                SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                    detail: format!("enclosing type `{enclosing}` does not resolve uniquely"),
-                }
-            });
+            return self.this_owner(token, receiver);
         }
         // A plain identifier is looked up as a value before it is looked up as
         // a type. That is C#'s own order for `E.I` -- the "Color Color" rule --
@@ -790,27 +879,8 @@ impl CSharpDiagnosticCollector<'_> {
                 // The seeder proved this identity against the workspace, so it
                 // is looked up as an identity rather than re-read as a written
                 // name.
-                Some(CSharpDeclaredType::Resolved { fqn }) => {
-                    return self.resolved_type_owner(token, &fqn, symbol);
-                }
-                Some(CSharpDeclaredType::Spelling(spelling)) => {
-                    // Only a written spelling can say `dynamic`; a resolved
-                    // workspace fq name never does.
-                    if is_csharp_dynamic(&spelling) {
-                        return Err(SemanticDiagnosticIncompleteReason::DynamicBehavior {
-                            detail: format!("`{symbol}` is declared `dynamic`"),
-                        });
-                    }
-                    if type_parameter_shadows_reference(receiver, self.source, &spelling) {
-                        return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                            detail: format!("receiver `{symbol}` has type parameter `{spelling}`"),
-                        });
-                    }
-                    return self.type_owner(token, &spelling)?.ok_or_else(|| {
-                        SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                            detail: format!("receiver `{symbol}` has no uniquely resolved type"),
-                        }
-                    });
+                Some(declared) => {
+                    return self.declared_type_owner(token, receiver, symbol, declared);
                 }
                 // Nothing binds the name as a value, so it may name a type and
                 // this is a static access.
@@ -850,6 +920,49 @@ impl CSharpDiagnosticCollector<'_> {
         })
     }
 
+    fn this_owner(
+        &self,
+        token: QueryToken<'_>,
+        receiver: Node<'_>,
+    ) -> Result<MemberOwner, SemanticDiagnosticIncompleteReason> {
+        let classes = self.csharp.class_range_index(self.file);
+        let Some(enclosing) = classes.enclosing_unit(receiver.start_byte()) else {
+            return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "`this` has no proven enclosing type declaration".to_string(),
+            });
+        };
+        self.resolved_type_owner(token, &enclosing.fq_name(), "this")
+    }
+
+    fn declared_type_owner(
+        &self,
+        token: QueryToken<'_>,
+        receiver: Node<'_>,
+        symbol: &str,
+        declared: CSharpDeclaredType,
+    ) -> Result<MemberOwner, SemanticDiagnosticIncompleteReason> {
+        match declared {
+            CSharpDeclaredType::Resolved { fqn } => self.resolved_type_owner(token, &fqn, symbol),
+            CSharpDeclaredType::Spelling(spelling) => {
+                if is_csharp_dynamic(&spelling) {
+                    return Err(SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                        detail: format!("`{symbol}` is declared `dynamic`"),
+                    });
+                }
+                if type_parameter_shadows_reference(receiver, self.source, &spelling) {
+                    return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                        detail: format!("receiver `{symbol}` has type parameter `{spelling}`"),
+                    });
+                }
+                self.type_owner(token, &spelling)?.ok_or_else(|| {
+                    SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                        detail: format!("receiver `{symbol}` has no uniquely resolved type"),
+                    }
+                })
+            }
+        }
+    }
+
     /// The declared type name of a local, parameter or field the receiver
     /// identifier binds.
     ///
@@ -874,12 +987,10 @@ impl CSharpDiagnosticCollector<'_> {
         );
         if !bindings.is_shadowed(symbol) {
             let classes = self.csharp.class_range_index(self.file);
-            return Ok(classes
-                .enclosing_unit(receiver.start_byte())
-                .and_then(|owner| {
-                    member_declared_type_fq_name(self.csharp, token, self.file, owner, symbol)
-                        .map(CSharpDeclaredType::resolved)
-                }));
+            return match classes.enclosing_unit(receiver.start_byte()) {
+                Some(owner) => self.workspace_value_member_type(token, owner, symbol, receiver),
+                None => Ok(None),
+            };
         }
         let resolution = bindings.resolve_symbol(symbol);
         let Some(targets) = resolution.as_precise() else {
@@ -889,11 +1000,257 @@ impl CSharpDiagnosticCollector<'_> {
         };
         let mut declared = targets.iter();
         match (declared.next(), declared.next()) {
-            (Some(only), None) => Ok(Some(only.clone())),
+            (Some(only), None) => {
+                let written = visible_declared_type_node(receiver, self.source, symbol);
+                if written
+                    .is_none_or(|node| matches!(node.kind(), "nullable_type" | "implicit_type"))
+                    && !self.is_proven_reference_type(token, only)
+                {
+                    return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                        detail: format!(
+                            "receiver `{symbol}` has no proven non-nullable value type"
+                        ),
+                    });
+                }
+                Ok(Some(only.clone()))
+            }
             _ => Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                 detail: format!("receiver `{symbol}` binds more than one declared type"),
             }),
         }
+    }
+
+    fn is_proven_reference_type(
+        &self,
+        token: QueryToken<'_>,
+        declared: &CSharpDeclaredType,
+    ) -> bool {
+        let CSharpDeclaredType::Resolved { fqn } = declared else {
+            return false;
+        };
+        let Some(unit) = self.proved_workspace_type_unit(token, fqn) else {
+            return false;
+        };
+        let signatures = self.csharp.signature_metadata(&unit);
+        !signatures.is_empty()
+            && signatures.iter().all(|signature| {
+                matches!(
+                    signature.class_like_kind(),
+                    Some(ClassLikeKind::Class | ClassLikeKind::Interface)
+                )
+            })
+    }
+
+    /// A uniquely declared field or property can carry a value through one
+    /// receiver step. A missing or ambiguous type remains incomplete, rather
+    /// than allowing the caller to reinterpret that value as a namespace.
+    fn workspace_value_member_type(
+        &self,
+        token: QueryToken<'_>,
+        owner: &CodeUnit,
+        member: &str,
+        site: Node<'_>,
+    ) -> Result<Option<CSharpDeclaredType>, SemanticDiagnosticIncompleteReason> {
+        let owner_fqn = owner.fq_name();
+        let unproved = || SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+            detail: format!(
+                "receiver member `{member}` on `{owner_fqn}` has no uniquely proven declared type"
+            ),
+        };
+        let graph = CSharpGraphSource::from_source(self.csharp);
+        let candidates = nearest_member_candidates_for_owner_inner(
+            &graph,
+            self.csharp,
+            token,
+            owner,
+            member,
+            None,
+            None,
+            false,
+            None,
+        );
+        if candidates.is_empty() {
+            return match self.inherited_member(token, &owner_fqn, member) {
+                InheritedMember::Absent => Ok(None),
+                InheritedMember::Found { .. } | InheritedMember::IncompleteSurface { .. } => {
+                    Err(unproved())
+                }
+            };
+        }
+        let [candidate] = candidates.as_slice() else {
+            return Err(unproved());
+        };
+        if !candidate.is_field() {
+            return Err(unproved());
+        }
+        let declaring = self
+            .csharp
+            .parent_of(candidate)
+            .expect("a nearest C# member has a declaring owner");
+        if declaring.fq_name() != owner_fqn {
+            let declaring_signatures = self.csharp.signature_metadata(&declaring);
+            if declaring_signatures.is_empty()
+                || declaring_signatures
+                    .iter()
+                    .any(|signature| signature.class_like_kind().is_none())
+            {
+                return Err(unproved());
+            }
+            if declaring_signatures
+                .iter()
+                .any(|signature| signature.class_like_kind() == Some(ClassLikeKind::Interface))
+            {
+                let owner_signatures = self.csharp.signature_metadata(owner);
+                if owner_signatures.is_empty()
+                    || owner_signatures.iter().any(|signature| {
+                        signature.class_like_kind() != Some(ClassLikeKind::Interface)
+                    })
+                {
+                    // A default interface member is not a member of the class
+                    // that implements it. It can type a receiver only when the
+                    // receiver itself has an interface type.
+                    return Err(unproved());
+                }
+                // An external interface at the same or a nearer level could
+                // declare a competing property. A single direct workspace
+                // base is the inherited-interface case this view can prove.
+                let bases = self.csharp.raw_supertypes_of(owner);
+                let direct = self.csharp.direct_ancestors_through(self.csharp, owner);
+                if bases.len() != 1
+                    || logical_type_count(&direct) != 1
+                    || !direct
+                        .iter()
+                        .any(|base| base.fq_name() == declaring.fq_name())
+                {
+                    return Err(unproved());
+                }
+            }
+            // An empty identifier cannot match a member. This existing surface
+            // walk must therefore finish every base before an inherited member
+            // can supply a type; an unknown base might hide that member.
+            match self.inherited_member(token, &owner_fqn, "") {
+                InheritedMember::Absent => {}
+                InheritedMember::IncompleteSurface { .. } => return Err(unproved()),
+                InheritedMember::Found { .. } => unreachable!("C# member names are nonempty"),
+            }
+        }
+        let metadata = self.csharp.signature_metadata(candidate);
+        if metadata.is_empty() {
+            return Err(unproved());
+        }
+        for row in &metadata {
+            let Some(identity) = row.return_type_identity() else {
+                return Err(unproved());
+            };
+            if identity.is_array() || identity.is_pointer() || identity.is_reference() {
+                return Err(unproved());
+            }
+            let Some(name) = identity.nominal_name() else {
+                return Err(unproved());
+            };
+            if let [identifier] = name.path()
+                && !name.is_absolute()
+            {
+                let mut enclosing = Some(declaring.clone());
+                while let Some(unit) = enclosing {
+                    if unit.is_class() {
+                        let signatures = self.csharp.signature_metadata(&unit);
+                        if signatures.is_empty()
+                            || signatures.iter().any(|signature| {
+                                !signature.type_parameters_recorded()
+                                    || signature.type_parameters().contains(identifier)
+                            })
+                        {
+                            return Err(unproved());
+                        }
+                    }
+                    enclosing = self.csharp.parent_of(&unit);
+                }
+            }
+        }
+        if candidate.source() == self.file {
+            let ranges = self.csharp.ranges(candidate);
+            if ranges.is_empty() {
+                return Err(unproved());
+            }
+            let mut resolved = None;
+            for range in ranges {
+                let mut node =
+                    node_for_exact_range(file_root(site), &range).ok_or_else(unproved)?;
+                let type_node = loop {
+                    if matches!(node.kind(), "variable_declaration" | "property_declaration") {
+                        break node.child_by_field_name("type").ok_or_else(unproved)?;
+                    }
+                    if matches!(
+                        node.kind(),
+                        "class_declaration" | "struct_declaration" | "interface_declaration"
+                    ) {
+                        return Err(unproved());
+                    }
+                    node = node.parent().ok_or_else(unproved)?;
+                };
+                let fqn =
+                    resolve_type_fq_name_of_node(self.csharp, self.file, self.source, type_node)
+                        .ok_or_else(unproved)?;
+                if type_node.kind() == "nullable_type"
+                    && !self
+                        .is_proven_reference_type(token, &CSharpDeclaredType::resolved(fqn.clone()))
+                {
+                    return Err(unproved());
+                }
+                if resolved.as_ref().is_some_and(|previous| previous != &fqn) {
+                    return Err(unproved());
+                }
+                resolved = Some(fqn);
+            }
+            return Ok(resolved.map(CSharpDeclaredType::resolved));
+        }
+
+        let session = ResolutionSession::unbounded();
+        let resolved = member_declared_type_fq_name_in_session(
+            self.csharp,
+            token,
+            self.file,
+            owner,
+            member,
+            &session,
+        );
+        let BoundedResolution::Complete {
+            value: Some(fqn), ..
+        } = session.finish(resolved)
+        else {
+            return Err(unproved());
+        };
+        let declared = CSharpDeclaredType::resolved(fqn);
+        // The persisted nominal identity drops `?`, so a cross-file value type
+        // does not prove whether the field is nullable.
+        if !self.is_proven_reference_type(token, &declared) {
+            return Err(unproved());
+        }
+        if let CSharpDeclaredType::Resolved { fqn } = &declared {
+            let target = self
+                .proved_workspace_type_unit(token, fqn)
+                .ok_or_else(unproved)?;
+            let namespace = target.package_name();
+            let declaration_namespace = declaring.package_name();
+            if !namespace.is_empty()
+                && namespace != declaration_namespace
+                && !declaration_namespace
+                    .strip_prefix(namespace)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+                && !metadata.iter().all(|row| {
+                    row.return_type_identity()
+                        .and_then(|identity| identity.nominal_name())
+                        .is_some_and(|name| {
+                            name.is_absolute()
+                                || name.path().join(".") == csharp_arity_preserving_full_name(fqn)
+                        })
+                })
+            {
+                return Err(unproved());
+            }
+        }
+        Ok(Some(declared))
     }
 
     /// The declaration a receiver's already-resolved type identity names.
@@ -955,6 +1312,7 @@ impl CSharpDiagnosticCollector<'_> {
     fn check_workspace_member(
         &mut self,
         token: QueryToken<'_>,
+        node: Node<'_>,
         range: Range,
         owner_fqn: &str,
         member: &str,
@@ -979,6 +1337,7 @@ impl CSharpDiagnosticCollector<'_> {
             ),
             InheritedMember::Absent => {
                 self.publish_member_absence(
+                    node,
                     range,
                     owner_fqn,
                     member,
@@ -988,7 +1347,13 @@ impl CSharpDiagnosticCollector<'_> {
         }
     }
 
-    fn check_external_member(&mut self, range: Range, owner_fqn: &str, member: &str) {
+    fn check_external_member(
+        &mut self,
+        node: Node<'_>,
+        range: Range,
+        owner_fqn: &str,
+        member: &str,
+    ) {
         match self.external.resolve_member(owner_fqn, member) {
             CSharpMemberSurface::Published => {
                 self.report
@@ -1011,6 +1376,7 @@ impl CSharpDiagnosticCollector<'_> {
                     return;
                 }
                 self.publish_member_absence(
+                    node,
                     range,
                     owner_fqn,
                     member,
@@ -1023,6 +1389,7 @@ impl CSharpDiagnosticCollector<'_> {
     /// Publish a member absence, unless an extension method could explain it.
     fn publish_member_absence(
         &mut self,
+        node: Node<'_>,
         range: Range,
         owner_fqn: &str,
         member: &str,
@@ -1041,7 +1408,7 @@ impl CSharpDiagnosticCollector<'_> {
             );
             return;
         }
-        let extension_possible = match self.extension_method_could_apply(member) {
+        let extension_possible = match self.extension_method_could_apply(node, member) {
             Ok(possible) => possible,
             Err(reason) => {
                 self.report.push_incomplete(Some(range), vec![reason]);
@@ -1091,18 +1458,21 @@ impl CSharpDiagnosticCollector<'_> {
     /// Otherwise an index this pass cannot read has to be assumed to hold one.
     fn extension_method_could_apply(
         &self,
+        node: Node<'_>,
         member: &str,
     ) -> Result<bool, SemanticDiagnosticIncompleteReason> {
+        let context = CSharpLookupContext::at(self.source, node, || true)
+            .expect("an unbounded C# lexical lookup completes");
+        let mut namespaces = self.usings.clone();
+        namespaces.extend(context.namespaces().map(str::to_string));
         if !self.workspace_bounded()?
             && (self.unreadable_external.is_some()
                 || self
                     .external
-                    .could_supply_extension_method(&self.usings, member))
+                    .could_supply_extension_method(&namespaces, member))
         {
             return Ok(true);
         }
-        let mut namespaces: Vec<&str> = self.usings.iter().map(String::as_str).collect();
-        namespaces.push(self.file_namespace.as_str());
         Ok(self
             .csharp
             .declaration_candidates_by_identifier(member)
@@ -1111,7 +1481,7 @@ impl CSharpDiagnosticCollector<'_> {
                 candidate.is_function()
                     && namespaces
                         .iter()
-                        .any(|namespace| candidate.package_name() == *namespace)
+                        .any(|namespace| candidate.package_name() == namespace.as_str())
             }))
     }
 
@@ -1349,24 +1719,6 @@ fn is_type_reference_position(node: Node<'_>) -> bool {
 }
 
 /// The name of the type declaration `node` sits in.
-fn enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
-    let parent = brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(
-        node,
-        |kind| {
-            matches!(
-                kind,
-                "class_declaration"
-                    | "struct_declaration"
-                    | "record_declaration"
-                    | "record_struct_declaration"
-                    | "interface_declaration"
-            )
-        },
-    )?;
-    let name = node_text(parent.child_by_field_name("name")?, source).trim();
-    (!name.is_empty()).then(|| name.to_string())
-}
-
 /// The file's root node, which bounds the local-binding seeding.
 fn file_root(node: Node<'_>) -> Node<'_> {
     let mut current = node;

@@ -390,6 +390,7 @@ impl<T> ReceiverAnalysisReport<T> {
             .values()
             .is_some_and(|values| values.len() > budget.max_targets);
         if candidates_truncated {
+            crate::analyzer::carried_context::mark_execution_dependent();
             outcome.truncate_values(budget.max_targets);
         }
         Self {
@@ -411,7 +412,12 @@ impl ReceiverAnalysisBudgetTracker {
 
     pub fn record_summary_expansion(&mut self) -> Result<(), ReceiverBudgetLimit> {
         self.summary_expansions += 1;
-        if self.summary_expansions > self.budget.max_summary_expansions {
+        if !crate::analyzer::work_budget::LimitedCounter::from_usage(
+            self.summary_expansions,
+            self.budget.max_summary_expansions,
+        )
+        .allows(0)
+        {
             Err(ReceiverBudgetLimit::SummaryExpansions)
         } else {
             Ok(())
@@ -420,7 +426,12 @@ impl ReceiverAnalysisBudgetTracker {
 
     pub fn record_scope_node(&mut self) -> Result<(), ReceiverBudgetLimit> {
         self.scope_nodes += 1;
-        if self.scope_nodes > self.budget.max_scope_nodes {
+        if !crate::analyzer::work_budget::LimitedCounter::from_usage(
+            self.scope_nodes,
+            self.budget.max_scope_nodes,
+        )
+        .allows(0)
+        {
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else {
             Ok(())
@@ -441,6 +452,7 @@ impl ReceiverAnalysisBudgetTracker {
             .values()
             .is_some_and(|values| values.len() > self.budget.max_targets);
         if candidates_truncated {
+            crate::analyzer::carried_context::mark_execution_dependent();
             outcome.truncate_values(self.budget.max_targets);
         }
         ReceiverAnalysisReport {

@@ -137,6 +137,35 @@ pub fn go_package_fq(package_name: &str) -> FqName {
     fq
 }
 
+/// Decode a Go model qualified type name into its import path and simple name.
+/// This is a value in an external data format, not source text: no AST or
+/// analyzer structure carries its package. Go type names cannot contain '.',
+/// so the last '.' separates the package from the simple name, including in
+/// names such as `gopkg.in/yaml.v3.Node`. This inverts the producer's
+/// `format!("{package}.{name}")` in `resolve_nominal`.
+pub fn go_model_type_name_parts(name: &str) -> Option<(&str, &str)> {
+    let (package, simple) = name.rsplit_once('.')?;
+    if package.is_empty() || simple.is_empty() {
+        return None;
+    }
+    debug_assert_eq!(format!("{package}.{simple}"), name);
+    Some((package, simple))
+}
+
+/// Package owning a model declaration; module records name the import path,
+/// while synthetic module-scope owners carry the producer's scope suffix.
+pub fn go_model_owner_package(name: &str, is_module: bool) -> Option<&str> {
+    let parts = go_model_type_name_parts(name);
+    if let Some((package, crate::packages::GO_MODULE_SCOPE_SEGMENT)) = parts {
+        return Some(package);
+    }
+    if is_module {
+        Some(name)
+    } else {
+        parts.map(|(package, _)| package)
+    }
+}
+
 pub fn determine_go_package_name(root: Node<'_>, source: &str) -> String {
     try_determine_go_package_name(root, source, || true)
         .expect("unconditional Go package-name walk cannot cancel")

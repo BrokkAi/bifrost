@@ -83,7 +83,7 @@ pub use crate::analyzer::go::semantic::callable_materialization::materialize_go_
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
 // The lowerer reaches declaration and import helpers (decoded import names).
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v96";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v97";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -316,7 +316,7 @@ pub(crate) fn lower_exact_go_file(
                 ) {
                     Ok(artifact) => Arc::new(artifact.with_query_source(Arc::from(source))),
                     Err(SemanticArtifactBuildError::Invalid(error)) => {
-                        return Err(SemanticProviderError::InvalidArtifact(error));
+                        return Err(SemanticProviderError::invalid_artifact(error));
                     }
                     Err(SemanticArtifactBuildError::ExceededBudget(exceeded)) => {
                         return Ok(SemanticOutcome::ExceededBudget {

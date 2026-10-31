@@ -60,6 +60,16 @@ fn dump_prepared_resolution_rows() -> std::result::Result<(), Box<dyn std::error
         let relative = path.strip_prefix(&root)?;
         let file = ProjectFile::new(&root, relative);
         let source = std::fs::read_to_string(&path)?;
+        let csharp_scan = (language == Language::CSharp)
+            .then(|| brokk_bifrost_csharp::preprocessor::scan_preprocessor(&source));
+        parser
+            .set_included_ranges(
+                csharp_scan
+                    .as_ref()
+                    .and_then(|s| s.included_ranges.as_deref())
+                    .unwrap_or(&[]),
+            )
+            .unwrap();
         let tree = parser.parse(&source, None).expect("uncancelled parse");
         let parsed = match language {
             Language::Rust => {
@@ -77,7 +87,10 @@ fn dump_prepared_resolution_rows() -> std::result::Result<(), Box<dyn std::error
             }
             Language::CSharp => {
                 brokk_bifrost_csharp::declarations::parse_csharp_file_with_native_facts(
-                    &file, &source, &tree,
+                    &file,
+                    &source,
+                    &tree,
+                    csharp_scan.as_ref().unwrap(),
                 )
             }
             Language::Python => {

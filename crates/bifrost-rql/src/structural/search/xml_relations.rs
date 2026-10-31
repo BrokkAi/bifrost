@@ -643,8 +643,32 @@ fn xml_element_signature(
                 ConfigurationNodeKind::Section { header, members } => {
                     signature.push(XmlSignaturePart::SectionStart);
                     work.push(XmlSignatureWork::EndSection);
+                    // Attributes are an unordered set keyed by qualified name.
+                    // Child element order remains part of the signature.
+                    let mut attributes = members
+                        .iter()
+                        .copied()
+                        .filter(|member| {
+                            matches!(
+                                value.document.fact(*member).map(ConfigurationFact::kind),
+                                Some(ConfigurationNodeKind::Member {
+                                    role: ConfigurationMemberRole::XmlAttribute,
+                                    ..
+                                })
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    attributes.sort_by(|left, right| {
+                        member_key(value.document.as_ref(), *left)
+                            .cmp(&member_key(value.document.as_ref(), *right))
+                    });
                     for member in members.iter().rev() {
-                        work.push(XmlSignatureWork::Fact(*member));
+                        if !attributes.contains(member) {
+                            work.push(XmlSignatureWork::Fact(*member));
+                        }
+                    }
+                    for attribute in attributes.into_iter().rev() {
+                        work.push(XmlSignatureWork::Fact(attribute));
                     }
                     if let Some(header) = header {
                         work.push(XmlSignatureWork::Fact(*header));

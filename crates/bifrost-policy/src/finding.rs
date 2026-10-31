@@ -181,6 +181,16 @@ impl PolicyRunCompletion {
         }
     }
 
+    /// Whether the caller's deadline for this one policy stopped it, so the
+    /// run is a timeout rather than Bifrost's own inconclusive verdict.
+    pub fn stopped_by_rule_deadline(&self) -> bool {
+        matches!(
+            self,
+            Self::Inconclusive { reasons, .. }
+                if reasons.contains(&PolicyIncompleteReason::RuleDeadlineExceeded)
+        )
+    }
+
     /// Add one incomplete reason that is not tied to files.
     ///
     /// A reliable completion becomes inconclusive for the whole run, and an
@@ -747,6 +757,11 @@ pub enum PolicyIncompleteReason {
     CvssVariantBudget,
     ProjectionScenarioMembershipBudget,
     OrganizationalRiskOverlayBudget,
+    /// The policy's own deadline from the caller stopped it while the rest of
+    /// the batch went on. Spelled as SlopCop's runner spells the rule deadline
+    /// it enforced itself before Bifrost could, so a stored run reads the same
+    /// whichever side stopped it (#7557).
+    RuleDeadlineExceeded,
 }
 
 impl PolicyIncompleteReason {
@@ -772,6 +787,7 @@ impl PolicyIncompleteReason {
             Self::CvssVariantBudget => "cvss_variant_budget",
             Self::ProjectionScenarioMembershipBudget => "projection_scenario_membership_budget",
             Self::OrganizationalRiskOverlayBudget => "organizational_risk_overlay_budget",
+            Self::RuleDeadlineExceeded => "rule_deadline_exceeded",
         }
     }
 }
@@ -3532,10 +3548,6 @@ impl WitnessStep {
 
     pub fn evidence_refs(&self) -> &[EvidenceRef] {
         &self.evidence_refs
-    }
-
-    pub fn provenance(&self) -> Option<&WitnessStepProvenance> {
-        self.provenance.as_deref()
     }
 }
 

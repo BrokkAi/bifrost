@@ -173,7 +173,9 @@ mod ruby_extraction_tests {
                 analyzer
                     .store_context
                     .store
-                    .contains_parsed_blob(oid, language)
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, language,
+                    ))
                     .unwrap(),
             );
         }

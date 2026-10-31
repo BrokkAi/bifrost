@@ -90,7 +90,12 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionCons
 use brokk_bifrost_analysis::analyzer::semantic_model::AcquisitionReceiptRequest;
 
 pub const PACK_SPEC_SCHEMA_VERSION: u32 = 2;
-pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 3;
+/// Schema 4 added the `rule` and `runtime_exposure` measurement lookups
+/// (#8324). Readers that know only schema 3 reject them, so a packs release
+/// declares the schema in its `release_index` axis and older engines skip it.
+pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 4;
+/// Schema 3 bundles are schema 4 bundles without the new lookup kinds.
+pub const READABLE_RELEASE_BUNDLE_SCHEMA_VERSIONS: &[u32] = &[3, RELEASE_BUNDLE_SCHEMA_VERSION];
 
 fn current_release_generator() -> ReleaseGenerator {
     ReleaseGenerator {
@@ -146,6 +151,16 @@ pub enum PinnedLookupQuery {
         name: String,
         has_receiver: bool,
         parameter_count: u32,
+    },
+    /// A generator rule by id, for authored models whose shards carry only
+    /// rules.
+    Rule {
+        id: String,
+    },
+    /// A runtime-global exposure by `exposureId`, for authored models whose
+    /// shards carry only runtime values.
+    RuntimeExposure {
+        exposure_id: String,
     },
 }
 
@@ -2388,6 +2403,17 @@ fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLook
             ))
             .records
             .len(),
+        PinnedLookupQuery::Rule { id } => active.rules_with_id(id).records.len(),
+        PinnedLookupQuery::RuntimeExposure { exposure_id } => active
+            .runtime_values()
+            .map(|(payload, _)| {
+                payload
+                    .exposures
+                    .iter()
+                    .filter(|exposure| exposure.exposure_id == *exposure_id)
+                    .count()
+            })
+            .sum(),
     };
     count.try_into().unwrap_or(u64::MAX)
 }
@@ -2560,7 +2586,7 @@ fn read_release_bundle_index(output_root: &Path) -> Result<ReleaseBundleIndex, B
         .map_err(|error| BundleError::new(format!("read {}: {error}", index_path.display())))?;
     let index: ReleaseBundleIndex = serde_json::from_slice(&index_bytes)
         .map_err(|error| BundleError::new(format!("parse {}: {error}", index_path.display())))?;
-    if index.schema_version != RELEASE_BUNDLE_SCHEMA_VERSION {
+    if !READABLE_RELEASE_BUNDLE_SCHEMA_VERSIONS.contains(&index.schema_version) {
         return Err(BundleError::new(format!(
             "unsupported release bundle schema {}",
             index.schema_version
@@ -3082,7 +3108,7 @@ fn verify_rejects(
         .map_err(|error| BundleError::new(format!("read {}: {error}", rejects_path.display())))?;
     let rejects: ReleaseBundleRejects = serde_json::from_slice(&rejects_bytes)
         .map_err(|error| BundleError::new(format!("parse {}: {error}", rejects_path.display())))?;
-    if rejects.schema_version != RELEASE_BUNDLE_SCHEMA_VERSION {
+    if rejects.schema_version != index.schema_version {
         return Err(BundleError::new(format!(
             "unsupported release rejects schema {}",
             rejects.schema_version
@@ -3669,7 +3695,7 @@ fn read_measurements(
         .map_err(|error| {
             BundleError::new(format!("parse {}: {error}", measurements_path.display()))
         })?;
-    if measurements.schema_version != RELEASE_BUNDLE_SCHEMA_VERSION {
+    if measurements.schema_version != index.schema_version {
         return Err(BundleError::new(format!(
             "unsupported release measurements schema {}",
             measurements.schema_version

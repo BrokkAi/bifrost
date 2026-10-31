@@ -72,7 +72,11 @@ mod rust_departing_tests_tests {
         let oid = oid_for(IMPORT_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral analyzer store");
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect("canonical import fixture publishes");
         let actual = store.conn.execute(move |conn| {
             let id = blob_id(conn, oid);
@@ -90,7 +94,11 @@ mod rust_departing_tests_tests {
         let oid = oid_for(IMPORT_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral analyzer store");
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect("canonical import fixture publishes");
 
         let cancelled = store.conn.execute(move |conn| {

@@ -29,10 +29,6 @@ impl PolicyFormatOptions {
         }
         Ok(Self { max_width })
     }
-
-    pub fn max_width(self) -> usize {
-        self.max_width
-    }
 }
 
 impl Default for PolicyFormatOptions {
@@ -46,12 +42,6 @@ impl Default for PolicyFormatOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyFormatOptionsError {
     max_width: usize,
-}
-
-impl PolicyFormatOptionsError {
-    pub fn max_width(self) -> usize {
-        self.max_width
-    }
 }
 
 impl fmt::Display for PolicyFormatOptionsError {

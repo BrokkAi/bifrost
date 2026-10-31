@@ -3019,9 +3019,5 @@ fn value_transfer_from_csmi(
             })
         },
     )?;
-    Ok(
-        crate::analyzer::semantic_model::conversion::authored_summary_value_transfer_from_compiled(
-            &compiled,
-        ),
-    )
+    Ok(compiled)
 }

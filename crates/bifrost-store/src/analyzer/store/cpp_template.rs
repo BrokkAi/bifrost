@@ -527,7 +527,7 @@ struct RawBlob {
 
 pub(super) fn read_bulk(
     conn: &Connection,
-    lang: &str,
+    key: &super::BlobKey,
     oids: &[String],
 ) -> Result<HashMap<String, HashMap<i64, CppTemplateMetadata>>> {
     let mut blobs: HashMap<String, RawBlob> = HashMap::default();
@@ -540,11 +540,11 @@ pub(super) fn read_bulk(
             format!(
                 "SELECT keys.blob_oid, {columns} FROM blobs AS keys
                  JOIN {table} AS facts ON facts.blob_id = keys.id
-                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
                  ORDER BY keys.blob_oid, {order}"
             )
         };
-        let parameters = chunk_params(lang, chunk);
+        let parameters = chunk_params(key, chunk);
 
         let mut statement = conn.prepare_cached(&query(
             "unit_cpp_class_templates",

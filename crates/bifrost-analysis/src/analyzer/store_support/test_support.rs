@@ -106,8 +106,7 @@ pub fn assert_signature_metadata_round_trips<A: LanguageAdapter>(
     store
         .write_parsed_blob_at_generation(
             &crate::analyzer::store::test_blob_file(),
-            oid,
-            lang,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
             generation,
             adapter,
             state.as_ref(),
@@ -140,21 +139,36 @@ pub fn assert_signature_metadata_round_trips<A: LanguageAdapter>(
     drop(conn);
 
     let limited = store
-        .signature_metadata_for_unit_limited(oid, lang, generation, &target, usize::MAX)
+        .signature_metadata_for_unit_limited(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            generation,
+            &target,
+            usize::MAX,
+        )
         .unwrap();
     assert!(limited.complete, "{lang}: bounded read must complete");
     assert_eq!(limited.rows, metadata, "{lang}: bounded per-unit reader");
 
     assert_eq!(
         store
-            .signature_metadata_for_unit(oid, lang, generation, &target)
+            .signature_metadata_for_unit(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+                generation,
+                &target
+            )
             .unwrap(),
         metadata,
         "{lang}: unbounded per-unit reader"
     );
 
     let hydrated = store
-        .hydrate_file_state_with_source(oid, lang, generation, adapter, file, &source)
+        .hydrate_file_state_with_source(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            generation,
+            adapter,
+            file,
+            &source,
+        )
         .unwrap()
         .expect("single-file hydration");
     assert_eq!(
@@ -174,7 +188,7 @@ pub fn assert_signature_metadata_round_trips<A: LanguageAdapter>(
     let bulk = store
         .hydrate_file_states(
             &[(file.clone(), oid)],
-            lang,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
             adapter,
             &HashMap::from_iter([(file.clone(), source.clone())]),
         )
@@ -223,10 +237,18 @@ pub fn assert_round_trip<A: LanguageAdapter>(adapter: &A, lang: &str, file: &Pro
     let parsed = parse_state(adapter, file);
     let store = AnalyzerStore::open_ephemeral().unwrap();
     store
-        .write_parsed_blob(oid, lang, adapter, &parsed)
+        .write_parsed_blob(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            adapter,
+            &parsed,
+        )
         .unwrap();
     let hydrated = store
-        .hydrate_file_state(oid, lang, adapter, file)
+        .hydrate_file_state(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            adapter,
+            file,
+        )
         .unwrap()
         .unwrap();
     assert_file_state_equivalent(&parsed, &hydrated);
@@ -244,12 +266,15 @@ pub fn assert_direct_prepared_parity<A: LanguageAdapter>(
     let parsed = Arc::new(parse_state(adapter, file));
     let direct = AnalyzerStore::open_ephemeral().unwrap();
     direct
-        .write_parsed_blob(oid, lang, adapter, parsed.as_ref())
+        .write_parsed_blob(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            adapter,
+            parsed.as_ref(),
+        )
         .unwrap();
     let prepared_store = AnalyzerStore::open_ephemeral().unwrap();
     let prepared = AnalyzerStore::prepare_parsed_blob(
-        oid,
-        lang,
+        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
         GenerationId::BOOTSTRAP,
         adapter,
         Arc::clone(&parsed),
@@ -262,11 +287,19 @@ pub fn assert_direct_prepared_parity<A: LanguageAdapter>(
     assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
 
     let direct_state = direct
-        .hydrate_file_state(oid, lang, adapter, file)
+        .hydrate_file_state(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            adapter,
+            file,
+        )
         .unwrap()
         .unwrap();
     let prepared_state = prepared_store
-        .hydrate_file_state(oid, lang, adapter, file)
+        .hydrate_file_state(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            adapter,
+            file,
+        )
         .unwrap()
         .unwrap();
     assert_file_state_equivalent(parsed.as_ref(), &direct_state);
@@ -275,7 +308,7 @@ pub fn assert_direct_prepared_parity<A: LanguageAdapter>(
     let bulk_states = prepared_store
         .hydrate_file_states(
             &[(file.clone(), oid)],
-            lang,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
             adapter,
             &HashMap::from_iter([(file.clone(), source)]),
         )
@@ -288,8 +321,12 @@ pub fn assert_direct_prepared_parity<A: LanguageAdapter>(
         parsed.scala_exports
     );
     assert_eq!(
-        direct.content_row_count(oid, lang).unwrap(),
-        prepared_store.content_row_count(oid, lang).unwrap()
+        direct
+            .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang))
+            .unwrap(),
+        prepared_store
+            .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang))
+            .unwrap()
     );
 }
 #[doc(hidden)]
@@ -304,7 +341,11 @@ pub fn assert_deleting_side_table_marks_incomplete<A: LanguageAdapter>(
     let parsed = parse_state(adapter, file);
     let store = AnalyzerStore::open_ephemeral().unwrap();
     store
-        .write_parsed_blob(oid, lang, adapter, &parsed)
+        .write_parsed_blob(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            adapter,
+            &parsed,
+        )
         .unwrap();
 
     {
@@ -371,22 +412,35 @@ pub fn assert_deleting_side_table_marks_incomplete<A: LanguageAdapter>(
             .unwrap_or_else(|error| panic!("injecting {table} corruption for {lang}: {error}"));
     }
 
-    assert!(!store.contains_parsed_blob(oid, lang).unwrap());
+    assert!(
+        !store
+            .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang))
+            .unwrap()
+    );
     assert_eq!(
         store
-            .missing_parsed_blob_keys(&[(oid, lang.to_string())])
+            .missing_parsed_blob_keys(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang)])
             .unwrap(),
-        vec![(oid, lang.to_string())]
+        vec![brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang)]
     );
     assert!(
         store
-            .hydrate_file_state(oid, lang, adapter, file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+                adapter,
+                file
+            )
             .unwrap()
             .is_none()
     );
     assert!(
         !store
-            .hydrate_file_states(&[(file.clone(), oid)], lang, adapter, &HashMap::default())
+            .hydrate_file_states(
+                &[(file.clone(), oid)],
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+                adapter,
+                &HashMap::default()
+            )
             .unwrap()
             .contains_key(file)
     );
@@ -416,8 +470,14 @@ fn file_state_from_source_with_grammar<A: LanguageAdapter>(
 ) -> FileState {
     let mut parser = Parser::new();
     parser.set_language(&language).expect(configure_message);
+    let preprocessor = adapter.preprocess(file, &source);
+    if let Some(ranges) = preprocessor.as_ref().and_then(|p| p.included_ranges()) {
+        parser.set_included_ranges(ranges).expect(configure_message);
+    }
     let tree = parser.parse(&source, None).expect(parse_message);
-    let mut parsed: ParsedFile = adapter.parse_file(file, &source, &tree);
+    let mut parsed: ParsedFile = adapter
+        .parse_file_preprocessed(file, &source, &tree, preprocessor.as_deref())
+        .0;
     parsed.add_file_scope(file, &source);
     let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
     TreeSitterAnalyzer::<A>::file_state_from_parsed(
@@ -444,26 +504,45 @@ pub fn assert_prior_parsed_blob_invalidated<A: LanguageAdapter>(
     store
         .write_parsed_blob_at_generation(
             &crate::analyzer::store::test_blob_file(),
-            oid,
-            language_key,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, language_key),
             prior_generation,
             adapter,
             state,
         )
         .unwrap();
-    assert!(store.contains_parsed_blob(oid, language_key).unwrap());
+    assert!(
+        store
+            .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                language_key
+            ))
+            .unwrap()
+    );
 
     let current_generation = store
         .ensure_language_epoch(language, &adapter.parser_language())
         .unwrap();
 
     assert_ne!(current_generation, prior_generation);
-    assert!(!store.contains_parsed_blob(oid, language_key).unwrap());
+    assert!(
+        !store
+            .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                language_key
+            ))
+            .unwrap()
+    );
     assert_eq!(
         store
-            .missing_parsed_blob_keys(&[(oid, language_key.to_string())])
+            .missing_parsed_blob_keys(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                language_key
+            )])
             .unwrap(),
-        vec![(oid, language_key.to_string())]
+        vec![brokk_bifrost_core::gitblob::BlobKey::unvaried(
+            oid,
+            language_key
+        )]
     );
 }
 #[doc(hidden)]
@@ -482,8 +561,7 @@ pub fn persisted_short_names<A: LanguageAdapter>(
     store
         .write_parsed_blob_at_generation(
             &crate::analyzer::store::test_blob_file(),
-            oid,
-            lang,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
             generation,
             adapter,
             &state,

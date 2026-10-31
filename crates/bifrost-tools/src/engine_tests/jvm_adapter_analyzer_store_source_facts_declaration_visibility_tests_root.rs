@@ -64,8 +64,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &stale_projection,
@@ -134,8 +133,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -211,8 +209,7 @@ mod jvm_extraction_tests {
             let error = store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     generation,
                     &JavaAdapter,
                     &state,
@@ -226,7 +223,7 @@ mod jvm_extraction_tests {
             );
             assert_eq!(
                 store
-                    .content_row_count(oid, "java")
+                    .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
                     .expect("failed row count"),
                 0
             );
@@ -271,8 +268,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -336,8 +332,7 @@ mod jvm_extraction_tests {
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     generation,
                     &JavaAdapter,
                     &state,
@@ -433,7 +428,11 @@ mod jvm_extraction_tests {
             );
             assert!(
                 store
-                    .signature_metadata_for_unit(oid, "java", generation, &target)
+                    .signature_metadata_for_unit(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                        generation,
+                        &target
+                    )
                     .is_err(),
                 "{corruption} must fail the known-unit metadata read"
             );
@@ -466,8 +465,7 @@ mod jvm_extraction_tests {
                 assert!(
                     store
                         .hydrate_file_state_with_source(
-                            oid,
-                            "java",
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                             generation,
                             &JavaAdapter,
                             &file,
@@ -651,8 +649,7 @@ mod jvm_extraction_tests {
         let expected = &state.signature_metadata;
         let hydrated = store
             .hydrate_file_state_with_source(
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 file,
@@ -665,7 +662,7 @@ mod jvm_extraction_tests {
         let bulk = store
             .hydrate_file_states(
                 &[(file.clone(), oid)],
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "java"),
                 &JavaAdapter,
                 &CoreHashMap::from_iter([(file.clone(), JAVA_SOURCE.to_owned())]),
             )
@@ -680,13 +677,22 @@ mod jvm_extraction_tests {
             .expect("fixture must retain divergent metadata alternatives");
         assert_eq!(
             store
-                .signature_metadata_for_unit(oid, "java", generation, &target)
+                .signature_metadata_for_unit(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    generation,
+                    &target
+                )
                 .expect("unbounded metadata reader"),
             target_metadata,
             "unbounded reader preserves every canonical metadata alternative"
         );
         let bounded = store
-            .signature_metadata_for_unit_limited(oid, "java", generation, &target, 1)
+            .signature_metadata_for_unit_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                generation,
+                &target,
+                1,
+            )
             .expect("bounded metadata reader");
         assert!(
             !bounded.complete,

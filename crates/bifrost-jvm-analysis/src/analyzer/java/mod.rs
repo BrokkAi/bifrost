@@ -65,6 +65,8 @@ pub mod source_facts;
 pub(crate) mod source_publication;
 #[doc(hidden)]
 pub mod source_storage;
+#[cfg(test)]
+mod statement_facts_tests;
 mod structural;
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -310,6 +312,19 @@ impl JavaAnalyzer {
             .selected_jdk_home_for_file(file)
     }
 
+    pub(crate) fn selected_jdk_artifact_for_file(
+        &self,
+        requesting_analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence>
+    {
+        let home = self.selected_jdk_home_for_file(file).ok()?;
+        requesting_analyzer
+            .active_semantic_model_snapshot()?
+            .jdk_artifact_for_home(home)
+            .cloned()
+    }
+
     #[cfg(test)]
     pub(crate) fn relational_batch_reader_checkouts_for_test(&self) -> usize {
         self.inner
@@ -349,21 +364,29 @@ impl JavaAnalyzer {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    fn from_inner(
+        inner: TreeSitterAnalyzer<JavaAdapter>,
+        java_config: brokk_bifrost_core::analyzer::config::JvmAnalyzerConfig,
+        memo_budget: u64,
+    ) -> Self {
+        Self {
+            inner,
+            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+            import_inventory: fresh_import_inventory(),
+            java_config,
+            external_index: Arc::new(
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            ),
+            external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
+        }
+    }
+
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let java_config = config.jvm.clone();
         TreeSitterAnalyzer::wrap_with_config(
             config,
             |config| TreeSitterAnalyzer::new_with_config(project, JavaAdapter, config),
-            |inner, memo_budget| Self {
-                inner,
-                memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
-                import_inventory: fresh_import_inventory(),
-                java_config,
-                external_index: Arc::new(
-                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
-                ),
-                external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
-            },
+            |inner, memo_budget| Self::from_inner(inner, java_config, memo_budget),
         )
     }
 
@@ -393,16 +416,7 @@ impl JavaAnalyzer {
                     progress,
                 )
             },
-            |inner, memo_budget| Self {
-                inner,
-                memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
-                import_inventory: fresh_import_inventory(),
-                java_config,
-                external_index: Arc::new(
-                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
-                ),
-                external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
-            },
+            |inner, memo_budget| Self::from_inner(inner, java_config, memo_budget),
         )
     }
 
@@ -425,16 +439,7 @@ impl JavaAnalyzer {
                     progress,
                 )
             },
-            |inner, memo_budget| Self {
-                inner,
-                memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
-                import_inventory: fresh_import_inventory(),
-                java_config,
-                external_index: Arc::new(
-                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
-                ),
-                external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
-            },
+            |inner, memo_budget| Self::from_inner(inner, java_config, memo_budget),
         )
     }
 
@@ -1091,6 +1096,10 @@ impl IAnalyzer for JavaAnalyzer {
         &self,
         file: &ProjectFile,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
+        use crate::analyzer::usages::get_definition::java::{
+            JavaResolutionSession, java_type_from_node_with_context, resolve_java_type_reference,
+        };
+        use brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::AnalyzerDefinitionLookup;
         use brokk_bifrost_analysis::analyzer::structural::lexical_environment::{
             BindingOfOutcome, binding_of, environment_for_file,
         };
@@ -1099,97 +1108,162 @@ impl IAnalyzer for JavaAnalyzer {
         };
         use brokk_bifrost_core::analyzer::structural::occurrences::Namespace;
         use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
+
+        let generation = self.project().analysis_generation();
         let source = self.inner.file_source(file)?;
         let oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
             .expect("source blob hash");
-        let key = (oid, file.clone());
+        // Analyzer clones share this cache, including across editor snapshots.
+        // A proof can depend on any file in that snapshot, not just this blob.
+        let overlay = self
+            .project()
+            .overlay_content()
+            .map(|content| content.digest());
+        let key = (oid, file.clone(), overlay);
         let result = self.memo_caches.statement_facts.read(
             &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
             |cache, capture| {
-                if let Some(rows) = cache.get(&key) {
+                if self.project().analysis_generation() == generation
+                    && let Some(rows) = cache.get(&key) {
                     return Ok::<_, ()>(rows);
                 }
                 let mut cacheable = false;
                 let entry = Arc::new(capture.try_build_weighted(|| {
-        let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
-        let tree = parse_tree(&source).ok_or(())?;
-        let root = tree.root_node();
-        let mut rows = capture_statement_facts(&JAVA_STRUCTURAL_SPEC, root, &source);
-        if !rows.switches.is_empty() {
-            let environment = environment_for_file(self, file);
-            let support = brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::AnalyzerDefinitionLookup::new(self, Language::Java);
-            let session =
-                crate::analyzer::usages::get_definition::java::JavaResolutionSession::unbounded(
-                    &support,
-                );
-            let lookup = |name: tree_sitter::Node<'_>, namespace| {
-                let text = name.utf8_text(source.as_bytes()).ok()?;
-                let binding =
-                    match binding_of(&environment, text, name.start_byte(), Some(namespace)) {
-                        BindingOfOutcome::Reached(binding)
-                        | BindingOfOutcome::Shadowed {
-                            winner: binding, ..
-                        } => binding,
-                        BindingOfOutcome::NoBinding | BindingOfOutcome::Incomplete(_) => {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
+            self.inner
+                .record_read_key(self.inner.file_read_key(file, oid));
+            let tree = parse_tree(&source).ok_or(())?;
+            let root = tree.root_node();
+            let mut rows = capture_statement_facts(&JAVA_STRUCTURAL_SPEC, root, &source, &Default::default());
+            if !rows.switches.is_empty() {
+                let environment = environment_for_file(self, file);
+                let support = AnalyzerDefinitionLookup::new(self, Language::Java);
+                let session = JavaResolutionSession::unbounded(&support);
+                let lookup = |name: tree_sitter::Node<'_>, namespace| {
+                    let text = name.utf8_text(source.as_bytes()).ok()?;
+                    let binding =
+                        match binding_of(&environment, text, name.start_byte(), Some(namespace)) {
+                            BindingOfOutcome::Reached(binding)
+                            | BindingOfOutcome::Shadowed {
+                                winner: binding, ..
+                            } => binding,
+                            BindingOfOutcome::NoBinding | BindingOfOutcome::Incomplete(_) => {
+                                return None;
+                            }
+                        };
+                    let range = environment.bindings[binding].range;
+                    root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                };
+                let producer =
+                    StatementFacts::new(&JAVA_STRUCTURAL_SPEC).expect("Java statement syntax");
+                // Bind the operand in this file, then inspect the resolved
+                // declaration in its own source snapshot. A default arm proves
+                // the negative without needing the operand's type.
+                let switches: Vec<_> = rows
+                    .switches
+                    .iter()
+                    .map(|switch| (switch.range, switch.default_present))
+                    .collect();
+                for (range, default_present) in switches {
+                    if default_present {
+                        continue;
+                    }
+                    let switch = root
+                        .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                        .expect("captured switch belongs to its source tree");
+                    let proven = (|| {
+                        let operand = switch.child_by_field_name("condition").map(
+                            brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression,
+                        )?;
+                        if operand.kind() != "identifier" {
                             return None;
                         }
-                    };
-                let range = environment.bindings[binding].range;
-                root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
-            };
-            let producer =
-                StatementFacts::new(&JAVA_STRUCTURAL_SPEC).expect("Java statement syntax");
-            // Bind values through the shared lexical environment and types
-            // through Java's existing context-aware resolver. Only an enum
-            // declaration in this source snapshot supplies a local proof.
-            let switches: Vec<_> = rows.switches.iter().map(|switch| switch.range).collect();
-            for range in switches {
-                let Some(switch) =
-                    root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
-                else {
-                    continue;
-                };
-                let Some(operand) = switch
-                    .child_by_field_name("condition")
-                    .map(brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression)
-                else {
-                    continue;
-                };
-                if operand.kind() != "identifier" {
-                    continue;
+                        let binder = lookup(operand, Namespace::Value)?;
+                        let type_node = binder.parent().and_then(declared_type_node)?;
+                        match type_node.kind() {
+                            "integral_type" | "floating_point_type" | "boolean_type"
+                            | "array_type" => return Some(true),
+                            "type_identifier" | "scoped_type_identifier" => {}
+                            _ => return None,
+                        }
+                        let unit = java_type_from_node_with_context(
+                            self, scope.token(), self, &session, file, &source, type_node,
+                        );
+                        let Some(unit) = unit else {
+                            // The intrinsic type resolver rules out nearer declarations,
+                            // type parameters and unindexed imports before selecting String.
+                            let outcome = resolve_java_type_reference(
+                                self, self, &session, file, &source, type_node,
+                            );
+                            return outcome.reference.as_ref().and_then(|reference| {
+                                (reference.text == "java.lang.String"
+                                    && outcome.diagnostics.iter().any(|diagnostic| {
+                                        diagnostic.kind == "intrinsic_type_reference"
+                                    }))
+                                .then_some(true)
+                            });
+                        };
+                        let mut other_source = None;
+                        let mut other_tree = None;
+                        if unit.source() != file {
+                            let text = self.inner.file_source(unit.source())?;
+                            let other_oid = git2::Oid::hash_object(
+                                git2::ObjectType::Blob,
+                                text.as_bytes(),
+                            )
+                            .expect("source blob hash");
+                            self.inner
+                                .record_read_key(self.inner.file_read_key(unit.source(), other_oid));
+                            other_tree = Some(parse_tree(&text)?);
+                            other_source = Some(text);
+                        }
+                        let declaration_source = other_source.as_deref().unwrap_or(&source);
+                        let declaration_root =
+                            other_tree.as_ref().map_or(root, |tree| tree.root_node());
+                        let declaration = self
+                            .ranges(&unit)
+                            .into_iter()
+                            .filter_map(|range| {
+                                declaration_root.named_descendant_for_byte_range(
+                                    range.start_byte,
+                                    range.end_byte,
+                                )
+                            })
+                            .find(|node| {
+                                matches!(
+                                    node.kind(),
+                                    "enum_declaration" | "class_declaration" | "interface_declaration"
+                                        | "record_declaration" | "annotation_type_declaration"
+                                )
+                            })?;
+                        if declaration.kind() == "enum_declaration" {
+                            Some(producer.complete_enum_switch(
+                                switch, declaration, &source, declaration_source, &mut rows,
+                            ))
+                        } else {
+                            Some(true)
+                        }
+                    })()
+                    .unwrap_or(false);
+                    if !proven {
+                        rows.switches
+                            .iter_mut()
+                            .find(|fact| fact.range == range)
+                            .expect("captured switch fact")
+                            .enum_proof_undecided = true;
+                    }
                 }
-                let Some(binder) = lookup(operand, Namespace::Value) else {
-                    continue;
-                };
-                let Some(type_node) = binder.parent().and_then(declared_type_node) else {
-                    continue;
-                };
-                if type_node.kind() != "type_identifier" {
-                    continue;
-                }
-                let Some(unit) = crate::analyzer::usages::get_definition::java::java_type_from_node_with_context(
-                    self, scope.token(), self, &session, file, &source, type_node,
-                ).filter(|unit| unit.source() == file) else { continue; };
-                let Some(enumeration) = self
-                    .ranges(&unit)
-                    .into_iter()
-                    .filter_map(|range| {
-                        root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
-                    })
-                    .find(|node| node.kind() == "enum_declaration")
-                else {
-                    continue;
-                };
-                producer.complete_enum_switch(switch, enumeration, &source, &mut rows);
             }
-        }
-        let rows = Arc::new(rows);
-                    cacheable = scope.captured_read_incompleteness().is_empty();
-                    let bytes = rows.estimated_retained_bytes()
-                        + brokk_bifrost_analysis::analyzer::cache_weight::estimate_project_file(file) as usize;
-                    Ok::<_, ()>((rows, bytes))
+            cacheable = scope.captured_read_incompleteness().is_empty()
+                && self.project().analysis_generation() == generation;
+            if self.project().analysis_generation() != generation {
+                self.mark_execution_dependent();
+            }
+            let rows = Arc::new(rows);
+            let bytes = rows.estimated_retained_bytes()
+                + brokk_bifrost_analysis::analyzer::cache_weight::estimate_project_file(file) as usize;
+            Ok::<_, ()>((rows, bytes))
                 })?);
-                // Keep the existing complete-build-only admission rule.
                 if cacheable {
                     cache.insert(key, Arc::clone(&entry));
                 }

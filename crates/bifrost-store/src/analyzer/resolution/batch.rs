@@ -1180,7 +1180,13 @@ pub struct ForwardCandidateArtifactCache {
     /// which is where the repeated seed reads, candidate reads, hydrations and
     /// typed reads of the graph route were going. Only complete, live answers
     /// are published here: see `retain_demanded_reference_answer`.
-    demanded_reference_answers: HashMap<DemandedReferenceKey, super::fact_resolution::SharedAnswer>,
+    demanded_reference_answers: HashMap<
+        DemandedReferenceKey,
+        super::query_obligations::ClosedQueryValue<(
+            super::fact_resolution::SharedAnswer,
+            Option<super::ClosedQueryScope>,
+        )>,
+    >,
     /// Budget accounting shared by the type and member stages of one receiver
     /// query. The selected authority keeps unrelated frontiers distinct.
     expanded_owner_frontiers: HashSet<DemandedReferenceKey>,
@@ -1216,8 +1222,15 @@ impl ForwardCandidateArtifactCache {
     pub(super) fn demanded_reference_answer(
         &self,
         key: &DemandedReferenceKey,
-    ) -> Option<&super::fact_resolution::SharedAnswer> {
-        self.demanded_reference_answers.get(key)
+        consumer: &mut super::QueryObligations,
+    ) -> Option<&(
+        super::fact_resolution::SharedAnswer,
+        Option<super::ClosedQueryScope>,
+    )> {
+        Some(self.demanded_reference_answers.get(key)?.read(consumer))
+    }
+    pub(super) fn has_demanded_reference_answer(&self, key: &DemandedReferenceKey) -> bool {
+        self.demanded_reference_answers.contains_key(key)
     }
 
     /// Publish one demanded reference's exhausted answer.
@@ -1230,15 +1243,28 @@ impl ForwardCandidateArtifactCache {
         &mut self,
         key: DemandedReferenceKey,
         answer: super::fact_resolution::SharedAnswer,
+        query_scope: Option<super::ClosedQueryScope>,
+        obligations: super::QueryObligations,
     ) {
+        // Ordinary route-discharge receipts are evaluator-local. This memo
+        // carries only the immutable lexical value and its query scope/pending
+        // assumptions, not whichever unrelated receipts its consumer held.
+        let mut query_scope = query_scope;
+        let mut scope = obligations;
         if let Some(existing) = self.demanded_reference_answers.get(&key) {
+            let (binding, prior) = existing.read(&mut scope);
             assert_eq!(
-                existing, &answer,
-                "one demanded reference key has one exhausted answer: {key:?}"
+                binding, &answer,
+                "one demanded reference key has one exhausted binding: {key:?}"
             );
-            return;
+            if let Some(prior) = prior {
+                query_scope
+                    .get_or_insert_with(Default::default)
+                    .merge(prior.clone());
+            }
         }
-        self.demanded_reference_answers.insert(key, answer);
+        let value = super::query_obligations::ClosedQueryValue::new((answer, query_scope), scope);
+        self.demanded_reference_answers.insert(key, value);
     }
 
     /// How many demanded-reference answers this operation retained, and an
@@ -1252,7 +1278,10 @@ impl ForwardCandidateArtifactCache {
     pub(super) fn demanded_reference_memo_size(&self) -> (usize, usize) {
         let mut bytes = 0_usize;
         for (key, answer) in &self.demanded_reference_answers {
-            bytes += size_of_val(key) + answer.structural_bytes();
+            // Instrumentation does not consume a binding, but uses the same
+            // recording accessor with a local accounting scope.
+            let mut scope = super::QueryObligations::empty();
+            bytes += size_of_val(key) + answer.read(&mut scope).0.structural_bytes();
         }
         (self.demanded_reference_answers.len(), bytes)
     }

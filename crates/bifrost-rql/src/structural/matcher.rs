@@ -65,6 +65,43 @@ pub(crate) struct CallableSignatureIncomplete {
     pub duplicate_dictionary_key_unrecorded: Cell<bool>,
     pub string_literal_value_unrecorded: Cell<bool>,
     pub local_value_unresolved: Cell<bool>,
+    pub role_target_unrecorded: Cell<bool>,
+}
+
+impl CallableSignatureIncomplete {
+    fn flags(&self) -> [&Cell<bool>; 6] {
+        let Self {
+            visibility_unrecorded,
+            parameter_types_unrecorded,
+            duplicate_dictionary_key_unrecorded,
+            string_literal_value_unrecorded,
+            local_value_unresolved,
+            role_target_unrecorded,
+        } = self;
+        [
+            visibility_unrecorded,
+            parameter_types_unrecorded,
+            duplicate_dictionary_key_unrecorded,
+            string_literal_value_unrecorded,
+            local_value_unresolved,
+            role_target_unrecorded,
+        ]
+    }
+
+    // Unknown is not absence. Keep diagnostics sticky while withholding an
+    // unproved positive from a negated predicate.
+    fn negate(&self, evaluate: impl FnOnce() -> bool) -> bool {
+        let flags = self.flags();
+        // Isolate this probe so an earlier incomplete candidate cannot mask
+        // the same missing capability on this candidate (or a nested not).
+        let before = flags.map(|flag| flag.replace(false));
+        let matched = evaluate();
+        let unknown = flags.iter().any(|flag| flag.get());
+        for (flag, previous) in flags.into_iter().zip(before) {
+            flag.set(flag.get() || previous);
+        }
+        !matched && !unknown
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -292,7 +329,10 @@ pub(crate) fn match_query_candidates(
             // Verifier-only negation: captures inside a failed positive probe
             // must not leak into the result.
             let mut discarded = Vec::new();
-            if eval_containment(not_inside, facts, id, &mut discarded, &mut context) {
+            let incomplete = context.incomplete;
+            if !incomplete
+                .negate(|| eval_containment(not_inside, facts, id, &mut discarded, &mut context))
+            {
                 continue;
             }
         }
@@ -624,10 +664,12 @@ fn eval_pattern_inner_with_name(
 
     if let Some(negated) = &pattern.not {
         let checkpoint = captures.len();
-        let matched =
-            eval_pattern_inner_with_name(negated, facts, node, name_override, captures, context);
+        let incomplete = context.incomplete;
+        let absent = incomplete.negate(|| {
+            eval_pattern_inner_with_name(negated, facts, node, name_override, captures, context)
+        });
         captures.truncate(checkpoint);
-        if matched {
+        if !absent {
             return false;
         }
     }
@@ -761,7 +803,10 @@ fn eval_pattern_inner_with_name(
     }
     if let Some(not_has) = &pattern.not_has {
         let mut discarded = Vec::new();
-        if some_descendant_matches(not_has, facts, node, &mut discarded, context) {
+        let incomplete = context.incomplete;
+        if !incomplete
+            .negate(|| some_descendant_matches(not_has, facts, node, &mut discarded, context))
+        {
             return false;
         }
     }
@@ -939,8 +984,12 @@ fn some_descendant_matches(
 /// Evaluate a sub-pattern against a role target. When the target is itself a
 /// normalized fact, full pattern semantics apply to that fact while name
 /// predicates prefer the role-derived name when present; otherwise only
-/// name/text/capture can be satisfied from the edge's raw span and derived
-/// name (kind or nested constraints fail).
+/// name/text/capture and boolean combinations can be satisfied from the edge's
+/// raw span and derived name. Kind-specific predicates are false on a target
+/// without a normalized kind (string-value keeps its existing unrecorded-value
+/// diagnostic). Predicates requiring unread structure below or around the
+/// target report incomplete: has, not_has, local_value, arguments, keyword
+/// arguments, and role constraints.
 struct IndexedRoleTarget<'a> {
     target: &'a RoleTarget,
     index: Option<usize>,
@@ -981,8 +1030,10 @@ fn eval_span_only(
         context.incomplete.string_literal_value_unrecorded.set(true);
         return false;
     }
-    if !pattern.kinds.is_empty()
-        || pattern.boolean_value.is_some()
+    if !pattern.kinds.is_empty() {
+        return false;
+    }
+    if pattern.boolean_value.is_some()
         || pattern.string_value.is_some()
         || pattern.language_rule.is_some()
         || pattern.body_state.is_some()
@@ -1008,15 +1059,43 @@ fn eval_span_only(
         || !pattern.visibility.is_empty()
         || pattern.parameter_type.is_some()
         || pattern.comment_block_text.is_some()
-        || pattern.has.is_some()
+    {
+        return false;
+    }
+    // These predicates need structure that a raw role span does not expose.
+    if pattern.has.is_some()
         || pattern.local_value.is_some()
         || pattern.not_has.is_some()
-        || pattern.not.is_some()
-        || !pattern.all.is_empty()
-        || !pattern.any.is_empty()
         || !pattern.args.is_empty()
         || !pattern.kwargs.is_empty()
         || pattern.has_role_constraints()
+    {
+        context.incomplete.role_target_unrecorded.set(true);
+        return false;
+    }
+    if let Some(negated) = &pattern.not {
+        let checkpoint = captures.len();
+        let incomplete = context.incomplete;
+        let absent =
+            incomplete.negate(|| eval_span_only(negated, facts, target, captures, context));
+        captures.truncate(checkpoint);
+        if !absent {
+            return false;
+        }
+    }
+    for child in &pattern.all {
+        if !eval_with_capture_rollback(captures, |captures| {
+            eval_span_only(child, facts, target, captures, context)
+        }) {
+            return false;
+        }
+    }
+    if !pattern.any.is_empty()
+        && !pattern.any.iter().any(|child| {
+            eval_with_capture_rollback(captures, |captures| {
+                eval_span_only(child, facts, target, captures, context)
+            })
+        })
     {
         return false;
     }

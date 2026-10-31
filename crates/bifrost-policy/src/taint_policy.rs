@@ -4555,6 +4555,8 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
                 .map(|(model, _)| model.clone())
                 .collect::<Vec<_>>();
+            reduce_bound_endpoints(policy, &mut sources)?;
+            reduce_bound_endpoints(policy, &mut sinks)?;
             sort_bound_endpoints(&mut sources);
             sort_bound_endpoints(&mut sinks);
             sort_bound_sanitizers(&mut kills);
@@ -4842,6 +4844,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             "the engine rule composes only a policy with bound sinks"
         );
         sort_bound_endpoints(&mut sinks);
+        reduce_bound_endpoints(policy, &mut sinks)?;
         let models: Arc<[BoundExternalModel]> = models.into();
         let behavior = spec.call_modeling.unmodeled;
         let plan_error =
@@ -8889,6 +8892,7 @@ impl<'a> FrontierEndpointBinder<'a> {
                 FrontierEndpoint::Transform(transform) => transforms.push(transform),
             }
         }
+        reduce_bound_endpoints(self.policy, &mut sources)?;
         sort_bound_endpoints(&mut sources);
         sort_bound_sanitizers(&mut sanitizers);
         sort_bound_transforms(&mut transforms);
@@ -12322,6 +12326,65 @@ fn store_compatibility_hash(
         hasher.write_u8(u8::from(read.is_complete()));
     }
     hasher.finish()
+}
+
+fn reduce_bound_endpoints(
+    policy: &LoadedPolicy,
+    endpoints: &mut Vec<BoundEndpoint>,
+) -> Result<(), TaintPolicyCompileError> {
+    use crate::composition::PrecedenceGraph;
+    use crate::resolved::ResolvedPrecedenceEdge;
+    let graph = PrecedenceGraph::try_new(
+        policy
+            .endpoint_dependencies()
+            .iter()
+            .map(|entry| entry.identity().clone()),
+        policy
+            .precedence_manifest()
+            .edges
+            .iter()
+            .filter_map(|edge| match edge {
+                ResolvedPrecedenceEdge::Endpoint {
+                    dominant,
+                    dominated,
+                } => Some((dominant.clone(), dominated.clone())),
+                _ => None,
+            }),
+    )
+    .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+    // Each invocation contains one role. Point handles include the procedure;
+    // the carrier identifies the actual bound value or port.
+    let mut groups = HashMap::<_, Vec<usize>>::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        groups
+            .entry((
+                endpoint.point.clone(),
+                endpoint.phase,
+                endpoint.carrier.clone(),
+            ))
+            .or_default()
+            .push(index);
+    }
+    let mut keep = vec![true; endpoints.len()];
+    for indices in groups.values() {
+        let live = graph
+            .live_candidates(
+                indices
+                    .iter()
+                    .map(|&index| endpoints[index].endpoint.clone()),
+            )
+            .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+        for &index in indices {
+            keep[index] = live.contains(&endpoints[index].endpoint);
+        }
+    }
+    let mut index = 0;
+    endpoints.retain(|_| {
+        let retain = keep[index];
+        index += 1;
+        retain
+    });
+    Ok(())
 }
 
 /// Mint the value-flow source specs for a bound endpoint list, keeping each

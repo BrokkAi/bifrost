@@ -39,15 +39,29 @@ pub(super) fn statement_fact_expansions(
     }
     let rows = analyzer.statement_source_facts(&seed.file);
     let range = super::relations::seed_range(seed);
-    report_conditional_undecided(
+    report_undecided(
         seed,
         kind,
         rows.iter()
             .flat_map(|rows| &rows.undecided)
             .filter(|site| site.kind == kind)
             .map(|site| site.range),
+        "conditional-compilation activation is unproven",
         diagnostics,
     );
+    if kind == StatementFactKind::MissingCaseInSwitch {
+        report_undecided(
+            seed,
+            kind,
+            rows.iter()
+                .flat_map(|rows| &rows.switches)
+                .filter(|switch| switch.range == range && switch.enum_proof_undecided)
+                .map(|switch| switch.range)
+                .chain((rows.is_none() && seed.language == Language::Java).then_some(range)),
+            "enum-switch exhaustiveness proof is unavailable",
+            diagnostics,
+        );
+    }
     let Some(rows) = rows else {
         return Vec::new();
     };
@@ -78,21 +92,17 @@ pub(super) fn statement_fact_expansions(
     }
 }
 
-fn report_conditional_undecided(
+fn report_undecided(
     seed: &SeedMatch,
     kind: StatementFactKind,
     sites: impl Iterator<Item = Range>,
+    reason: &'static str,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
     let range = super::relations::seed_range(seed);
     let undecided = sites
         .filter(|site| range.contains(site))
-        .map(|site| {
-            super::language_rules::UndecidedSite::at(
-                site,
-                "conditional-compilation activation is unproven",
-            )
-        })
+        .map(|site| super::language_rules::UndecidedSite::at(site, reason))
         .collect();
     diagnostics.extend(
         super::language_rules::LanguageRuleMatches::decided(
@@ -125,7 +135,11 @@ fn report_nested_loop_incomplete(
     }
     diagnostics.push(super::QueryExecutionState::diagnostic(
         analyzer,
-        CodeQueryDiagnostic {
+        CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: match cause {
+                Some(cause) => brokk_bifrost_rql::Incompleteness::Operational(cause),
+                None => brokk_bifrost_rql::Incompleteness::Content,
+            },
             related: Vec::new(),
             source: None,
             code,
@@ -135,7 +149,7 @@ fn report_nested_loop_incomplete(
             message,
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        },
+        }),
         cause,
     ));
 }
@@ -220,10 +234,11 @@ fn nested_loop_fact_expansions(
             );
             continue;
         }
-        report_conditional_undecided(
+        report_undecided(
             seed,
             StatementFactKind::NestedLoopsWithSameVariable,
             facts.undecided.iter().copied(),
+            "conditional-compilation activation is unproven",
             diagnostics,
         );
         if facts.rows.contains(&range) {

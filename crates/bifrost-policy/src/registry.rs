@@ -168,48 +168,12 @@ impl PolicyRegistryLimits {
         self.max_retained_source_and_selector_bytes
     }
 
-    pub fn with_max_policies(mut self, value: usize) -> Result<Self, PolicyRegistryLimitError> {
-        set_registry_limit(
-            &mut self.max_policies,
-            "max_policies",
-            value,
-            MAX_REGISTERED_POLICIES,
-        )?;
-        Ok(self)
-    }
-
     pub fn with_max_endpoints(mut self, value: usize) -> Result<Self, PolicyRegistryLimitError> {
         set_registry_limit(
             &mut self.max_endpoints,
             "max_endpoints",
             value,
             MAX_REGISTERED_ENDPOINTS,
-        )?;
-        Ok(self)
-    }
-
-    pub fn with_max_match_directories_per_policy(
-        mut self,
-        value: usize,
-    ) -> Result<Self, PolicyRegistryLimitError> {
-        set_registry_limit(
-            &mut self.max_match_directories_per_policy,
-            "max_match_directories_per_policy",
-            value,
-            MAX_MATCH_DIRECTORIES_PER_POLICY,
-        )?;
-        Ok(self)
-    }
-
-    pub fn with_max_match_directory_depth(
-        mut self,
-        value: usize,
-    ) -> Result<Self, PolicyRegistryLimitError> {
-        set_registry_limit(
-            &mut self.max_match_directory_depth,
-            "max_match_directory_depth",
-            value,
-            MAX_POLICY_MATCH_DIRECTORY_DEPTH,
         )?;
         Ok(self)
     }

@@ -236,7 +236,7 @@ pub const IMPORT_SOURCE_LOCATIONS_SQL: &str = "
       FROM blobs AS keys
       JOIN source_fact_manifests AS manifest ON manifest.blob_id = keys.id
       JOIN source_rust_import_targets AS imports ON imports.blob_id = keys.id
-      WHERE keys.blob_oid = ?1 AND keys.lang = 'rust'
+      WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.parse_variant = ?4
         AND imports.ordinal = ?2 AND manifest.publication_state = 'complete'
         AND manifest.facts_version = ?3
     ), source_occurrences AS MATERIALIZED (
@@ -263,7 +263,7 @@ pub const RUST_DECLARATION_PROPERTY_MANIFEST_SQL: &str =
                     manifest.rust_constructor_field_count, manifest.declaration_unit_count
              FROM rust_published_fact_blobs AS keys
              JOIN source_fact_manifests AS manifest ON manifest.blob_id = keys.blob_id
-             WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.generation = ?2
+             WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.parse_variant = ?4 AND keys.generation = ?2
                AND manifest.facts_version = ?3";
 
 #[doc(hidden)]
@@ -352,7 +352,7 @@ pub const RUST_PRIMARY_CONTEXT_MANIFEST_SQL: &str = "SELECT keys.blob_id
        JOIN source_fact_manifests AS manifest ON manifest.blob_id = keys.blob_id
        JOIN source_rust_item_manifests AS item ON item.blob_id = keys.blob_id
        JOIN source_rust_module_manifests AS module ON module.blob_id = keys.blob_id
-      WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.generation = ?2
+      WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.parse_variant = ?8 AND keys.generation = ?2
         AND manifest.publication_state = 'complete' AND manifest.facts_version = ?3
         AND item.facts_version = ?4 AND item.macro_facts_version = ?5
         AND item.type_forms_version = ?6 AND item.macro_contexts_version = ?7";
@@ -364,11 +364,13 @@ impl super::AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_primary_contexts_at(
         &self,
-        oid: git2::Oid,
+        key: &super::BlobKey,
         generation: super::GenerationId,
         reference_byte: usize,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<SourceOccurrenceId>>> {
+        let oid = key.oid;
+        debug_assert_eq!(key.lang, "rust");
         if !keep_going() {
             return Ok(None);
         }
@@ -383,7 +385,7 @@ impl super::AnalyzerStore {
                     rust_items::RUST_ITEM_SOURCE_FACTS_VERSION,
                     rust_items::RUST_MACRO_FACTS_VERSION,
                     rust_items::RUST_TYPE_FORMS_VERSION,
-                    rust_items::RUST_MACRO_CONTEXTS_VERSION,
+                    rust_items::RUST_MACRO_CONTEXTS_VERSION, key.variant,
                 ],
                 |row| row.get(0),
             )
@@ -415,11 +417,13 @@ impl super::AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_primary_occurrences_at(
         &self,
-        oid: git2::Oid,
+        key: &super::BlobKey,
         generation: super::GenerationId,
         range: std::ops::Range<usize>,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<SourceOccurrenceId>>> {
+        let oid = key.oid;
+        debug_assert_eq!(key.lang, "rust");
         assert!(
             range.start <= range.end,
             "query source range must be ordered"
@@ -433,7 +437,7 @@ impl super::AnalyzerStore {
         let blob_id: i64 = tx
             .query_row(
                 RUST_DECLARATION_PROPERTY_MANIFEST_SQL,
-                params![oid.to_string(), generation.get(), SOURCE_FACTS_VERSION],
+                params![oid.to_string(), generation.get(), SOURCE_FACTS_VERSION, key.variant],
                 |row| row.get(0),
             )
             .optional()?
@@ -467,12 +471,14 @@ impl super::AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_declaration_properties<A: super::StoreLanguageAdapter>(
         &self,
-        oid: git2::Oid,
+        key: &super::BlobKey,
         generation: super::GenerationId,
         adapter: &A,
         file: &ProjectFile,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<(CodeUnit, RustDeclarationPropertyFact)>>> {
+        let oid = key.oid;
+        debug_assert_eq!(key.lang, "rust");
         if !keep_going() {
             return Ok(None);
         }
@@ -483,7 +489,12 @@ impl super::AnalyzerStore {
         let publication = tx
             .query_row(
                 RUST_DECLARATION_PROPERTY_MANIFEST_SQL,
-                params![oid_text, generation.get(), SOURCE_FACTS_VERSION],
+                params![
+                    oid_text,
+                    generation.get(),
+                    SOURCE_FACTS_VERSION,
+                    key.variant
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
@@ -605,9 +616,7 @@ impl super::AnalyzerStore {
         if !keep_going() {
             return Ok(None);
         }
-        let Some(units) =
-            super::read_unit_rows_while(&tx, &oid_text, "rust", adapter, file, keep_going)?
-        else {
+        let Some(units) = super::read_unit_rows_while(&tx, key, adapter, file, keep_going)? else {
             return Ok(None);
         };
         let units: HashMap<_, _> = units.into_iter().map(|row| (row.key, row.unit)).collect();
@@ -652,11 +661,13 @@ impl super::AnalyzerStore {
     #[doc(hidden)]
     pub fn load_rust_import_source_locations(
         &self,
-        oid: git2::Oid,
+        key: &super::BlobKey,
         generation: super::GenerationId,
         ordinals: &std::collections::BTreeSet<usize>,
         cancellation: &CancellationToken,
     ) -> Result<Option<std::collections::BTreeMap<usize, ImportSourceLocations>>> {
+        let oid = key.oid;
+        debug_assert_eq!(key.lang, "rust");
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         super::require_current_generation(&tx, "rust", generation)?;
@@ -669,7 +680,12 @@ impl super::AnalyzerStore {
             }
             let row = statement
                 .query_row(
-                    params![oid, usize_to_i64(ordinal)?, SOURCE_FACTS_VERSION],
+                    params![
+                        oid,
+                        usize_to_i64(ordinal)?,
+                        SOURCE_FACTS_VERSION,
+                        key.variant
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, bool>(0)?,
@@ -1479,6 +1495,7 @@ WITH files AS MATERIALIZED (
   AND (source.valid_until IS NULL OR json_extract(request.value,'$[3]')<source.valid_until)
  LEFT JOIN blobs blob ON blob.blob_oid=source.blob_oid
   AND blob.lang=source.lang AND blob.generation=source.generation
+  AND blob.parse_variant=x''
 ), references_by_name AS (
  SELECT files.ordinal,
         CASE WHEN substr(name.spelling,1,2)='r#' THEN substr(name.spelling,3)

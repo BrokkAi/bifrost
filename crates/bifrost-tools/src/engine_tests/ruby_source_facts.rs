@@ -63,7 +63,11 @@ end
         let path = fixture.root().join("ruby-source.db");
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         store
-            .write_parsed_blob(oid, "ruby", &RubyAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                &RubyAdapter,
+                &state,
+            )
             .unwrap();
         drop(store);
         let store = AnalyzerStore::open_persistent(&path).unwrap();
@@ -89,8 +93,7 @@ end
         assert_eq!(
             store
                 .load_structural_facts_rows(
-                    oid,
-                    "ruby",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
                     generation,
                     brokk_bifrost_analysis::analyzer::structural::facts::STRUCTURAL_FACTS_VERSION
                 )
@@ -137,7 +140,11 @@ end
             let oid = oid_for(source.as_bytes());
             assert!(store.ruby_source_facts(oid, generation).is_err());
             store
-                .write_parsed_blob(oid, "ruby", &RubyAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                    &RubyAdapter,
+                    &state,
+                )
                 .unwrap();
             let facts = store.ruby_source_facts(oid, generation).unwrap();
             assert!(facts.loads.is_empty());
@@ -155,7 +162,11 @@ end
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("ruby").unwrap();
         store
-            .write_parsed_blob(oid, "ruby", &RubyAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                &RubyAdapter,
+                &state,
+            )
             .unwrap();
         store.conn.execute(|conn| {
         for sql in ["UPDATE source_ruby_loads SET kind=2", "DELETE FROM source_ruby_load_constants", "UPDATE source_ruby_manifests SET has_parse_errors=1", "UPDATE blob_meta SET ruby_source_version=NULL"] {
@@ -184,7 +195,11 @@ end
             })
             .unwrap();
         store
-            .write_parsed_blob(oid, "ruby", &RubyAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                &RubyAdapter,
+                &state,
+            )
             .unwrap();
         assert_eq!(
             store
@@ -213,7 +228,11 @@ end
                 oid_for(format!("Ruby planner {index}").as_bytes())
             };
             store
-                .write_parsed_blob(current, "ruby", &RubyAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(current, "ruby"),
+                    &RubyAdapter,
+                    &state,
+                )
                 .unwrap();
         }
         for refresh in [false, true] {
@@ -288,8 +307,7 @@ end
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("ruby").unwrap();
         let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "ruby",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
             generation,
             &RubyAdapter,
             Arc::clone(&state),
@@ -304,7 +322,12 @@ end
         );
         assert!(outcomes[0].error.is_some());
         assert!(store.ruby_source_facts(oid, generation).is_err());
-        assert_eq!(store.content_row_count(oid, "ruby").unwrap(), 0);
+        assert_eq!(
+            store
+                .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"))
+                .unwrap(),
+            0
+        );
         store
             .conn
             .execute(|conn| {
@@ -319,11 +342,20 @@ end
             .unwrap();
         assert!(
             store
-                .write_parsed_blob(oid, "ruby", &RubyAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                    &RubyAdapter,
+                    &state
+                )
                 .is_err()
         );
         assert!(store.ruby_source_facts(oid, generation).is_err());
-        assert_eq!(store.content_row_count(oid, "ruby").unwrap(), 0);
+        assert_eq!(
+            store
+                .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"))
+                .unwrap(),
+            0
+        );
         store
             .conn
             .execute(|conn| {
@@ -344,7 +376,11 @@ end
             })
             .unwrap();
         store
-            .write_parsed_blob(oid, "ruby", &RubyAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                &RubyAdapter,
+                &state,
+            )
             .unwrap();
         assert_eq!(
             store
@@ -392,7 +428,11 @@ end
             let oid = oid_for(source.as_bytes());
             let store = AnalyzerStore::open_persistent(&path).unwrap();
             store
-                .write_parsed_blob(oid, "ruby", &RubyAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                    &RubyAdapter,
+                    &state,
+                )
                 .unwrap();
             drop(store);
             let store = AnalyzerStore::open_persistent(&path).unwrap();

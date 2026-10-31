@@ -743,6 +743,7 @@ pub fn parse_statement_fact_rows(source: &str) -> StatementFactRows {
         &crate::structural::CPP_STRUCTURAL_SPEC,
         tree.root_node(),
         source,
+        &Default::default(),
     )
 }
 

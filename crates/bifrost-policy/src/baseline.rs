@@ -203,10 +203,6 @@ pub enum PolicyBaselineSource {
 }
 
 impl PolicyBaselineSource {
-    pub fn explicit(path: impl AsRef<Path>) -> Result<Self, PolicyBaselineSourceError> {
-        Self::from_workspace_path(WorkspaceRelativePath::try_from_path(path.as_ref())?)
-    }
-
     pub fn explicit_portable(path: impl AsRef<str>) -> Result<Self, PolicyBaselineSourceError> {
         Self::from_workspace_path(WorkspaceRelativePath::new(path)?)
     }
@@ -267,16 +263,6 @@ impl fmt::Display for PolicyBaselineSourceError {
 }
 
 crate::impl_policy_source_error!(PolicyBaselineSourceError);
-
-/// Open a workspace capability once, then load and normalize its configured
-/// baseline document. Only an actual missing file maps to `Ok(None)`.
-pub fn load_policy_baseline(
-    workspace_root: &Path,
-    options: &PolicyBaselineOptions,
-) -> Result<Option<PolicyBaselineDocument>, PolicyBaselineLoadError> {
-    let root = WorkspaceRoot::open(workspace_root).map_err(PolicyBaselineLoadError::Workspace)?;
-    load_policy_baseline_from_root(&root, options)
-}
 
 pub(crate) fn load_policy_baseline_from_root(
     root: &WorkspaceRoot,
@@ -931,27 +917,6 @@ impl PolicyBaselineReview {
         {
             entry.result_omitted = true;
         }
-    }
-}
-
-impl RetainedSize for PolicyBaselinePolicyRecord {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.policy_id))
-            .saturating_add(std::mem::size_of_val::<[PolicyFindingId]>(
-                &self.finding_ids,
-            ))
-    }
-}
-
-impl RetainedSize for PolicyBaselineDocument {
-    fn retained_size(&self) -> usize {
-        self.policies.iter().fold(
-            std::mem::size_of::<Self>()
-                .saturating_add(self.reason.len())
-                .saturating_add(self.accepted_by.as_deref().map_or(0, str::len)),
-            |bytes, policy| bytes.saturating_add(policy.retained_size()),
-        )
     }
 }
 

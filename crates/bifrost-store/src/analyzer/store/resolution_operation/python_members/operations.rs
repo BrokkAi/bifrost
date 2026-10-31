@@ -245,6 +245,8 @@ pub(super) fn attribute_rows(
     if fixed_owner(half.rules.ready, owner) {
         return Ok(Read::ready(Vec::new()));
     }
+    half.rules
+        .record_dynamic_receiver_scope(half.reference, half.query_obligations)?;
     source_rows(half.rules, spelling, &[owner])
 }
 
@@ -284,6 +286,8 @@ pub(super) fn owner_rows(
     if fixed_owner(half.rules.ready, owner) {
         return Ok(Read::ready(Vec::new()));
     }
+    half.rules
+        .record_dynamic_receiver_scope(half.reference, half.query_obligations)?;
     Ok(match source_rows(half.rules, spelling, &[owner])? {
         Read::Ready {
             mut value,
@@ -1022,9 +1026,9 @@ pub(in crate::analyzer::store::resolution_operation) fn structural_mutations(
     )
 }
 
-pub(in crate::analyzer::store::resolution_operation) fn dynamic_receiver_obligation(
+pub(in crate::analyzer::store::resolution_operation) fn dynamic_receiver_query_obligation(
     mutations: &[StructuralMutation],
-) -> Option<String> {
+) -> Option<crate::analyzer::resolution::QueryObligation> {
     let mut count = 0;
     let mut kinds = std::collections::BTreeSet::new();
     for mutation in mutations.iter().filter(|mutation| {
@@ -1036,6 +1040,16 @@ pub(in crate::analyzer::store::resolution_operation) fn dynamic_receiver_obligat
         kinds.insert(mutation.receiver_kind);
     }
     (count != 0).then(|| {
-        format!("python_dynamic_receiver_mutation_open:operations={count}:receiver_kinds={kinds:?}")
+        crate::analyzer::resolution::QueryObligation::new(
+            "python_dynamic_receiver_mutation_open",
+            format!("operations={count}"),
+            format!("receiver_kinds={kinds:?}"),
+        )
     })
+}
+
+pub(in crate::analyzer::store::resolution_operation) fn dynamic_receiver_obligation(
+    mutations: &[StructuralMutation],
+) -> Option<String> {
+    dynamic_receiver_query_obligation(mutations).map(|obligation| obligation.to_string())
 }

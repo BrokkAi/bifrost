@@ -127,6 +127,7 @@ const fn incomplete_reason_label(reason: super::PolicyIncompleteReason) -> &'sta
         R::CvssVariantBudget => b"cvss-variant-budget",
         R::ProjectionScenarioMembershipBudget => b"projection-scenario-membership-budget",
         R::OrganizationalRiskOverlayBudget => b"organizational-risk-overlay-budget",
+        R::RuleDeadlineExceeded => b"rule-deadline-exceeded",
     }
 }
 

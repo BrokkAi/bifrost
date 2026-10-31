@@ -105,11 +105,26 @@ pub mod resolution;
 pub fn whole_workspace_descendants(
     operation: impl for<'scope> FnOnce(
         &DescendantIndexScope<'scope>,
-    ) -> Option<crate::hash::HashSet<CodeUnit>>,
-) -> crate::hash::HashSet<CodeUnit> {
+    ) -> Result<
+        brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+        brokk_bifrost_core::analyzer::capabilities::Cancelled,
+    >,
+) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
     let cancellation = crate::cancellation::CancellationToken::default();
     let scope = DescendantIndexScope::whole_workspace(&cancellation);
     operation(&scope).expect("a descendant index that cannot stop always completes")
+}
+
+/// Preserve inherited stable gaps when descendant evidence is unavailable.
+#[doc(hidden)]
+pub fn record_descendant_query_failure(analyzer: &dyn IAnalyzer) {
+    use crate::analyzer::i_analyzer::QueryReadIncomplete;
+    if analyzer.current_query_read_completion().is_ok() {
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+            "descendant index is incomplete".into(),
+        ));
+    }
+    analyzer.record_unattributed_read();
 }
 
 mod source_ingestion;

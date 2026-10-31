@@ -769,6 +769,13 @@ pub fn compare_partial_flows_with_reference<F: ObservationFilter>(
     )?;
     let eager_widened =
         REFERENCE_WIDENED.with(|snapshot| std::mem::take(snapshot.borrow_mut().as_mut().unwrap()));
+    assert!(
+        reference.partial.outcome == PartialFlowOutcome::Complete
+            && eager.partial.outcome == PartialFlowOutcome::Complete,
+        "reference equality requires complete answers: reference={:?}, eager={:?}",
+        reference.partial.outcome,
+        eager.partial.outcome,
+    );
     let mut comparison = PartialFlowReferenceComparison::default();
     let mut expected = reference.clone();
     let accept = |key: (bool, u32, ExtraTarget)| {

@@ -380,9 +380,9 @@ pub mod native_resolution_test_support {
             let content = publication.store.admit_cached_selected_content(
                 &snapshot,
                 &rel_path,
-                oid,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
                 &ResolutionContentInput::Parsed {
-                    content_oid: oid,
+                    key: brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
                     semantic_language: Language::Python,
                 },
                 &cancellation,

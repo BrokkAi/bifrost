@@ -29,7 +29,7 @@ pub(crate) type GoSourceMemo = ReplayingMemo<
     Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
-            git2::Oid,
+            brokk_bifrost_core::gitblob::BlobKey,
             ProjectFile,
         ),
         Arc<GoMemoEntry<Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>>>,

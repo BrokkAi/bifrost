@@ -191,7 +191,8 @@ fn ordinary_assignment_relation_expansions(
         unsupported.push(AssignmentRelationKind::FailedSwap.label());
     }
     if !unsupported.is_empty() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: procedure.diagnostic_source(),
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -205,7 +206,7 @@ fn ordinary_assignment_relation_expansions(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: Some(rel_path_string(procedure.file())),
-        });
+        }));
     }
     if !(self_selected && self_supported || swap_selected && swap_supported) {
         return Vec::new();
@@ -238,7 +239,8 @@ fn ordinary_assignment_relation_expansions(
         }
         diagnostics.push(super::QueryExecutionState::diagnostic(
             workspace.analyzer(),
-            CodeQueryDiagnostic {
+            CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: procedure.diagnostic_source(),
                 code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -252,7 +254,7 @@ fn ordinary_assignment_relation_expansions(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: Some(rel_path_string(procedure.file())),
-            },
+            }),
             CodeQueryDiagnosticCode::from_execution_reason(
                 CodeQueryDiagnosticCode::EffectDerivationIncomplete,
                 candidates.reason.unwrap_or(derivation_reason::UNKNOWN),
@@ -559,7 +561,8 @@ fn overwritten_unread_expansions(
             | crate::analyzer::LanguageDialect::Standard(Language::Cpp)
     );
     if !supports_relation(dialect, AssignmentRelationKind::OverwrittenUnread) {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: procedure.diagnostic_source(),
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -573,7 +576,7 @@ fn overwritten_unread_expansions(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: Some(rel_path_string(procedure.file())),
-        });
+        }));
         return Vec::new();
     }
     let mut candidates = if cpp_family {
@@ -638,7 +641,8 @@ fn overwritten_unread_expansions(
         }
         diagnostics.push(super::QueryExecutionState::diagnostic(
             workspace.analyzer(),
-            CodeQueryDiagnostic {
+            CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: procedure.diagnostic_source(),
                 code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -652,7 +656,7 @@ fn overwritten_unread_expansions(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: Some(rel_path_string(procedure.file())),
-            },
+            }),
             CodeQueryDiagnosticCode::from_execution_reason(
                 CodeQueryDiagnosticCode::EffectDerivationIncomplete,
                 candidates.reason.unwrap_or(derivation_reason::UNKNOWN),
@@ -835,7 +839,8 @@ fn overwritten_unread_expansions(
                     }
                     diagnostics.push(super::QueryExecutionState::diagnostic(
                         workspace.analyzer(),
-                        CodeQueryDiagnostic {
+                        CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                             related: procedure.related_flow_reasons(&reasons),
                             source: procedure.diagnostic_source(),
                             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -849,7 +854,7 @@ fn overwritten_unread_expansions(
                             ),
                             exhausted_roots: Vec::new(),
                             withheld_rows_path: Some(rel_path_string(procedure.file())),
-                        },
+                        }),
                         cause,
                     ));
                 }
@@ -1014,6 +1019,7 @@ fn report_open_candidates(
     if !open_reasons.is_empty() {
         let mut diagnostic = super::incomplete_diagnostic(
             CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+            brokk_bifrost_rql::Incompleteness::Content,
             procedure
                 .handle
                 .artifact()

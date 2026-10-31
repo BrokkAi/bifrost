@@ -2416,7 +2416,14 @@ retention, is `run`.
 `endpoint_dominance_undecidable`, `stable_anchor_unavailable`,
 `report_retention_budget`, `cvss_variant_budget`,
 `projection_scenario_membership_budget`,
-`organizational_risk_overlay_budget`.
+`organizational_risk_overlay_budget`, `rule_deadline_exceeded`.
+
+`deadline_exceeded` means the request's deadline stopped the run, and the
+whole batch stopped with it. `rule_deadline_exceeded` means the caller's
+deadline for this one policy (`run_policy`'s `policy_deadlines_ms`) stopped
+it while the other policies went on. Such a run reached no verdict, so it
+makes the exit status 2 unless the policy's `on-unknown` verdict is
+`warn-unreliable` or `fail-closed`.
 
 `failed` reasons: `invalid_execution_plan`,
 `workspace_snapshot_unavailable`, `source_read_failed`, `workspace_io`,
@@ -2481,8 +2488,15 @@ A document state is `not_evaluated`, `not_found`, `loaded`, or `invalid`.
 | `stage_timings` | `{stage, elapsed_ms}` entries. Stages: `policy_selection`, `suppression_preflight`, `workspace_snapshot`, `policy_registration`, `policy_preparation`, `diff_base`, `policy_evaluation`, `report_construction`. |
 | `termination` | `null`, or `deadline_exceeded` when the run stopped at its deadline. |
 | `terminal_stage` | The stage that was running when the run stopped, or `null`. |
-| `active_policy_id` | The policy that was running when the run stopped, or `null`. |
-| `completed_policy_ids`, `pending_policy_ids` | Progress at the time the run stopped. |
+| `active_policy_id` | The first policy, in policy order, that the deadline stopped while it ran, or `null`. It is also listed in `interrupted_policy_ids`. |
+| `completed_policy_ids` | Policies whose evaluation ended on its own, whatever its verdict. A policy that started after the deadline but finished, for example from cached work, is listed here. |
+| `pending_policy_ids` | Policies that had not started when the deadline passed. |
+| `interrupted_policy_ids` | Policies the request deadline stopped while they ran. Omitted when empty. |
+| `timed_out_policy_ids` | Policies that their own deadline from `policy_deadlines_ms` stopped while the batch went on. Omitted when empty. |
+
+The execution metadata is filled in when the run stopped at its deadline or
+when any policy reached its own deadline. A policy's own deadline does not set
+`termination`.
 
 ### Rule descriptor
 

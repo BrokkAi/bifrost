@@ -509,7 +509,12 @@ fn scan_scala_files_for_foreign_target(
     if matches!(spec.kind, TargetKind::Method | TargetKind::Field)
         && let Some(hierarchy) = analyzer.type_hierarchy_provider()
     {
-        for descendant in hierarchy.get_descendants(&spec.owner) {
+        let descendants = hierarchy.get_descendants(&spec.owner);
+        if !descendants.is_complete() {
+            brokk_bifrost_analysis::analyzer::record_descendant_query_failure(analyzer);
+            return false;
+        }
+        for descendant in descendants.edges {
             if descendant.is_class() {
                 receiver_owners.insert(descendant.fq_name());
             }

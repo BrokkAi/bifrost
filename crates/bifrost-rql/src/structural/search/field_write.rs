@@ -265,6 +265,10 @@ fn push_incomplete(
         analyzer,
         incomplete_diagnostic(
             code,
+            match cause {
+                Some(cause) => brokk_bifrost_rql::Incompleteness::Operational(cause),
+                None => brokk_bifrost_rql::Incompleteness::Content,
+            },
             language.config_label(),
             message.to_string(),
             Vec::new(),

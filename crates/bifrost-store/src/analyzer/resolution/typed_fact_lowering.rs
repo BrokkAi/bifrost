@@ -2968,10 +2968,10 @@ impl LoweredTypedFragment {
                 );
             }
             for &argument in obligation.argument_slots.iter() {
-                assert_eq!(
-                    assert_declared_frontier(&inventory, argument, "call argument"),
-                    ResolutionTypeSlotRole::Argument,
-                    "call argument must name an Argument frontier"
+                assert!(
+                    assert_declared_frontier(&inventory, argument, "call argument")
+                        .is_call_argument(),
+                    "call argument must name an ordinary or spread argument frontier"
                 );
             }
             if let Some(segment) = obligation.owner_type_segment {
@@ -5106,7 +5106,7 @@ impl<'facts> TypedFactIndex<'facts> {
                 .unwrap_or_else(|| panic!("argument names unknown call: {argument:?}"));
             let value = self.slot(argument.value);
             assert_eq!(value.site, call.call);
-            assert_eq!(value.role, ResolutionTypeSlotRole::Argument);
+            assert!(value.role.is_call_argument());
             assert!(
                 call_arguments.insert((argument.call, argument.ordinal)),
                 "duplicate call argument ordinal: {argument:?}"
@@ -5858,7 +5858,7 @@ fn transfer_accepts_output_role(
             );
         }
         ResolutionTypeTransferKind::Receiver => ResolutionTypeSlotRole::Receiver,
-        ResolutionTypeTransferKind::Argument => ResolutionTypeSlotRole::Argument,
+        ResolutionTypeTransferKind::Argument => return output.is_call_argument(),
         ResolutionTypeTransferKind::Return => ResolutionTypeSlotRole::ReturnValue,
         ResolutionTypeTransferKind::UnaryIndirection => ResolutionTypeSlotRole::ExpressionValue,
         ResolutionTypeTransferKind::AddressOf => {
@@ -6871,6 +6871,7 @@ const fn type_slot_role_rank(role: ResolutionTypeSlotRole) -> u8 {
         ResolutionTypeSlotRole::Argument => 5,
         ResolutionTypeSlotRole::CallResult => 6,
         ResolutionTypeSlotRole::ExpressionValue => 7,
+        ResolutionTypeSlotRole::SpreadArgument => 8,
     }
 }
 

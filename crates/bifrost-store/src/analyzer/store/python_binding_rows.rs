@@ -492,7 +492,7 @@ pub(crate) const ENVIRONMENT_SOURCE_SQL: &str = r#"WITH selected AS MATERIALIZED
  SELECT f.rel_path,f.blob_oid,b.id AS blob_id,s.format,
         s.export_curated,s.export_wildcard
  FROM workspace_file_versions f
- LEFT JOIN blobs b ON b.blob_oid=f.blob_oid AND b.lang=f.lang
+ LEFT JOIN blobs b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.parse_variant=x''
                   AND b.generation=f.generation
  LEFT JOIN python_binding_source s ON s.blob_id=b.id
  WHERE f.workspace_id=?1 AND f.lang='python' AND f.generation=?2

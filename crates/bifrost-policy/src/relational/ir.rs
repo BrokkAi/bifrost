@@ -208,14 +208,6 @@ impl IrSchema {
             .map(|field| field.column.name.clone())
             .collect()
     }
-
-    pub fn len(&self) -> usize {
-        self.fields.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.fields.is_empty()
-    }
 }
 
 pub(super) fn index_of_column<'a>(

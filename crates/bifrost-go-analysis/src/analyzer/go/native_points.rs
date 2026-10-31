@@ -3142,17 +3142,6 @@ impl<'a> GoNativePointRequest<'a> {
             )),
             _ => None,
         };
-        let legacy_reasons = match &native {
-            BoundedResolution::Complete {
-                value: (_, Some(evidence)),
-                ..
-            } => super::model_receiver::legacy_model_reasons(
-                evidence.model_selection.as_deref(),
-                evidence.answer.completion(),
-                &self.operation.ready.context_identities,
-            ),
-            _ => std::collections::BTreeSet::new(),
-        };
         let path = brokk_bifrost_core::path_utils::rel_path_string(query.file);
         let source_refusals = self
             .files
@@ -3168,101 +3157,6 @@ impl<'a> GoNativePointRequest<'a> {
         );
         if let BoundedResolution::Complete { value, .. } = &mut answer {
             value.native_resolution = native_resolution;
-        }
-        if !legacy_reasons.is_empty()
-            && let Some(tree) = query.tree.or(parsed_tree.as_ref())
-            && let BoundedResolution::Complete { value, work } = &mut answer
-            && value.model_member_selection.is_none()
-            && value.exact_external_call.is_none()
-            && value.call_application != CallApplicationKind::PackageFunction
-            && matches!(
-                value.outcome.status,
-                DefinitionLookupStatus::NoDefinition
-                    | DefinitionLookupStatus::Incomplete
-                    | DefinitionLookupStatus::UnresolvableImportBoundary
-            )
-        {
-            let prior_work = *work;
-            let budget =
-                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                    max_scope_nodes: query
-                        .budget
-                        .max_scope_nodes
-                        .saturating_sub(prior_work.scope_nodes),
-                    max_summary_expansions: query
-                        .budget
-                        .max_summary_expansions
-                        .saturating_sub(prior_work.summary_expansions),
-                    max_resolution_rounds: query
-                        .budget
-                        .max_resolution_rounds
-                        .saturating_sub(prior_work.resolution_rounds),
-                    ..query.budget
-                };
-            let session = brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(budget, query.cancellation);
-            let selected =
-                crate::analyzer::usages::get_definition::go::go_g1b_legacy_model_receiver(
-                    BoundedReceiverQuery {
-                        tree: Some(tree),
-                        budget,
-                        ..query
-                    },
-                    &session,
-                    &legacy_reasons,
-                );
-            match session.finish(selected) {
-                BoundedResolution::Complete {
-                    value: target,
-                    work: legacy_work,
-                } => {
-                    *work = go_add_resolution_work(prior_work, legacy_work);
-                    if let Some(target) = target
-                        && let (Some(callee), Some(proof)) =
-                            (target.external_callee, target.external_call)
-                    {
-                        let mut reference = query.site.clone();
-                        reference.text = callee;
-                        value.outcome = DefinitionLookupOutcome {
-                            modeled_definitions: Vec::new(),
-                            status: DefinitionLookupStatus::UnresolvableImportBoundary,
-                            reference: Some(reference),
-                            definitions: Vec::new(),
-                            lexical_definition: None,
-                            diagnostics: legacy_reasons
-                                .iter()
-                                .map(|reason| DefinitionLookupDiagnostic {
-                                    kind: reason.label().into(),
-                                    message:
-                                        "named native G1b gap retains the legacy receiver answer"
-                                            .into(),
-                                    claim: None,
-                                })
-                                .collect(),
-                        };
-                        value.call_application = proof.call_application();
-                        value.external_callee_identity =
-                            target.external_concrete_owner_fqn.map(|owner| {
-                                ResolverOwnedExternalCalleeIdentity::new(
-                                    brokk_bifrost_core::analyzer::Language::Go,
-                                    owner,
-                                    target.member,
-                                )
-                            });
-                        value.exact_external_call = Some(proof);
-                    }
-                }
-                BoundedResolution::Exceeded { limit, work } => {
-                    answer = BoundedResolution::Exceeded {
-                        limit,
-                        work: go_add_resolution_work(prior_work, work),
-                    }
-                }
-                BoundedResolution::Cancelled { work } => {
-                    answer = BoundedResolution::Cancelled {
-                        work: go_add_resolution_work(prior_work, work),
-                    }
-                }
-            }
         }
         if let Some(tree) = query.tree.or(parsed_tree.as_ref())
             && let BoundedResolution::Complete { value, work } = &mut answer

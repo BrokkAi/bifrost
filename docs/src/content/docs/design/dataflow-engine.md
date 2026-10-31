@@ -639,11 +639,18 @@ Filtered port flows must be a subset of their stored flows.
 
 The first search records all alternative derivation supports within its
 existing budgets. Refinement rewalks that request-local proof graph; it never
-adds a procedure or taint-port edge. This boundary matters when the first
-search was truncated: filtering an early path must not free a fresh budget to
-explore a previously unexpanded path. Refined findings are a subset of the
-baseline findings and retain its truncation and cancellation reasons even
-when all observed candidates disappear. Unexpanded paths remain unclassified.
+adds a procedure or taint-port edge. Because refinement
+adds no edges, filtering an early path after a truncated first search does
+not free budget to explore a previously unexpanded path, and refined findings
+are a subset of the baseline findings. That subset is a consequence of the
+no-new-edges rule, not a contract in itself (owner decision 2026-10-30: the
+same rule applies to choices made within a request). An implementation that
+does expand new supports during refinement must record them into the
+request-local proof graph, so that later refinements and the incremental
+equality contract see them, and may then reach a different defensible set;
+in every case the truncation and cancellation reasons are still reported
+even when all observed candidates disappear, selected targets stay stable,
+and unexpanded paths remain unclassified rather than assumed absent.
 
 Two implementations of the observation filter share the same fixpoint and
 leave the fact lattice unchanged. The lenient filter blocks proven matches

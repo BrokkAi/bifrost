@@ -118,8 +118,7 @@ pub fn persist_alias_fixture<A: LanguageAdapter>(
     store
         .write_parsed_blob_at_generation(
             &crate::analyzer::store::test_blob_file(),
-            oid,
-            storage_language,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, storage_language),
             generation,
             adapter,
             &state,
@@ -131,18 +130,32 @@ pub fn persist_alias_fixture<A: LanguageAdapter>(
         adapter.language().config_label(),
         "storage alias must retain semantic language metadata"
     );
-    assert!(store.content_row_count(oid, storage_language).unwrap() > 0);
+    assert!(
+        store
+            .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                storage_language
+            ))
+            .unwrap()
+            > 0
+    );
     store
         .write_parsed_blob_at_generation(
             &crate::analyzer::store::test_blob_file(),
-            oid,
-            storage_language,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, storage_language),
             generation,
             adapter,
             &state,
         )
         .expect("repeat alias fixture persistence");
     assert_eq!(manifest_snapshot(store, oid, storage_language), first);
-    assert!(store.contains_parsed_blob(oid, storage_language).unwrap());
+    assert!(
+        store
+            .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                storage_language
+            ))
+            .unwrap()
+    );
     first
 }

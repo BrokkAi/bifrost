@@ -279,7 +279,13 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 ..item
             };
             let node = item.node;
-            if node.is_error() || node.is_missing() {
+            if node.is_error()
+                || node.is_missing()
+                || (matches!(
+                    node.kind(),
+                    "identifier" | "type_identifier" | "operator_identifier"
+                ) && crate::recovered_name(node, self.source))
+            {
                 let site =
                     self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration, item.scope);
                 self.gap(site, ResolutionGapKind::MalformedSyntax);
@@ -866,6 +872,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let name = node
             .child_by_field_name("name")
             .expect("named Scala callable parameter");
+        if crate::recovered_name(name, self.source) {
+            self.gap(parameter, ResolutionGapKind::MalformedSyntax);
+            return;
+        }
         let label = self.intern_name(node_text(name, self.source));
         self.facts
             .callable_parameter_semantics
@@ -1580,6 +1590,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     let classified_route = ResolutionRouteGap::OmittedReference {
                         scope,
                         terminal: terminal_identifier(chain)
+                            .filter(|terminal| !crate::recovered_name(*terminal, self.source))
                             .map(|terminal| self.intern_name(node_text(terminal, self.source))),
                         namespace: terminal_identifier(chain).and_then(|terminal| {
                             scala_occurrence_role(terminal).and_then(|role| {
@@ -2155,6 +2166,11 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
     }
 
     fn lower_import(&mut self, node: Node<'source>, scope: ResolutionScopeId) {
+        if crate::recovered_name(node, self.source) {
+            let site = self.add_site(node, ResolutionSiteKind::UnsupportedRoute, scope);
+            self.gap(site, ResolutionGapKind::MalformedSyntax);
+            return;
+        }
         let clauses = import_clauses(node);
         if clauses.is_empty() {
             let site = self.add_site(node, ResolutionSiteKind::ImportDeclaration, scope);
@@ -2326,6 +2342,14 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             star,
             activation_start,
         } = route;
+        if source
+            .into_iter()
+            .chain(local)
+            .any(|name| crate::recovered_name(name, self.source))
+        {
+            self.gap(site, ResolutionGapKind::MalformedSyntax);
+            return;
+        }
         let kind = if star {
             ResolutionImportRouteKind::Star
         } else {
@@ -2692,6 +2716,13 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 if let Some(name) = package_node.child_by_field_name("name") {
                     segments.extend(package_name_nodes(name));
                 }
+            }
+            if segments
+                .iter()
+                .any(|segment| crate::recovered_name(*segment, self.source))
+            {
+                self.gap(self.placement_site, ResolutionGapKind::MalformedSyntax);
+                continue;
             }
             for (ordinal, segment) in segments.into_iter().enumerate() {
                 let name = self.intern_name(node_text(segment, self.source));
@@ -3542,6 +3573,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             // exact named routes as written imports, rather than retaining
             // duplicate instance-member declarations on the enum class.
             let name = declaration_name(case).expect("a named enum case");
+            if crate::recovered_name(name, self.source) {
+                self.gap(site, ResolutionGapKind::MalformedSyntax);
+                continue;
+            }
             let import =
                 self.add_site_distinct(case, ResolutionSiteKind::ImportDeclaration, enum_scope);
             let Some(route) = &companions[&enum_site].3 else {
@@ -3782,6 +3817,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let scope = self.facts.sites[class.site.index()].scope;
         let reference = self.push_site(occurrence, ResolutionSiteKind::SyntheticReference, scope);
         let source = self.source;
+        if declaration_name(class.node).is_none_or(|name| crate::recovered_name(name, source)) {
+            self.gap(reference, ResolutionGapKind::MalformedSyntax);
+            return self.add_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
+        }
         let spelling = node_text(
             declaration_name(class.node).expect("a named case class"),
             source,
@@ -3822,6 +3861,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     let label_node = argument
                         .child_by_field_name("left")
                         .expect("a named Scala argument has a label node");
+                    if crate::recovered_name(label_node, self.source) {
+                        self.gap(call, ResolutionGapKind::MalformedSyntax);
+                        continue;
+                    }
                     let name = self.intern_name(node_text(label_node, self.source));
                     let scope = self.facts.sites[call.index()].scope;
                     let reference = self.add_site_distinct(
@@ -4205,6 +4248,14 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             let scope = self.facts.sites[declaration.index()].scope;
             let type_site = self.add_site(type_node, ResolutionSiteKind::TypeReference, scope);
             let slot = self.add_slot(type_site, ResolutionTypeSlotRole::TargetTypeIdentity);
+            if type_node.kind() == "function_type"
+                && type_node
+                    .child_by_field_name("return_type")
+                    .is_none_or(|result| result.is_missing() || result.has_error())
+            {
+                self.gap(type_site, ResolutionGapKind::UnsupportedTypeSyntax);
+                return slot;
+            }
             let name = self.intern_name(&name);
             self.facts.intrinsic_type_seeds.push(
                 brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeSeedFact::direct(
@@ -4367,11 +4418,17 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 let mut cursor = parameters.walk();
                 types.extend(parameters.named_children(&mut cursor));
             }
-            types.push(
-                function
-                    .child_by_field_name("return_type")
-                    .expect("a function type has a result"),
-            );
+            let Some(result) = function
+                .child_by_field_name("return_type")
+                .filter(|node| !node.is_missing() && !node.has_error())
+            else {
+                self.facts.gaps.push(ResolutionGapFact::new(
+                    self.facts.type_slots[owner.index()].site,
+                    ResolutionGapKind::UnsupportedTypeSyntax,
+                ));
+                continue;
+            };
+            types.push(result);
             let arguments = types
                 .into_iter()
                 .map(|ty| self.declared_type_identity_slot(declaration, ty))
@@ -5799,13 +5856,43 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         if let Some(slot) = self.expression_slots_by_node.get(&value_node.id()) {
             return *slot;
         }
-        let slot = match expression.kind() {
-            "instance_expression" => self.construction_slot(expression, scope),
-            "call_expression" => self.curried_construction_slot(expression, scope),
-            kind => match scala_literal_type_name(kind, expression, self.source) {
-                Some(type_name) => self.literal_slot(expression, scope, type_name),
-                None => self.unsupported_expression_slot(expression, scope),
-            },
+        // `value.asInstanceOf[T]` is a generic function application with no
+        // value arguments. Its written target is the expression's static type,
+        // independently of whether the target reference currently resolves.
+        let cast_type = if expression.kind() == "generic_function"
+            && let Some(function) = expression
+                .child_by_field_name("function")
+                .map(expression_target_node)
+            && function.kind() == "field_expression"
+            && function.child_by_field_name("value").is_some()
+            && let Some(field) = function.child_by_field_name("field")
+            && scala_identifier_spelling(node_text(field, self.source)) == "asInstanceOf"
+            && let Some(arguments) = expression.child_by_field_name("type_arguments")
+        {
+            let mut cursor = arguments.walk();
+            let mut types = arguments
+                .named_children(&mut cursor)
+                .filter(|node| !node.is_extra());
+            let first = types.next();
+            if types.next().is_none() { first } else { None }
+        } else {
+            None
+        };
+        let slot = if let Some(type_node) = cast_type {
+            let site = self.add_site(expression, ResolutionSiteKind::UnaryExpression, scope);
+            let identity = self.declared_type_identity_slot(site, type_node);
+            let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            crate::call_arguments::publish_jvm_expression_type(&mut self.facts, identity, output);
+            output
+        } else {
+            match expression.kind() {
+                "instance_expression" => self.construction_slot(expression, scope),
+                "call_expression" => self.curried_construction_slot(expression, scope),
+                kind => match scala_literal_type_name(kind, expression, self.source) {
+                    Some(type_name) => self.literal_slot(expression, scope, type_name),
+                    None => self.unsupported_expression_slot(expression, scope),
+                },
+            }
         };
         self.expression_slots_by_node.insert(value_node.id(), slot);
         slot
@@ -5919,6 +6006,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         namespace: ResolutionNamespace,
         qualifier: Option<ResolutionTypeSlotId>,
     ) {
+        if crate::recovered_name(node, self.source) {
+            self.gap(site, ResolutionGapKind::MalformedSyntax);
+            return;
+        }
         let spelling = node_text(node, self.source).trim();
         assert!(
             !spelling.is_empty(),
@@ -6113,6 +6204,13 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         owner_continued: bool,
         anchor: ResolutionRootImportAnchor,
     ) {
+        if segments
+            .iter()
+            .any(|segment| crate::recovered_name(*segment, self.source))
+        {
+            self.gap(reference, ResolutionGapKind::MalformedSyntax);
+            return;
+        }
         let route_segments = segments[..segments.len() - 1]
             .iter()
             .map(|segment| self.intern_name(node_text(*segment, self.source)))
@@ -6521,12 +6619,7 @@ fn scala_export_selector_nodes<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
 }
 
 fn is_type_parameter_name(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "type_parameters" | "covariant_type_parameter" | "contravariant_type_parameter"
-        ) && field_name_in_parent(parent, node) == Some("name")
-    })
+    crate::type_parameters::is_name(node, brokk_bifrost_core::analyzer::Language::Scala)
 }
 
 fn scala_parameter_list_is_contextual(parameters: Node<'_>) -> bool {
@@ -8921,6 +9014,66 @@ mod tests {
             transfer.output == receiver && transfer.kind == ResolutionTypeTransferKind::Receiver
         }));
         assert_eq!(facts.type_slots[receiver.index()].site, sink_call.call);
+    }
+
+    #[test]
+    #[hardwon("#7577: unresolved Scala cast targets did not publish an argument type slot")]
+    fn scala_unresolved_cast_target_still_produces_argument_type() {
+        let parsed = parse(
+            "object Cast { def sink(value: Any): Unit = (); def run(o: Any): Unit = sink(o.asInstanceOf[Missing]) }",
+        );
+        let facts = &parsed.resolution_facts;
+        let reference = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && facts.names[identifier.name.index()].spelling == "Missing"
+            })
+            .expect("unresolved target remains a type reference")
+            .site;
+        let identity = facts
+            .binding_projections
+            .iter()
+            .find(|projection| {
+                projection.reference == reference
+                    && projection.kind == BindingProjectionKind::TargetTypeIdentity
+            })
+            .expect("target reference has an identity slot")
+            .output;
+        let declared = facts
+            .type_transfers
+            .iter()
+            .find(|transfer| {
+                transfer.input == identity
+                    && transfer.kind == ResolutionTypeTransferKind::DeclaredType
+            })
+            .expect("cast publishes the target as a runtime value")
+            .output;
+        let expression = facts
+            .type_transfers
+            .iter()
+            .find(|transfer| {
+                transfer.input == declared
+                    && transfer.kind == ResolutionTypeTransferKind::Contextual
+            })
+            .expect("cast publishes an expression value")
+            .output;
+        let [argument] = facts.call_arguments.as_slice() else {
+            panic!("expected the sink argument: {:?}", facts.call_arguments);
+        };
+        assert!(facts.type_transfers.iter().any(|transfer| {
+            transfer.input == expression
+                && transfer.output == argument.value
+                && transfer.kind == ResolutionTypeTransferKind::Argument
+        }));
+        let site = facts.type_slots[expression.index()].site;
+        assert!(
+            !facts
+                .gaps
+                .iter()
+                .any(|gap| { gap.site == site && gap.kind == ResolutionGapKind::InferredType })
+        );
     }
 
     #[test]

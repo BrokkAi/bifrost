@@ -18,6 +18,7 @@ use super::member_access::*;
 use super::source_demand::SourceDemandKey;
 
 use super::*;
+use crate::analyzer::resolution::ClosedQueryScope;
 
 use crate::analyzer::resolution::BatchCandidateRequest;
 use crate::analyzer::resolution::DemandClosureDischarges;
@@ -64,6 +65,7 @@ pub struct ProofId(pub usize);
 
 #[doc(hidden)]
 pub struct RootFrame {
+    pub(super) query_obligations: crate::analyzer::resolution::QueryObligations,
     pub(super) endpoint: EndpointSignature,
     pub(super) sources: Box<[RootSource]>,
     pub(super) halves: Vec<SelectedRootPathHalf>,
@@ -86,6 +88,7 @@ impl RootFrame {
         completion: ResolutionCompletion,
     ) -> Self {
         Self {
+            query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
             endpoint,
             sources,
             halves,
@@ -1474,9 +1477,33 @@ pub struct ClosurePolicy {
     pub completion: ResolutionCompletion,
     pub base: BaseEligibility,
     // One canonical authority, carried by the existing scheduler discharge type.
+    query_scope: Option<ClosedQueryScope>,
     discharges: Option<DemandClosureDischarges>,
     pub generated: Box<[GeneratedContinuation]>,
 }
+/// Shared candidate authority; languages choose ownership of the published route.
+pub(super) fn candidate_closure_policy(facts: &ClosureFacts<'_>) -> ClosurePolicy {
+    let targets: BTreeSet<_> = facts
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.admission == crate::analyzer::resolution::BindingCandidateAdmission::Target
+        })
+        .map(|candidate| candidate.definition)
+        .collect();
+    let discharges = if targets.is_empty() {
+        DemandClosureDischarges::default()
+    } else {
+        DemandClosureDischarges::default().with_selected_targets(targets)
+    };
+    ClosurePolicy::new(
+        ResolutionCompletion::Complete,
+        BaseEligibility::Retain,
+        discharges,
+        Box::new([]),
+    )
+}
+
 impl ClosurePolicy {
     pub fn new(
         completion: ResolutionCompletion,
@@ -1498,12 +1525,19 @@ impl ClosurePolicy {
                 .is_none_or(|targets| !targets.is_empty() || discharges.authoritative_empty_result)
         );
         Self {
+            query_scope: None,
             associations: Vec::new(),
             completion,
             base,
             discharges: (discharges != DemandClosureDischarges::default()).then_some(discharges),
             generated,
         }
+    }
+    pub(crate) fn with_query_scope(mut self, scope: ClosedQueryScope) -> Self {
+        self.query_scope
+            .get_or_insert_with(Default::default)
+            .merge(scope);
+        self
     }
     pub fn authority(&self) -> ResultAuthority<'_> {
         let Some(discharges) = &self.discharges else {
@@ -1521,8 +1555,8 @@ impl ClosurePolicy {
     pub fn preserve_discharge_record(&mut self) {
         self.discharges.get_or_insert_with(Default::default);
     }
-    pub fn into_discharges(self) -> Option<DemandClosureDischarges> {
-        self.discharges
+    fn into_carriers(self) -> (Option<DemandClosureDischarges>, Option<ClosedQueryScope>) {
+        (self.discharges, self.query_scope)
     }
 }
 #[doc(hidden)]
@@ -1602,6 +1636,8 @@ pub struct PublicationMaterial<C> {
 #[derive(Default)]
 #[doc(hidden)]
 pub struct ClosureWitness {
+    pub(crate) pending_query_obligations:
+        Vec<crate::analyzer::resolution::query_obligations::PendingQueryObligation>,
     pub discharged_provider_reasons: BTreeSet<SemanticId>,
     pub positive_binding_providers: BTreeMap<SemanticId, BTreeSet<SemanticId>>,
 }
@@ -1933,26 +1969,7 @@ pub trait DemandRules {
         _frame: &RootFrame,
         facts: &ClosureFacts<'_>,
     ) -> Result<Read<ClosurePolicy>> {
-        let targets: BTreeSet<_> = facts
-            .candidates
-            .iter()
-            .filter(|candidate| {
-                candidate.admission
-                    == crate::analyzer::resolution::BindingCandidateAdmission::Target
-            })
-            .map(|candidate| candidate.definition)
-            .collect();
-        let discharges = if targets.is_empty() {
-            DemandClosureDischarges::default()
-        } else {
-            DemandClosureDischarges::default().with_selected_targets(targets)
-        };
-        Ok(Read::ready(ClosurePolicy::new(
-            ResolutionCompletion::Complete,
-            BaseEligibility::Retain,
-            discharges,
-            Box::new([]),
-        )))
+        Ok(Read::ready(candidate_closure_policy(facts)))
     }
     fn member_request(
         &self,
@@ -2469,6 +2486,42 @@ where
         let closure = close_root(self, endpoint, frame, inputs, member_completion)?;
         Ok(closure)
     }
+    fn finish_closure(
+        &mut self,
+        endpoint: &DemandRelationKey,
+        frame: &RootFrame,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+        closure: &mut LanguageClosure,
+    ) {
+        let mut scope = frame.query_obligations.clone();
+        for (_, answer) in inputs {
+            scope.union(&answer.query_obligations);
+        }
+        for prefix in &frame.resolved_prefixes {
+            scope.union(&prefix.answer.query_obligations);
+        }
+        if !scope.is_empty() {
+            closure
+                .query_scope
+                .get_or_insert_with(Default::default)
+                .query_obligations
+                .union(&scope);
+        }
+        if !matches!(
+            closure.outcome,
+            crate::analyzer::resolution::RootClosure::Cancelled(_)
+        ) && let Some(registration) = self.arena.borrow_mut().registrations.get_mut(endpoint)
+        {
+            registration.query_carrier = closure.query_scope.clone();
+        }
+    }
+    fn retained_query_scope(&self, endpoint: &DemandRelationKey) -> Option<ClosedQueryScope> {
+        self.arena
+            .borrow()
+            .registered_endpoint(&endpoint.endpoint)?
+            .query_carrier
+            .clone()
+    }
     fn reverse_dependencies(
         &mut self,
         endpoint: &EndpointSignature,
@@ -2487,6 +2540,7 @@ impl RootFrame {
         halves: Vec<SelectedRootPathHalf>,
     ) -> Self {
         Self {
+            query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
             endpoint: endpoint.clone(),
             sources: (0..halves.len())
                 .map(|index| RootSource::Positioned {
@@ -3812,6 +3866,8 @@ pub(super) fn close_half_candidates(
 pub struct ClosedEndpointRegistration {
     pub(crate) blueprint: SelectedFactOperationBlueprint,
     pub(crate) completion: ResolutionCompletion,
+    // Query scope is arena-owned; closure proof receipts remain provider-local.
+    pub(crate) query_carrier: Option<ClosedQueryScope>,
 }
 
 #[derive(Default)]
@@ -6026,6 +6082,7 @@ fn poll_root<R: DemandRules>(
             outcome: crate::analyzer::resolution::RootClosure::Published(
                 retained.completion.clone(),
             ),
+            query_scope: retained.query_carrier.clone(),
             discharges: None,
         }));
     }
@@ -6140,6 +6197,7 @@ fn settle_root<R: DemandRules>(
                 ClosedEndpointRegistration {
                     blueprint: registration,
                     completion: completion.clone(),
+                    query_carrier: None,
                 }
             )
             .is_none()
@@ -6227,9 +6285,10 @@ pub(super) fn publish_closure<R: DemandRules>(
                     .is_none()
             );
         }
-        let discharges = policy.into_discharges();
+        let (discharges, query_scope) = policy.into_carriers();
         return Ok(LanguageClosure {
             outcome: crate::analyzer::resolution::RootClosure::Published(evidence),
+            query_scope,
             discharges,
         });
     }
@@ -6510,6 +6569,7 @@ pub(super) fn publish_closure<R: DemandRules>(
                     ClosedEndpointRegistration {
                         blueprint: registration,
                         completion: evidence.clone(),
+                        query_carrier: None,
                     }
                 )
                 .is_none(),
@@ -6535,9 +6595,10 @@ pub(super) fn publish_closure<R: DemandRules>(
         shared.rules.commit_associations(&policy.associations);
     }
     shared.rules.note_closure_work("demand_close_published");
-    let discharges = policy.into_discharges();
+    let (discharges, query_scope) = policy.into_carriers();
     Ok(LanguageClosure {
         outcome: crate::analyzer::resolution::RootClosure::Published(evidence),
+        query_scope,
         discharges,
     })
 }

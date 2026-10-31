@@ -17,13 +17,13 @@
       "registry": "PyPI brokk-bifrost",
       "pattern": "^brokk_bifrost-.*\\.whl$",
       "limit_bytes": 104857600,
-      "source": "PyPI's default per-file limit of 100 MiB; the project has no raised limit."
+      "source": "PyPI's default per-file limit of 100 MiB; the project has no raised limit. The raw binary deflated to 97.7 MB in v0.14.3, so since #8288 the wheel carries it xz-compressed (the v0.14.3 manylinux x86_64 binary rewrites to a 54656836-byte wheel) and its launcher unpacks it on first run."
     },
     {
       "registry": "npm",
       "pattern": "^(brokkai-bifrost-|brokkai-dsh-plugin-bifrost-).*\\.tgz$",
       "limit_bytes": 200000000,
-      "source": "npm publishes no exact tarball limit. @brokkai/bifrost-darwin-universal@0.14.2 (199943577 bytes) published; 0.14.3 (205.5 MB) was refused with 413 Payload Too Large (release run 40897040195). This is the largest size known to pass, rounded up to 200 MB."
+      "source": "npm publishes no exact tarball limit. @brokkai/bifrost-darwin-universal@0.14.2 (199943577 bytes) published; 0.14.3 (205.5 MB) was refused with 413 Payload Too Large (release run 40897040195). This is the largest size known to pass, rounded up to 200 MB. Since #8288 macOS ships one package per CPU, @brokkai/bifrost-darwin-arm64 and @brokkai/bifrost-darwin-x64, about half the universal size each."
     },
     {
       "registry": "GitHub release",

@@ -541,7 +541,12 @@ fn nested_cancelled_macro_composed_field_read_marks_outer_scope_incomplete() {
         ),
         "a later scope sharing the request memos must inherit their incompleteness"
     );
-    assert!(analyzer.get_direct_ancestors(&owner_unit).is_empty());
+    assert!(
+        analyzer
+            .get_direct_ancestors(&owner_unit)
+            .definite()
+            .is_empty()
+    );
     assert!(
         analyzer.direct_ancestors.get(&owner_unit).is_none(),
         "an incomplete dependency must neither panic nor publish an ancestor cache entry"
@@ -2211,12 +2216,12 @@ fn cached_file_reads_replay_included_headers() {
         .find(|unit| unit.identifier() == "Target")
         .expect("target");
     let (first, reads) = capture_query_reads(&cpp, || cpp.get_direct_ancestors(&target));
-    assert_eq!(first.len(), 1);
+    assert_eq!(first.definite().len(), 1);
     assert!(reads.keys().iter().any(
         |key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "alias.hpp")
     ));
     let (second, reads) = capture_query_reads(&cpp, || cpp.get_direct_ancestors(&target));
-    assert_eq!(first, second);
+    assert_eq!(first.definite(), second.definite());
     assert!(reads.keys().iter().any(
         |key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "alias.hpp")
     ));

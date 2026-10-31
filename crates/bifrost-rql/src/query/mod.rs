@@ -85,3 +85,6 @@ pub use source::{
 mod tests;
 
 pub(crate) use json::dependency_evidence_seed_to_json;
+
+#[cfg(test)]
+mod author_contracts;

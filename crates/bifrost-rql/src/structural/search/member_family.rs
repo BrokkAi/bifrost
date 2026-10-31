@@ -173,6 +173,10 @@ fn finish(
     {
         diagnostics.push(incomplete_diagnostic(
             code,
+            match answer.reason {
+                Some(brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason::HierarchyTruncated) => Incompleteness::Operational(DerivationExecutionCause::Provider),
+                _ => Incompleteness::Content,
+            },
             crate::analyzer::common::language_for_file(declaration.unit.source()).config_label(),
             format!(
                 "member-family {} for {} in {} has no established edges: {}{}",

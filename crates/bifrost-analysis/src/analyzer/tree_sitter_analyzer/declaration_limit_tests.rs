@@ -270,6 +270,7 @@ fn candidate_alias_walk_stops_at_the_caller_budget() {
         .resolve_live_oid_for_file(&first)
         .expect("live OID");
     let row = HydratedCandidateRow {
+        variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
         blob_oid: oid,
         lang: "python".to_string(),
         unit_key: 1,

@@ -5,6 +5,10 @@ fn package_storage_content_qualifier(package_name: &str) -> String {
 }
 
 /// Language-specific storage behavior shared by the analyzer store and resolution.
+///
+/// Connection-taking hydration hooks run inside the caller's read transaction.
+/// Implementations that read store-backed inputs must use that connection rather
+/// than checking out another reader, including through their bound project.
 pub trait StoreLanguageAdapter: Send + Sync + 'static {
     fn language(&self) -> Language;
     fn claims_included_files(&self) -> bool {
@@ -46,6 +50,15 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
     ) -> Result<String> {
         Ok(content_qualifier.to_string())
     }
+    /// Store hydration hooks must reuse the open read for store-backed inputs.
+    fn hydrate_content_qualifier_with_conn(
+        &self,
+        _conn: &Connection,
+        content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> Result<String> {
+        self.hydrate_content_qualifier(content_qualifier, file)
+    }
     fn default_package_anchor(&self) -> Option<PackageAnchor> {
         None
     }
@@ -67,6 +80,15 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
     ) -> Result<Option<FqName>> {
         Ok(self.resolve_package_anchor(anchor, content_qualifier, file))
     }
+    fn hydrate_package_anchor_with_conn(
+        &self,
+        _conn: &Connection,
+        anchor: PackageAnchor,
+        content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> Result<Option<FqName>> {
+        self.hydrate_package_anchor(anchor, content_qualifier, file)
+    }
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
         !code_unit.is_file_scope()
     }
@@ -83,6 +105,15 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
         _state: &mut FileState,
     ) -> Result<()> {
         Ok(())
+    }
+    fn synthesize_hydrated_units_with_conn(
+        &self,
+        _conn: &Connection,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut FileState,
+    ) -> Result<()> {
+        self.synthesize_hydrated_units(file, source, state)
     }
     fn synthesize_summary_projection(
         &self,
@@ -107,6 +138,13 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
     /// Query-side module hydration can reuse the selected path publication.
     fn hydrate_path_synthetic_module_unit(&self, file: &ProjectFile) -> Result<Option<CodeUnit>> {
         Ok(self.path_synthetic_module_unit(file))
+    }
+    fn hydrate_path_synthetic_module_unit_with_conn(
+        &self,
+        _conn: &Connection,
+        file: &ProjectFile,
+    ) -> Result<Option<CodeUnit>> {
+        self.hydrate_path_synthetic_module_unit(file)
     }
     fn has_path_synthetic_module_units(&self) -> bool {
         false

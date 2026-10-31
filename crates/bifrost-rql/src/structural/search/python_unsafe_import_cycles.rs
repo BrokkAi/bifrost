@@ -113,6 +113,7 @@ pub(super) fn unsafe_cyclic_import_expansions(
         if python_import_cycles::module_identity_is_limited(target.rel_path()) {
             python_import_cycles::report_incomplete(
                 diagnostics,
+                Incompleteness::Content,
                 "Python package module identity is path-derived and remains incomplete until #3673 supplies snapshot-consistent source roots.",
             );
             results.push(rule_fact(
@@ -160,14 +161,17 @@ pub(super) fn unsafe_cyclic_import_expansions(
         ) {
             Some(value) => value,
             None => {
-                results.push(rule_fact(
+                let mut fact = rule_fact(
                     seed,
                     candidate.anchor,
                     "open",
                     "none",
                     false,
                     Some("target module binding or import facts are unavailable"),
-                ));
+                );
+                fact.incompleteness =
+                    Incompleteness::Operational(DerivationExecutionCause::Provider);
+                results.push(fact);
                 continue;
             }
         };
@@ -918,6 +922,7 @@ fn rule_fact(
 ) -> PythonRuleFactValue {
     let range = row_range(seed.facts.source(), anchor.clone());
     make_row(
+        Incompleteness::Content,
         RELATION,
         &seed.file,
         anchor,
@@ -931,7 +936,8 @@ fn rule_fact(
 }
 
 fn python_rule_incomplete_diagnostic(message: &str) -> CodeQueryDiagnostic {
-    CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -941,5 +947,5 @@ fn python_rule_incomplete_diagnostic(message: &str) -> CodeQueryDiagnostic {
         message: message.to_owned(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    }
+    })
 }

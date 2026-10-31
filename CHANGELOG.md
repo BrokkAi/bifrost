@@ -7,7 +7,7 @@ projection and its commit history does not contain every source commit.
 
 ## Unreleased
 
-## [0.14.4] - 2026-10-29
+## [0.14.4] - 2026-10-30
 
 ### Changed
 
@@ -32,6 +32,17 @@ projection and its commit history does not contain every source commit.
   packages exceeded the PyPI and npm upload limits and were not published;
   0.14.4 publishes all of them. Release qualification now fails any artifact
   over its registry's limit and warns above 90% of it (#8078, #8077).
+
+- Native Python and JVM query answers report the environment assumptions
+  behind a binding separately from certainty about its target (#8023).
+- The npm package installs a per-CPU macOS package,
+  `@brokkai/bifrost-darwin-arm64` or `@brokkai/bifrost-darwin-x64`, instead of
+  `@brokkai/bifrost-darwin-universal`, which grew past npm's upload limit.
+  Releases also publish per-CPU macOS archives beside the universal one.
+- The `brokk-bifrost` PyPI wheel ships the `bifrost` executable
+  xz-compressed, at about 55 MB instead of 98 MB. The first run unpacks and
+  verifies it in a few seconds; the `bifrost` and `brokk-bifrost` commands are
+  unchanged.
 
 ### Fixed
 
@@ -84,6 +95,54 @@ projection and its commit history does not contain every source commit.
   pending-cleanup analysis incomplete.
 - Scala collection contracts apply to packs generated from the real
   `scala-library`, not only to complete packs (#3130).
+
+- JavaScript and TypeScript method calls on instances of uniquely imported
+  classes can now resolve to their declarations (#7240).
+- Go navigation and usage searches resolve methods on type assertion results,
+  including generic pointers and comma-ok assignments (#7391).
+- C++ field navigation respects translation-unit preprocessor guards and retains
+  uncertain header candidates without claiming a proven definition (#7153).
+- Preserve Python module identities during import and declaration hydration when
+  the analyzer uses its single-connection memory store.
+- Python star imports resolve explicitly exported child modules and their members
+  when the selected package has no binding of the same name (#6945).
+- C# diagnostics resolve value-rooted member chains before namespace paths,
+  reporting missing members on the actual receiver type (#7330).
+- Java enum-switch queries examine enums declared in other workspace files
+  and report incomplete results when exhaustiveness cannot be established
+  (#7424).
+- Scala call analysis uses the written target type of `asInstanceOf` casts
+  when assessing overloads (#7577).
+- Call relations and RQL no longer treat ambiguous overloads as proven call
+  targets, avoiding false recursion findings while retaining possible callers
+  (#8197).
+- C# flow analysis records writes from compound assignments and increment or
+  decrement operations even when the operator is unresolved, retaining the
+  operator's uncertainty without losing the write (#8161).
+- C# rethrow queries identify the individual throw statement and its owning
+  catch, including parenthesized and verbatim catch-variable references.
+  Static-array checks also handle zero-length multidimensional arrays and
+  assignments in static constructors (#8195, #8178).
+- JVM on-demand and default imports resolve uniquely indexed external types
+  while respecting language-specific precedence and retaining uncertainty
+  when a higher-priority provider is unavailable (#8128).
+- RQL Boolean patterns evaluate targets without a normalized structural kind,
+  and negation withholds rows when its child cannot be decided (#8146).
+- Go conditional-wrapper result contracts no longer depend on traversal order
+  when the same wrapper is reached at different nesting depths; the existing
+  depth limit still applies (#8219).
+- Typestate policies sharing an endpoint selector reuse its staged result
+  instead of panicking during evaluation (#8236).
+- Kotlin and Scala resolution returns structured uncertainty instead of
+  panicking on recovered identifiers or missing function-type results;
+  Kotlin function types with `dynamic` results remain explicitly unsupported
+  (#8228).
+- Native Go resolves modeled callable result types without falling back to
+  legacy receiver inference (#8082).
+
+- Kotlin bare value references now check implicit receiver properties before
+  top-level and imported properties, while preserving local and parameter priority
+  and falling through when a closed receiver inventory has no value member (#6234).
 
 ### Performance
 

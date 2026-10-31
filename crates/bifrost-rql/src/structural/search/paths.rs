@@ -130,7 +130,8 @@ impl PathTraversalCache {
             if unsupported {
                 // An unsupported axis is a property of the adapter, so it is
                 // repeated identically for every item and normalized later.
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::IdentityAxisUnsupported,
@@ -144,7 +145,7 @@ impl PathTraversalCache {
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
                 continue;
             }
             let cause = if reasons
@@ -160,7 +161,8 @@ impl PathTraversalCache {
             } else {
                 None
             };
-            diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+            diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
@@ -179,7 +181,7 @@ impl PathTraversalCache {
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            }, cause));
+            }), cause));
         }
     }
 }

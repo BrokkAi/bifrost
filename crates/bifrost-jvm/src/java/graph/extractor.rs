@@ -1004,7 +1004,11 @@ fn method_reference_target_resolution(
     }
     let mut candidates = Vec::new();
     for owner in &owners {
-        candidates.extend(method_reference_candidates_for_owner(owner, token, ctx));
+        let Some(owner_candidates) = method_reference_candidates_for_owner(owner, token, ctx)
+        else {
+            return MethodReferenceTargetResolution::Unproven;
+        };
+        candidates.extend(owner_candidates);
     }
     let matching = candidates
         .iter()
@@ -1067,9 +1071,9 @@ fn method_reference_candidates_for_owner(
     owner_fq_name: &str,
     _token: QueryToken<'_>,
     ctx: &ScanCtx<'_>,
-) -> Vec<CodeUnit> {
+) -> Option<Vec<CodeUnit>> {
     let Some(owner) = ctx.graph.index.definitions(owner_fq_name).next() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let mut candidates = ctx
         .graph
@@ -1078,9 +1082,13 @@ fn method_reference_candidates_for_owner(
         .filter(CodeUnit::is_function)
         .collect::<Vec<_>>();
     let Some(provider) = ctx.graph.hierarchy else {
-        return candidates;
+        return Some(candidates);
     };
-    for ancestor in provider.get_ancestors(&owner) {
+    let ancestors = provider.get_ancestors(&owner);
+    if !ancestors.is_complete() {
+        return None;
+    }
+    for ancestor in ancestors.edges {
         candidates.extend(
             ctx.graph
                 .structural_members(ancestor.fq(), &ctx.spec.member_name)
@@ -1090,7 +1098,7 @@ fn method_reference_candidates_for_owner(
     }
     candidates.sort();
     candidates.dedup();
-    candidates
+    Some(candidates)
 }
 
 fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -1121,12 +1129,18 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(hierarchy) = ctx.graph.hierarchy else {
         return;
     };
-    let candidate_overrides_target = hierarchy
-        .get_ancestors(owner)
+    let candidate_ancestors = hierarchy.get_ancestors(owner);
+    let target_ancestors = hierarchy.get_ancestors(&ctx.spec.owner);
+    if !candidate_ancestors.is_complete() || !target_ancestors.is_complete() {
+        hits::push_unproven_hit(node, ctx);
+        return;
+    }
+    let candidate_overrides_target = candidate_ancestors
+        .edges
         .iter()
         .any(|ancestor| ancestor == &ctx.spec.owner);
-    let target_overrides_candidate = hierarchy
-        .get_ancestors(&ctx.spec.owner)
+    let target_overrides_candidate = target_ancestors
+        .edges
         .iter()
         .any(|ancestor| ancestor == owner);
     if candidate_overrides_target || target_overrides_candidate {

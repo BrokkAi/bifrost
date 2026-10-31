@@ -370,6 +370,12 @@ impl Project for PersistentFileSetProject {
         Some(&self.persistence_root)
     }
 
+    fn read_file_snapshot(
+        &self,
+        file: &ProjectFile,
+    ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectFileSnapshot> {
+        self.sources.read_file_snapshot(file)
+    }
     fn read_source_snapshot(
         &self,
         file: &ProjectFile,

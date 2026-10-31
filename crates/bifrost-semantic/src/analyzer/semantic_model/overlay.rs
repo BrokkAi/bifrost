@@ -1631,6 +1631,11 @@ pub fn mark_symbol_identity_conflicts(symbols: &mut [SemanticModelSymbol]) {
 /// A language's final step over one selected group and its requested inputs.
 #[doc(hidden)]
 pub trait ModelCompositionLanguage: Sync {
+    /// External-format package and simple type name, where the language has them.
+    fn declaration_type_name_parts<'a>(&self, _name: &'a str) -> Option<(&'a str, &'a str)> {
+        None
+    }
+
     fn group_dependencies<'a>(
         &self,
         _symbol: &'a SemanticModelSymbol,
@@ -1670,6 +1675,10 @@ impl ModelCompositionLanguage for OrdinaryModelComposition {}
 
 struct GoModelComposition;
 impl ModelCompositionLanguage for GoModelComposition {
+    fn declaration_type_name_parts<'a>(&self, name: &'a str) -> Option<(&'a str, &'a str)> {
+        brokk_bifrost_go::declarations::go_model_type_name_parts(name)
+    }
+
     fn group_dependencies<'a>(
         &self,
         symbol: &'a SemanticModelSymbol,

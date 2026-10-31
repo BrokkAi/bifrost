@@ -29,8 +29,8 @@ test("detects the Linux C library", () => {
 });
 
 test("selects each published native package", () => {
-  assert.equal(platformPackageName("darwin", "arm64"), "@brokkai/bifrost-darwin-universal");
-  assert.equal(platformPackageName("darwin", "x64"), "@brokkai/bifrost-darwin-universal");
+  assert.equal(platformPackageName("darwin", "arm64"), "@brokkai/bifrost-darwin-arm64");
+  assert.equal(platformPackageName("darwin", "x64"), "@brokkai/bifrost-darwin-x64");
   assert.equal(platformPackageName("linux", "x64", "gnu"), "@brokkai/bifrost-linux-x64-gnu");
   assert.equal(platformPackageName("linux", "arm64", "gnu"), "@brokkai/bifrost-linux-arm64-gnu");
   assert.equal(platformPackageName("android", "arm64"), "@brokkai/bifrost-android-arm64");

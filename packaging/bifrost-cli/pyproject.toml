@@ -35,8 +35,10 @@ requires = ["maturin>=1.14,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
+# scripts/public/compress-cli-wheel.py rewrites the built wheel: the binary
+# ships xz-compressed with the launcher in launcher/brokk_bifrost_cli, which
+# also provides the bifrost and brokk-bifrost commands (#8288).
 bindings = "bin"
-data = "wheel-data"
 manifest-path = "../../Cargo.toml"
 strip = true
 targets = [{ name = "bifrost", kind = "bin" }]

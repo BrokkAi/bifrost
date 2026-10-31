@@ -448,6 +448,10 @@ fn java_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
         return None;
     }
 
+    if crate::type_parameters::is_name(node, brokk_bifrost_core::analyzer::Language::Java) {
+        return Some(OccurrenceRole::DeclarationName);
+    }
+
     // Climb out of any qualified-name chain this token terminates. A token in
     // a `scope` position is a path segment however deep the chain runs. Which
     // child spells the chain node's own segment comes from `JAVA_PATH_CHAIN`,
@@ -865,6 +869,14 @@ impl StructuralSpec for JavaStructuralSpec {
                 })
                 .collect(),
         )
+    }
+
+    fn type_parameter_owner<'tree>(&self, name: Node<'tree>) -> Option<Node<'tree>> {
+        crate::type_parameters::owner(name, brokk_bifrost_core::analyzer::Language::Java)
+    }
+
+    fn type_parameter_scope_barrier(&self, owner: Node<'_>) -> bool {
+        crate::type_parameters::barrier(owner, brokk_bifrost_core::analyzer::Language::Java)
     }
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
@@ -1741,6 +1753,17 @@ mod result_use_tests {
 impl brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSyntax
     for JavaStructuralSpec
 {
+    fn supports_kind(
+        &self,
+        kind: brokk_bifrost_core::analyzer::statement_facts::StatementFactKind,
+    ) -> bool {
+        use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
+        !matches!(
+            kind,
+            StatementFactKind::NestedIfStatements | StatementFactKind::MisleadingIndentation
+        )
+    }
+
     fn roles<'tree>(&self, node: Node<'tree>, role: Role) -> Vec<Node<'tree>> {
         let field = match role {
             Role::Test if matches!(node.kind(), "switch_label" | "switch_rule") => {

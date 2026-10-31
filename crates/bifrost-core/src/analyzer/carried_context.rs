@@ -8,18 +8,41 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-type Frame = Arc<dyn Any + Send + Sync>;
+type Payload = Arc<dyn Any + Send + Sync>;
+
+/// The narrow operation core can perform on an opaque attribution frame.
+pub trait ExecutionAttribution: Any + Send + Sync {
+    fn mark_execution_dependent(&self);
+}
+
+#[derive(Clone)]
+struct Frame {
+    payload: Payload,
+    execution: Option<Arc<dyn ExecutionAttribution>>,
+}
+
+/// Mark the observing thread's current capture, including transported work.
+/// An absent or explicitly empty frame has no recipient.
+pub fn mark_execution_dependent() {
+    CONTEXT.with(|stack| {
+        if let Some(Some(frame)) = stack.borrow().last()
+            && let Some(attribution) = &frame.execution
+        {
+            attribution.mark_execution_dependent();
+        }
+    });
+}
 
 thread_local! {
     static CONTEXT: RefCell<Vec<Option<Frame>>> = const { RefCell::new(Vec::new()) };
-    static REQUEST_STATE: RefCell<Vec<Option<Frame>>> = const { RefCell::new(Vec::new()) };
+    static REQUEST_STATE: RefCell<Vec<Option<Payload>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The context of the thread handing work to another thread.
 #[derive(Clone)]
 pub struct CarriedContext {
     frame: Option<Frame>,
-    request_state: Option<Frame>,
+    request_state: Option<Payload>,
     project_reads_suppressed: bool,
 }
 
@@ -38,7 +61,7 @@ impl CarriedContext {
     }
 
     pub fn run<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _guard = push(self.frame.clone());
+        let _guard = push_frame(self.frame.clone());
         let _request_state = push_request_state(self.request_state.clone());
         super::project_reads::with_project_read_suppression(self.project_reads_suppressed, f)
     }
@@ -53,7 +76,23 @@ pub struct CarriedContextGuard {
     _thread: PhantomData<std::sync::MutexGuard<'static, ()>>,
 }
 
-pub fn push(frame: Option<Frame>) -> CarriedContextGuard {
+pub fn push(frame: Option<Payload>) -> CarriedContextGuard {
+    push_frame(frame.map(|payload| Frame {
+        payload,
+        execution: None,
+    }))
+}
+
+pub fn push_with_execution_attribution<T: ExecutionAttribution>(
+    frame: Arc<T>,
+) -> CarriedContextGuard {
+    push_frame(Some(Frame {
+        payload: frame.clone(),
+        execution: Some(frame),
+    }))
+}
+
+fn push_frame(frame: Option<Frame>) -> CarriedContextGuard {
     let depth = CONTEXT.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.push(frame.clone());
@@ -74,6 +113,7 @@ pub fn top<T: Any + Send + Sync>() -> Option<Option<Arc<T>>> {
         .map(|slot| {
             slot.map(|frame| {
                 frame
+                    .payload
                     .downcast()
                     .unwrap_or_else(|_| panic!("#7116: unexpected carried context frame type"))
             })
@@ -89,6 +129,7 @@ pub fn with_top<T: Any + Send + Sync, R>(f: impl FnOnce(Option<Option<&T>>) -> R
         f(stack.last().map(|slot| {
             slot.as_ref().map(|frame| {
                 frame
+                    .payload
                     .downcast_ref::<T>()
                     .expect("#7116: unexpected carried context frame type")
             })
@@ -108,7 +149,7 @@ impl Drop for CarriedContextGuard {
             let popped = stack.pop().expect("carried context stack underflow");
             assert!(
                 match (&popped, &self.frame) {
-                    (Some(popped), Some(frame)) => Arc::ptr_eq(popped, frame),
+                    (Some(popped), Some(frame)) => Arc::ptr_eq(&popped.payload, &frame.payload),
                     (None, None) => true,
                     _ => false,
                 },
@@ -120,7 +161,7 @@ impl Drop for CarriedContextGuard {
 
 /// Request-owned state travels independently of read-attribution routing.
 /// An empty slot masks any state already installed on the receiving thread.
-pub fn push_request_state(state: Option<Frame>) -> RequestStateGuard {
+pub fn push_request_state(state: Option<Payload>) -> RequestStateGuard {
     let depth = REQUEST_STATE.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.push(state.clone());
@@ -146,7 +187,7 @@ pub fn request_state<T: Any + Send + Sync>() -> Option<Arc<T>> {
 
 /// Restores the request state on the thread that installed it.
 pub struct RequestStateGuard {
-    state: Option<Frame>,
+    state: Option<Payload>,
     depth: usize,
     _thread: PhantomData<std::sync::MutexGuard<'static, ()>>,
 }

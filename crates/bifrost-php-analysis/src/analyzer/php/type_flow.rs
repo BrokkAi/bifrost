@@ -548,7 +548,7 @@ fn resolved_external_bases(
             continue;
         };
         let context = contexts.context_at(start);
-        let direct = php.get_direct_ancestors(owner);
+        let direct = php.get_direct_ancestors(owner).definite().to_vec();
         for raw in php.inner.raw_supertypes_of(owner) {
             let Some(fqn) = resolve_php_type(&raw, context) else {
                 unresolved = true;
@@ -696,7 +696,7 @@ fn workspace_member_lookup(
     if current_indexed_prepared(php, unit.source()).is_none() {
         return MemberLookup::Unknown(UnknownReason::UncertainFlow);
     }
-    let workspace_ancestors = php.get_ancestors(unit);
+    let workspace_ancestors = php.get_ancestors(unit).definite().to_vec();
     let open_workspace_surface = workspace_ancestors
         .iter()
         .any(|ancestor| !runtime_workspace_class(workspace, php, ancestor));
@@ -728,7 +728,7 @@ fn workspace_member_lookup(
         }
         level = level
             .iter()
-            .flat_map(|owner| php.get_direct_ancestors(owner))
+            .flat_map(|owner| php.get_direct_ancestors(owner).definite().to_vec())
             .collect();
         level.sort();
         level.dedup();
@@ -1061,7 +1061,7 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
         if !runtime_workspace_class(workspace, php, unit) {
             return ClassHierarchy::unknown();
         }
-        let mut workspace_ancestors = php.get_ancestors(unit);
+        let mut workspace_ancestors = php.get_ancestors(unit).definite().to_vec();
         workspace_ancestors.sort();
         workspace_ancestors.dedup();
         let open_workspace_surface = workspace_ancestors

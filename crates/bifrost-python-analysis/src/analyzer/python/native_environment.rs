@@ -149,10 +149,14 @@ pub fn python_environment_root(
         fn contains(&self, path: &Path) -> bool {
             self.0.contains(path)
         }
-        fn configuration_source(&self, path: &Path) -> Option<std::borrow::Cow<'_, str>> {
-            self.0
+        fn configuration_source(
+            &self,
+            path: &Path,
+        ) -> std::io::Result<Option<std::borrow::Cow<'_, str>>> {
+            Ok(self
+                .0
                 .configuration_source(path)
-                .map(std::borrow::Cow::Borrowed)
+                .map(std::borrow::Cow::Borrowed))
         }
     }
     move |path, inputs| {
@@ -161,7 +165,7 @@ pub fn python_environment_root(
                 &root,
                 path,
                 &Inputs(inputs),
-            ),
+            )?,
         )
     }
 }

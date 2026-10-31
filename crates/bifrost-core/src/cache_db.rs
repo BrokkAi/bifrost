@@ -509,6 +509,18 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 222,
         sql: include_str!("../migrations/cache/0222-field-slot-exact-result-sources.sql"),
     },
+    CacheMigration {
+        version: 223,
+        sql: include_str!("../migrations/cache/0223-overload-discriminator.sql"),
+    },
+    CacheMigration {
+        version: 224,
+        sql: include_str!("../migrations/cache/0224-csharp-compilation-symbols.sql"),
+    },
+    CacheMigration {
+        version: 225,
+        sql: include_str!("../migrations/cache/0225-blob-parse-variant.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -534,8 +546,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    204, 165, 128, 252, 184, 105, 151, 40, 61, 116, 136, 206, 215, 72, 249, 53, 2, 90, 187, 88, 50,
-    135, 25, 234, 55, 161, 90, 248, 140, 182, 47, 120,
+    14, 148, 100, 134, 47, 165, 2, 230, 28, 119, 76, 156, 104, 53, 82, 168, 77, 220, 151, 196, 70,
+    17, 233, 149, 40, 105, 76, 233, 55, 119, 174, 139,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -3156,6 +3168,8 @@ mod tests {
 
     #[path = "cpp_class_templates.rs"]
     mod cpp_class_templates;
+    #[path = "csharp_compilation_migration.rs"]
+    mod csharp_compilation_migration;
     #[path = "resolution_schema.rs"]
     mod resolution_schema;
     #[path = "rust_crate_rows.rs"]

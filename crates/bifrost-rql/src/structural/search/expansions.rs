@@ -47,7 +47,8 @@ fn finish_call_declaration_expansions(
         reclassify_declared_subset_omissions(&mut traversal_diagnostics);
     }
     diagnostics.extend(traversal_diagnostics);
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::CallRelationCandidatesOmitted,
@@ -67,7 +68,7 @@ fn finish_call_declaration_expansions(
         ),
     exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
     // The explicit proven-subset contract declines only the exhaustive
     // negative claim caused by an unrenderable related declaration. It never
     // hides a real traversal limit, which is carried by `exhausted`.
@@ -140,6 +141,8 @@ pub(super) fn call_declaration_expansions(
         );
         if declared_non_exhaustive {
             reclassify_declared_subset_omissions(&mut diagnostics[relation_diagnostic_start..]);
+        } else if filter.proof == Some(UsageProof::Proven) {
+            mark_proven_call_ambiguity_incomplete(&result, diagnostics);
         }
         exhausted |= result.truncated || result.cancelled;
         for site in result
@@ -180,7 +183,12 @@ pub(super) fn call_declaration_expansions(
                     true,
                 );
             }
-            if budget.pipeline_rows >= limits.max_pipeline_rows {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                budget.pipeline_rows,
+                limits.max_pipeline_rows,
+            )
+            .allows(1)
+            {
                 return finish_call_declaration_expansions(
                     diagnostics,
                     diagnostic_start,
@@ -215,7 +223,12 @@ pub(super) fn call_declaration_expansions(
                 }
             };
             let next_depth = work.depth + 1;
-            if budget.provenance_steps.saturating_add(next_depth) > limits.max_pipeline_rows {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                budget.provenance_steps.saturating_add(next_depth),
+                limits.max_pipeline_rows,
+            )
+            .allows(0)
+            {
                 budget.provenance_steps = limits.max_pipeline_rows;
                 return finish_call_declaration_expansions(
                     diagnostics,
@@ -281,7 +294,9 @@ fn call_path_contains(
         return Some(true);
     }
     while let Some(index) = tail {
-        if *work >= max_work {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(*work, max_work)
+            .allows(1)
+        {
             return None;
         }
         *work += 1;
@@ -393,7 +408,8 @@ pub(super) fn inbound_reference_expansions(
         let report = cache.reported_inbound.insert(declaration.unit.clone());
         if report && query.source_bytes_truncated {
             exhausted = true;
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated,
@@ -407,10 +423,11 @@ pub(super) fn inbound_reference_expansions(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         } else if report && query.candidate_files_truncated {
             exhausted = true;
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::ReferenceCandidateFilesTruncated,
@@ -424,7 +441,7 @@ pub(super) fn inbound_reference_expansions(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
         if let FuzzyResult::Incomplete {
             diagnostics: reasons,
@@ -432,7 +449,8 @@ pub(super) fn inbound_reference_expansions(
         } = &query.result
             && report
         {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 exhausted_roots: Vec::new(),
@@ -446,7 +464,7 @@ pub(super) fn inbound_reference_expansions(
                     declaration.unit.fq_name()
                 ),
                 withheld_rows_path: None,
-            });
+            }));
         }
         match query.result {
             FuzzyResult::Success {
@@ -486,7 +504,8 @@ pub(super) fn inbound_reference_expansions(
                                 .count(),
                         );
                     if omitted > 0 {
-                        diagnostics.push(CodeQueryDiagnostic {
+                        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                             related: Vec::new(),
                             source: None,
                             code: CodeQueryDiagnosticCode::ReferenceCandidatesOmitted,
@@ -502,7 +521,7 @@ pub(super) fn inbound_reference_expansions(
                             ),
                         exhausted_roots: Vec::new(),
                             withheld_rows_path: None,
-                        });
+                        }));
                     }
                 }
             }
@@ -518,7 +537,8 @@ pub(super) fn inbound_reference_expansions(
                     )
                 }));
                 if report {
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
@@ -534,7 +554,7 @@ pub(super) fn inbound_reference_expansions(
                         ),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                 }
             }
             FuzzyResult::TooManyCallsites {
@@ -551,7 +571,8 @@ pub(super) fn inbound_reference_expansions(
                 ));
                 exhausted = true;
                 if report {
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::ReferenceCallsiteLimit,
@@ -567,12 +588,13 @@ pub(super) fn inbound_reference_expansions(
                         ),
                     exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                 }
             }
             FuzzyResult::Failure { reason, .. } => {
                 if report {
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
@@ -588,7 +610,7 @@ pub(super) fn inbound_reference_expansions(
                         ),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                 }
             }
         }
@@ -629,7 +651,8 @@ pub(super) fn inbound_reference_expansions(
         diagnostics.retain(|diagnostic| {
             diagnostic.code != CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
         });
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::ReferenceCandidatesOmitted,
@@ -649,7 +672,7 @@ pub(super) fn inbound_reference_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     sort_reference_sites(&mut sites);
     sites.dedup();
@@ -763,7 +786,8 @@ pub(super) fn append_outbound_lookup_diagnostics(
     omitted: usize,
 ) {
     if ambiguous_sites > 0 && ambiguous_candidates_complete {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
@@ -777,10 +801,11 @@ pub(super) fn append_outbound_lookup_diagnostics(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     if omitted > 0 {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
@@ -794,7 +819,7 @@ pub(super) fn append_outbound_lookup_diagnostics(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
 }
 
@@ -822,7 +847,10 @@ pub(super) fn scan_outbound_reference_hits(
         analyzer.mark_execution_dependent();
         diagnostics.push(super::QueryExecutionState::diagnostic(
             analyzer,
-            CodeQueryDiagnostic {
+            CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                    brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                ),
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
@@ -835,7 +863,7 @@ pub(super) fn scan_outbound_reference_hits(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            },
+            }),
             Some(DerivationExecutionCause::Provider),
         ));
         return (Vec::new(), true);
@@ -843,15 +871,33 @@ pub(super) fn scan_outbound_reference_hits(
     let remaining_source_bytes = limits
         .max_scanned_source_bytes
         .saturating_sub(budget.scanned_source_bytes);
-    if budget.scanned_files >= limits.max_scanned_files || source.len() > remaining_source_bytes {
+    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        budget.scanned_files,
+        limits.max_scanned_files,
+    )
+    .allows(1)
+        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            0,
+            remaining_source_bytes,
+        )
+        .allows(source.len())
+    {
         push_budget_diagnostic(diagnostics, budget);
         return (Vec::new(), true);
     }
     budget.scanned_files += 1;
     budget.scanned_source_bytes += source.len();
     let source = Arc::<str>::from(source);
-    let Some(tree) = parse_tree_for_language(file, language, &source) else {
-        diagnostics.push(CodeQueryDiagnostic {
+    let parsed = crate::analyzer::usages::get_definition::parse_tree_for_language_outcome(
+        file, language, &source,
+    );
+    let incompleteness = match &parsed {
+        Err(cause) => Incompleteness::Operational(*cause),
+        Ok(_) => Incompleteness::Content,
+    };
+    let Ok(Some(tree)) = parsed else {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesParserUnsupported,
@@ -861,7 +907,7 @@ pub(super) fn scan_outbound_reference_hits(
             message: format!("uses does not support parsing {}", rel_path_string(file)),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
         return (Vec::new(), false);
     };
     const MAX_OUTBOUND_SITES_PER_FILE: usize = 50_000;
@@ -901,7 +947,8 @@ pub(super) fn scan_outbound_reference_hits(
         if candidate_limit == remaining_reference_budget {
             push_budget_diagnostic(diagnostics, budget);
         } else {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::UsesCandidateLimit,
@@ -914,12 +961,13 @@ pub(super) fn scan_outbound_reference_hits(
                 ),
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
     }
     if candidate_limit == 0 {
         exhausted = true;
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesCandidateLimit,
@@ -932,7 +980,7 @@ pub(super) fn scan_outbound_reference_hits(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     let requests = ranges
         .into_iter()
@@ -992,7 +1040,8 @@ pub(super) fn scan_outbound_reference_hits(
             ..
         } = &result.result
         {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 exhausted_roots: Vec::new(),
@@ -1005,13 +1054,14 @@ pub(super) fn scan_outbound_reference_hits(
                     target.fq_name()
                 ),
                 withheld_rows_path: None,
-            });
+            }));
         }
         let (target_hits, target_truncated) =
             reference_hits_for_target(analyzer, result.result, target);
         if target_truncated {
             exhausted = true;
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::UsesCandidateLimit,
@@ -1024,7 +1074,7 @@ pub(super) fn scan_outbound_reference_hits(
                 ),
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
         for hit in target_hits {
             let range = (hit.range.start_byte, hit.range.end_byte);

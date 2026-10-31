@@ -132,7 +132,11 @@ mod jvm_extraction_tests {
         {
             let store = AnalyzerStore::open_persistent(&path).unwrap();
             store
-                .write_parsed_blob(oid, "scala", &ScalaAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
+                    &ScalaAdapter,
+                    &state,
+                )
                 .unwrap();
         }
         std::fs::remove_file(file.abs_path()).unwrap();
@@ -205,7 +209,11 @@ mod jvm_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("scala").unwrap();
         store
-            .write_parsed_blob(oid, "scala", &ScalaAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
+                &ScalaAdapter,
+                &state,
+            )
             .unwrap();
         assert!(
             store
@@ -272,7 +280,11 @@ mod jvm_extraction_tests {
         let oid = oid_for(SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "scala", &ScalaAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
+                &ScalaAdapter,
+                &state,
+            )
             .unwrap();
 
         store

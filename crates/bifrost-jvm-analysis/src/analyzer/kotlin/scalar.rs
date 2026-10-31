@@ -69,33 +69,19 @@ pub fn kotlin_declared_scalar_types(
             let scalar = if let Some(written) = kotlin_binding_type_node(binding) {
                 from_type(written)
             } else {
-                kotlin_property_initializer(property)
-                    .and_then(|initializer| kotlin_literal_scalar_type(initializer, source))
-                    .map(|scalar| match scalar {
-                        KotlinScalarType::Int => DeclaredScalarType::Signed(32),
-                        KotlinScalarType::Long => DeclaredScalarType::Signed(64),
-                        KotlinScalarType::Short => DeclaredScalarType::Signed(16),
-                        KotlinScalarType::Byte => DeclaredScalarType::Signed(8),
-                        KotlinScalarType::Boolean => DeclaredScalarType::Boolean,
-                    })
+                brokk_bifrost_jvm::kotlin::syntax::kotlin_property_initializer(named_children(
+                    property,
+                ))
+                .and_then(|initializer| kotlin_literal_scalar_type(initializer, source))
+                .map(|scalar| match scalar {
+                    KotlinScalarType::Int => DeclaredScalarType::Signed(32),
+                    KotlinScalarType::Long => DeclaredScalarType::Signed(64),
+                    KotlinScalarType::Short => DeclaredScalarType::Signed(16),
+                    KotlinScalarType::Byte => DeclaredScalarType::Signed(8),
+                    KotlinScalarType::Boolean => DeclaredScalarType::Boolean,
+                })
             }?;
             Some((value, scalar))
         })
         .collect()
-}
-
-fn kotlin_property_initializer<'tree>(property: Node<'tree>) -> Option<Node<'tree>> {
-    let mut seen_binding = false;
-    for child in named_children(property) {
-        match child.kind() {
-            "modifiers" | "binding_pattern_kind" | "type_constraints" => continue,
-            "variable_declaration" | "multi_variable_declaration" => {
-                seen_binding = true;
-            }
-            "getter" | "setter" | "property_delegate" | "receiver_type" => continue,
-            _ if seen_binding => return Some(child),
-            _ => continue,
-        }
-    }
-    None
 }

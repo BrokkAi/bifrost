@@ -40,7 +40,11 @@ mod js_ts_extraction_root {
         {
             let store = AnalyzerStore::open_persistent(&path).unwrap();
             store
-                .write_parsed_blob(oid, "typescript:ts", &TypescriptAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "typescript:ts"),
+                    &TypescriptAdapter,
+                    &state,
+                )
                 .unwrap();
         }
         std::fs::remove_file(file.abs_path()).unwrap();
@@ -107,12 +111,20 @@ mod js_ts_extraction_root {
         let family = state.source_facts.as_mut().unwrap().js_ts.take().unwrap();
         assert!(
             store
-                .write_parsed_blob(oid, "typescript:ts", &TypescriptAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "typescript:ts"),
+                    &TypescriptAdapter,
+                    &state
+                )
                 .is_err()
         );
         state.source_facts.as_mut().unwrap().js_ts = Some(family);
         store
-            .write_parsed_blob(oid, "typescript:ts", &TypescriptAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "typescript:ts"),
+                &TypescriptAdapter,
+                &state,
+            )
             .unwrap();
         let read = store
             .js_ts_source_facts(oid, generation, &TypescriptAdapter, &file, &|| true)
@@ -148,7 +160,11 @@ mod js_ts_extraction_root {
             let store = AnalyzerStore::open_ephemeral().unwrap();
             let generation = store.current_generation("typescript:ts").unwrap();
             store
-                .write_parsed_blob(oid, "typescript:ts", &TypescriptAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "typescript:ts"),
+                    &TypescriptAdapter,
+                    &state,
+                )
                 .unwrap();
             store
                 .conn

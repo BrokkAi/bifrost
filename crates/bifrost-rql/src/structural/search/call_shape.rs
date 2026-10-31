@@ -138,7 +138,8 @@ pub(super) fn call_shape_expansions_for_input(
     if !outcome.coverage.is_exact()
         && reported_suppressed_shapes.insert(outcome.site_ast_id.clone())
     {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::CallShapeCoverageIncomplete,
@@ -154,7 +155,7 @@ pub(super) fn call_shape_expansions_for_input(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     let value = CallShapeValue {
         report: Arc::new(report),

@@ -157,9 +157,12 @@ fn collect_visible_skeletons(
 }
 
 fn direct_named_ancestors(analyzer: &JavaAnalyzer, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    // S2b: Summary skeletons have no hierarchy incompleteness channel.
     let mut seen = BTreeSet::new();
     analyzer
         .get_direct_ancestors(code_unit)
+        .definite()
+        .to_vec()
         .into_iter()
         .filter(|ancestor| !ancestor.is_anonymous())
         .filter(|ancestor| {

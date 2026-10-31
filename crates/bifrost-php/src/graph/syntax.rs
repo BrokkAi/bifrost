@@ -1965,7 +1965,7 @@ fn declared_member_family(
     let mut seen = HashSet::default();
     let mut level: Vec<_> = owners
         .iter()
-        .flat_map(|owner| php.get_direct_ancestors(owner))
+        .flat_map(|owner| php.get_direct_ancestors(owner).definite().to_vec())
         .collect();
     while !level.is_empty() {
         let mut families: HashMap<String, Vec<CodeUnit>> = HashMap::default();
@@ -1994,7 +1994,7 @@ fn declared_member_family(
                     .or_default()
                     .push(definition);
             }
-            next_level.extend(php.get_direct_ancestors(&ancestor));
+            next_level.extend(php.get_direct_ancestors(&ancestor).definite().to_vec());
         }
         if !families.is_empty() {
             let mut families = families.into_values();
@@ -2492,14 +2492,23 @@ pub(crate) mod graph_boundary_tests {
         }
     }
     impl TypeHierarchyProvider for Fixture {
-        fn get_direct_ancestors(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-            self.facts
-                .declarations_for(unit)
-                .flat_map(|d| &d.supertypes)
-                .flat_map(|name| self.definitions(name))
-                .collect()
+        fn get_direct_ancestors(
+            &self,
+            unit: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+            let edges: Vec<CodeUnit> = {
+                self.facts
+                    .declarations_for(unit)
+                    .flat_map(|d| &d.supertypes)
+                    .flat_map(|name| self.definitions(name))
+                    .collect()
+            };
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
         }
-        fn get_direct_descendants(&self, _: &CodeUnit) -> HashSet<CodeUnit> {
+        fn get_direct_descendants(
+            &self,
+            _: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
             unimplemented!()
         }
     }

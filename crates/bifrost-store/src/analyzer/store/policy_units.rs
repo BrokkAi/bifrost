@@ -818,6 +818,7 @@ fn write_unit(
     let (blob_id, lang) = match key.partition.blob() {
         Some((blob, language)) => {
             let lang = language.config_label();
+            let blob_key = super::BlobKey::unvaried(*blob, lang);
             // Resolved under the complete-blob condition the fact tables use:
             // a unit hangs off its seed blob so that re-parsing that blob
             // takes the unit with it.
@@ -826,10 +827,10 @@ fn write_unit(
                     &format!(
                         "SELECT meta.blob_id FROM blob_meta AS meta
                          JOIN blobs ON blobs.id = meta.blob_id
-                         WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2
+                         WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2 AND blobs.parse_variant = ?3
                            AND {PARSED_BLOB_COMPLETE_CONDITION}"
                     ),
-                    params![blob.to_string(), lang],
+                    params![blob_key.oid.to_string(), blob_key.lang, blob_key.variant],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional()?;

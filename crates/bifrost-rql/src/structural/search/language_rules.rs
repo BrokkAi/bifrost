@@ -72,7 +72,8 @@ impl LanguageRuleMatches {
     ) -> Self {
         Self {
             matches: ranges.into_iter().map(Into::into).collect(),
-            diagnostics: vec![CodeQueryDiagnostic {
+            diagnostics: vec![CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: super::results::CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -82,7 +83,7 @@ impl LanguageRuleMatches {
                 message,
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            }],
+            })],
         }
     }
 

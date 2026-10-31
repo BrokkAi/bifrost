@@ -380,7 +380,7 @@ const RUST_UNIVERSE: &[UniverseEntry] = &[
     rust_primitive_type("f64"),
 ];
 
-const GO_UNIVERSE: &[UniverseEntry] = &[
+pub(crate) const GO_UNIVERSE: &[UniverseEntry] = &[
     go_primitive_type("bool", None),
     go_primitive_type("byte", Some(GoRangeType::Integer)),
     go_primitive_type("rune", Some(GoRangeType::Integer)),

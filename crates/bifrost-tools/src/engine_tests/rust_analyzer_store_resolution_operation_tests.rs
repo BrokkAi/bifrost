@@ -2086,8 +2086,7 @@ pub mod rust_departing_root_tests {
             let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                 .expect("hash private Rust persisted source");
             let prepared = AnalyzerStore::prepare_parsed_blob(
-                oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 self.generation,
                 &RustAdapter,
                 Arc::clone(&state),
@@ -2148,8 +2147,7 @@ pub mod rust_departing_root_tests {
                     .expect("hash private Rust persisted source");
                 prepared.push(
                     AnalyzerStore::prepare_parsed_blob(
-                        oid,
-                        "rust",
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                         self.generation,
                         &RustAdapter,
                         Arc::clone(&state),
@@ -2421,8 +2419,7 @@ pub mod rust_departing_root_tests {
                 });
                 prepared.push(
                     AnalyzerStore::prepare_parsed_blob(
-                        oid,
-                        "rust",
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                         generation,
                         &adapter,
                         Arc::clone(&state),
@@ -2538,8 +2535,7 @@ pub mod rust_departing_root_tests {
             let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                 .expect("hash Rust replacement source");
             let prepared = AnalyzerStore::prepare_parsed_blob(
-                oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 self.generation,
                 &RustAdapter,
                 Arc::clone(state),
@@ -3705,7 +3701,16 @@ pub mod rust_departing_root_tests {
             // The request-owned identity-recipe cache answers three recipe reads
             // that repeat an earlier read in the search: -3 statements and -3
             // decoded rows. Opening is unchanged.
-            (273, 241, 334, 207),
+            // #7506: debug builds add three cold-open debug_assert! COUNT checks
+            // (resolution_selection.rs) and, per search, four reads that verify
+            // reason-owner memo hits against the publication (resolution_typed.rs,
+            // cfg(debug_assertions)). Release-code builds such as the measure
+            // profile compile them out: 270/238 open, 330 search.
+            if cfg!(debug_assertions) {
+                (273, 241, 334, 207)
+            } else {
+                (270, 238, 330, 207)
+            },
             "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3755,7 +3760,11 @@ pub mod rust_departing_root_tests {
             // #6594 removes the same four request-buffer writes per search.
             // #6594: independently measured warm/repeated searches also skip 31 empty reads.
             // The same three cached recipe reads as the cold search: -3/-3.
-            (5, 4, 334, 207),
+            if cfg!(debug_assertions) {
+                (5, 4, 334, 207)
+            } else {
+                (5, 4, 330, 207)
+            },
             "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3777,7 +3786,11 @@ pub mod rust_departing_root_tests {
             // #6594 removes the same four request-buffer writes per search.
             // #6594: independently measured warm/repeated searches also skip 31 empty reads.
             // The same three cached recipe reads as the cold search: -3/-3.
-            (5, 4, 334, 207),
+            if cfg!(debug_assertions) {
+                (5, 4, 334, 207)
+            } else {
+                (5, 4, 330, 207)
+            },
             "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
         );
         assert_eq!(cold.2, first_warm.2);
@@ -4521,8 +4534,7 @@ pub mod rust_departing_root_tests {
         let oid =
             Oid::hash_object(ObjectType::Blob, SOURCE.as_bytes()).expect("hash Rust macro source");
         let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "rust",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
             fixture.generation,
             &RustAdapter,
             state,
@@ -5774,16 +5786,14 @@ pub mod rust_departing_root_tests {
             .expect("hash alternate Rust provider source");
         let prepared = vec![
             AnalyzerStore::prepare_parsed_blob(
-                alt_root_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(alt_root_oid, "rust"),
                 fixture.generation,
                 &RustAdapter,
                 alt_root_state,
             )
             .expect("prepare alternate Rust provider root blob"),
             AnalyzerStore::prepare_parsed_blob(
-                alt_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(alt_oid, "rust"),
                 fixture.generation,
                 &RustAdapter,
                 alt_state,

@@ -306,8 +306,8 @@ impl<'a> CppNativeProof<'a> {
         let Some(hierarchy) = self.cpp.type_hierarchy_provider() else {
             return Err("native_virtual_hierarchy");
         };
-        for ancestor in hierarchy.get_ancestors(&owner) {
-            for candidate in self.cpp.get_direct_children(&ancestor) {
+        for ancestor in hierarchy.get_ancestors(&owner).definite() {
+            for candidate in self.cpp.get_direct_children(ancestor) {
                 if !candidate.is_function()
                     || candidate.identifier() != target.identifier()
                     || !callable_shapes_agree(self.cpp, self.token, target, &candidate)

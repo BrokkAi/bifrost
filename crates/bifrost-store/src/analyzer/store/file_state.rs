@@ -128,7 +128,7 @@ pub struct FileState {
     ///
     /// Empty for every language but C++, and empty on a hydrated state: a
     /// projection is a write-side product of one parse, never a hydration
-    /// output. `blobs`/`code_units` are already keyed `(blob_oid, lang)`, so
+    /// output. `blobs`/`code_units` are already keyed `(blob_oid, lang, parse_variant)`, so
     /// this needs no schema of its own.
     #[doc(hidden)]
     pub additional_projections: Vec<(&'static str, Arc<FileState>)>,

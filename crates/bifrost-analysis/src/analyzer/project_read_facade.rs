@@ -164,6 +164,17 @@ impl Project for ProjectReadFacade {
             },
         )
     }
+    fn read_file_snapshot(
+        &self,
+        file: &ProjectFile,
+    ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectFileSnapshot> {
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || self.delegate.read_file_snapshot(file),
+            |snapshot| Some(snapshot.oid()),
+        )
+    }
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
         self.project_reads.source(
             self.as_project(),

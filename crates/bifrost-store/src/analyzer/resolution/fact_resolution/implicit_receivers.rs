@@ -43,7 +43,7 @@ fn is_lexical_scope_continuation(path: &PartialPath) -> bool {
         && path.witness() == [WitnessStep::Node(path.end().node())]
 }
 
-// The source can issue several namespace roots for one call. Keep each
+// The source can issue several namespace roots for one reference. Keep each
 // prefix and request its endpoint; a callable local may exist on only one.
 struct ReceiverLexicalFrame {
     requests: Vec<BatchCandidateRequest>,
@@ -243,7 +243,8 @@ struct ReceiverLevel {
 
 pub(super) struct DemandImplicitReceiverFrame {
     seed: ReferenceSeed,
-    call: InternedFactRow<SelectedTypedRow<LoweredCallApplicabilityObligation>>,
+    // Absent for a non-invoking value reference.
+    call: Option<InternedFactRow<SelectedTypedRow<LoweredCallApplicabilityObligation>>>,
     raw: SharedAnswer,
     rule: ImplicitReceiverLookup,
     chain: Vec<ImplicitReceiverScope>,
@@ -265,16 +266,22 @@ pub(super) struct DemandImplicitReceiverFrame {
 impl DemandImplicitReceiverFrame {
     pub(super) fn new(
         evaluation: &mut FactEvaluation<'_, '_>,
-        call: InternedFactRow<SelectedTypedRow<LoweredCallApplicabilityObligation>>,
+        reference: SemanticId,
+        call: Option<InternedFactRow<SelectedTypedRow<LoweredCallApplicabilityObligation>>>,
         raw: SharedAnswer,
     ) -> StoreResult<Option<Self>> {
-        let obligation = call.get(evaluation.session).row();
-        let reference = obligation.callee_reference();
-        let adapter = call_applicability_adapter(obligation.language());
-        let Some(rule) = adapter.implicit_receiver_lookup() else {
-            return Ok(None);
-        };
-        if !implicit_receiver_call(obligation) {
+        if let Some(call) = call {
+            let call = call.get(evaluation.session).row();
+            assert_eq!(
+                reference,
+                call.callee_reference(),
+                "one implicit lookup site"
+            );
+            if !implicit_receiver_call(call) {
+                return Ok(None);
+            }
+        }
+        if evaluation.forced_reference_gaps.contains_key(&reference) {
             return Ok(None);
         }
         let Some(seed) = evaluation
@@ -284,10 +291,20 @@ impl DemandImplicitReceiverFrame {
         else {
             return Ok(None);
         };
-        if !seed
-            .site_metadata()
-            .is_some_and(|metadata| metadata.unqualified())
-        {
+        let adapter = call_applicability_adapter(seed.language());
+        let Some(rule) = adapter.implicit_receiver_lookup() else {
+            return Ok(None);
+        };
+        if !seed.site_metadata().is_some_and(|metadata| {
+            metadata.unqualified()
+                && (call.is_some()
+                    || (adapter.implicit_receiver_value_lookup()
+                        && metadata.site_kind() == ResolutionSiteKind::ValueReference
+                        && matches!(
+                            metadata.namespace(),
+                            ResolutionNamespace::Value | ResolutionNamespace::TypeOrValue
+                        )))
+        }) {
             return Ok(None);
         }
         let lexical = Some(ReceiverLexicalFrame::new(&seed));
@@ -319,8 +336,7 @@ impl DemandImplicitReceiverFrame {
         previous_states: &StateMap,
     ) -> StoreResult<bool> {
         let (chain, lookups) = self.lexical.take().unwrap().finish(evaluation)?;
-        let obligation = self.call.get(evaluation.session).row();
-        let language = obligation.language();
+        let language = self.seed.language();
         let adapter = call_applicability_adapter(language);
         let mut levels = Vec::new();
         let mut seen = HashSet::default();
@@ -395,19 +411,21 @@ impl DemandImplicitReceiverFrame {
             else {
                 return Ok(false);
             };
-            shapes.push(
-                HierarchyLookupShape::new(
-                    lookup,
-                    namespace,
-                    if namespace == ResolutionNamespace::Type {
-                        QualifierCategory::Type
-                    } else {
-                        QualifierCategory::Runtime
-                    },
-                    0,
-                )
-                .with_callable_overload_set(),
+            let shape = HierarchyLookupShape::new(
+                lookup,
+                namespace,
+                if namespace == ResolutionNamespace::Type {
+                    QualifierCategory::Type
+                } else {
+                    QualifierCategory::Runtime
+                },
+                0,
             );
+            shapes.push(if self.call.is_some() {
+                shape.with_callable_overload_set()
+            } else {
+                shape
+            });
         }
         self.chain = chain;
         self.levels = levels;
@@ -577,12 +595,104 @@ impl DemandImplicitReceiverFrame {
             let level = &self.levels[self.level];
             let Some(ty) = level.ty else {
                 // The extension receiver's type is a fixed-point dependency.
-                // No outer receiver can prove the call while it remains open.
+                // No outer receiver can prove the reference while it remains open.
                 self.level += 1;
                 self.shape = 0;
                 return Ok(Continue);
             };
             let shape = self.shapes[self.shape];
+            // A non-invoking value cannot bind a callable-only inventory entry.
+            // A closed inventory can prove absence here; unknown inventories
+            // still go through the shared hierarchy and retain their evidence.
+            if self.call.is_none()
+                && let Some(super::super::universe::IntrinsicMemberInventory::Jvm(members)) =
+                    evaluation.session.closed_member_inventory(ty.identity())?
+                && let Some(digest) = evaluation
+                    .session
+                    .lexical_source
+                    .shared_name_digest_for_identity(shape.lookup, evaluation.cancellation)?
+                && !members.iter().any(|member| {
+                    member.kind == brokk_bifrost_jvm::intrinsics::ClosedMemberKind::Value
+                        && super::super::ResolutionLookupSemanticRecipe::new(
+                            self.seed.language(),
+                            shape.namespace,
+                            member.name,
+                        )
+                        .name_digest()
+                            == digest
+                })
+            {
+                self.shape += 1;
+                return Ok(Continue);
+            }
+            // A directly declared classifier shadows inherited names in its
+            // dispatch body. The aggregate lexical answer can still carry open
+            // imports, so use its complete witnesses and exact member ownership.
+            // Cut only this owner's inherited continuation, retaining any open
+            // inner receiver level and unrelated lexical uncertainty.
+            if self.call.is_none() && !self.raw.targets().is_empty() {
+                let scope = &self.chain[level.origin.lexical_scope()];
+                if scope.owner.as_ref().is_some_and(|owner| {
+                    owner.scope_kind() == ResolutionScopeKind::TypeBody
+                        && owner.definition() == ty.identity()
+                }) {
+                    let read = evaluation
+                        .session
+                        .member_owners_for_definitions(self.raw.targets())?;
+                    let Some(members) = evaluation.accept_session_read(read) else {
+                        return Ok(Ready(None));
+                    };
+                    let classifiers = members
+                        .iter()
+                        .filter_map(|member| {
+                            let member = member.get(evaluation.session).row();
+                            (member.owner_definition() == ty.identity()
+                                && member.kind() == ResolutionMemberKind::NestedType
+                                && self.raw.witnesses().iter().any(|witness| {
+                                    witness.target() == member.definition()
+                                        && witness.completion() == &ResolutionCompletion::Complete
+                                }))
+                            .then_some(member.definition())
+                        })
+                        .collect::<HashSet<_>>();
+                    if self
+                        .raw
+                        .targets()
+                        .iter()
+                        .all(|target| classifiers.contains(target))
+                    {
+                        let read = evaluation
+                            .session
+                            .property_gaps_for_definitions(&[ty.identity()])?;
+                        let Some(gaps) = evaluation.accept_session_read(read) else {
+                            return Ok(Ready(None));
+                        };
+                        let reasons = gaps
+                            .iter()
+                            .filter_map(|gap| {
+                                let gap = gap.get(evaluation.session).row();
+                                (gap.kind() == ResolutionGapKind::UnsupportedHierarchyTraversal)
+                                    .then_some(gap.reason_semantic())
+                            })
+                            .collect::<HashSet<_>>();
+                        let removals = scope
+                            .paths
+                            .iter()
+                            .filter_map(|(identity, path)| {
+                                matches!(path.completion(), ResolutionCompletion::Incomplete(found)
+                                if found.iter().any(|reason| matches!(reason,
+                                    ResolutionIncompleteReason::UnsupportedSemantic(reason)
+                                        if reasons.contains(reason))))
+                                .then_some(*identity)
+                            })
+                            .collect::<Vec<_>>();
+                        self.levels[self.level].removals.extend(removals);
+                        self.levels[self.level].members.extend(classifiers);
+                        self.shape = self.shapes.len();
+                        return Ok(Continue);
+                    }
+                }
+            }
             let roots = [HierarchyRoot {
                 owner_path_prefix: None,
                 owner: ty.identity(),
@@ -843,27 +953,28 @@ impl DemandImplicitReceiverFrame {
         // Java sees JVM methods with an extension receiver as ordinary
         // members. Only the language rule with an extension phase separates
         // them from the current level's ordinary member inventory.
-        let extensions = if self.rule == ImplicitReceiverLookup::FirstApplicable {
-            let definitions = candidates.iter().copied().collect::<Vec<_>>();
-            let read = evaluation
-                .session
-                .signatures_for_definitions(&definitions)?;
-            let Some(signatures) = evaluation.accept_session_read(read) else {
-                return Ok(None);
+        let extensions =
+            if self.call.is_some() && self.rule == ImplicitReceiverLookup::FirstApplicable {
+                let definitions = candidates.iter().copied().collect::<Vec<_>>();
+                let read = evaluation
+                    .session
+                    .signatures_for_definitions(&definitions)?;
+                let Some(signatures) = evaluation.accept_session_read(read) else {
+                    return Ok(None);
+                };
+                signatures
+                    .iter()
+                    .filter_map(|signature| {
+                        let signature = signature.get(evaluation.session).row();
+                        signature
+                            .extension_receiver()
+                            .map(|_| signature.definition())
+                    })
+                    .collect::<HashSet<_>>()
+            } else {
+                HashSet::default()
             };
-            signatures
-                .iter()
-                .filter_map(|signature| {
-                    let signature = signature.get(evaluation.session).row();
-                    signature
-                        .extension_receiver()
-                        .map(|_| signature.definition())
-                })
-                .collect::<HashSet<_>>()
-        } else {
-            HashSet::default()
-        };
-        // A local lexical callable keeps priority over every implicit receiver.
+        // A local lexical binding keeps priority over every implicit receiver.
         // Use the source-issued binder paths, not names or dense node ordering.
         if let Some(outermost_executable) = self.chain.iter().rposition(|scope| {
             scope
@@ -966,7 +1077,7 @@ impl DemandImplicitReceiverFrame {
             }
             // Retain outer candidates as best-effort answers, carrying every
             // unexamined inner frontier so none can become a proven answer.
-            if self.rule == ImplicitReceiverLookup::FirstMemberName {
+            if self.call.is_none() || self.rule == ImplicitReceiverLookup::FirstMemberName {
                 continue;
             }
             let mut allowed = HashSet::default();
@@ -1082,7 +1193,15 @@ impl DemandImplicitReceiverFrame {
             completion: ResolutionCompletion::Complete,
         };
         let reference = self.seed.reference();
-        let call = self.call.get(evaluation.session).row().clone();
+        // Value lookup selects bindings, without invoking them or testing a
+        // callable signature. Locals and receiver properties use the same
+        // lexical paths and hierarchy completeness as calls.
+        let Some(call) = self.call else {
+            result.allowed.extend(targets.iter().copied());
+            return Ok(Some(result));
+        };
+        let call_row = call;
+        let call = call.get(evaluation.session).row().clone();
         let adapter = call_applicability_adapter(call.language());
         let mut targets = targets.iter().copied().collect::<Vec<_>>();
         targets.sort_unstable();
@@ -1111,7 +1230,7 @@ impl DemandImplicitReceiverFrame {
             if evaluation
                 .expand_types_in_call_position(
                     &[reference],
-                    &std::iter::once((reference, self.call)).collect(),
+                    &std::iter::once((reference, call_row)).collect(),
                     &mut projected,
                 )?
                 .is_none()
@@ -1268,7 +1387,8 @@ impl DemandReferenceEvaluationFrame {
         if self.implicit.is_none() {
             self.implicit = DemandImplicitReceiverFrame::new(
                 evaluation,
-                self.calls[&reference],
+                reference,
+                self.calls.get(&reference).copied(),
                 Arc::clone(self.implicit_answer.as_ref().unwrap()),
             )?;
             if self.implicit.is_none() {
@@ -1318,13 +1438,33 @@ impl DemandReferenceEvaluationFrame {
 }
 
 impl FactEvaluation<'_, '_> {
+    pub(super) fn uses_implicit_receiver_lookup(
+        &self,
+        reference: SemanticId,
+        call: Option<InternedFactRow<SelectedTypedRow<LoweredCallApplicabilityObligation>>>,
+    ) -> StoreResult<bool> {
+        if let Some(call) = call {
+            return Ok(implicit_receiver_call(call.get(self.session).row()));
+        }
+        // Dependencies may belong to a different language from the root query.
+        // A source without language metadata has not opted into value lookup.
+        let language = self
+            .session
+            .lexical_source
+            .semantic_language_of(reference, self.cancellation)?;
+        Ok(language.is_some_and(|language| {
+            call_applicability_adapter(language).implicit_receiver_value_lookup()
+        }))
+    }
+
     pub(super) fn replay_eager_implicit_receivers(
         &mut self,
-        call: InternedFactRow<SelectedTypedRow<LoweredCallApplicabilityObligation>>,
+        reference: SemanticId,
+        call: Option<InternedFactRow<SelectedTypedRow<LoweredCallApplicabilityObligation>>>,
         raw: SharedAnswer,
         previous_states: &StateMap,
     ) -> StoreResult<Option<ResolutionAnswer>> {
-        let Some(mut frame) = DemandImplicitReceiverFrame::new(self, call, raw)? else {
+        let Some(mut frame) = DemandImplicitReceiverFrame::new(self, reference, call, raw)? else {
             return Ok(None);
         };
         loop {

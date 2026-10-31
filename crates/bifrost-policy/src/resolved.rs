@@ -590,19 +590,6 @@ pub struct ResolvedEndpointSetDependency {
 }
 
 impl ResolvedEndpointSetDependency {
-    pub fn new(
-        source: PolicySourceIdentity,
-        semantic_hash: EndpointSetSemanticHash,
-        mut entries: Vec<PolicyDependencyPath>,
-    ) -> Self {
-        sort_dedup(&mut entries);
-        Self {
-            source,
-            semantic_hash,
-            entries,
-        }
-    }
-
     pub fn source(&self) -> &PolicySourceIdentity {
         &self.source
     }
@@ -1249,7 +1236,6 @@ pub struct LoadedPolicy {
     semantic_hash: PolicySemanticHash,
     schema_resolution: SchemaVersionResolution,
     resolved_selectors: Vec<ResolvedPolicySelector>,
-    selector_origins: Vec<SelectorOrigin>,
     catalogs: Vec<ResolvedCatalogIdentity>,
     endpoint_dependencies: Vec<ResolvedEndpointDependency>,
     match_directory_manifests: Vec<ResolvedMatchDirectoryManifest>,
@@ -1361,10 +1347,6 @@ impl LoadedPolicy {
             &endpoint_set_dependencies,
             &precedence_manifest,
         )?;
-        let selector_origins = resolved_selectors
-            .iter()
-            .map(|selector| selector.origin.clone())
-            .collect();
         Ok(Self {
             definition,
             source,
@@ -1372,7 +1354,6 @@ impl LoadedPolicy {
             semantic_hash,
             schema_resolution,
             resolved_selectors,
-            selector_origins,
             catalogs,
             endpoint_dependencies,
             match_directory_manifests,
@@ -1405,10 +1386,6 @@ impl LoadedPolicy {
 
     pub fn resolved_selectors(&self) -> &[ResolvedPolicySelector] {
         &self.resolved_selectors
-    }
-
-    pub fn selector_origins(&self) -> &[SelectorOrigin] {
-        &self.selector_origins
     }
 
     pub fn catalogs(&self) -> &[ResolvedCatalogIdentity] {

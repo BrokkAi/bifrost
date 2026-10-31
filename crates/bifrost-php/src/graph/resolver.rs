@@ -160,7 +160,7 @@ fn class_is_subtype_of_owner(
     class_unit: &CodeUnit,
     owner_fq_name: &str,
 ) -> bool {
-    let mut stack = php.get_direct_ancestors(class_unit);
+    let mut stack = php.get_direct_ancestors(class_unit).definite().to_vec();
     let mut visited = HashSet::default();
     while let Some(candidate) = stack.pop() {
         let candidate_fq_name = candidate.fq_name();
@@ -168,7 +168,7 @@ fn class_is_subtype_of_owner(
             return true;
         }
         if visited.insert(candidate_fq_name) {
-            stack.extend(php.get_direct_ancestors(&candidate));
+            stack.extend(php.get_direct_ancestors(&candidate).definite().to_vec());
         }
     }
     false

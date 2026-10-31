@@ -1660,7 +1660,7 @@ mod tests {
                         int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
                     ],
                     "rust_point_item_macro_decisions" => {
-                        vec![text(&blob_oid), text("src/lib.rs")]
+                        vec![text(&blob_oid), text("src/lib.rs"), Value::Blob(Vec::new())]
                     }
                     "rust_point_summary_importing_files" => {
                         vec![text(&target_blob_oid), text("src/inner.rs")]
@@ -1846,6 +1846,7 @@ mod tests {
                             int(0),
                             text("src/lib.rs"),
                             int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                            Value::Blob(Vec::new()),
                         ]
                     }
                     "rust_point_reference_module_placements"

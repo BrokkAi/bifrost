@@ -23,10 +23,7 @@ use brokk_bifrost_analysis::workspace_document::{
 
 use super::classification::{TextValidationError, validate_required_text};
 use super::definition::{PolicyCategoryId, PolicyId, PolicyIdentifierError};
-use super::retained::{
-    RetainedSize, retained_extra, retained_size_with_extra, retained_size_with_extras,
-    retained_size_with_field_extra,
-};
+use super::retained::{RetainedSize, retained_extra, retained_size_with_field_extra};
 
 pub const DEFAULT_POLICY_SCOPE_PATH: &str = ".bifrost/policy-scope.json";
 pub const MAX_POLICY_SCOPE_DOCUMENT_BYTES: u64 = 256 * 1024;
@@ -168,10 +165,6 @@ pub enum PolicyScopeSource {
 }
 
 impl PolicyScopeSource {
-    pub fn explicit(path: impl AsRef<Path>) -> Result<Self, PolicyScopeSourceError> {
-        Self::from_workspace_path(WorkspaceRelativePath::try_from_path(path.as_ref())?)
-    }
-
     pub fn explicit_portable(path: impl AsRef<str>) -> Result<Self, PolicyScopeSourceError> {
         Self::from_workspace_path(WorkspaceRelativePath::new(path)?)
     }
@@ -325,16 +318,6 @@ pub(crate) fn compare_scope_reviews(
     right: &PolicyScopeReview,
 ) -> Ordering {
     compare_scope_key(&left.entry, &right.entry)
-}
-
-/// Open a workspace capability once, then load and normalize its configured
-/// scope document. Only an actual missing file maps to `Ok(None)`.
-pub fn load_policy_scope(
-    workspace_root: &Path,
-    options: &PolicyScopeOptions,
-) -> Result<Option<PolicyScopeDocument>, PolicyScopeLoadError> {
-    let root = WorkspaceRoot::open(workspace_root).map_err(PolicyScopeLoadError::Workspace)?;
-    load_policy_scope_from_root(&root, options)
 }
 
 pub(crate) fn load_policy_scope_from_root(
@@ -717,30 +700,6 @@ impl RetainedSize for PolicyScopeEntry {
                     .iter()
                     .fold(0usize, |bytes, id| bytes.saturating_add(retained_extra(id))),
             )
-    }
-}
-
-impl RetainedSize for PolicyScopeDocument {
-    fn retained_size(&self) -> usize {
-        retained_size_with_extras(self, self.scopes.iter().map(RetainedSize::retained_size))
-    }
-}
-
-impl RetainedSize for PolicyScopeSource {
-    fn retained_size(&self) -> usize {
-        retained_size_with_extra(
-            self,
-            match self {
-                Self::Conventional => 0,
-                Self::Explicit(path) => retained_extra(path),
-            },
-        )
-    }
-}
-
-impl RetainedSize for PolicyScopeOptions {
-    fn retained_size(&self) -> usize {
-        retained_size_with_field_extra(self, &self.source)
     }
 }
 

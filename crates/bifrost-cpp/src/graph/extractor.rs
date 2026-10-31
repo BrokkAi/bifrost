@@ -8580,55 +8580,60 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .then_some(ctx.spec.owner.as_ref())
         .flatten()
     {
-        let resolution =
-            match resolve_active_using_enum_member(node, ctx) {
-                ActiveUsingEnumMemberResolution::Block(resolution) => resolution,
-                ActiveUsingEnumMemberResolution::Class(resolution) => {
+        let resolution = match resolve_active_using_enum_member(node, ctx) {
+            ActiveUsingEnumMemberResolution::Block(resolution) => resolution,
+            ActiveUsingEnumMemberResolution::Class(resolution) => {
+                if direct_class_member_shadows(node, ctx) {
+                    return;
+                }
+                resolution
+            }
+            ActiveUsingEnumMemberResolution::Namespace(resolution) => {
+                if let Some(owner) = structured_enclosing_owner(node, ctx) {
                     if direct_class_member_shadows(node, ctx) {
                         return;
                     }
-                    resolution
-                }
-                ActiveUsingEnumMemberResolution::Namespace(resolution) => {
-                    if let Some(owner) = structured_enclosing_owner(node, ctx) {
-                        if direct_class_member_shadows(node, ctx) {
-                            return;
-                        }
-                        let complete_same_file_leaf =
-                            owner.source() == ctx.file
-                                && ctx.analyzer.type_hierarchy_provider().is_some_and(
-                                    |hierarchy| hierarchy.get_direct_ancestors(&owner).is_empty(),
-                                );
-                        if !complete_same_file_leaf {
-                            push_unproven_hit(node, ctx);
-                            return;
-                        }
-                    }
-                    match owner_context {
-                        StructuredOwnerContextResolution::SelfTarget
-                        | StructuredOwnerContextResolution::InheritedTarget
-                        | StructuredOwnerContextResolution::NonTarget => return,
-                        StructuredOwnerContextResolution::Ambiguous => {
-                            push_unproven_hit(node, ctx);
-                            return;
-                        }
-                        StructuredOwnerContextResolution::Missing => {}
-                    }
-                    if namespace_value_shadows(node, ctx) {
+                    let complete_same_file_leaf = owner.source() == ctx.file
+                        && ctx
+                            .analyzer
+                            .type_hierarchy_provider()
+                            .is_some_and(|hierarchy| {
+                                hierarchy
+                                    .get_direct_ancestors(&owner)
+                                    .definite()
+                                    .to_vec()
+                                    .is_empty()
+                            });
+                    if !complete_same_file_leaf {
+                        push_unproven_hit(node, ctx);
                         return;
                     }
-                    resolution
                 }
-                ActiveUsingEnumMemberResolution::Missing => {
-                    if direct_class_member_shadows(node, ctx)
-                        || (structured_enclosing_owner(node, ctx).is_none()
-                            && namespace_value_shadows(node, ctx))
-                    {
+                match owner_context {
+                    StructuredOwnerContextResolution::SelfTarget
+                    | StructuredOwnerContextResolution::InheritedTarget
+                    | StructuredOwnerContextResolution::NonTarget => return,
+                    StructuredOwnerContextResolution::Ambiguous => {
+                        push_unproven_hit(node, ctx);
                         return;
                     }
-                    UsingEnumMemberResolution::Missing
+                    StructuredOwnerContextResolution::Missing => {}
                 }
-            };
+                if namespace_value_shadows(node, ctx) {
+                    return;
+                }
+                resolution
+            }
+            ActiveUsingEnumMemberResolution::Missing => {
+                if direct_class_member_shadows(node, ctx)
+                    || (structured_enclosing_owner(node, ctx).is_none()
+                        && namespace_value_shadows(node, ctx))
+                {
+                    return;
+                }
+                UsingEnumMemberResolution::Missing
+            }
+        };
         match resolution {
             UsingEnumMemberResolution::Resolved { owner, member }
                 if same_visible_symbol(&owner, target_owner)
@@ -13864,7 +13869,10 @@ fn indexed_declaring_owner_for_recovered_member(
         return EnclosingMemberOwnerResolution::Owner(receiver_owner);
     }
 
-    let mut stack = hierarchy.get_direct_ancestors(&receiver_owner);
+    let mut stack = hierarchy
+        .get_direct_ancestors(&receiver_owner)
+        .definite()
+        .to_vec();
     let mut propagated_counts: HashMap<CodeUnit, u8> = HashMap::default();
     let mut declaring_owner = None;
     while let Some(raw_owner) = stack.pop() {
@@ -13886,7 +13894,7 @@ fn indexed_declaring_owner_for_recovered_member(
             declaring_owner = Some(owner);
             continue;
         }
-        stack.extend(hierarchy.get_direct_ancestors(&owner));
+        stack.extend(hierarchy.get_direct_ancestors(&owner).definite().to_vec());
     }
     declaring_owner
         .map(EnclosingMemberOwnerResolution::Owner)

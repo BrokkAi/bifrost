@@ -178,6 +178,7 @@ fn record_external_inputs(
             ".mvn/maven.config",
             ".mvn/jvm.config",
             ".mvn/extensions.xml",
+            ".mvn/wrapper/maven-wrapper.properties",
         ]
         .map(std::path::PathBuf::from),
     );
@@ -215,6 +216,75 @@ mod tests {
         AnalyzerConfig, ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadKey,
         ReadVerdict, capture_query_reads,
     };
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8148: a binary .mvn/wrapper/maven-wrapper.jar authority input refused every JVM external index fill"
+    )]
+    fn binary_wrapper_inputs_retain_external_index_and_properties_invalidate() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("App.java", "class App {}")
+            .file("pom.xml", "<project/>")
+            .file(".mvn/wrapper/maven-wrapper.jar", "PK\0\0")
+            .file("buildSrc/resource.bin", "binary\0resource")
+            .file(
+                ".mvn/wrapper/maven-wrapper.properties",
+                "distributionUrl=first",
+            )
+            .build();
+        for path in [".mvn/wrapper/maven-wrapper.jar", "buildSrc/resource.bin"] {
+            std::fs::write(project.file(path).abs_path(), b"PK\0\xff").unwrap();
+        }
+        let base = project.workspace_analyzer(AnalyzerConfig::default());
+        let java = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            crate::analyzer::java::JavaAnalyzer,
+        >(base.analyzer())
+        .unwrap();
+        let (first, reads) =
+            capture_query_reads(base.analyzer(), || java.external_declaration_index());
+        let (second, warm) =
+            capture_query_reads(base.analyzer(), || java.external_declaration_index());
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "external index rebuilt"
+        );
+        assert_eq!(reads.unattributed_reads(), 0, "{reads:?}");
+        assert_eq!(warm.unattributed_reads(), 0, "{warm:?}");
+        assert_eq!(reads.keys(), warm.keys());
+        assert!(
+            warm.keys()
+                .iter()
+                .any(|key| matches!(key, ReadKey::File { rel_path, .. }
+            if rel_path.as_ref() == "buildSrc/resource.bin")),
+            "{warm:?}"
+        );
+        assert!(
+            !warm
+                .keys()
+                .iter()
+                .any(|key| matches!(key, ReadKey::File { rel_path, .. }
+            if rel_path.as_ref() == ".mvn/wrapper/maven-wrapper.jar")),
+            "{warm:?}"
+        );
+        let verify = |head: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer| {
+            brokk_bifrost_analysis::analyzer::read_verification::verify_read_set(
+                head,
+                &ChangedFacts::between(&base, head),
+                &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                &warm.keys(),
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            )
+        };
+        assert_eq!(verify(&base), ReadVerdict::Unchanged);
+        project
+            .file(".mvn/wrapper/maven-wrapper.properties")
+            .write("distributionUrl=second")
+            .unwrap();
+        let edited = project.workspace_analyzer(AnalyzerConfig::default());
+        assert_ne!(verify(&edited), ReadVerdict::Unchanged);
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(

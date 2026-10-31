@@ -18,6 +18,7 @@ use super::super::flow_state::{
     flow_state_for_file_with_snapshot, flow_state_for_materialized_artifact,
     flow_state_for_materialized_procedure, flow_state_for_selected_property,
 };
+use super::Incompleteness;
 use super::results::{
     CodeQueryBindingInitializerCall, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryFlowRelation, CodeQueryRange, CodeQueryStateEvent,
@@ -277,14 +278,18 @@ impl FlowStateTraversalCache {
             self.active_semantic_model_snapshot
                 .read(&memo_attribution(workspace.analyzer()), Clone::clone),
         );
-        Arc::new(flow_state_for_selected_property(
+        let derived = Arc::new(flow_state_for_selected_property(
             workspace,
             file,
             &state,
             procedure,
             point,
             &mut request,
-        ))
+        ));
+        if request.refusal_count() > 0 {
+            workspace.analyzer().mark_execution_dependent();
+        }
+        derived
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -406,7 +411,8 @@ impl FlowStateTraversalCache {
                 .filter(|axis| !completeness.covers(**axis))
                 .map(|axis| axis.label())
                 .collect::<Vec<_>>();
-            diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+            diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: match cause { Some(cause) => Incompleteness::Operational(cause), None => Incompleteness::Content },
                 related,
                 source,
                 code,
@@ -419,7 +425,7 @@ impl FlowStateTraversalCache {
                 ),
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            }, cause));
+            }), cause));
         }
     }
 }
@@ -442,7 +448,7 @@ pub(super) const FLOW_RELATION_AXES: &[FlowStateAxis] = &[
 ///
 /// Total on purpose: a reason added to the derivation layer must be classified
 /// here deliberately rather than defaulting into a generic message.
-fn classify_reason(
+pub(super) fn classify_reason(
     reason: &FlowStateIncompleteReason,
 ) -> (
     CodeQueryDiagnosticCode,

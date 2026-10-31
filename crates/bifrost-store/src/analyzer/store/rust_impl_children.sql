@@ -60,7 +60,7 @@ WITH subjects AS (
   AND child.owner_declaration_id=impl.impl_declaration_id
  CROSS JOIN source_declaration_units AS units
    ON units.blob_id=child.blob_id AND units.declaration_id=child.declaration_id
- WHERE impl.subject_declaration_blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust')
+ WHERE impl.subject_declaration_blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust' AND parse_variant=x'')
   AND impl.subject_declaration_site IN (SELECT source_site FROM subjects)
   AND impl.subject_rel_path=?2
 )

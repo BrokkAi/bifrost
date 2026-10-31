@@ -22,8 +22,7 @@ use super::definition::{PolicyId, PolicyIdentifierError, Sha256ValueError, parse
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::identity::PolicySemanticHash;
 use super::retained::{
-    RetainedSize, retained_extra, retained_size_with_extra, retained_size_with_extras,
-    retained_size_with_field_extra,
+    RetainedSize, retained_extra, retained_size_with_extras, retained_size_with_field_extra,
 };
 use super::scope::{PolicyScopeDocumentState, PolicyScopeOptions};
 
@@ -551,10 +550,6 @@ impl PolicyReportEvaluationContext {
 
     pub const fn evaluation_date(&self) -> PolicyEvaluationDate {
         self.evaluation_date
-    }
-
-    pub fn scope_path(&self) -> &str {
-        &self.scope_path
     }
 
     pub const fn scope_document_state(&self) -> PolicyScopeDocumentState {
@@ -1294,46 +1289,6 @@ pub(crate) fn bounded_json_error_message(message: &str) -> Box<str> {
         end -= 1;
     }
     format!("{}...", &message[..end]).into_boxed_str()
-}
-
-impl RetainedSize for PolicySuppressionRecord {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.policy_id))
-            .saturating_add(retained_extra(&self.path))
-            .saturating_add(retained_extra(&self.reason))
-            .saturating_add(retained_extra(&self.policy_hash_at_acceptance))
-            .saturating_add(retained_extra(&self.accepted_by))
-            .saturating_add(retained_extra(&self.accepted_at))
-            .saturating_add(retained_extra(&self.expires_at))
-    }
-}
-
-impl RetainedSize for PolicySuppressionDocument {
-    fn retained_size(&self) -> usize {
-        retained_size_with_extras(
-            self,
-            self.suppressions.iter().map(RetainedSize::retained_size),
-        )
-    }
-}
-
-impl RetainedSize for PolicySuppressionSource {
-    fn retained_size(&self) -> usize {
-        retained_size_with_extra(
-            self,
-            match self {
-                Self::Conventional => 0,
-                Self::Explicit(path) => retained_extra(path),
-            },
-        )
-    }
-}
-
-impl RetainedSize for PolicySuppressionOptions {
-    fn retained_size(&self) -> usize {
-        retained_size_with_field_extra(self, &self.source)
-    }
 }
 
 impl RetainedSize for PolicyReportEvaluationContext {

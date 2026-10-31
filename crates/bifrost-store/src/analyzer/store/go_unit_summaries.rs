@@ -131,7 +131,7 @@ pub(crate) const UNIT_MEMBERS_SQL: &str =
     "SELECT blobs.id, files.blob_oid, files.rel_path, files.source_role
      FROM temp.go_summary_source_files AS files
      LEFT JOIN main.blobs AS blobs
-       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.generation = ?4
+       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
      WHERE files.context_id = ?1 AND files.package_id = ?2 AND files.source_role IN ('go', ?3)
      ORDER BY files.rel_path, files.source_role";
 
@@ -183,7 +183,7 @@ const UNIT_IMPORT_ROWS_SQL: &str = "SELECT imports.import_role, imports.source_s
 pub(crate) const MEMBERS_WITHOUT_BUNDLE_SQL: &str = "SELECT files.rel_path
      FROM temp.go_summary_source_files AS files
      JOIN main.blobs AS blobs
-       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.generation = ?4
+       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
      WHERE files.context_id = ?1 AND files.package_id = ?2 AND files.source_role IN ('go', ?3)
        AND NOT EXISTS (
          SELECT 1 FROM main.resolution_fragment_interiors AS interiors
@@ -198,7 +198,7 @@ pub(crate) const UNIT_EXPORTS_SQL: &str =
        members.namespace, catalog.shared_identity, identities.spelling, identities.identity_digest
      FROM temp.go_summary_source_files AS files
      JOIN main.blobs AS blobs
-       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.generation = ?4
+       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
      JOIN main.resolution_fragment_interiors AS interiors
        ON interiors.blob_id = blobs.id AND interiors.publication_state = 'complete'
       AND interiors.producer_epoch = ?5
@@ -220,7 +220,7 @@ pub(crate) const UNIT_ALIAS_EXPORTS_SQL: &str =
        imported.import_id, target_type.kind
      FROM temp.go_summary_source_files AS files
      JOIN main.blobs AS blobs
-       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.generation = ?4
+       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
      JOIN main.resolution_fragment_interiors AS interiors
        ON interiors.blob_id = blobs.id AND interiors.publication_state = 'complete'
       AND interiors.producer_epoch = ?5
@@ -245,6 +245,7 @@ pub(crate) const UNIT_ALIAS_EXPORTS_SQL: &str =
          JOIN main.blobs AS selected_blob
            ON selected_blob.blob_oid = selected_file.blob_oid
           AND selected_blob.lang = 'go' AND selected_blob.generation = ?4
+          AND selected_blob.parse_variant = x''
          WHERE selected_file.context_id = ?1 AND selected_file.package_id = ?2
            AND selected_file.source_role IN ('go', ?3)
        )
@@ -307,7 +308,7 @@ pub(crate) const UNIT_IMPORTS_SQL: &str = "SELECT blobs.id, files.source_role, s
        imports.definition_key, imports.kind, segments.segment
      FROM temp.go_summary_source_files AS files
      JOIN main.blobs AS blobs
-       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.generation = ?4
+       ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
      JOIN main.source_imports AS source_imports ON source_imports.blob_id = blobs.id
      LEFT JOIN main.resolution_go_package_imports AS imports
        ON imports.blob_id = source_imports.blob_id

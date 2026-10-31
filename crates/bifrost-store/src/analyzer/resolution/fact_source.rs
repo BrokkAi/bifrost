@@ -177,6 +177,15 @@ pub struct GoModelMemberDeclaration {
     pub declaration: crate::analyzer::semantic_model::overlay::SemanticModelSymbol,
 }
 
+/// A reached callable and its native signature, retained only for this query.
+#[derive(Debug, Clone)]
+pub struct ModelCallableResultDeclaration {
+    pub member: crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+    pub selection: crate::analyzer::semantic_model::overlay::ModelProviderSelection,
+    pub declaration: crate::analyzer::semantic_model::overlay::SemanticModelSymbol,
+    pub signature: Option<super::LoweredCallableSignatureProperty>,
+}
+
 /// One reached modeled receiver candidate. This is query-only provenance,
 /// never a source declaration, inventory ordinal, snapshot, or persisted row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2085,7 +2094,16 @@ pub trait SelectedTypedFactSource {
         _session: Option<
             &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
         >,
-    ) -> StoreResult<Option<Option<String>>> {
+    ) -> StoreResult<Option<Option<ModelCallableResultDeclaration>>> {
+        Ok((!cancellation.is_cancelled()).then_some(None))
+    }
+
+    /// A reached selected model member callable. No source or durable inventory is minted.
+    fn model_member_callable_result(
+        &self,
+        _member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<ModelCallableResultDeclaration>>> {
         Ok((!cancellation.is_cancelled()).then_some(None))
     }
 

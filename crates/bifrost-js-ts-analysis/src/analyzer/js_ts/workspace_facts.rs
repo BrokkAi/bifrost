@@ -72,7 +72,11 @@ pub(super) fn descendants(
                 .collect::<Vec<_>>();
             let ancestors = classes
                 .iter()
-                .flat_map(|class| super::providers::get_direct_ancestors(host, class))
+                .flat_map(|class| {
+                    super::providers::get_direct_ancestors(host, class)
+                        .definite()
+                        .to_vec()
+                })
                 .collect::<Vec<_>>();
             classes.extend(ancestors);
             classes.sort();
@@ -657,7 +661,10 @@ mod tests {
         analyzer
             .inner()
             .analyzer_store()
-            .mark_parsed_blob_incomplete_for_test(oid, "javascript");
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                "javascript",
+            ));
         workspace
             .analyzer()
             .test_hooks()

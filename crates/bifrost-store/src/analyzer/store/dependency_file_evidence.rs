@@ -16,7 +16,7 @@ const PRODUCER: &[u8] = b"bifrost.static-dependency-evidence.v3";
 pub(super) const READ_ROWS_SQL: &str = "SELECT ecosystem,package,kind,version_requirement,exact_version,source,locator,declared_by,scope,conditions,build_file,source_digest,start_byte,end_byte,complete FROM dependency_file_evidence WHERE set_id = ?1 ORDER BY id";
 
 fn supports_language(language: &str) -> bool {
-    matches!(language, "rust" | "javascript" | "typescript:ts")
+    matches!(language, "rust" | "javascript" | "typescript:ts" | "csharp")
 }
 
 fn prepare_selected(
@@ -29,6 +29,7 @@ fn prepare_selected(
         "rust" => crate::analyzer::Language::Rust,
         "javascript" => crate::analyzer::Language::JavaScript,
         "typescript:ts" => crate::analyzer::Language::TypeScript,
+        "csharp" => crate::analyzer::Language::CSharp,
         _ => unreachable!("unsupported dependency evidence language: {language}"),
     };
     crate::analyzer::store::store_language_support_for_hook(
@@ -97,7 +98,9 @@ fn selected_inputs<'a>(
     let mut selected = Vec::new();
     let mut gaps = Vec::new();
     let mut bytes = 0_usize;
-    let mut statement = conn.prepare_cached("SELECT versions.rel_path, length(retained.source_bytes), substr(retained.source_bytes,1,?5) FROM workspace_file_versions AS versions JOIN workspace_input_sources AS retained ON retained.content_oid=versions.blob_oid WHERE versions.workspace_id=?1 AND versions.lang=?2 AND versions.generation=?3 AND versions.input_kind='configuration' AND versions.valid_from<=?4 AND (versions.valid_until IS NULL OR versions.valid_until>?4) ORDER BY versions.rel_path LIMIT ?6")?;
+    // C# retains an absent input as an empty blob, and SQLite's substr of a
+    // zero-length blob is NULL rather than an empty blob.
+    let mut statement = conn.prepare_cached("SELECT versions.rel_path, length(retained.source_bytes), ifnull(substr(retained.source_bytes,1,?5),x'') FROM workspace_file_versions AS versions JOIN workspace_input_sources AS retained ON retained.content_oid=versions.blob_oid WHERE versions.workspace_id=?1 AND versions.lang=?2 AND versions.generation=?3 AND versions.input_kind='configuration' AND versions.valid_from<=?4 AND (versions.valid_until IS NULL OR versions.valid_until>?4) ORDER BY versions.rel_path LIMIT ?6")?;
     let mut rows = statement.query(params![
         snapshot.workspace_id.as_str(),
         snapshot.lang,
@@ -413,6 +416,7 @@ pub fn publish_overlay(
         crate::analyzer::Language::Rust => "rust",
         crate::analyzer::Language::JavaScript => "javascript",
         crate::analyzer::Language::TypeScript => "typescript:ts",
+        crate::analyzer::Language::CSharp => "csharp",
         _ => return Ok(None),
     };
     let snapshot = snapshots.get(key).ok_or_else(|| {

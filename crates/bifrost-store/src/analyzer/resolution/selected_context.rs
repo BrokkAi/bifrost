@@ -964,6 +964,61 @@ pub enum ExternalOwnerLanguage {
     Go,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static JVM_PROVIDER_TYPE_REFERENCE_WATCH: std::cell::RefCell<Option<Vec<(String, usize)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A bounded, thread-local observation of real provider registrations. It owns
+/// no reference map or workspace inventory and cannot move to another thread.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct JvmProviderTypeReferenceWatchForTest(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl JvmProviderTypeReferenceWatchForTest {
+    /// Complete counts for the explicitly bounded watched owner set.
+    pub fn claims(&self) -> Vec<(String, usize)> {
+        JVM_PROVIDER_TYPE_REFERENCE_WATCH.with(|watch| {
+            watch
+                .borrow()
+                .as_ref()
+                .expect("provider watch is active")
+                .clone()
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for JvmProviderTypeReferenceWatchForTest {
+    fn drop(&mut self) {
+        JVM_PROVIDER_TYPE_REFERENCE_WATCH.with(|watch| {
+            watch.borrow_mut().take().expect("provider watch is active");
+        });
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn watch_jvm_provider_type_references_for_test(
+    owners: &[&str],
+) -> JvmProviderTypeReferenceWatchForTest {
+    assert!(
+        owners.len() <= 16,
+        "a provider watch is bounded to sixteen owner names"
+    );
+    JVM_PROVIDER_TYPE_REFERENCE_WATCH.with(|watch| {
+        let previous = watch.borrow_mut().replace(
+            owners
+                .iter()
+                .map(|owner| ((*owner).to_owned(), 0))
+                .collect(),
+        );
+        assert!(previous.is_none(), "provider watches do not nest");
+    });
+    JvmProviderTypeReferenceWatchForTest(std::marker::PhantomData)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JvmExternalTypeIdentityClaim {
     Provider(ExternalOwnerLanguage, SemanticId),
@@ -1745,6 +1800,20 @@ impl SelectedContextIdentities {
                 || matches!(previous, JvmExternalTypeIdentityClaim::ImplicitFallback(_))),
             "one TypeIdentity reference names one external provider type"
         );
+        #[cfg(any(test, feature = "test-support"))]
+        if language == ExternalOwnerLanguage::Jvm {
+            JVM_PROVIDER_TYPE_REFERENCE_WATCH.with(|watch| {
+                if let Some(watched) = watch.borrow_mut().as_mut()
+                    && let Some(owner) = self.external_owner_identity(identity)
+                {
+                    for (name, claims) in watched {
+                        if owner.owner_fqn.as_ref() == name.as_str() {
+                            *claims += 1;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     /// A complete-empty scope answer may use this provider name as its nominal
@@ -1983,6 +2052,14 @@ impl SelectedContextIdentities {
             old.is_none_or(|old| old == *member),
             "one model member token has one provider coordinate"
         );
+    }
+
+    pub(crate) fn has_model_members(&self) -> bool {
+        !self
+            .model_members
+            .lock()
+            .expect("model members are not poisoned")
+            .is_empty()
     }
 
     pub(crate) fn model_member_identity(

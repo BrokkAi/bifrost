@@ -26,8 +26,8 @@ pub(super) const NAMING: &str = include_str!("rust_crate_point_naming.sql");
 /// One file's selected blob and its selected mount ordinal, both keyed on the
 /// same workspace-relative path, in one statement. Either can be absent: a
 /// content mount has no file version and an unselected file has no mount.
-pub(super) const FILE_BLOB_AND_MOUNT: &str = "SELECT (SELECT blobs.id FROM selected_workspace_file_versions AS files CROSS JOIN blobs ON blobs.lang=files.lang AND blobs.blob_oid=files.blob_oid WHERE files.lang='rust' AND files.rel_path=?1), mount.mount_ordinal, mount.semantic_language FROM (SELECT 1) AS requested LEFT JOIN temp.selected_resolution_mounts AS mount ON mount.storage_language='rust' AND mount.persisted_relative_path=?1";
-pub(super) const FILE_BLOB: &str = "SELECT blobs.id FROM selected_workspace_file_versions AS files CROSS JOIN blobs ON blobs.lang=files.lang AND blobs.blob_oid=files.blob_oid WHERE files.lang='rust' AND files.rel_path=?1";
+pub(super) const FILE_BLOB_AND_MOUNT: &str = "SELECT (SELECT blobs.id FROM selected_workspace_file_versions AS files CROSS JOIN blobs ON blobs.lang=files.lang AND blobs.blob_oid=files.blob_oid AND blobs.parse_variant=files.parse_variant WHERE files.lang='rust' AND files.rel_path=?1), mount.mount_ordinal, mount.semantic_language FROM (SELECT 1) AS requested LEFT JOIN temp.selected_resolution_mounts AS mount ON mount.storage_language='rust' AND mount.persisted_relative_path=?1";
+pub(super) const FILE_BLOB: &str = "SELECT blobs.id FROM selected_workspace_file_versions AS files CROSS JOIN blobs ON blobs.lang=files.lang AND blobs.blob_oid=files.blob_oid AND blobs.parse_variant=files.parse_variant WHERE files.lang='rust' AND files.rel_path=?1";
 pub(super) const MACRO_IMPORT_TARGET_RANGE: &str = "SELECT
  json_extract(spans, '$[' || ?2 || '][0]'),
  json_extract(spans, '$[' || ?2 || '][1]')
@@ -41,7 +41,7 @@ WITH RECURSIVE selected_members(
         member.member_ordinal, member.blob_id
  FROM selected_workspace_file_versions AS files
  CROSS JOIN main.blobs AS blob
-  ON blob.lang=files.lang AND blob.blob_oid=files.blob_oid
+  ON blob.lang=files.lang AND blob.blob_oid=files.blob_oid AND blob.parse_variant=files.parse_variant
  AND blob.generation=files.generation
  CROSS JOIN main.resolution_unit_summary_members AS member
   INDEXED BY resolution_unit_summary_members_blob
@@ -4637,27 +4637,27 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         (
             "rust_point_store_trait_impl_rows",
             super::super::RUST_TRAIT_IMPL_ROWS_SQL.as_str(),
-            4,
+            5,
         ),
         (
             "rust_point_store_traits_of_impl",
             super::super::RUST_TRAITS_OF_IMPL_SQL.as_str(),
-            4,
+            5,
         ),
         (
             "rust_point_store_trait_impl_spellings",
             super::super::RUST_TRAIT_IMPL_SPELLINGS_SQL.as_str(),
-            4,
+            5,
         ),
         (
             "rust_point_store_traits_implemented_by",
             super::super::RUST_TRAITS_IMPLEMENTED_BY_SQL.as_str(),
-            4,
+            5,
         ),
         (
             "rust_point_store_types_implementing",
             super::super::RUST_TYPES_IMPLEMENTING_SQL.as_str(),
-            4,
+            5,
         ),
         (
             "rust_point_reference_names_macro_module",

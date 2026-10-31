@@ -119,8 +119,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -130,7 +129,13 @@ mod jvm_extraction_tests {
 
         let store = AnalyzerStore::open_persistent(&store_path).unwrap();
         let hydrated = store
-            .hydrate_file_state_with_source(oid, "java", generation, &JavaAdapter, &file, source)
+            .hydrate_file_state_with_source(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                generation,
+                &JavaAdapter,
+                &file,
+                source,
+            )
             .unwrap()
             .expect("single-file hydration");
         assert_eq!(
@@ -142,7 +147,7 @@ mod jvm_extraction_tests {
         let bulk = store
             .hydrate_file_states(
                 &[(file.clone(), oid)],
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "java"),
                 &JavaAdapter,
                 &HashMap::from_iter([(file.clone(), source.to_string())]),
             )
@@ -166,8 +171,7 @@ mod jvm_extraction_tests {
         drop(conn);
 
         let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
             generation,
             &JavaAdapter,
             Arc::new(state.clone()),
@@ -186,8 +190,7 @@ mod jvm_extraction_tests {
             assert_eq!(
                 persisted_blob_mutation_cost_fallback_statement(
                     &mut statement,
-                    oid.to_string().as_str(),
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 )
                 .unwrap(),
                 PersistedMutationCost {
@@ -259,8 +262,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -303,8 +305,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -312,7 +313,11 @@ mod jvm_extraction_tests {
             .unwrap();
 
         let ordinary = store
-            .content_package_limited(oid, "java", generation, 1)
+            .content_package_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                generation,
+                1,
+            )
             .unwrap();
         assert!(ordinary.complete);
         assert_eq!(ordinary.rows, vec!["demo".to_string()]);
@@ -337,7 +342,11 @@ mod jvm_extraction_tests {
         }
 
         let limited = store
-            .content_package_limited(oid, "java", generation, 1)
+            .content_package_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                generation,
+                1,
+            )
             .unwrap();
         assert!(!limited.complete);
         assert!(limited.rows.is_empty());
@@ -360,8 +369,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -370,8 +378,7 @@ mod jvm_extraction_tests {
 
         let ordinary = store
             .first_declaration_content_qualifier_for_key_limited(
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 usize::MAX,
             )
@@ -416,7 +423,11 @@ mod jvm_extraction_tests {
         }
 
         let package = store
-            .content_package_limited(oid, "java", generation, 1)
+            .content_package_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                generation,
+                1,
+            )
             .unwrap();
         assert!(package.complete);
         assert_eq!(package.rows, vec![String::new()]);
@@ -424,8 +435,7 @@ mod jvm_extraction_tests {
 
         let limited = store
             .first_declaration_content_qualifier_for_key_limited(
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 usize::MAX,
             )
@@ -458,8 +468,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -497,14 +506,22 @@ mod jvm_extraction_tests {
         }
 
         let tiny = store
-            .first_declaration_content_qualifier_for_key_limited(oid, "java", generation, 1)
+            .first_declaration_content_qualifier_for_key_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                generation,
+                1,
+            )
             .unwrap();
         assert!(!tiny.complete);
         assert!(tiny.rows.is_empty());
         assert_eq!(tiny.inspected, 1);
 
         let sufficient = store
-            .first_declaration_content_qualifier_for_key_limited(oid, "java", generation, 2)
+            .first_declaration_content_qualifier_for_key_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                generation,
+                2,
+            )
             .unwrap();
         assert!(sufficient.complete);
         assert_eq!(sufficient.rows, vec!["late.namespace".to_string()]);
@@ -540,8 +557,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "scala",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
                 generation,
                 &ScalaAdapter,
                 &state,
@@ -563,7 +579,12 @@ mod jvm_extraction_tests {
             );
         }
         let raw = store
-            .raw_supertypes_for_unit_limited(oid, "scala", generation, &target, usize::MAX)
+            .raw_supertypes_for_unit_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
+                generation,
+                &target,
+                usize::MAX,
+            )
             .unwrap();
         assert!(!raw.complete);
         assert!(raw.rows.is_empty());
@@ -583,7 +604,12 @@ mod jvm_extraction_tests {
             );
         }
         let lookup_paths = store
-            .supertype_lookup_paths_for_unit_limited(oid, "scala", generation, &target, usize::MAX)
+            .supertype_lookup_paths_for_unit_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
+                generation,
+                &target,
+                usize::MAX,
+            )
             .unwrap();
         assert!(!lookup_paths.complete);
         assert!(lookup_paths.rows.is_empty());
@@ -606,8 +632,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -673,8 +698,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 state.as_ref(),
@@ -712,8 +736,7 @@ mod jvm_extraction_tests {
                     store
                         .write_parsed_blob_at_generation(
                             &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                            extra_oid,
-                            "java",
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(extra_oid, "java"),
                             generation,
                             &JavaAdapter,
                             &extra_state,
@@ -747,7 +770,10 @@ mod jvm_extraction_tests {
                     let hydrated = store
                         .hydrate_file_states(
                             &[(file.clone(), oid)],
-                            "java",
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                git2::Oid::zero(),
+                                "java",
+                            ),
                             &JavaAdapter,
                             &HashMap::default(),
                         )
@@ -951,7 +977,11 @@ mod jvm_extraction_tests {
             Arc::new(AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap());
         for (oid, file) in [(alpha_oid, &alpha_file), (beta_oid, &beta_file)] {
             store
-                .write_parsed_blob(oid, "java", &JavaAdapter, &parse_state(&JavaAdapter, file))
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    &JavaAdapter,
+                    &parse_state(&JavaAdapter, file),
+                )
                 .unwrap();
         }
         let generations = Arc::new(
@@ -973,7 +1003,12 @@ mod jvm_extraction_tests {
                             .search_candidate_name_rows_for_langs(
                                 &["java".to_string()],
                                 &generations,
-                                &[ActiveSearchBlob::unfiltered(expected_oid)],
+                                &[ActiveSearchBlob::unfiltered(
+                                    brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                        expected_oid,
+                                        "java",
+                                    ),
+                                )],
                                 Some(&[vec!["Service".to_string()]]),
                                 None,
                             )
@@ -1003,7 +1038,11 @@ mod jvm_extraction_tests {
         let oid = oid_for(file.read_to_string().unwrap().as_bytes());
         let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
         store
-            .write_parsed_blob(oid, "java", &JavaAdapter, &parse_state(&JavaAdapter, &file))
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &JavaAdapter,
+                &parse_state(&JavaAdapter, &file),
+            )
             .unwrap();
         let languages = vec!["java".to_string()];
         let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
@@ -1023,7 +1062,12 @@ mod jvm_extraction_tests {
                 .collect::<std::collections::BTreeSet<_>>()
         };
 
-        let all = scan(ActiveSearchBlob::unfiltered(oid), None);
+        let all = scan(
+            ActiveSearchBlob::unfiltered(brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "java",
+            )),
+            None,
+        );
         assert!(
             all.contains("AlphaService")
                 && all.contains("BetaWorker")
@@ -1032,7 +1076,9 @@ mod jvm_extraction_tests {
         );
 
         let beta = scan(
-            ActiveSearchBlob::unfiltered(oid),
+            ActiveSearchBlob::unfiltered(brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "java",
+            )),
             Some(&[vec!["betaworker".to_string()]]),
         );
         assert!(
@@ -1043,7 +1089,9 @@ mod jvm_extraction_tests {
 
         assert!(
             scan(
-                ActiveSearchBlob::unfiltered(oid),
+                ActiveSearchBlob::unfiltered(brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "java"
+                )),
                 Some(&[vec!["zzz".to_string()]])
             )
             .is_empty(),
@@ -1055,7 +1103,7 @@ mod jvm_extraction_tests {
         assert_eq!(
             scan(
                 ActiveSearchBlob {
-                    oid,
+                    key: brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     package_literals: "zzz".to_string(),
                     prefilter_exempt: false,
                 },
@@ -1068,7 +1116,7 @@ mod jvm_extraction_tests {
         assert_eq!(
             scan(
                 ActiveSearchBlob {
-                    oid,
+                    key: brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     package_literals: String::new(),
                     prefilter_exempt: true,
                 },
@@ -1094,7 +1142,11 @@ mod jvm_extraction_tests {
             let file = write_file(root, path, source);
             let oid = oid_for(source.as_bytes());
             store
-                .write_parsed_blob(oid, "java", &adapter, &parse_state(&adapter, &file))
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    &adapter,
+                    &parse_state(&adapter, &file),
+                )
                 .unwrap();
         }
 
@@ -1152,13 +1204,16 @@ mod jvm_extraction_tests {
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "java", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &adapter,
+                &state,
+            )
             .unwrap();
 
         let projection = store
             .summary_file_projection(
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 GenerationId::BOOTSTRAP,
                 &adapter,
                 &file,
@@ -1167,7 +1222,11 @@ mod jvm_extraction_tests {
             .unwrap()
             .expect("complete summary projection");
         let hydrated = store
-            .hydrate_file_state(oid, "java", &adapter, &file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &adapter,
+                &file,
+            )
             .unwrap()
             .expect("complete file state");
         let hydrated_top_level: Vec<_> = hydrated
@@ -1197,8 +1256,7 @@ mod jvm_extraction_tests {
         assert!(
             store
                 .summary_file_projection(
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     GenerationId::BOOTSTRAP,
                     &adapter,
                     &file,
@@ -1223,12 +1281,19 @@ mod jvm_extraction_tests {
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "java", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &adapter,
+                &state,
+            )
             .unwrap();
 
         let facts = store
             .hydrate_import_facts_by_key(
-                &[(file.clone(), oid, "java".to_string())],
+                &[(
+                    file.clone(),
+                    brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                )],
                 &HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]),
                 &adapter,
             )
@@ -1252,7 +1317,11 @@ mod jvm_extraction_tests {
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "java", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &adapter,
+                &state,
+            )
             .unwrap();
 
         let candidates = store
@@ -1297,7 +1366,11 @@ mod jvm_extraction_tests {
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "java", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         store
             .sync_workspace_snapshot(
@@ -1428,10 +1501,18 @@ mod jvm_extraction_tests {
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(old_oid, "java", &adapter, &old_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(old_oid, "java"),
+                &adapter,
+                &old_state,
+            )
             .unwrap();
         store
-            .write_parsed_blob(new_oid, "java", &adapter, &new_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(new_oid, "java"),
+                &adapter,
+                &new_state,
+            )
             .unwrap();
         let old_snapshot = store
             .sync_workspace_snapshot(
@@ -1721,7 +1802,11 @@ mod jvm_extraction_tests {
             let oid = oid_for(source.as_bytes());
             let state = parse_state(&adapter, &file);
             store
-                .write_parsed_blob(oid, "java", &adapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    &adapter,
+                    &state,
+                )
                 .unwrap();
             oids.push((package, oid));
             workspace_files.push(WorkspaceFileRow {
@@ -1854,14 +1939,19 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "scala",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
                 prior_generation,
                 &ScalaAdapter,
                 state.as_ref(),
             )
             .unwrap();
-        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "scala"
+                ))
+                .unwrap()
+        );
 
         let current_generation = store
             .ensure_language_epoch(
@@ -1870,12 +1960,20 @@ mod jvm_extraction_tests {
             )
             .unwrap();
         assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "scala"
+                ))
+                .unwrap()
+        );
         assert_eq!(
             store
-                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
+                .missing_parsed_blob_keys(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "scala"
+                )])
                 .unwrap(),
-            vec![(oid, "scala".to_string())]
+            vec![brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala")]
         );
 
         // Once the current epoch has been populated, reopening the same
@@ -1883,8 +1981,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "scala",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
                 current_generation,
                 &ScalaAdapter,
                 state.as_ref(),
@@ -1897,9 +1994,19 @@ mod jvm_extraction_tests {
             )
             .unwrap();
         assert_eq!(reused_generation, current_generation);
-        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "scala"
+                ))
+                .unwrap()
+        );
         let hydrated = store
-            .hydrate_file_state(oid, "scala", &ScalaAdapter, &file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
+                &ScalaAdapter,
+                &file,
+            )
             .unwrap()
             .expect("current-generation Scala rows should hydrate");
         assert!(
@@ -1930,7 +2037,11 @@ mod jvm_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store.ensure_language_epoch_value("cpp", "epoch-a").unwrap();
         store
-            .write_parsed_blob(oid, "cpp", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                &adapter,
+                &state,
+            )
             .unwrap();
 
         let physical_counts = || {
@@ -1954,15 +2065,25 @@ mod jvm_extraction_tests {
         };
         let before = physical_counts();
         assert!(before.into_iter().all(|count| count > 0), "{before:?}");
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"))
+                .unwrap()
+        );
 
         store.ensure_language_epoch_value("cpp", "epoch-b").unwrap();
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"))
+                .unwrap()
+        );
         assert_eq!(
             store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .missing_parsed_blob_keys(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "cpp"
+                )])
                 .unwrap(),
-            vec![(oid, "cpp".to_string())]
+            vec![brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp")]
         );
         assert_eq!(
             before,
@@ -1984,8 +2105,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 a1,
                 &JavaAdapter,
                 &state,
@@ -2001,10 +2121,17 @@ mod jvm_extraction_tests {
         assert_ne!(a1, b);
         assert_ne!(a1, a2);
         assert_ne!(b, a2);
-        assert!(!store.contains_parsed_blob(oid, "java").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
+                .unwrap()
+        );
         assert!(
             store
-                .contains_parsed_blob_at_generation(oid, "java", a1)
+                .contains_parsed_blob_at_generation(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    a1
+                )
                 .unwrap_err()
                 .is_stale_generation()
         );
@@ -2019,17 +2146,20 @@ mod jvm_extraction_tests {
         let a = store
             .ensure_language_epoch_value("java", "epoch-a")
             .unwrap();
-        let prepared =
-            AnalyzerStore::prepare_parsed_blob(oid, "java", a, &JavaAdapter, Arc::clone(&state))
-                .unwrap();
+        let prepared = AnalyzerStore::prepare_parsed_blob(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+            a,
+            &JavaAdapter,
+            Arc::clone(&state),
+        )
+        .unwrap();
         let b = store
             .ensure_language_epoch_value("java", "epoch-b")
             .unwrap();
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 b,
                 &JavaAdapter,
                 state.as_ref(),
@@ -2042,7 +2172,10 @@ mod jvm_extraction_tests {
         assert!(outcomes[0].error.as_ref().unwrap().is_stale_generation());
         assert!(
             store
-                .register_blobs(&[oid], "java", a)
+                .register_blobs(
+                    &[brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java")],
+                    a
+                )
                 .unwrap_err()
                 .is_stale_generation()
         );
@@ -2090,7 +2223,11 @@ mod jvm_extraction_tests {
                 .unwrap_err()
                 .is_stale_generation()
         );
-        assert!(store.contains_parsed_blob(oid, "java").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
+                .unwrap()
+        );
         let langs = vec!["java".to_string()];
         let generations = HashMap::from_iter([("java".to_string(), b)]);
         assert_eq!(
@@ -2116,8 +2253,7 @@ mod jvm_extraction_tests {
         writer
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 a,
                 &JavaAdapter,
                 &state_a,
@@ -2129,8 +2265,7 @@ mod jvm_extraction_tests {
         require_current_generation(&read_tx, "java", a).unwrap();
         let old_meta = read_blob_meta(
             &read_tx,
-            &oid.to_string(),
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
             &JavaAdapter,
             &file,
             "class Alpha {}\n",
@@ -2146,16 +2281,20 @@ mod jvm_extraction_tests {
         writer
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 b,
                 &JavaAdapter,
                 &state_b,
             )
             .unwrap();
 
-        let old_units =
-            read_unit_rows(&read_tx, &oid.to_string(), "java", &JavaAdapter, &file).unwrap();
+        let old_units = read_unit_rows(
+            &read_tx,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+            &JavaAdapter,
+            &file,
+        )
+        .unwrap();
         assert_eq!(old_units.len(), old_meta.stored_unit_count);
         assert!(old_units.iter().any(|row| row.unit.short_name() == "Alpha"));
         assert!(!old_units.iter().any(|row| row.unit.short_name() == "Beta"));
@@ -2163,7 +2302,13 @@ mod jvm_extraction_tests {
         drop(reader_conn);
 
         let hydrated = reader
-            .hydrate_file_state_with_source(oid, "java", b, &JavaAdapter, &file, "class Beta {}\n")
+            .hydrate_file_state_with_source(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                b,
+                &JavaAdapter,
+                &file,
+                "class Beta {}\n",
+            )
             .unwrap()
             .unwrap();
         assert!(
@@ -2194,8 +2339,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 a,
                 &JavaAdapter,
                 &state,
@@ -2225,7 +2369,15 @@ mod jvm_extraction_tests {
         let one = oid_for(b"one");
         let two = oid_for(b"two");
         let c = store.ensure_language_epoch_value("rust", "c").unwrap();
-        store.register_blobs(&[one, two], "rust", c).unwrap();
+        store
+            .register_blobs(
+                &[
+                    brokk_bifrost_core::gitblob::BlobKey::unvaried(one, "rust"),
+                    brokk_bifrost_core::gitblob::BlobKey::unvaried(two, "rust"),
+                ],
+                c,
+            )
+            .unwrap();
         store.ensure_language_epoch_value("rust", "d").unwrap();
         assert_eq!(store.reclaim_stale_generations(1).unwrap(), 1);
         let remaining: usize = store
@@ -2253,8 +2405,7 @@ mod jvm_extraction_tests {
                 let oid =
                     Oid::hash_object(ObjectType::Blob, format!("blob-{index}").as_bytes()).unwrap();
                 AnalyzerStore::prepare_parsed_blob(
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     GenerationId::BOOTSTRAP,
                     &JavaAdapter,
                     Arc::clone(&state),
@@ -2303,8 +2454,7 @@ mod jvm_extraction_tests {
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    *oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(*oid, "java"),
                     generation_a,
                     &JavaAdapter,
                     &old_state,
@@ -2319,8 +2469,7 @@ mod jvm_extraction_tests {
             .copied()
             .map(|oid| {
                 AnalyzerStore::prepare_parsed_blob(
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     generation_b,
                     &JavaAdapter,
                     Arc::clone(&replacement_state),
@@ -2338,8 +2487,7 @@ mod jvm_extraction_tests {
         assert_eq!(stats.transactions, 1);
         assert_eq!(stats.committed_blobs, REPLACEMENTS);
         let expected = AnalyzerStore::prepare_parsed_blob(
-            oids[0],
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oids[0], "java"),
             generation_b,
             &JavaAdapter,
             Arc::clone(&replacement_state),
@@ -2390,8 +2538,7 @@ mod jvm_extraction_tests {
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    *oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(*oid, "java"),
                     generation_a,
                     &JavaAdapter,
                     &state,
@@ -2399,8 +2546,7 @@ mod jvm_extraction_tests {
                 .unwrap();
         }
         let expected = AnalyzerStore::prepare_parsed_blob(
-            oids[0],
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oids[0], "java"),
             generation_a,
             &JavaAdapter,
             Arc::clone(&state),
@@ -2419,8 +2565,7 @@ mod jvm_extraction_tests {
         assert_eq!(
             persisted_blob_mutation_cost_fallback_statement(
                 &mut fallback_statement,
-                oids[0].to_string().as_str(),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oids[0], "java"),
             )
             .unwrap(),
             PersistedMutationCost {
@@ -2439,8 +2584,7 @@ mod jvm_extraction_tests {
             .iter()
             .map(|oid| {
                 AnalyzerStore::prepare_parsed_blob(
-                    *oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(*oid, "java"),
                     generation_b,
                     &JavaAdapter,
                     Arc::clone(&state),
@@ -2475,8 +2619,7 @@ mod jvm_extraction_tests {
             .unwrap();
         let stale_oid = oid_for(b"conflicting stale prepared blob");
         let stale = AnalyzerStore::prepare_parsed_blob(
-            stale_oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(stale_oid, "java"),
             generation_a,
             &JavaAdapter,
             Arc::clone(&state),
@@ -2487,8 +2630,7 @@ mod jvm_extraction_tests {
             .unwrap();
         let current_oid = oid_for(b"conflicting current prepared blob");
         let current = AnalyzerStore::prepare_parsed_blob(
-            current_oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(current_oid, "java"),
             generation_b,
             &JavaAdapter,
             state,
@@ -2521,8 +2663,21 @@ mod jvm_extraction_tests {
         );
         assert_eq!(store.prepared_generation_lookup_queries_for_test(), 2);
         assert_eq!(store.replacement_cost_lookup_queries_for_test(), 1);
-        assert!(store.contains_parsed_blob(current_oid, "java").unwrap());
-        assert!(!store.contains_parsed_blob(stale_oid, "java").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    current_oid,
+                    "java"
+                ))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    stale_oid, "java"
+                ))
+                .unwrap()
+        );
     }
     #[test]
     fn replacement_cost_set_preserves_duplicate_order_and_distinguishes_all_states() {
@@ -2543,20 +2698,24 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                complete_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(complete_oid, "java"),
                 generation,
                 &JavaAdapter,
                 &old_state,
             )
             .unwrap();
         store
-            .register_blobs(&[root_only_oid], "java", generation)
+            .register_blobs(
+                &[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    root_only_oid,
+                    "java",
+                )],
+                generation,
+            )
             .unwrap();
         let prepare = |oid| {
             AnalyzerStore::prepare_parsed_blob(
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 Arc::clone(&old_state),
@@ -2600,8 +2759,7 @@ mod jvm_extraction_tests {
         assert_eq!(
             persisted_blob_mutation_cost_fallback_statement(
                 &mut physical_cost_statement,
-                &complete_oid.to_string(),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(complete_oid, "java"),
             )
             .unwrap(),
             expected_complete,
@@ -2635,8 +2793,7 @@ mod jvm_extraction_tests {
         assert_eq!(
             persisted_blob_mutation_cost_fallback_statement(
                 &mut fallback_statement,
-                complete_oid.to_string().as_str(),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(complete_oid, "java"),
             )
             .unwrap(),
             PersistedMutationCost {
@@ -2674,8 +2831,7 @@ mod jvm_extraction_tests {
         let prepared = (0..PRODUCERS)
             .map(|_| {
                 AnalyzerStore::prepare_parsed_blob(
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     generation,
                     &JavaAdapter,
                     Arc::clone(&state),
@@ -2741,7 +2897,11 @@ mod jvm_extraction_tests {
             1,
             "identical queued repairs must persist one representative"
         );
-        assert!(stores[0].contains_parsed_blob(oid, "java").unwrap());
+        assert!(
+            stores[0]
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
+                .unwrap()
+        );
     }
     #[test]
     fn prepared_blob_batches_respect_row_and_payload_caps() {
@@ -2750,8 +2910,10 @@ mod jvm_extraction_tests {
         let state = Arc::new(parse_state(&JavaAdapter, &file));
         let make = |index| {
             AnalyzerStore::prepare_parsed_blob(
-                Oid::hash_object(ObjectType::Blob, format!("blob-{index}").as_bytes()).unwrap(),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    Oid::hash_object(ObjectType::Blob, format!("blob-{index}").as_bytes()).unwrap(),
+                    "java",
+                ),
                 GenerationId::BOOTSTRAP,
                 &JavaAdapter,
                 Arc::clone(&state),
@@ -2782,8 +2944,7 @@ mod jvm_extraction_tests {
         let oid = oid_for(b"oversized singleton");
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
             GenerationId::BOOTSTRAP,
             &JavaAdapter,
             Arc::clone(&state),
@@ -2809,7 +2970,11 @@ mod jvm_extraction_tests {
         assert_eq!(stats.peak_batch_payload_bytes, expected_bytes);
         assert_eq!(store.parsed_blob_transaction_starts_for_test(), 1);
         let hydrated = store
-            .hydrate_file_state(oid, "java", &JavaAdapter, &file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &JavaAdapter,
+                &file,
+            )
             .unwrap()
             .expect("the complete source must publish");
         assert_file_state_equivalent(&state, &hydrated);
@@ -2836,8 +3001,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                replaced_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(replaced_oid, "java"),
                 generation_a,
                 &JavaAdapter,
                 &old_state,
@@ -2856,8 +3020,7 @@ mod jvm_extraction_tests {
                 .unwrap();
             persisted_blob_mutation_cost_fallback_statement(
                 &mut statement,
-                &replaced_oid.to_string(),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(replaced_oid, "java"),
             )
             .unwrap()
         };
@@ -2865,8 +3028,7 @@ mod jvm_extraction_tests {
             .ensure_language_epoch_value("java", "replacement-budget-b")
             .unwrap();
         let replacement = AnalyzerStore::prepare_parsed_blob(
-            replaced_oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(replaced_oid, "java"),
             generation_b,
             &JavaAdapter,
             Arc::clone(&replacement_state),
@@ -2875,8 +3037,7 @@ mod jvm_extraction_tests {
         let replacement_insert_rows = replacement.logical_rows();
         let replacement_insert_bytes = replacement.payload_bytes();
         let peer = AnalyzerStore::prepare_parsed_blob(
-            peer_oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(peer_oid, "java"),
             generation_b,
             &JavaAdapter,
             peer_state,
@@ -2923,7 +3084,14 @@ mod jvm_extraction_tests {
             replacement_insert_bytes + old_bytes
         );
         assert!(stats.peak_batch_rows > row_cap);
-        assert!(store.contains_parsed_blob(replaced_oid, "java").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    replaced_oid,
+                    "java"
+                ))
+                .unwrap()
+        );
         let stored_generation: i64 = store
             .conn
             .lock()
@@ -2936,7 +3104,11 @@ mod jvm_extraction_tests {
             .unwrap();
         assert_eq!(stored_generation, generation_b.0);
         let hydrated = store
-            .hydrate_file_state(replaced_oid, "java", &JavaAdapter, &replacement_file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(replaced_oid, "java"),
+                &JavaAdapter,
+                &replacement_file,
+            )
             .unwrap()
             .expect("replacement must be complete");
         assert_file_state_equivalent(&replacement_state, &hydrated);
@@ -2949,8 +3121,7 @@ mod jvm_extraction_tests {
         let prepare = |text: &[u8]| {
             let oid = Oid::hash_object(ObjectType::Blob, text).unwrap();
             let prepared = AnalyzerStore::prepare_parsed_blob(
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 GenerationId::BOOTSTRAP,
                 &JavaAdapter,
                 Arc::clone(&state),
@@ -2973,10 +3144,35 @@ mod jvm_extraction_tests {
             },
         );
 
-        assert!(store.contains_parsed_blob(good_a_oid, "java").unwrap());
-        assert!(store.contains_parsed_blob(good_b_oid, "java").unwrap());
-        assert!(!store.contains_parsed_blob(bad_oid, "java").unwrap());
-        assert_eq!(store.content_row_count(bad_oid, "java").unwrap(), 0);
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    good_a_oid, "java"
+                ))
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    good_b_oid, "java"
+                ))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    bad_oid, "java"
+                ))
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    bad_oid, "java"
+                ))
+                .unwrap(),
+            0
+        );
         assert_eq!(stats.committed_blobs, 2);
         assert_eq!(stats.failed_blobs, 1);
         assert_eq!(
@@ -3001,13 +3197,28 @@ mod jvm_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
 
         store
-            .write_parsed_blob(oid, "java", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &adapter,
+                &state,
+            )
             .unwrap();
-        let first_count = store.content_row_count(oid, "java").unwrap();
+        let first_count = store
+            .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
+            .unwrap();
         store
-            .write_parsed_blob(oid, "java", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &adapter,
+                &state,
+            )
             .unwrap();
-        assert_eq!(store.content_row_count(oid, "java").unwrap(), first_count);
+        assert_eq!(
+            store
+                .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
+                .unwrap(),
+            first_count
+        );
     }
     /// Nothing an import row stores may depend on where the file lives: two
     /// byte-identical files share one blob row. Writing the same source at two
@@ -3024,7 +3235,11 @@ mod jvm_extraction_tests {
             let state = parse_state(&ScalaAdapter, file);
             let store = AnalyzerStore::open_ephemeral().unwrap();
             store
-                .write_parsed_blob(oid, "scala", &ScalaAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
+                    &ScalaAdapter,
+                    &state,
+                )
                 .unwrap();
             let conn = store.conn.lock().expect("store mutex");
             let mut statement = conn
@@ -3106,13 +3321,22 @@ mod jvm_extraction_tests {
             let file = write_file(temp.path(), path, source);
             let oid = oid_for(source.as_bytes());
             store
-                .write_parsed_blob(oid, "java", &JavaAdapter, &parse_state(&JavaAdapter, &file))
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    &JavaAdapter,
+                    &parse_state(&JavaAdapter, &file),
+                )
                 .unwrap();
             oids.push(oid);
         }
         let generation = store.current_generation("java").unwrap();
         let batched = store
-            .workspace_content_package_facts("java", generation, &oids, None)
+            .workspace_content_package_facts(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "java"),
+                generation,
+                &oids,
+                None,
+            )
             .unwrap()
             .facts
             .into_iter()
@@ -3121,7 +3345,12 @@ mod jvm_extraction_tests {
             .iter()
             .flat_map(|oid| {
                 store
-                    .workspace_content_package_facts("java", generation, &[*oid], None)
+                    .workspace_content_package_facts(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "java"),
+                        generation,
+                        &[*oid],
+                        None,
+                    )
                     .unwrap()
                     .facts
             })
@@ -3146,7 +3375,11 @@ mod jvm_extraction_tests {
         for index in 0..blobs {
             let oid = oid_for(format!("sample blob {index}").as_bytes());
             store
-                .write_parsed_blob(oid, "java", &adapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    &adapter,
+                    &state,
+                )
                 .unwrap();
             workspace_files.push(WorkspaceFileRow {
                 rel_path: format!("src/demo/Sample_{index}.java"),

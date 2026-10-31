@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use git2::Repository;
+use crate::gitblob::{BlobKey, ParseVariant};
+use git2::{Oid, Repository};
 use growable_bloom_filter::GrowableBloom;
 use rusqlite::{Connection, TransactionBehavior};
 
@@ -44,12 +45,13 @@ pub const DELETE_UNBOUND_TOPOLOGIES_SQL: &str =
          WHERE summary_versions.topology_id = rust_crate_topologies.topology_id)";
 
 const DELETE_ANALYZER_CANDIDATE_SQL: &str = "DELETE FROM blobs
-     WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3
+     WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3 AND parse_variant = ?4
        AND NOT EXISTS (
          SELECT 1
          FROM workspace_file_versions AS versions
            INDEXED BY idx_workspace_file_versions_blob_root
          WHERE versions.input_kind = 'source' AND versions.blob_oid = ?1
+           AND blobs.parse_variant = x''
            AND versions.lang = ?2
            AND versions.generation = ?3
        )
@@ -799,15 +801,16 @@ fn sweep_with_claim(
         "CREATE TEMP TABLE gc_analyzer_candidates(
            blob_oid TEXT NOT NULL,
            lang TEXT NOT NULL,
+           parse_variant BLOB NOT NULL,
            generation INTEGER NOT NULL,
-           PRIMARY KEY(blob_oid, lang, generation)
+           PRIMARY KEY(blob_oid, lang, parse_variant, generation)
          ) WITHOUT ROWID;",
     )?;
 
     // The Git reachability walk reads the repository, not the store, and it is
     // the longest part of a collection. It runs before the build lock is
     // taken, so a request that needs the lock never queues behind it.
-    let mut live = live_bloom(repo, workspace_root)?;
+    let live = live_bloom(repo, workspace_root)?;
 
     // From here to the deletion commit, and no further.
     //
@@ -835,8 +838,8 @@ fn sweep_with_claim(
     // persist another blob once the lock is released; that new row belongs to
     // the next collection.
     conn.execute_batch(
-        "INSERT INTO gc_analyzer_candidates(blob_oid, lang, generation)
-           SELECT blobs.blob_oid, blobs.lang, blobs.generation
+        "INSERT INTO gc_analyzer_candidates(blob_oid, lang, parse_variant, generation)
+           SELECT blobs.blob_oid, blobs.lang, blobs.parse_variant, blobs.generation
            FROM blobs
            LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
            WHERE blobs.generation = COALESCE(epochs.generation, 0);",
@@ -850,32 +853,30 @@ fn sweep_with_claim(
         }
     });
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // Retained workspace revisions also own their blobs, including immutable
-    // diff images whose objects need not be reachable from any Git ref. Read
-    // these roots under the deletion transaction so a projection published
-    // during the Git walk is protected too. Stream them once rather than
-    // scanning workspace history separately for every candidate blob.
-    {
-        let mut stmt =
-            tx.prepare("SELECT blob_oid FROM workspace_file_versions WHERE input_kind = 'source'")?;
-        let roots = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for root in roots {
-            live.insert(root?);
-        }
-    }
+    // Retained versions pin exact identities in the deletion SQL. Their OIDs
+    // must not enter the Git bloom and retain another language or variant.
     let dead_analyzer = {
-        let mut stmt =
-            tx.prepare("SELECT blob_oid, lang, generation FROM gc_analyzer_candidates")?;
+        let mut stmt = tx.prepare(
+            "SELECT blob_oid, lang, generation, parse_variant FROM gc_analyzer_candidates",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, ParseVariant>(3)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .filter(|(oid, _, _)| !live.contains(oid))
+            .filter(|(oid, _, _, variant)| *variant != ParseVariant::Empty || !live.contains(oid))
+            .map(|(oid, lang, generation, variant)| {
+                let oid =
+                    Oid::from_str(&oid).map_err(|error| GcStopped::from(error.to_string()))?;
+                Ok((BlobKey { oid, lang, variant }, generation))
+            })
+            .collect::<Result<Vec<_>, GcStopped>>()?
+            .into_iter()
             .collect::<Vec<_>>()
     };
     // #4994: orphan topologies retain blobs through non-cascading FKs in
@@ -966,12 +967,12 @@ fn maintain_collected_store(
 
 fn delete_analyzer_candidates(
     tx: &rusqlite::Transaction<'_>,
-    candidates: &[(String, String, i64)],
+    candidates: &[(BlobKey, i64)],
 ) -> Result<usize, GcStopped> {
     let mut delete = tx.prepare(DELETE_ANALYZER_CANDIDATE_SQL)?;
     let mut dropped = 0usize;
-    for (oid, lang, generation) in candidates {
-        dropped += delete.execute((oid, lang, generation))?;
+    for (key, generation) in candidates {
+        dropped += delete.execute((key.oid.to_string(), &key.lang, generation, key.variant))?;
     }
     Ok(dropped)
 }
@@ -1402,8 +1403,18 @@ mod tests {
             }
         }
 
+        // Reachable bytes retain the empty parse, but not an unreferenced
+        // configured parse of those same bytes.
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation, parse_variant) VALUES(?1, 'go', 1, ?2)",
+                rusqlite::params![live_oid, ParseVariant::Digest([1; 32])],
+            ).unwrap();
+        }
         let outcome = force_gc(&db_path, &repo, &workspace_root).unwrap();
         assert!(outcome.ran);
+        assert_eq!(outcome.analyzer_dropped, 2);
 
         let conn = Connection::open(&db_path).unwrap();
         let remaining: Vec<String> = conn
@@ -2008,6 +2019,11 @@ mod tests {
             )
             .unwrap();
             conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 0)",
+                [retained_oid],
+            )
+            .unwrap();
+            conn.execute(
                 "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
                  VALUES(?1, 'java', 1, 1)",
                 [workspace_id],
@@ -2025,12 +2041,12 @@ mod tests {
 
         let outcome = force_gc(&db_path, &repo, &repo_root).unwrap();
         assert!(outcome.ran);
-        assert_eq!(outcome.analyzer_dropped, 0);
+        assert_eq!(outcome.analyzer_dropped, 1);
 
         let conn = Connection::open(&db_path).unwrap();
         assert_eq!(
             conn.query_row(
-                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java' AND parse_variant = x''",
                 [retained_oid],
                 |row| row.get::<_, i64>(0),
             )
@@ -2073,7 +2089,7 @@ mod tests {
             .unwrap();
             let blob_id: i64 = conn
                 .query_row(
-                    "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                    "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java' AND parse_variant = x''",
                     [oid],
                     |row| row.get(0),
                 )
@@ -2341,10 +2357,10 @@ mod tests {
             [oid],
         )
         .unwrap();
-        let candidate = vec![(oid.to_string(), "java".to_string(), 1)];
+        let candidate = vec![(BlobKey::unvaried(Oid::from_str(oid).unwrap(), "java"), 1)];
 
         conn.execute(
-            "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+            "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = 'java' AND parse_variant = x''",
             [oid],
         )
         .unwrap();
@@ -2364,7 +2380,7 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(
             conn.query_row(
-                "SELECT generation FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                "SELECT generation FROM blobs WHERE blob_oid = ?1 AND lang = 'java' AND parse_variant = x''",
                 [oid],
                 |row| row.get::<_, i64>(0),
             )
@@ -2384,7 +2400,12 @@ mod tests {
             ))
             .unwrap()
             .query_map(
-                rusqlite::params!["2222222222222222222222222222222222222222", "java", 1],
+                rusqlite::params![
+                    "2222222222222222222222222222222222222222",
+                    "java",
+                    1,
+                    ParseVariant::Empty
+                ],
                 |row| row.get::<_, String>(3),
             )
             .unwrap()
@@ -2499,13 +2520,13 @@ mod tests {
         )
         .unwrap();
 
-        let candidate = vec![(oid.to_string(), "java".to_string(), 1)];
+        let candidate = vec![(BlobKey::unvaried(Oid::from_str(oid).unwrap(), "java"), 1)];
         let tx = conn.transaction().unwrap();
         assert_eq!(delete_analyzer_candidates(&tx, &candidate).unwrap(), 0);
         tx.commit().unwrap();
         assert_eq!(
             conn.query_row(
-                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java' AND parse_variant = x''",
                 [oid],
                 |row| row.get::<_, i64>(0),
             )

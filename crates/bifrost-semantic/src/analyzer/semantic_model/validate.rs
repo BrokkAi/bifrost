@@ -108,6 +108,9 @@ pub(crate) fn validate_pack_internal(
 ) -> (Vec<Diagnostic>, u32) {
     let mut validator = Validator {
         language: pack.language.clone(),
+        go_packages_by_type_id: HashMap::new(),
+        go_local_types: HashSet::new(),
+        go_current_package: None,
         diagnostics: Vec::new(),
         limits,
         stable_ids: HashMap::new(),
@@ -146,6 +149,9 @@ pub(crate) fn validate_pack_internal(
 
 struct Validator {
     language: String,
+    go_packages_by_type_id: HashMap<String, String>,
+    go_local_types: HashSet<(String, String)>,
+    go_current_package: Option<String>,
     diagnostics: Vec<Diagnostic>,
     limits: ValidationLimits,
     stable_ids: HashMap<String, String>,
@@ -281,6 +287,24 @@ impl Validator {
                 self.type_ids
                     .extend(types.iter().map(|fact| fact.id.clone()));
                 for fact in types {
+                    if self.language == "go" {
+                        let parts =
+                            brokk_bifrost_go::declarations::go_model_type_name_parts(&fact.name);
+                        if fact.type_kind != TypeKind::Module
+                            && let Some((package, simple)) = parts
+                        {
+                            self.go_local_types
+                                .insert((package.to_owned(), simple.to_owned()));
+                        }
+                        let package = brokk_bifrost_go::declarations::go_model_owner_package(
+                            &fact.name,
+                            fact.type_kind == TypeKind::Module,
+                        );
+                        if let Some(package) = package {
+                            self.go_packages_by_type_id
+                                .insert(fact.id.clone(), package.to_owned());
+                        }
+                    }
                     self.type_kinds_by_id
                         .insert(fact.id.clone(), fact.type_kind);
                     self.type_kinds_by_name
@@ -1437,6 +1461,7 @@ impl Validator {
     }
 
     fn payload(&mut self, path: &str, payload: &AuthoredPayload) {
+        self.go_current_package = None;
         match payload {
             AuthoredPayload::DeclarationFacts {
                 types,
@@ -1496,6 +1521,7 @@ impl Validator {
                     }
                 }
                 for (index, fact) in types.iter().enumerate() {
+                    self.go_current_package = self.go_packages_by_type_id.get(&fact.id).cloned();
                     if fact.callable_surface_complete
                         && self.predates_schema(CALLABLE_SURFACE_MIN_SCHEMA_VERSION)
                     {
@@ -1819,6 +1845,7 @@ impl Validator {
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
                 }
                 for (index, fact) in members.iter().enumerate() {
+                    self.go_current_package = self.go_packages_by_type_id.get(&fact.owner).cloned();
                     let fact_path = format!("{path}.members[{index}]");
                     if fact.implemented_trait.is_some() || fact.self_form.is_some() {
                         self.rust_contract_version(&fact_path);
@@ -5319,6 +5346,18 @@ impl Validator {
                     name, arguments, ..
                 } => {
                     self.qualified_name(&format!("{current_path}.name"), name);
+                    if let Some(package) = &self.go_current_package
+                        && self
+                            .go_local_types
+                            .contains(&(package.clone(), name.clone()))
+                    {
+                        self.error(
+                            "go.local_type_bare_reference",
+                            &current_path,
+                            "reference the package-local type with Declared; a bare Named spelling of a Go universe type means the universe type",
+                        );
+                    }
+
                     for (index, argument) in arguments.iter().enumerate().rev() {
                         stack.push((
                             argument,
@@ -6906,6 +6945,79 @@ mod native_deferred_bridge_tests {
             "type_parameters":parameters,
             "locator":{"kind":"artifact","path":"test", "symbol":symbol},
         })
+    }
+
+    #[test]
+    fn go_local_named_references_require_declaration_ids_per_package() {
+        let limits = ValidationLimits {
+            max_shards: 100,
+            max_records_per_shard: 1000,
+            max_records_per_pack: 1000,
+            max_text_bytes: 10000,
+            max_depth: 64,
+        };
+        let mut pack = native_pack(serde_json::json!([]));
+        pack.language = "go".to_owned();
+        pack.ecosystem = "go".to_owned();
+        pack.shards[0].deferred_yields = None;
+        let ty = |id: &str, name: &str, kind: &str| {
+            serde_json::json!({
+                "id": id, "name": name, "type_kind": kind, "visibility": "public",
+                "locator": {"kind": "artifact", "path": "fixture", "symbol": name}
+            })
+        };
+        pack.shards[0].payload = serde_json::from_value(serde_json::json!({
+            "kind": "declaration_facts",
+            "types": [ty("p", "gopkg.in/p.v3", "module"),
+                      ty("q", "example.com/q", "module"),
+                      ty("any", "gopkg.in/p.v3.any", "type_alias"),
+                      ty("error", "gopkg.in/p.v3.error", "interface"),
+                      ty("custom", "gopkg.in/p.v3.Custom", "struct")],
+            "members": [{"id": "function", "owner": "q", "name": "Function",
+                "member_kind": "function", "visibility": "public",
+                "signature": {"parameters": [], "returns": {"kind": "named", "name": "any"}},
+                "locator": {"kind": "artifact", "path": "fixture", "symbol": "Function"}}]
+        }))
+        .unwrap();
+        assert_eq!(validate_pack(&pack, limits), Vec::<Diagnostic>::new());
+        let AuthoredPayload::DeclarationFacts { members, .. } = &mut pack.shards[0].payload else {
+            unreachable!()
+        };
+        members[0].owner = "p".to_owned();
+        members[0].signature.as_mut().unwrap().returns = Some(TypeRef::Named {
+            name: "error".to_owned(),
+            arguments: vec![],
+            nullable: false,
+        });
+        let diagnostics = validate_pack(&pack, limits);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, "go.local_type_bare_reference");
+        assert_eq!(
+            diagnostics[0].path,
+            "$.shards[0].payload.members[0].signature.returns"
+        );
+        let AuthoredPayload::DeclarationFacts { members, .. } = &mut pack.shards[0].payload else {
+            unreachable!()
+        };
+        members[0].signature.as_mut().unwrap().returns = Some(TypeRef::Declared {
+            id: "error".to_owned(),
+            arguments: vec![],
+            nullable: false,
+        });
+        assert_eq!(validate_pack(&pack, limits), Vec::<Diagnostic>::new());
+        // The contract is independent of the universe's current name list.
+        let AuthoredPayload::DeclarationFacts { members, .. } = &mut pack.shards[0].payload else {
+            unreachable!()
+        };
+        members[0].signature.as_mut().unwrap().returns = Some(TypeRef::Named {
+            name: "Custom".to_owned(),
+            arguments: vec![],
+            nullable: false,
+        });
+        assert_eq!(
+            validate_pack(&pack, limits)[0].code,
+            "go.local_type_bare_reference"
+        );
     }
 
     fn native_pack(map_binders: Value) -> AuthoredSemanticModelPack {

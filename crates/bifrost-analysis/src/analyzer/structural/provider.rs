@@ -502,7 +502,7 @@ impl StructuralFactsCache {
         extract: impl FnOnce() -> Option<FileFacts>,
     ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
         match self.reuse_or_build(
-            Some(key),
+            Some(key.clone()),
             || false,
             || {
                 if let Some(facts) = load() {
@@ -593,11 +593,11 @@ impl StructuralFactsCache {
                     done: Mutex::new(false),
                     completed: Condvar::new(),
                 });
-                live.building.insert(key, Arc::clone(&slot));
+                live.building.insert(key.clone(), Arc::clone(&slot));
                 HELD_BUILD_SLOTS.with(|held| held.set(held.get() + 1));
                 break Some(Building {
                     live: &self.live,
-                    key,
+                    key: key.clone(),
                     slot,
                 });
             }
@@ -613,10 +613,10 @@ impl StructuralFactsCache {
                     .live_registration
                     .set(LiveRegistration {
                         registry: Arc::downgrade(&self.live),
-                        key,
+                        key: key.clone(),
                     })
                     .expect("fresh facts must not already be registered");
-                live.entries.insert(key, Arc::downgrade(&facts));
+                live.entries.insert(key.clone(), Arc::downgrade(&facts));
                 None
             }
         };
@@ -800,7 +800,7 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
         };
         match self
             .structural_cache()
-            .reuse_or_build(snapshot_key, || false, build)
+            .reuse_or_build(snapshot_key.clone(), || false, build)
         {
             Ok((facts, outcome)) => (Some(facts), outcome),
             Err(attempt) => attempt,
@@ -878,8 +878,15 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
             .iter()
             .filter(|file| analyzer_languages.contains(&file.language()))
             .collect();
-        let workspace_source_bytes = analyzable.par_iter().map(|file| source_bytes(file)).sum();
-        let source_bytes = files.par_iter().map(source_bytes).sum();
+        let carried = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
+        let workspace_source_bytes = analyzable
+            .par_iter()
+            .map(|file| carried.run(|| source_bytes(file)))
+            .sum();
+        let source_bytes = files
+            .par_iter()
+            .map(|file| carried.run(|| source_bytes(file)))
+            .sum();
         Some(StructuralIndexCensus {
             files: files.len() as u64,
             source_bytes,
@@ -1001,7 +1008,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         let probed = self
             .reusable_live_oid(file)
             .and_then(|oid| Some((oid, self.structural_facts_key(file, oid)?)));
-        if let Some((oid, key)) = probed
+        if let Some((oid, key)) = probed.clone()
             && let Some(facts) = self.structural_cache().get(&key)
         {
             self.record_reads(|sink| sink.push(self.file_read_key(file, oid)));
@@ -1036,7 +1043,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         // bytes, recorded whether the cache, the store, or a fresh extraction
         // answers: all three are the same input.
         self.record_reads(|sink| sink.push(self.file_read_key(file, content_oid)));
-        let key = match probed {
+        let key = match probed.clone() {
             // The probe and source read are separate observations. An overlay
             // or file replacement between them may change the content; only
             // an unchanged identity has already missed in the memo.
@@ -1416,17 +1423,17 @@ mod tests {
         let cache = StructuralFactsCache::new(1024 * 1024);
         let shared = cache.sharing_entries();
         let source = "live facts";
-        let key = StructuralSnapshotKey::for_test(source, "typescript");
+        let key = &StructuralSnapshotKey::for_test(source, "typescript");
         let hydrate = |cache: &StructuralFactsCache| {
-            assert!(cache.get(&key).is_none());
+            assert!(cache.get(key).is_none());
             cache.materialize(
-                key,
+                key.clone(),
                 || Some(empty_facts(source)),
                 || panic!("unexpected extraction"),
             )
         };
         let first = hydrate(&cache).0.unwrap();
-        cache.cache.invalidate(&key);
+        cache.cache.invalidate(key);
         cache.cache.run_pending_tasks();
         let (second, outcome) = hydrate(&shared);
         let second = second.unwrap();
@@ -1438,13 +1445,13 @@ mod tests {
         let old = Arc::downgrade(&first);
         drop(first);
         drop(second);
-        cache.cache.invalidate(&key);
+        cache.cache.invalidate(key);
         cache.cache.run_pending_tasks();
         assert!(old.upgrade().is_none());
         let fresh = hydrate(&cache).0.unwrap();
         assert_eq!(cache.hydration_count(), 2);
         drop(fresh);
-        cache.cache.invalidate(&key);
+        cache.cache.invalidate(key);
         cache.cache.run_pending_tasks();
 
         assert!(cache.live.lock().unwrap().entries.is_empty());
@@ -1457,12 +1464,12 @@ mod tests {
         let holders: Vec<_> = (0..128)
             .map(|index| {
                 let source = format!("live facts {index}");
-                let key = StructuralSnapshotKey::for_test(&source, "typescript");
+                let key = &StructuralSnapshotKey::for_test(&source, "typescript");
                 let facts = cache
-                    .materialize(key, || Some(empty_facts(&source)), || None)
+                    .materialize(key.clone(), || Some(empty_facts(&source)), || None)
                     .0
                     .unwrap();
-                cache.cache.invalidate(&key);
+                cache.cache.invalidate(key);
                 cache.cache.run_pending_tasks();
                 facts
             })
@@ -1475,14 +1482,19 @@ mod tests {
 
         // Simulate an old allocation's delayed registration drop after its
         // dead weak entry has been replaced by a newer live allocation.
-        let key = StructuralSnapshotKey::for_test("replacement", "typescript");
+        let key = &StructuralSnapshotKey::for_test("replacement", "typescript");
         let late_drop = LiveRegistration {
             registry: Arc::downgrade(&cache.live),
-            key,
+            key: key.clone(),
         };
-        cache.live.lock().unwrap().entries.insert(key, Weak::new());
+        cache
+            .live
+            .lock()
+            .unwrap()
+            .entries
+            .insert(key.clone(), Weak::new());
         let fresh = cache
-            .materialize(key, || Some(empty_facts("replacement")), || None)
+            .materialize(key.clone(), || Some(empty_facts("replacement")), || None)
             .0
             .unwrap();
         drop(late_drop);
@@ -1492,11 +1504,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .entries
-                .get(&key)
+                .get(key)
                 .unwrap()
                 .ptr_eq(&Arc::downgrade(&fresh))
         );
-        cache.cache.invalidate(&key);
+        cache.cache.invalidate(key);
         cache.cache.run_pending_tasks();
         drop(fresh);
         assert!(cache.live.lock().unwrap().entries.is_empty());
@@ -1508,7 +1520,7 @@ mod tests {
         use std::sync::mpsc;
 
         let cache = StructuralFactsCache::new(1024 * 1024);
-        let key = StructuralSnapshotKey::for_test("cancelled waiter", "typescript");
+        let key = &StructuralSnapshotKey::for_test("cancelled waiter", "typescript");
         let cancellation = CancellationToken::new();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1519,7 +1531,7 @@ mod tests {
             let leader = scope.spawn(move || {
                 cache
                     .reuse_or_build(
-                        Some(key),
+                        Some(key.clone()),
                         || false,
                         || {
                             started_tx.send(()).unwrap();
@@ -1536,7 +1548,7 @@ mod tests {
             let cancellation = &cancellation;
             let waiter = scope.spawn(move || {
                 let result = cache.reuse_or_build(
-                    Some(key),
+                    Some(key.clone()),
                     || {
                         waiting_tx.send(()).unwrap();
                         cancellation.is_cancelled()
@@ -1557,7 +1569,7 @@ mod tests {
                 Err(StructuralFactsLimitedOutcome::Cancelled)
             ));
             assert!(!leader.is_finished());
-            assert!(cache.live.lock().unwrap().building.contains_key(&key));
+            assert!(cache.live.lock().unwrap().building.contains_key(key));
             release_tx.send(()).unwrap();
             waiter.join().unwrap();
             let _facts = leader.join().unwrap();
@@ -1572,17 +1584,17 @@ mod tests {
 
         for fail_leader in [false, true] {
             let cache = StructuralFactsCache::new(1024 * 1024);
-            let key = StructuralSnapshotKey::for_test("shared build", "typescript");
+            let key = &StructuralSnapshotKey::for_test("shared build", "typescript");
             let builds = AtomicU64::new(0);
             let (started_tx, started_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
             thread::scope(|scope| {
-                assert!(cache.get(&key).is_none());
+                assert!(cache.get(key).is_none());
                 let cache = &cache;
                 let builds = &builds;
                 let leader = scope.spawn(move || {
                     cache.reuse_or_build(
-                        Some(key),
+                        Some(key.clone()),
                         || false,
                         || {
                             builds.fetch_add(1, Ordering::Relaxed);
@@ -1600,11 +1612,11 @@ mod tests {
                     )
                 });
                 started_rx.recv().unwrap();
-                let slot = Arc::clone(cache.live.lock().unwrap().building.get(&key).unwrap());
+                let slot = Arc::clone(cache.live.lock().unwrap().building.get(key).unwrap());
                 let waiter = scope.spawn(move || {
-                    assert!(cache.get(&key).is_none());
+                    assert!(cache.get(key).is_none());
                     cache.reuse_or_build(
-                        Some(key),
+                        Some(key.clone()),
                         || false,
                         || {
                             builds.fetch_add(1, Ordering::Relaxed);
@@ -1646,17 +1658,17 @@ mod tests {
     #[test]
     fn structural_facts_cache_reentrant_build_adopts_inner_allocation() {
         let cache = StructuralFactsCache::new(1024 * 1024);
-        let key = StructuralSnapshotKey::for_test("reentrant", "typescript");
+        let key = &StructuralSnapshotKey::for_test("reentrant", "typescript");
         let mut inner = None;
         let (outer, _) = cache
             .reuse_or_build(
-                Some(key),
+                Some(key.clone()),
                 || false,
                 || {
                     inner = cache
-                        .materialize(key, || Some(empty_facts("reentrant")), || None)
+                        .materialize(key.clone(), || Some(empty_facts("reentrant")), || None)
                         .0;
-                    assert!(cache.live.lock().unwrap().building.contains_key(&key));
+                    assert!(cache.live.lock().unwrap().building.contains_key(key));
                     Ok::<_, ()>((
                         Arc::new(empty_facts("reentrant")),
                         StructuralFactsCacheOutcome::Extracted,
@@ -1671,12 +1683,12 @@ mod tests {
     #[test]
     fn structural_facts_cache_reports_exact_materialization_outcomes() {
         let source = "export function demo() {}\n";
-        let key = StructuralSnapshotKey::for_test(source, "typescript");
+        let key = &StructuralSnapshotKey::for_test(source, "typescript");
         let hydrated = StructuralFactsCache::new(1024 * 1024);
 
-        assert!(hydrated.get(&key).is_none());
+        assert!(hydrated.get(key).is_none());
         let (facts, outcome) = hydrated.materialize(
-            key,
+            key.clone(),
             || Some(empty_facts(source)),
             || panic!("persisted hydration must avoid extraction"),
         );
@@ -1685,7 +1697,7 @@ mod tests {
         assert_eq!(hydrated.hydration_count(), 1);
         assert_eq!(hydrated.extraction_count(), 0);
 
-        assert!(hydrated.get(&key).is_some());
+        assert!(hydrated.get(key).is_some());
         assert_eq!(hydrated.hydration_count(), 1);
         assert_eq!(hydrated.extraction_count(), 0);
 
@@ -1698,7 +1710,8 @@ mod tests {
         );
 
         let extracted = StructuralFactsCache::new(1024 * 1024);
-        let (facts, outcome) = extracted.materialize(key, || None, || Some(empty_facts(source)));
+        let (facts, outcome) =
+            extracted.materialize(key.clone(), || None, || Some(empty_facts(source)));
         assert!(facts.is_some());
         assert_eq!(outcome, StructuralFactsCacheOutcome::Extracted);
         assert_eq!(extracted.hydration_count(), 0);
@@ -1707,7 +1720,7 @@ mod tests {
         // A second view of the same entries answers from them, and counts its
         // own work rather than the first view's.
         let shared = extracted.sharing_entries();
-        assert!(shared.get(&key).is_some());
+        assert!(shared.get(key).is_some());
         assert_eq!(shared.extraction_count(), 0);
 
         let unavailable = StructuralFactsCache::new(1024 * 1024);

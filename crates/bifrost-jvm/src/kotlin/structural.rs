@@ -254,6 +254,10 @@ fn kotlin_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
         return None;
     }
 
+    if crate::type_parameters::is_name(node, brokk_bifrost_core::analyzer::Language::Kotlin) {
+        return Some(OccurrenceRole::DeclarationName);
+    }
+
     let mut current = node;
     while let Some(parent) = current.parent() {
         match parent.kind() {
@@ -657,6 +661,14 @@ impl StructuralSpec for KotlinStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &KOTLIN_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn type_parameter_owner<'tree>(&self, name: Node<'tree>) -> Option<Node<'tree>> {
+        crate::type_parameters::owner(name, brokk_bifrost_core::analyzer::Language::Kotlin)
+    }
+
+    fn type_parameter_scope_barrier(&self, owner: Node<'_>) -> bool {
+        crate::type_parameters::barrier(owner, brokk_bifrost_core::analyzer::Language::Kotlin)
     }
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {

@@ -112,7 +112,9 @@ test("uv CLI package exposes bifrost through its package name", () => {
     uvCliManifest,
     /^targets = \[\{ name = "bifrost", kind = "bin" \}\]$/mu,
   );
-  assert.match(uvCliManifest, /^data = "wheel-data"$/mu);
+  // The bifrost and brokk-bifrost commands come from the launcher that
+  // compress-cli-wheel.py adds (#8288), not from maturin's data scripts.
+  assert.doesNotMatch(uvCliManifest, /^data = /mu);
   assert.match(uvCliManifest, /^license-files = \["\.generated-licenses\/\*"\]$/mu);
   for (const license of [
     "LICENSE.md",
@@ -690,11 +692,57 @@ readinessTest("release readiness reuses compatibility-keyed Cargo state across c
   }
 });
 
+const compressCliWheel =
+  "python scripts/public/compress-cli-wheel.py packaging/bifrost-cli/wheelhouse packaging/bifrost-cli/dist/*.whl";
+
+// The raw binary deflates to about 95 MB against PyPI's 100 MiB limit (#8288),
+// so every later step must read the compressed wheel. On Linux, maturin-action
+// leaves packaging/bifrost-cli/dist owned by root (its chown ignores
+// working-directory), so the compressed wheel goes to a runner-owned wheelhouse.
+function assertCompressedCliWheelConsumed(job, build, upload) {
+  const compress = job.indexOf(compressCliWheel);
+  assert.ok(compress > job.indexOf(build), "compress after maturin builds the wheel");
+  const after = job.slice(compress + compressCliWheel.length);
+  assert.ok(!after.includes("packaging/bifrost-cli/dist"), "no step after compression reads maturin's uncompressed wheel");
+  assert.ok(after.indexOf(upload) < after.indexOf("path: packaging/bifrost-cli/wheelhouse/*.whl"), "upload the compressed wheel");
+  return after;
+}
+
+test("the uv CLI wheel build uploads the compressed wheel", () => {
+  assertCompressedCliWheelConsumed(jobBlock(wheelBuilder, "build-cli"), "name: Build uv CLI wheel", "name: Upload uv CLI wheel artifact");
+});
+
+readinessTest("the uv CLI wheel is compressed before it is smoked and uploaded", () => {
+  const after = assertCompressedCliWheelConsumed(
+    jobBlock(readiness, "uv-wheels"),
+    "name: Build uv CLI wheel",
+    "name: Upload exact uv CLI wheel",
+  );
+  assert.ok(after.includes("--wheel-directory packaging/bifrost-cli/wheelhouse --kind cli"), "smoke the compressed wheel");
+  assert.match(after, /lipo -archs "\$unpacked\/bifrost"/u, "check the decompressed binary's architecture");
+});
+
+readinessTest("release wheels compress at deflate level 9 for PyPI headroom", () => {
+  // The CLI and searchtools wheels sit within 10% of PyPI's 100 MiB limit (#8288).
+  for (const jobName of ["python-wheels", "uv-wheels"]) {
+    assert.match(
+      jobBlock(readiness, jobName),
+      /args: --release --locked --out dist --compression-method deflated --compression-level 9\n/u,
+      `${jobName} must build its wheel at deflate level 9`,
+    );
+  }
+});
+
 readinessTest("release binaries use the restricted larger-runner pools", () => {
   const build = jobBlock(readiness, "build");
   assert.match(
     build,
     /target: universal-apple-darwin[\s\S]{0,160}?runner: bifrost-macos-arm64-5core/u,
+  );
+  // The npm packages carry one macOS slice each (#8288), staged beside the universal archive.
+  assert.match(
+    build,
+    /for slice in x86_64-apple-darwin:x86_64 aarch64-apple-darwin:arm64; do[\s\S]*?lipo -archs[\s\S]*?stage-unix-release-archive\.sh "target\/\$\{target\}\/release\/\$\{BIN_NAME\}" "\$target"/u,
   );
   for (const target of ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]) {
     assert.match(
@@ -743,7 +791,7 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
   assert.match(offlinePackAcceptance, /mounted_java_home=/u);
   assert.match(offlinePackAcceptance, /missing-JAVA_HOME acceptance unexpectedly selected/u);
   assert.match(offlinePackAcceptance, /\[\[ "\$label" == "missing" \|\| "\$label" == "positive" \]\]/u);
-  assert.match(offlinePackAcceptance, /positiveStatus === 2/u);
+  assert.match(offlinePackAcceptance, /positiveStatus === 0/u);
   assert.match(offlinePackAcceptance, /reasons\[0\] === "partial_discovery"/u);
   assert.match(offlinePackAcceptance, /call_binding_dispatch_partial/u);
   assert.match(offlinePackAcceptance, /UnsupportedExpression/u);

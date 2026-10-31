@@ -137,6 +137,17 @@ impl Producer<'_, '_> {
                 namespace,
                 ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
             ) {
+                if namespace == ResolutionNamespace::Type {
+                    self.facts
+                        .root_references
+                        .push(ResolutionRootReferenceFact {
+                            reference,
+                            root_scope: ctx.scope,
+                            anchor: ResolutionRootImportAnchor::Lexical,
+                            prefix_reference: None,
+                            owner_continued: false,
+                        });
+                }
                 self.facts
                     .package_references
                     .push(ResolutionPackageReferenceFact {

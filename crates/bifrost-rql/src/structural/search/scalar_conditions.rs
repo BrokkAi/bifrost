@@ -777,12 +777,19 @@ fn derive_scalar_condition_outcomes(
             .map_err(|_| ScalarConditionGap::StaleSource)?;
     let language = prepared.dialect().language();
     let semantics = procedure.semantics();
-    if semantics
-        .points()
-        .len()
-        .saturating_mul(semantics.values().len())
-        > MAX_SCALAR_MATRIX_CELLS
-        || semantics.control_edges().len() > MAX_SCALAR_CONTROL_EDGES
+    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        semantics
+            .points()
+            .len()
+            .saturating_mul(semantics.values().len()),
+        MAX_SCALAR_MATRIX_CELLS,
+    )
+    .allows(0)
+        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            semantics.control_edges().len(),
+            MAX_SCALAR_CONTROL_EDGES,
+        )
+        .allows(0)
     {
         return Err(ScalarConditionGap::WorkLimit);
     }
@@ -1037,7 +1044,12 @@ fn peel_parentheses(mut node: Node<'_>) -> Result<Node<'_>, ScalarConditionGap> 
     ) && node.named_child_count() == 1
     {
         layers += 1;
-        if layers > MAX_COMPOSED_NODES {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            layers,
+            MAX_COMPOSED_NODES,
+        )
+        .allows(0)
+        {
             return Err(ScalarConditionGap::WorkLimit);
         }
         node = node.named_child(0).expect("one named expression child");
@@ -1617,7 +1629,12 @@ fn composed_leaves<'tree>(
     let mut visited = 0_usize;
     while let Some((node, entry)) = stack.pop() {
         visited += 1;
-        if visited > MAX_COMPOSED_NODES {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            visited,
+            MAX_COMPOSED_NODES,
+        )
+        .allows(0)
+        {
             return Err(ScalarConditionGap::WorkLimit);
         }
         let node = peel_parentheses(node)?;
@@ -1669,7 +1686,12 @@ fn composed_leaves<'tree>(
             }
             ConditionShape::Leaf => leaves.push(ConditionLeaf { node, entry }),
         }
-        if stack.len().saturating_add(leaves.len()) > MAX_COMPOSED_LEAVES {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            stack.len().saturating_add(leaves.len()),
+            MAX_COMPOSED_LEAVES,
+        )
+        .allows(0)
+        {
             return Err(ScalarConditionGap::WorkLimit);
         }
     }
@@ -1710,9 +1732,6 @@ fn exact_entry_reaches_guard(
             || (span.end_byte() as usize) > entry_node.end_byte()
         {
             return false;
-        }
-        if current == guard.point {
-            return true;
         }
         let mut normal = None;
         for (_, edge) in semantics.successor_edges(current) {
@@ -1767,7 +1786,12 @@ impl ComposedConditions<'_> {
             let mut ascended = 0_usize;
             loop {
                 ascended += 1;
-                if ascended > MAX_COMPOSED_NODES {
+                if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    ascended,
+                    MAX_COMPOSED_NODES,
+                )
+                .allows(0)
+                {
                     return Err(ScalarConditionGap::WorkLimit);
                 }
                 if syntax.is_owner(ancestor)
@@ -1787,7 +1811,12 @@ impl ComposedConditions<'_> {
                 };
                 ancestor = parent;
             }
-            if groups.len() > MAX_COMPOSED_CONDITIONS {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                groups.len(),
+                MAX_COMPOSED_CONDITIONS,
+            )
+            .allows(0)
+            {
                 return Err(ScalarConditionGap::WorkLimit);
             }
         }

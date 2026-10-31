@@ -1046,6 +1046,7 @@ fn kotlin_callable_header(node: Node<'_>, source: &str) -> String {
 }
 
 struct KotlinParameterFacts {
+    overload_tokens: Vec<String>,
     metadata: Vec<ParameterMetadata>,
     /// The written type of each parameter, `vararg`-prefixed where declared:
     /// what tells same-named overloads apart (see `kotlin_signature_key`).
@@ -1131,11 +1132,28 @@ fn kotlin_parameter_facts_from(
     repeated: bool,
 ) -> KotlinParameterFacts {
     KotlinParameterFacts {
+        overload_tokens: Vec::new(),
         required: metadata.len().saturating_sub(optional),
         metadata,
         key_types,
         repeated,
     }
+}
+
+fn kotlin_overload_parameter_tokens(ty: Option<Node<'_>>, source: &str) -> Vec<String> {
+    use brokk_bifrost_core::analyzer::tree_walk::{
+        canonical_type_tokens_redirecting, overload_parameter_tokens,
+    };
+    let Some(ty) = ty else {
+        return overload_parameter_tokens(None, source);
+    };
+    let mut tokens = vec!["<parameter>".to_owned()];
+    tokens.extend(canonical_type_tokens_redirecting(ty, source, &|node| {
+        (node.kind() == "parameter")
+            .then(|| kotlin_binding_type_node(node))
+            .flatten()
+    }));
+    tokens
 }
 
 /// Parameter facts for a `function_value_parameters` list.
@@ -1148,6 +1166,7 @@ fn kotlin_parameter_facts_from(
 /// parameter that follows it.
 fn kotlin_function_parameter_facts(list: Node<'_>, source: &str) -> KotlinParameterFacts {
     let mut metadata = Vec::new();
+    let mut overload_tokens = Vec::new();
     let mut key_types = Vec::new();
     let mut optional = 0usize;
     let mut repeated = false;
@@ -1163,6 +1182,13 @@ fn kotlin_function_parameter_facts(list: Node<'_>, source: &str) -> KotlinParame
                 // required.
                 optional += 1;
             }
+            if pending_vararg {
+                overload_tokens.push("<vararg>".to_owned());
+            }
+            overload_tokens.extend(kotlin_overload_parameter_tokens(
+                kotlin_binding_type_node(child),
+                source,
+            ));
             key_types.push(kotlin_parameter_key_type(child, pending_vararg, source));
             pending_vararg = false;
             metadata.push(kotlin_parameter_metadata(child, source));
@@ -1170,7 +1196,9 @@ fn kotlin_function_parameter_facts(list: Node<'_>, source: &str) -> KotlinParame
             optional += 1;
         }
     }
-    kotlin_parameter_facts_from(metadata, key_types, optional, repeated)
+    let mut facts = kotlin_parameter_facts_from(metadata, key_types, optional, repeated);
+    facts.overload_tokens = overload_tokens;
+    facts
 }
 
 /// Parameter facts for a `primary_constructor`'s `class_parameter` list.
@@ -1183,6 +1211,7 @@ fn kotlin_function_parameter_facts(list: Node<'_>, source: &str) -> KotlinParame
 /// defaulted constructor parameter as required.
 fn kotlin_class_parameter_facts(parameters: &[Node<'_>], source: &str) -> KotlinParameterFacts {
     let mut metadata = Vec::new();
+    let mut overload_tokens = Vec::new();
     let mut key_types = Vec::new();
     let mut optional = 0usize;
     let mut repeated = false;
@@ -1195,15 +1224,28 @@ fn kotlin_class_parameter_facts(parameters: &[Node<'_>], source: &str) -> Kotlin
             optional += 1;
             repeated |= vararg;
         }
+        if vararg {
+            overload_tokens.push("<vararg>".to_owned());
+        }
+        overload_tokens.extend(kotlin_overload_parameter_tokens(
+            kotlin_binding_type_node(*parameter),
+            source,
+        ));
         key_types.push(kotlin_parameter_key_type(*parameter, vararg, source));
         metadata.push(kotlin_parameter_metadata(*parameter, source));
     }
-    kotlin_parameter_facts_from(metadata, key_types, optional, repeated)
+    let mut facts = kotlin_parameter_facts_from(metadata, key_types, optional, repeated);
+    facts.overload_tokens = overload_tokens;
+    facts
 }
 
 fn kotlin_signature_metadata(signature: String, facts: KotlinParameterFacts) -> SignatureMetadata {
     let arity = CallableArity::new(facts.required, facts.metadata.len(), facts.repeated);
-    SignatureMetadata::new(signature, facts.metadata).with_callable_arity(arity)
+    SignatureMetadata::new(signature, facts.metadata)
+        .with_callable_arity(arity)
+        .with_overload_discriminator(Some(
+            brokk_bifrost_core::analyzer::tree_walk::overload_discriminator(facts.overload_tokens),
+        ))
 }
 
 /// Arity values for one callable identity, or an empty set when one overload
@@ -1235,7 +1277,7 @@ pub fn kotlin_callable_metadata_accepts_arity(
 
 fn kotlin_callable_signature_metadata(
     signature: String,
-    facts: KotlinParameterFacts,
+    mut facts: KotlinParameterFacts,
     node: Node<'_>,
     source: &str,
 ) -> SignatureMetadata {
@@ -1244,6 +1286,12 @@ fn kotlin_callable_signature_metadata(
     // learn them (issue #1345). Both are recorded as *spelled*: resolution
     // belongs to the consumer and its scope, because a spelled type means
     // whatever the file that wrote it says it means.
+    if let Some(receiver) = node.child_by_field_name("receiver") {
+        facts.overload_tokens.push("<receiver>".to_owned());
+        facts.overload_tokens.extend(
+            brokk_bifrost_core::analyzer::tree_walk::canonical_type_tokens(receiver, source),
+        );
+    }
     kotlin_signature_metadata(signature, facts)
         .with_return_type_text(kotlin_declared_return_type_text(node, source))
         .with_return_type_identity(kotlin_nominal_type_identity(

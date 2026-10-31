@@ -294,22 +294,6 @@ impl CvssOverlayEvidenceMetadata {
         )
     }
 
-    pub fn evidence_refs(&self) -> &[super::finding_identity::EvidenceRef] {
-        &self.evidence_refs
-    }
-
-    pub fn rationale(&self) -> &str {
-        &self.rationale
-    }
-
-    pub fn assumptions(&self) -> &[String] {
-        &self.assumptions
-    }
-
-    pub fn assessor_or_tool(&self) -> &str {
-        &self.assessor_or_tool
-    }
-
     pub fn assessed_at(&self) -> &str {
         &self.assessed_at
     }

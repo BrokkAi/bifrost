@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn domain_values_preserve_inclusive_byte_limits() {
     assert!(serde_json::from_str::<ConfigurationFormat>("\"bogus\"").is_err());
-    for label in ["yaml", "toml", "json", "xml", "properties"] {
+    for label in ["yaml", "toml", "json", "xml", "properties", "hocon"] {
         let value = serde_json::to_value(ConfigurationFormat::from_label(label).unwrap()).unwrap();
         assert_eq!(value, serde_json::json!(label));
         assert_eq!(

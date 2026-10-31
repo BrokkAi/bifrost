@@ -9,6 +9,7 @@ CROSS JOIN source_rust_module_scopes AS scope ON scope.blob_id=mount.blob_id
 CROSS JOIN selected_workspace_file_versions AS file
  ON file.lang=mount.storage_language AND file.rel_path=mount.persisted_relative_path
 CROSS JOIN blobs AS base ON base.lang=file.lang AND base.blob_oid=file.blob_oid
+ AND base.parse_variant=x''
 CROSS JOIN main.resolution_unit_summary_members AS members
  INDEXED BY resolution_unit_summary_members_blob
  ON members.blob_id=base.id AND members.rel_path=mount.persisted_relative_path

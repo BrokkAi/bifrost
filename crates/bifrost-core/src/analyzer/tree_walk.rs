@@ -1081,6 +1081,66 @@ impl<'tree> Iterator for Ancestors<'_, 'tree> {
     }
 }
 
+/// Canonical leaf tokens for overload identity. Traversal is iterative and
+/// excludes comment subtrees, missing recovery tokens and source trivia.
+pub fn canonical_type_tokens(node: Node<'_>, source: &str) -> Vec<String> {
+    canonical_type_tokens_redirecting(node, source, &|_| None)
+}
+
+/// Canonical tokens with a language hook selecting a replacement subtree.
+pub fn canonical_type_tokens_redirecting<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    redirect: &dyn Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.is_extra() || is_comment_kind(node.kind()) || node.is_missing() {
+            continue;
+        }
+        if let Some(replacement) = redirect(node) {
+            pending.push(replacement);
+        } else if node.child_count() == 0 {
+            if node.end_byte() > node.start_byte() {
+                tokens.push(source[node.byte_range()].to_owned());
+            }
+        } else {
+            for index in (0..node.child_count()).rev() {
+                pending.push(node.child(index).expect("child index in bounds"));
+            }
+        }
+    }
+    tokens
+}
+
+/// Length-delimited tokens keep punctuation and explicit structural markers
+/// unambiguous without depending on whitespace or parameter names.
+pub fn overload_discriminator(tokens: impl IntoIterator<Item = String>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"bifrost.overload-discriminator.v1");
+    for token in tokens {
+        digest.update((token.len() as u64).to_le_bytes());
+        digest.update(token.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// A parameter boundary and its type; incomplete syntax keeps the slot.
+pub fn overload_parameter_tokens(node: Option<Node<'_>>, source: &str) -> Vec<String> {
+    let mut tokens = vec!["<parameter>".to_owned()];
+    // Type punctuation is emitted as separate tree-sitter leaves; identifiers
+    // cannot contain angle brackets (escaped names retain their delimiters).
+    // Thus a real canonical type leaf cannot equal the single <untyped> token.
+    tokens.extend(
+        node.map(|node| canonical_type_tokens(node, source))
+            .filter(|tokens| !tokens.is_empty())
+            .unwrap_or_else(|| vec!["<untyped>".to_owned()]),
+    );
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::expanded_comment_start;

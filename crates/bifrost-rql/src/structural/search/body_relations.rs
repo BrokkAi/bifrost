@@ -2,7 +2,7 @@
 
 use super::language_rules::{LanguageRuleMatches, UndecidedSite};
 use crate::analyzer::ProjectFile;
-use crate::analyzer::usages::get_definition::parse_tree_for_language;
+use crate::analyzer::usages::get_definition::parse_tree_for_language_preprocessed;
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::body_relations::{
     BodyOwner, BodyState, BodyStateAnswer, body_relation_for_block, body_state,
@@ -21,13 +21,14 @@ pub(super) fn matches_for_file(
     state: BodyState,
     owner: Option<BodyOwner>,
 ) -> LanguageRuleMatches {
-    let Some(tree) = parse_tree_for_language(file, language, source) else {
+    let Some((tree, preprocessor)) = parse_tree_for_language_preprocessed(file, language, source)
+    else {
         return LanguageRuleMatches::default();
     };
-    let regions = brokk_bifrost_analysis::analyzer::languages::language_knowledge(language)
-        .expect("body relation language is registered")
-        .structural_spec()
-        .conditional_regions(tree.root_node(), source);
+    let regions = preprocessor
+        .as_ref()
+        .map(|p| p.conditional_regions(source))
+        .unwrap_or_default();
     let mut undecided = Vec::new();
     let mut pending = vec![tree.root_node()];
     let mut ranges = Vec::new();

@@ -639,7 +639,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
             return ClassHierarchy::unknown();
         }
         let ruby = ruby_analyzer(workspace);
-        let ancestors = ruby.get_ancestors(unit);
+        let ancestors = ruby.get_ancestors(unit).definite().to_vec();
         if ancestors
             .iter()
             .any(|ancestor| current_prepared(workspace, ancestor.source()).is_none())

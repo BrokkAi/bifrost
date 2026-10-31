@@ -846,6 +846,44 @@ fn model_call_binding_for_external_dispatch(
     )
 }
 
+/// Shared resolver-owned callable selection for binding and result proofs.
+pub(super) fn selected_model_callable(
+    analyzer: &dyn IAnalyzer,
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    modeled_key: &ModeledProcedureKey,
+    selected_descriptor: Option<&crate::analyzer::resolution::ExternalMemberIdentity>,
+    application: &SemanticModelCallApplication,
+) -> Option<crate::analyzer::semantic_model::SemanticModelCallableMatch> {
+    let key = SemanticModelCallableKey::new(
+        &modeled_key.language,
+        &modeled_key.owner,
+        &modeled_key.member,
+        modeled_key.has_receiver,
+        modeled_key.parameter_count,
+    );
+    let selected_record =
+        match selected_descriptor {
+            Some(selected) => Some(analyzer.active_semantic_model_snapshot().and_then(
+                |snapshot| {
+                    crate::analyzer::store::active_models::selected_external_descriptor(
+                        snapshot.active_models(),
+                        selected,
+                    )
+                },
+            )?),
+            None => None,
+        };
+    Some(
+        overlay.callable_for_selected_application(
+            key,
+            application,
+            selected_record
+                .as_ref()
+                .map(|(provider, record)| (provider.as_str(), record.as_str())),
+        ),
+    )
+}
+
 fn model_call_binding_for_external_shape(
     analyzer: &dyn IAnalyzer,
     modeled_key: ModeledProcedureKey,
@@ -868,32 +906,17 @@ fn model_call_binding_for_external_shape(
         modeled_key.has_receiver,
         modeled_key.parameter_count,
     );
-    let application = structured_model_application(shape);
     let model_callable_id = overlay.callable_family_id_for_target(key);
-    let selected_record = match selected_descriptor {
-        Some(selected) => {
-            let Some(record) = analyzer
-                .active_semantic_model_snapshot()
-                .and_then(|snapshot| {
-                    crate::analyzer::store::active_models::selected_external_descriptor(
-                        snapshot.active_models(),
-                        selected,
-                    )
-                })
-            else {
-                return ModelCallBinding::Unavailable;
-            };
-            Some(record)
-        }
-        None => None,
-    };
-    let matched = overlay.callable_for_selected_application(
-        key,
+    let application = structured_model_application(shape);
+    let Some(matched) = selected_model_callable(
+        analyzer,
+        &overlay,
+        &modeled_key,
+        selected_descriptor,
         &application,
-        selected_record
-            .as_ref()
-            .map(|(provider, record)| (provider.as_str(), record.as_str())),
-    );
+    ) else {
+        return ModelCallBinding::Unavailable;
+    };
     let exact_target_matches = |symbol: &crate::analyzer::semantic_model::SemanticModelSymbol| {
         exact_external_target.is_none_or(|target| {
             symbol.has_exact_artifact_locator(target.procedure().path().as_str(), target.symbol())
@@ -1975,9 +1998,12 @@ pub(super) fn call_binding_expansions(
         ResolvedCallTarget::Unresolved => (CallBindingTarget::Unresolved, None, None, None),
     };
 
-    let dispatch_answer = semantic
+    let (dispatch_answer, dispatch_incompleteness) = semantic
         .as_deref_mut()
-        .map(|semantic| semantic.dispatch_at_source(&file, shape.report.outcome.range));
+        .map(|semantic| semantic.dispatch_at_source_with_cause(&file, shape.report.outcome.range))
+        .map_or((None, Incompleteness::Content), |(answer, cause)| {
+            (Some(answer), cause)
+        });
     let external_model_arm = dispatch_answer.as_ref().and_then(|answer| {
         (answer.arms.len() == 1
             && answer.arms[0].target_unit.is_none()
@@ -2103,7 +2129,8 @@ pub(super) fn call_binding_expansions(
                 model_id = incomplete_model_id;
                 pack_id = provenance.as_ref().map(|value| value.pack_id.clone());
                 semantic_model_provenance = provenance;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -2113,7 +2140,7 @@ pub(super) fn call_binding_expansions(
                     message: "call_bindings found incomplete or conflicting semantic-model provenance for an exact source target".to_owned(),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
             }
         }
     }
@@ -2301,7 +2328,8 @@ pub(super) fn call_binding_expansions(
                 pack_id = incomplete_pack_id;
                 target_origin = incomplete_provenance.as_ref().map(|_| "semantic_model");
                 semantic_model_provenance = incomplete_provenance;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -2313,7 +2341,7 @@ pub(super) fn call_binding_expansions(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
             }
             ModelCallBinding::CompatibleLayout {
                 layout,
@@ -2351,7 +2379,8 @@ pub(super) fn call_binding_expansions(
                 pack_id = incomplete_pack_id;
                 target_origin = incomplete_provenance.as_ref().map(|_| "semantic_model");
                 semantic_model_provenance = incomplete_provenance;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -2363,7 +2392,7 @@ pub(super) fn call_binding_expansions(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
             }
             ModelCallBinding::Empty | ModelCallBinding::Unavailable => {
                 target = if resolver_owned_external_dispatch.is_some() {
@@ -2459,7 +2488,8 @@ pub(super) fn call_binding_expansions(
         );
     let mut report = call_binding_report(analyzer, &file, &shape.report, target, cancellation);
     if let Some(original_gap) = native_resolution_gap.as_ref() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -2471,10 +2501,13 @@ pub(super) fn call_binding_expansions(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     if let Some(original_reasons) = incomplete_callee_diagnostics.as_ref() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+            ),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -2491,7 +2524,7 @@ pub(super) fn call_binding_expansions(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     // The initial producer consumes exact source signatures. Model signature
     // substitution must not lend a different signature's proof to these rows.
@@ -2640,8 +2673,14 @@ pub(super) fn call_binding_expansions(
     } else {
         CallBindingSelectorProof::unavailable()
     };
+    let binding_incompleteness = if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+    } else {
+        dispatch_incompleteness
+    };
     if has_semantic && !binding_is_complete {
-        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: binding_incompleteness,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -2657,9 +2696,10 @@ pub(super) fn call_binding_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }, match dispatch.outcome { "cancelled" => Some(DerivationExecutionCause::Cancelled), "exceeded_budget" => Some(DerivationExecutionCause::Budget), _ if dispatch.coverage == "truncated" => Some(DerivationExecutionCause::Budget), _ => None }));
+        }), match dispatch.outcome { "cancelled" => Some(DerivationExecutionCause::Cancelled), "exceeded_budget" => Some(DerivationExecutionCause::Budget), _ if dispatch.coverage == "truncated" => Some(DerivationExecutionCause::Budget), _ => None }));
     } else if has_semantic && !selector.exact {
-        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: binding_incompleteness,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::CallBindingDispatchPartial,
@@ -2672,7 +2712,7 @@ pub(super) fn call_binding_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }, match dispatch.outcome { "cancelled" => Some(DerivationExecutionCause::Cancelled), "exceeded_budget" => Some(DerivationExecutionCause::Budget), _ if dispatch.coverage == "truncated" => Some(DerivationExecutionCause::Budget), _ => None }));
+        }), match dispatch.outcome { "cancelled" => Some(DerivationExecutionCause::Cancelled), "exceeded_budget" => Some(DerivationExecutionCause::Budget), _ if dispatch.coverage == "truncated" => Some(DerivationExecutionCause::Budget), _ => None }));
     }
     let site = CallBindingSiteValue {
         report,
@@ -2762,7 +2802,7 @@ pub(super) fn call_binding_expansions(
 /// The exact call partition already published by the shared shape relation.
 /// Missing or non-exact coverage is typed unknown; no source reparse happens
 /// here, and no argument is inferred from a callee display string.
-fn structured_model_application(shape: &CallShapeValue) -> SemanticModelCallApplication {
+pub(super) fn structured_model_application(shape: &CallShapeValue) -> SemanticModelCallApplication {
     if !shape.report.outcome.coverage.is_exact() {
         return SemanticModelCallApplication::Unknown;
     }

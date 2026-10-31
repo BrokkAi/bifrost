@@ -231,12 +231,16 @@ pub(super) fn dispatch_expansions_for_input(
 ) -> Vec<PipelineExpansion> {
     let facts = coherent_trace_facts_for_file(traces, file);
     let (site_id, derived_ast_id) = dispatch_site_identity(analyzer, file, range, facts);
+    let (answer, incompleteness) = semantic.dispatch_at_source_with_cause(file, range);
+    if incompleteness.execution_cause().is_some() {
+        analyzer.mark_execution_dependent();
+    }
     let site = DispatchSiteValue {
         file: file.clone(),
         range,
         site_id,
         site_ast_id: known_ast_id.or(derived_ast_id),
-        answer: Arc::new(semantic.dispatch_at_source(file, range)),
+        answer: Arc::new(answer),
     };
     if !targets {
         return vec![pipeline_expansion(PipelineValue::DispatchOutcome(

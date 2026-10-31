@@ -56,7 +56,7 @@ pub(crate) const JS_TS_SOURCE_HEADER_SQL: &str =
        JOIN source_fact_manifests AS source ON source.blob_id = blob.id
        JOIN blob_meta AS meta ON meta.blob_id = blob.id
        JOIN source_fact_readiness AS ready ON ready.blob_id = blob.id
-      WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.generation = ?3
+      WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.parse_variant = x'' AND blob.generation = ?3
         AND marker.facts_version = ?4 AND source.facts_version = ?5
         AND meta.js_ts_source_version = ?4
         AND source.publication_state = 'complete' AND meta.is_complete = 1
@@ -208,7 +208,7 @@ impl JsTsSourceStorage for AnalyzerStore {
             })?;
 
             let blob_id: i64 = tx.query_row(
-                    "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3",
+                    "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = x'' AND generation = ?3",
                     params![oid.to_string(), language, generation.get()],
                     |row| row.get(0),
                 )?;
@@ -956,9 +956,7 @@ impl JsTsSourceStorage for AnalyzerStore {
             }
 
             let Some(units) = read_source_unit_map(
-                tx,
-                &oid.to_string(),
-                language,
+                tx,&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, language),
                 adapter,
                 file,
                 keep_going,
@@ -1011,7 +1009,11 @@ pub trait CanonicalJsTsSourceFacts {
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>>;
@@ -1022,7 +1024,11 @@ impl<A: LanguageAdapter> CanonicalJsTsSourceFacts for TreeSitterAnalyzer<A> {
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>> {
@@ -1045,7 +1051,14 @@ impl<A: LanguageAdapter> CanonicalJsTsSourceFacts for TreeSitterAnalyzer<A> {
                 },
             ));
         }
-        let cache_key = (generation, oid, cache_file);
+        let cache_key = (
+            generation,
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                self.adapter().storage_language_key_for_file(file),
+            ),
+            cache_file,
+        );
         if let Some(facts) = cache.get(&cache_key) {
             return Some(facts);
         }

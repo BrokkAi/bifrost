@@ -1114,7 +1114,8 @@ mod value_domain {
     /// The configuration-fact vocabularies the row surface publishes
     /// (#3277). Each folds the exact labels its producing enum writes, so a
     /// row column cannot drift from the value ingestion produces.
-    pub(super) const CONFIGURATION_FORMAT: &[&str] = &["yaml", "toml", "json", "xml", "properties"];
+    pub(super) const CONFIGURATION_FORMAT: &[&str] =
+        &["yaml", "toml", "json", "xml", "properties", "hocon"];
     pub(super) const CONFIGURATION_NODE_KIND: &[&str] = &[
         "document", "object", "section", "sequence", "member", "scalar",
     ];
@@ -3063,6 +3064,7 @@ detailed_row_domains! {
                 "caught_type_relation",
                 &["system_exception", "not_system_exception", "unknown"],
             ),
+            CodeQueryRowField::optional_enum("throw_relation", &["caught_variable", "bare", "other", "no_owner", "unknown"]),
             CodeQueryRowField::optional("has_filter", Scalar::Boolean),
             CodeQueryRowField::optional_enum(
                 "rethrow_kind",
@@ -6245,6 +6247,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::FailureHandlerState { value }, "has_filter") => {
             value.has_filter.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "throw_relation") => {
+            value.throw_relation.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::FailureHandlerState { value }, "rethrow_kind") => {
             value.rethrow_kind.map(Scalar::ConstrainedEnum)

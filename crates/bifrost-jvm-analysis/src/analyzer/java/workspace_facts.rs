@@ -466,7 +466,13 @@ mod scope_authority_tests {
         let read = || {
             assert!(!java.referencing_files_of(&file).is_empty());
             java.same_package_reference_index();
-            assert!(!java.get_direct_descendants(&owner).is_empty());
+            assert!(
+                !java
+                    .get_direct_descendants(&owner)
+                    .definite()
+                    .to_vec()
+                    .is_empty()
+            );
         };
         read();
         let references = || {
@@ -479,7 +485,7 @@ mod scope_authority_tests {
             java.same_package_reference_index();
         };
         let descendants = || {
-            java.get_direct_descendants(&owner);
+            assert!(java.get_direct_descendants(&owner).is_complete());
         };
         let readers: [&dyn Fn(); 4] = [&references, &reverse, &same_package, &descendants];
         for reader in readers.into_iter().cycle().take(8) {
@@ -734,12 +740,14 @@ mod imported_type_resolution_tests {
             .expect("fixture child");
         java.test_hooks()
             .reset_full_declaration_scan_count_for_test();
-        let ancestors = java.get_direct_ancestors(&child);
+        let ancestors = java.get_direct_ancestors(&child).definite().to_vec();
         assert_eq!(
             ancestors.iter().map(CodeUnit::fq_name).collect::<Vec<_>>(),
             vec!["lib.Base"]
         );
-        let (warm, reads) = capture_query_reads(&java, || java.get_direct_ancestors(&child));
+        let (warm, reads) = capture_query_reads(&java, || {
+            java.get_direct_ancestors(&child).definite().to_vec()
+        });
         assert_eq!(warm, ancestors);
         assert_eq!(reads.unattributed_reads(), 0);
         assert_eq!(java.test_hooks().full_declaration_scan_count_for_test(), 0);

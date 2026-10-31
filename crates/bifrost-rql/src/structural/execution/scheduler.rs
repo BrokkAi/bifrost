@@ -143,7 +143,8 @@ impl BoundedReadyScheduler {
                             break;
                         }
                         queue_wait_ns.fetch_add(elapsed_ns(queue_epoch), Ordering::Relaxed);
-                        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        if context.run(|| cancellation.is_some_and(CancellationToken::is_cancelled))
+                        {
                             tasks_observed_cancelled_before_start.fetch_add(1, Ordering::Relaxed);
                         }
                         tasks_started.fetch_add(1, Ordering::Relaxed);

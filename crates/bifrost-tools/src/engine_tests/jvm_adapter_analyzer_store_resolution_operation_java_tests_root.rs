@@ -189,16 +189,14 @@ pub(crate) mod jvm_extraction_tests {
         let scala_oid = Oid::hash_object(ObjectType::Blob, scala_source.as_bytes()).unwrap();
         let prepared = vec![
             AnalyzerStore::prepare_parsed_blob(
-                java_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(java_oid, "java"),
                 java_generation,
                 &JavaAdapter,
                 java_state.clone(),
             )
             .unwrap(),
             AnalyzerStore::prepare_parsed_blob(
-                scala_oid,
-                "scala",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(scala_oid, "scala"),
                 scala_generation,
                 &ScalaAdapter,
                 scala_state.clone(),
@@ -683,16 +681,14 @@ pub(crate) mod jvm_extraction_tests {
         let peer_oid = Oid::hash_object(ObjectType::Blob, peer_source.as_bytes()).unwrap();
         let prepared = vec![
             AnalyzerStore::prepare_parsed_blob(
-                java_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(java_oid, "java"),
                 java_generation,
                 &JavaAdapter,
                 java_state.clone(),
             )
             .unwrap(),
             AnalyzerStore::prepare_parsed_blob(
-                peer_oid,
-                peer_storage_language,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(peer_oid, peer_storage_language),
                 peer_generation,
                 adapter,
                 peer_state.clone(),
@@ -893,8 +889,13 @@ pub(crate) mod jvm_extraction_tests {
         let (state, facts) = parsed_operation_state(root, path, source, adapter);
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
         let package = state.package_name.clone();
-        let prepared =
-            AnalyzerStore::prepare_parsed_blob(oid, storage, generation, adapter, state).unwrap();
+        let prepared = AnalyzerStore::prepare_parsed_blob(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, storage),
+            generation,
+            adapter,
+            state,
+        )
+        .unwrap();
         let (outcomes, _) =
             store.persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
         assert!(

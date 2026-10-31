@@ -280,22 +280,6 @@ impl ExplanationNode {
     }
 }
 
-impl RetainedSize for ExplanationNode {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.label.capacity())
-            .saturating_add(self.expected.as_ref().map_or(0, String::capacity))
-            .saturating_add(self.actual.as_ref().map_or(0, String::capacity))
-            .saturating_add(self.location.as_ref().map_or(0, retained_extra))
-            .saturating_add(
-                self.reasons
-                    .capacity()
-                    .saturating_mul(size_of::<PolicyIncompleteReason>()),
-            )
-            .saturating_add(retained_extra(&self.children))
-    }
-}
-
 /// What an explanation is about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -641,15 +625,6 @@ impl PolicyExplanation {
     /// equal explanations render byte-identically.
     pub fn to_json(&self) -> String {
         super::serialize_json(self, "the explanation model is serializable")
-    }
-}
-
-impl RetainedSize for PolicyExplanation {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.policy_id))
-            .saturating_add(retained_extra(&self.subject))
-            .saturating_add(retained_extra(&self.root))
     }
 }
 

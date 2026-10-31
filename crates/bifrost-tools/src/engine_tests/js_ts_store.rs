@@ -39,14 +39,19 @@ mod js_ts_extraction_tests {
                 store
                     .write_parsed_blob_at_generation(
                         &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                        oid,
-                        key,
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, key),
                         generation,
                         adapter,
                         &state,
                     )
                     .unwrap();
-                assert!(store.contains_parsed_blob(oid, key).unwrap());
+                assert!(
+                    store
+                        .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                            oid, key
+                        ))
+                        .unwrap()
+                );
             }
             // Follow the production path, including its language-level memoization.
             let epochs = keys
@@ -60,7 +65,14 @@ mod js_ts_extraction_tests {
                 .collect::<Vec<_>>();
             store.ensure_language_epoch_values(&epochs).unwrap();
             for (key, _) in &keys {
-                assert!(!store.contains_parsed_blob(oid, key).unwrap(), "{key}");
+                assert!(
+                    !store
+                        .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                            oid, key
+                        ))
+                        .unwrap(),
+                    "{key}"
+                );
             }
         }
 
@@ -306,25 +318,59 @@ mod js_ts_extraction_tests {
             .ensure_language_epoch_value("typescript", "epoch-a")
             .unwrap();
         store
-            .write_parsed_blob(java_oid, "java", &java, &java_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(java_oid, "java"),
+                &java,
+                &java_state,
+            )
             .unwrap();
         store
-            .write_parsed_blob(ts_oid, "typescript", &ts, &ts_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(ts_oid, "typescript"),
+                &ts,
+                &ts_state,
+            )
             .unwrap();
 
         store
             .ensure_language_epoch_value("java", "epoch-b")
             .unwrap();
         assert_eq!(
-            store.missing_blobs(&[java_oid], "java").unwrap(),
-            vec![java_oid]
+            store
+                .missing_blobs(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    java_oid, "java"
+                )])
+                .unwrap(),
+            vec![brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                java_oid, "java"
+            )]
         );
         assert_eq!(
-            store.missing_blobs(&[ts_oid], "typescript").unwrap(),
+            store
+                .missing_blobs(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    ts_oid,
+                    "typescript"
+                )])
+                .unwrap(),
             vec![]
         );
-        assert_eq!(store.content_row_count(java_oid, "java").unwrap(), 0);
-        assert!(store.content_row_count(ts_oid, "typescript").unwrap() > 0);
+        assert_eq!(
+            store
+                .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    java_oid, "java"
+                ))
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    ts_oid,
+                    "typescript"
+                ))
+                .unwrap()
+                > 0
+        );
     }
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]

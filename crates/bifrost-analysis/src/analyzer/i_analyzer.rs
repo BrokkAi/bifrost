@@ -152,6 +152,12 @@ pub use crate::forward_relational_definition_batch;
 #[macro_export]
 macro_rules! forward_query_read_ledger {
     () => {
+        fn current_query_read_completion(
+            &self,
+        ) -> Result<(), $crate::analyzer::QueryReadIncomplete> {
+            $crate::analyzer::IAnalyzer::current_query_read_completion(&self.inner)
+        }
+
         fn record_query_incomplete(&self, reason: $crate::analyzer::QueryReadIncomplete) {
             $crate::analyzer::IAnalyzer::record_query_incomplete(&self.inner, reason);
         }
@@ -1925,6 +1931,10 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// Records a typed reason a collection-returning read could not establish
     /// a complete answer, on the current request context and its enclosing chain.
     #[doc(hidden)]
+    fn current_query_read_completion(&self) -> Result<(), QueryReadIncomplete> {
+        Ok(())
+    }
+
     fn record_query_incomplete(&self, _reason: QueryReadIncomplete) {}
 
     /// Build the expensive lazily-initialized per-generation query indexes
@@ -1965,19 +1975,25 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// worker of the pool interactive requests fan out on.
     fn warm_structural_indexes(&self) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            // Warm workers must mask any request frame on a receiving thread.
+            let _maintenance = brokk_bifrost_core::analyzer::carried_context::push(None);
+            let carried_context =
+                brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             let providers = self.structural_fact_providers();
             crate::analyzer::install_on_dedicated_build_pool(|| {
                 use rayon::prelude::*;
                 providers.into_par_iter().for_each(|provider| {
-                    brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-                        let Some((cache, content_identity)) = structural_index_inputs(provider)
-                        else {
-                            return;
-                        };
-                        let cache = cache.inner();
-                        if cache.auto_build_outstanding(content_identity) {
-                            cache.acquire(provider, &crate::CancellationToken::default());
-                        }
+                    carried_context.run(|| {
+                        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+                            let Some((cache, content_identity)) = structural_index_inputs(provider)
+                            else {
+                                return;
+                            };
+                            let cache = cache.inner();
+                            if cache.auto_build_outstanding(content_identity) {
+                                cache.acquire(provider, &crate::CancellationToken::default());
+                            }
+                        })
                     })
                 });
             });
@@ -3027,6 +3043,16 @@ enum AttributionFrame {
 
 use brokk_bifrost_core::analyzer::carried_context::{self, CarriedContextGuard};
 
+impl carried_context::ExecutionAttribution for AttributionFrame {
+    fn mark_execution_dependent(&self) {
+        if let Self::Ledgers(ledgers) = self {
+            for (ledger, _) in ledgers {
+                ledger.mark_execution_dependent();
+            }
+        }
+    }
+}
+
 static READ_ATTRIBUTION_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -3071,7 +3097,9 @@ impl ReadAttribution {
     /// Install this attribution for the lifetime of the returned guard.
     pub fn install(&self) -> ReadAttributionGuard {
         ReadAttributionGuard {
-            _guard: Some(carried_context::push(Some(Arc::new(self.frame.clone())))),
+            _guard: Some(carried_context::push_with_execution_attribution(Arc::new(
+                self.frame.clone(),
+            ))),
             _request_state: carried_context::push_request_state(
                 self.request_state
                     .as_ref()
@@ -3109,7 +3137,8 @@ fn query_attribution(context: &Arc<AnalyzerQueryContext>) -> ReadAttributionGuar
         .map(|state| Arc::clone(&state.path_modules))
         .unwrap_or_default();
     ReadAttributionGuard {
-        _guard: frame.map(|frame| carried_context::push(Some(Arc::new(frame)))),
+        _guard: frame
+            .map(|frame| carried_context::push_with_execution_attribution(Arc::new(frame))),
         _request_state: carried_context::push_request_state(Some(Arc::new(AnalyzerRequestState {
             path_modules,
             context: Some(Arc::clone(context)),
@@ -4759,5 +4788,93 @@ mod memo_handle_tests {
         });
         assert!(reads.keys().is_empty());
         assert!(reads.is_bounded());
+    }
+    #[test]
+    fn caught_budget_refusal_is_execution_dependent() {
+        let analyzer = MultiAnalyzer::default();
+        let (answer, reads) = capture_query_reads(&analyzer, || {
+            let mut limits = crate::analyzer::semantic::SemanticBudget::default().limits();
+            limits.nested_entries = 1;
+            let budget = crate::analyzer::semantic::SemanticBudget::new(limits).unwrap();
+            let refused = budget.check_admission(crate::analyzer::semantic::SemanticWork {
+                nested_entries: 2,
+                ..Default::default()
+            });
+            assert!(refused.is_err());
+            17 // The caller catches the refusal and publishes a useful fallback.
+        });
+        assert_eq!(answer, 17);
+        assert!(reads.execution_dependences() > 0);
+        assert!(!reads.is_bounded());
+    }
+
+    #[test]
+    fn caught_worker_cancellation_is_execution_dependent() {
+        let analyzer = MultiAnalyzer::default();
+        let run = crate::CancellationToken::default();
+        let token = run.child();
+        let (_, cancelled_only) = capture_query_reads(&analyzer, || token.cancel());
+        assert!(
+            cancelled_only.is_bounded(),
+            "cancelling does not observe a stop"
+        );
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            let carried = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
+            let token = token.clone();
+            std::thread::spawn(move || carried.run(|| assert!(token.is_cancelled())))
+                .join()
+                .expect("worker must finish");
+        });
+        assert!(reads.execution_dependences() > 0);
+        assert!(!reads.is_bounded());
+        assert!(
+            !run.is_cancelled(),
+            "caught child cancellation leaves the run live"
+        );
+
+        let owner = std::thread::current().id();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        assert_eq!(pool.current_num_threads(), 2);
+        let (answer, worker_reads) = capture_query_reads(&analyzer, || {
+            let carried = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
+            pool.install(|| {
+                carried.run(|| {
+                    assert_ne!(std::thread::current().id(), owner);
+                    assert!(token.is_cancelled());
+                    17
+                })
+            })
+        });
+        assert_eq!(answer, 17);
+        assert!(worker_reads.execution_dependences() > 0);
+        assert!(!worker_reads.is_bounded());
+    }
+
+    #[test]
+    fn caught_distributed_cap_is_execution_dependent() {
+        let analyzer = MultiAnalyzer::default();
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert!(
+                !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(1, 1)
+                    .charge(1)
+            );
+        });
+        assert!(reads.execution_dependences() > 0);
+        assert!(!reads.is_bounded());
+    }
+
+    #[test]
+    fn caught_provider_failure_is_execution_dependent() {
+        let analyzer = MultiAnalyzer::default();
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            drop(crate::analyzer::semantic::SemanticProviderError::internal(
+                "caught failure",
+            ));
+        });
+        assert!(reads.execution_dependences() > 0);
+        assert!(!reads.is_bounded());
     }
 }

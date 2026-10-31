@@ -216,7 +216,7 @@ fn matches_declaration(
 }
 
 fn matches_same_project(configuration: &ConfigurationFactValue, code: &PipelineValue) -> bool {
-    terminal_source_file(code).is_some_and(|file| file.root() == configuration.file.root())
+    code_row_file(code).root() == configuration.file.root()
 }
 
 fn config_key(relation: ConfigurationCodeMatch, value: &ConfigurationFactValue) -> String {

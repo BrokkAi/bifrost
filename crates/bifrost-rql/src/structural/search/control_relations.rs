@@ -570,7 +570,11 @@ impl ControlRelationTraversalCache {
             }
             diagnostics.push(super::QueryExecutionState::diagnostic(
                 analyzer,
-                CodeQueryDiagnostic {
+                CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: match cause {
+                        Some(cause) => brokk_bifrost_rql::Incompleteness::Operational(cause),
+                        None => brokk_bifrost_rql::Incompleteness::Content,
+                    },
                     related: Vec::new(),
                     source: None,
                     code,
@@ -585,7 +589,7 @@ impl ControlRelationTraversalCache {
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                },
+                }),
                 cause,
             ));
         }

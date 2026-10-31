@@ -43,15 +43,25 @@ fn language_analyzer(language: Language, project: TestProject) -> Box<dyn IAnaly
     }
 }
 
+mod assignment_evidence;
+mod branch_evidence;
+mod call_site_correlations;
 mod comments;
 mod configuration;
 mod contracts;
+mod decorated_unit_provenance;
 mod details;
+mod environment_sessions;
 mod execution;
+mod execution_boundaries;
+mod execution_contracts;
 mod index_access;
 mod js_rule_coverage;
+mod materialization_coordinates;
+mod provenance_identity;
 mod public_response;
 mod python_call_callee;
+mod python_comment_blocks;
 mod python_comparison;
 mod python_imports;
 mod python_iterator_properties;
@@ -62,11 +72,19 @@ mod python_scope_coverage;
 mod python_workspace_authorities;
 mod recovered_syntax;
 mod relation_coverage;
+mod row_identities;
 mod rust_imports;
 mod rust_task_and_callback;
+mod seed_coverage;
 mod selected_edges;
+mod semantic_exhausted_roots;
 mod semantic_inventory_limits;
+mod session_and_trace_identities;
+mod set_explanation;
+mod structural_identity_filters;
+mod unit_output_bounds;
 mod unit_partition_properties;
+mod unit_union_bounds;
 mod units;
 
 use brokk_bifrost_ruby_analysis::RubyAnalyzer;
@@ -74,3 +92,10 @@ use brokk_bifrost_ruby_analysis::RubyAnalyzer;
 use brokk_bifrost_cpp_analysis::analyzer::CppAnalyzer;
 
 use brokk_bifrost_python_analysis::PythonAnalyzer;
+
+mod callable_overload_facts;
+
+mod python_definition_flags;
+mod python_receiver_evaluation;
+mod rune_rendering;
+mod semantic_policy_contracts;

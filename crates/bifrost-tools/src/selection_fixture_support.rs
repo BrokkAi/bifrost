@@ -31,8 +31,10 @@ pub fn write_fixture_blob(
             let state = parsed_fixture_state(&JavaAdapter, relative_path, source);
             store.write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                Oid::from_str(oid).unwrap(),
-                storage_language,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    Oid::from_str(oid).unwrap(),
+                    storage_language,
+                ),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -42,8 +44,10 @@ pub fn write_fixture_blob(
             let state = parsed_fixture_state(&GoAdapter, relative_path, source);
             store.write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                Oid::from_str(oid).unwrap(),
-                storage_language,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    Oid::from_str(oid).unwrap(),
+                    storage_language,
+                ),
                 generation,
                 &GoAdapter,
                 &state,
@@ -53,8 +57,10 @@ pub fn write_fixture_blob(
             let state = parsed_fixture_state(&RustAdapter, relative_path, source);
             store.write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                Oid::from_str(oid).unwrap(),
-                storage_language,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    Oid::from_str(oid).unwrap(),
+                    storage_language,
+                ),
                 generation,
                 &RustAdapter,
                 &state,
@@ -190,8 +196,10 @@ impl JvmSelectionFixture {
                                 parsed_fixture_state(&JavaAdapter, "src/Model.java", source);
                             store.write_parsed_blob_at_generation(
                                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                                Oid::from_str(oid).unwrap(),
-                                storage_language,
+                                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                    Oid::from_str(oid).unwrap(),
+                                    storage_language,
+                                ),
                                 generation,
                                 &JavaAdapter,
                                 &state,
@@ -201,8 +209,10 @@ impl JvmSelectionFixture {
                             let state = parsed_fixture_state(&RustAdapter, "src/Model.rs", source);
                             store.write_parsed_blob_at_generation(
                                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                                Oid::from_str(oid).unwrap(),
-                                storage_language,
+                                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                    Oid::from_str(oid).unwrap(),
+                                    storage_language,
+                                ),
                                 generation,
                                 &RustAdapter,
                                 &state,

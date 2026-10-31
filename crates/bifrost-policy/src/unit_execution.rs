@@ -387,12 +387,16 @@ impl<'a> UnitReuse<'a> {
         &mut self,
         key: &PolicyUnitKey,
     ) -> Result<Option<PolicyUnitProduct>, WidenReason> {
+        // A repeated consumer must see this attempt's writes. Use the same
+        // verification and accounting path as a committed product; publication
+        // remains atomic with recording the complete policy unit set.
+        let staged = self.incremental.staged_unit(self.policy_id, key);
         let mut store = self
             .incremental
             .store()
             .lock()
             .expect("policy-unit store mutex poisoned");
-        let Some(unit) = store.lookup(key) else {
+        let Some(unit) = staged.as_ref().or_else(|| store.lookup(key)) else {
             return Ok(None);
         };
         if unit.budget_mode() != BudgetMode::Exhaustive {

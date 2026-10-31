@@ -970,6 +970,7 @@ fn resolve_file_patterns(
 /// membership with `retain_analyzed`, which applies exactly the rule
 /// `analyzed_files` would have.
 fn glob_candidates(analyzer: &dyn IAnalyzer, globs: &[Pattern]) -> Vec<ProjectFile> {
+    let carried_context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     let _scope = profiling::scope("searchtools::glob_candidates");
     let Ok(listing) = analyzer.project().all_files_shared() else {
         return Vec::new();
@@ -978,10 +979,12 @@ fn glob_candidates(analyzer: &dyn IAnalyzer, globs: &[Pattern]) -> Vec<ProjectFi
     let mut candidates: Vec<_> = listing
         .par_iter()
         .filter(|file| {
-            brokk_bifrost_core::analyzer::common::languages_may_analyze(&languages, file) && {
-                let path = rel_path_string(file);
-                globs.iter().any(|glob| glob.matches(&path))
-            }
+            carried_context.run(|| {
+                brokk_bifrost_core::analyzer::common::languages_may_analyze(&languages, file) && {
+                    let path = rel_path_string(file);
+                    globs.iter().any(|glob| glob.matches(&path))
+                }
+            })
         })
         .cloned()
         .collect();

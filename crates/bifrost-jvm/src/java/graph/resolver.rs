@@ -577,8 +577,12 @@ fn receiver_type_matches_target_uncached(
         if java_owner_declares_matching_method(ctx, receiver_type, &ctx.spec.target) {
             return ReceiverTargetMatch::Incompatible;
         }
-        if !provider
-            .get_ancestors(receiver_type)
+        let ancestors = provider.get_ancestors(receiver_type);
+        if !ancestors.is_complete() {
+            return ReceiverTargetMatch::Unresolved;
+        }
+        if !ancestors
+            .edges
             .iter()
             .any(|ancestor| ancestor == &ctx.spec.owner)
         {
@@ -587,8 +591,8 @@ fn receiver_type_matches_target_uncached(
         if java_owner_declares_same_arity_overload(ctx, receiver_type, &ctx.spec.target) {
             return ReceiverTargetMatch::Unresolved;
         }
-        if provider
-            .get_ancestors(receiver_type)
+        if ancestors
+            .edges
             .iter()
             .filter(|ancestor| *ancestor != &ctx.spec.owner)
             .any(|ancestor| {
@@ -674,8 +678,12 @@ fn method_invocation_anonymous_return_match(
         return anonymous_return_types_match_target(outcome, token, ctx);
     }
     let provider = ctx.graph.hierarchy?;
-    let outcomes = provider
-        .get_ancestors(&owner)
+    let ancestors = provider.get_ancestors(&owner);
+    if !ancestors.is_complete() {
+        return None;
+    }
+    let outcomes = ancestors
+        .edges
         .into_iter()
         .filter_map(|ancestor| {
             method_anonymous_return_type_for_owner_fqn(&ancestor.fq_name(), token, name, arity, ctx)
@@ -1263,9 +1271,12 @@ pub fn resolve_nested_type_for_owner(
             .find(CodeUnit::is_class)
     };
     nested(owner).or_else(|| {
-        graph
-            .hierarchy?
-            .get_ancestors(owner)
+        let ancestors = graph.hierarchy?.get_ancestors(owner);
+        if !ancestors.is_complete() {
+            return None;
+        }
+        ancestors
+            .edges
             .into_iter()
             .find_map(|ancestor| nested(&ancestor))
     })

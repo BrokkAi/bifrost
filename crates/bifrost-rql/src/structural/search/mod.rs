@@ -282,10 +282,18 @@ pub(crate) mod test_support {
 impl QueryExecutionState<'_> {
     fn diagnostic(
         analyzer: &dyn IAnalyzer,
-        diagnostic: CodeQueryDiagnostic,
+        mut diagnostic: CodeQueryDiagnostic,
         cause: Option<DerivationExecutionCause>,
     ) -> CodeQueryDiagnostic {
-        if cause.is_some() || diagnostic.code.is_execution_state() {
+        if let Some(cause) = cause {
+            diagnostic.incompleteness = Incompleteness::Operational(cause);
+        }
+        let cause = diagnostic.incompleteness.execution_cause();
+        assert!(
+            !diagnostic.code.is_execution_state() || cause.is_some(),
+            "transient diagnostic must carry its execution cause"
+        );
+        if cause.is_some() {
             brokk_bifrost_core::profiling::note_with(|| {
                 format!(
                     "policy.units unbounded origin={}:{} cause={} execution_cause={cause:?}",
@@ -300,23 +308,37 @@ impl QueryExecutionState<'_> {
     }
 }
 
-/// Keep the first exact diagnostic value. Source, branch and related evidence
-/// are part of its identity, even when code and message are the same.
+/// Keep the first exact public diagnostic value, combining its execution
+/// provenance. Source, branch and related evidence are part of its identity.
 fn normalize_query_diagnostics(diagnostics: Vec<CodeQueryDiagnostic>) -> Vec<CodeQueryDiagnostic> {
-    let mut seen = HashSet::default();
-    diagnostics
-        .into_iter()
-        .filter(|diagnostic| seen.insert(diagnostic.clone()))
-        .collect()
+    use std::collections::hash_map::Entry;
+    let mut indices = HashMap::<CodeQueryDiagnostic, usize>::default();
+    let mut result: Vec<CodeQueryDiagnostic> = Vec::new();
+    for diagnostic in diagnostics {
+        match indices.entry(diagnostic.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(result.len());
+                result.push(diagnostic);
+            }
+            Entry::Occupied(entry) => {
+                let retained = &mut result[*entry.get()];
+                retained.incompleteness =
+                    retained.incompleteness.combine(diagnostic.incompleteness);
+            }
+        }
+    }
+    result
 }
 
 fn incomplete_diagnostic(
     code: CodeQueryDiagnosticCode,
+    incompleteness: Incompleteness,
     language: &'static str,
     message: String,
     exhausted_roots: Vec<CodeQueryExhaustedRoot>,
 ) -> CodeQueryDiagnostic {
-    CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         related: Vec::new(),
         source: None,
         code,
@@ -326,26 +348,24 @@ fn incomplete_diagnostic(
         message,
         exhausted_roots,
         withheld_rows_path: None,
-    }
+    })
 }
 
 fn push_deduplicated_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     code: CodeQueryDiagnosticCode,
+    incompleteness: Incompleteness,
     message: String,
 ) {
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == code && diagnostic.message == message)
+    let diagnostic = incomplete_diagnostic(code, incompleteness, "workspace", message, Vec::new());
+    if let Some(existing) = diagnostics
+        .iter_mut()
+        .find(|existing| existing.code == code && existing.message == diagnostic.message)
     {
-        return;
+        existing.incompleteness = existing.incompleteness.combine(diagnostic.incompleteness);
+    } else {
+        diagnostics.push(diagnostic);
     }
-    diagnostics.push(incomplete_diagnostic(
-        code,
-        "workspace",
-        message,
-        Vec::new(),
-    ));
 }
 
 fn same_range(left: &Range, right: &Range) -> bool {
@@ -735,6 +755,7 @@ pub use results::{CodeQueryFlowRelation, CodeQueryStateEvent, CodeQueryStateEven
 pub use results::{CodeQueryRelatedSource, CodeQuerySourceSpan};
 pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
 pub use results::{CodeQueryRustMarkerImpl, CodeQueryRustMarkerUse};
+pub use results::{DiagnosticExecutionCause, Incompleteness};
 pub use results::{MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES, render_exhausted_roots};
 pub use type_flow::{CodeQueryRootAllotment, TypeFlowRootMemo};
 
@@ -2940,6 +2961,7 @@ impl FairSeedBudgetLease {
             .expect("fair seed budget lock poisoned");
         loop {
             if state.failed {
+                brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
                 return FairSeedBudgetAdmission::Cancelled;
             }
             if self
@@ -2963,6 +2985,12 @@ impl FairSeedBudgetLease {
                 .iter()
                 .all(|finished| *finished)
             {
+                for (&used, limit) in requested.iter().zip(allowance) {
+                    brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                        used, limit,
+                    )
+                    .allows(0);
+                }
                 return FairSeedBudgetAdmission::Rejected(self.coordinator.global_projected(
                     &state,
                     self.branch,
@@ -3007,6 +3035,7 @@ impl FairSeedBudgetLease {
                 return FairSeedBudgetSharedAdmission::AlreadyCharged;
             }
             if state.failed {
+                brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
                 return FairSeedBudgetSharedAdmission::Cancelled;
             }
             if self
@@ -3031,6 +3060,12 @@ impl FairSeedBudgetLease {
                 .iter()
                 .all(|finished| *finished)
             {
+                for (&used, limit) in requested.iter().zip(allowance) {
+                    brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                        used, limit,
+                    )
+                    .allows(0);
+                }
                 return FairSeedBudgetSharedAdmission::Rejected(self.coordinator.global_projected(
                     &state,
                     self.branch,
@@ -4743,7 +4778,8 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         state
             .access_failure
             .get_or_insert_with(|| "workspace content changed before result rendering".to_string());
-        diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+        diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -4753,7 +4789,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             message: "workspace content changed after structural posting selection; retry the query for a coherent snapshot".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }, Some(DerivationExecutionCause::Snapshot)));
+        }), Some(DerivationExecutionCause::Snapshot)));
     }
     if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
         profile.execution_ns = elapsed_ns(started);
@@ -4889,7 +4925,8 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
                 && diagnostic.message.contains("structural posting")
         }) {
-            diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+            diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -4899,7 +4936,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                 message: "source generation changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            }, Some(DerivationExecutionCause::Snapshot)));
+            }), Some(DerivationExecutionCause::Snapshot)));
         }
     }
     if !cancelled && !structural_index_stale {
@@ -6803,6 +6840,17 @@ fn source_slice_sha256(source: &str, byte_span: &std::ops::Range<usize>) -> Opti
         .map(|bytes| Sha256::digest(bytes).into())
 }
 
+/// The file carried by a code row, including artifact-only terminal rows.
+fn code_row_file(value: &PipelineValue) -> &ProjectFile {
+    match value {
+        PipelineValue::File(file) => file,
+        PipelineValue::ReceiverAnalysis(value) | PipelineValue::MemberTargetAnalysis(value) => {
+            &value.report.site.file
+        }
+        other => terminal_source_file(other).expect("every other code row names its source file"),
+    }
+}
+
 fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
     match value {
         PipelineValue::StructuralMatch(seed) => Some(&seed.file),
@@ -6996,7 +7044,8 @@ fn retain_held_source_snapshot(
         return false;
     }
     if !conflict_before {
-        diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+        diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -7009,7 +7058,7 @@ fn retain_held_source_snapshot(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }, Some(DerivationExecutionCause::Snapshot)));
+        }), Some(DerivationExecutionCause::Snapshot)));
     }
     true
 }
@@ -7352,7 +7401,12 @@ fn retain_budgeted_source_snapshot(
 
     let mut projected = *budget;
     projected.scanned_files = projected.scanned_files.saturating_add(1);
-    if projected.scanned_files > limits.max_scanned_files {
+    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        projected.scanned_files,
+        limits.max_scanned_files,
+    )
+    .allows(0)
+    {
         cache.retain_loaded_source(file, None);
         push_budget_diagnostic(diagnostics, &projected);
         return true;
@@ -7362,7 +7416,12 @@ fn retain_budgeted_source_snapshot(
     projected.scanned_source_bytes = projected
         .scanned_source_bytes
         .saturating_add(source.as_ref().map_or(0, String::len));
-    if projected.scanned_source_bytes > limits.max_scanned_source_bytes {
+    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        projected.scanned_source_bytes,
+        limits.max_scanned_source_bytes,
+    )
+    .allows(0)
+    {
         cache.retain_loaded_source(file, None);
         push_budget_diagnostic(diagnostics, &projected);
         return true;

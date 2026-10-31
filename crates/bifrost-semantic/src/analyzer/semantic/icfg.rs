@@ -167,6 +167,7 @@ pub const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // #7578: requirement origins use definitions reaching the operand, including loop backedges.
 // #7619: inherited external JVM methods now publish selected callable targets.
 // #7620: Java wildcard sibling applicability changes query-time call proofs.
+// #6234: bare Kotlin value bindings now check implicit receivers.
 // #7509 M3a: Go type answers at declaration names come from the declaration
 // value slot, so value-type barrier observations change for unchanged bytes.
 // #3494: closed Ruby member selections discharge their dispatch gaps.
@@ -193,8 +194,22 @@ pub const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // #8036: retain native Go declared external receiver call identities.
 // #7968: Go interface satisfaction decides members by the shared membership rule.
 // #7509 G1b-1: native Go owners behind incomplete imports replace the legacy receiver answer.
+// #7362: fixed JVM identities retain independent selected-environment scope.
+// #6664: an incomplete descendant read leaves families and dispatch open instead of empty.
+// #8153: overloads of one owner no longer prove an incoming call target, so the
+// workspace oracle's incoming-actual substitution and reverse-caller reads change.
+// #8000: selected external JVM on-demand candidates change type and member answers.
+// #7509 G1b-2: native Go modeled callable results replace the legacy receiver answer.
+// #6945: curated Python star imports can bind placed child modules and their calls.
+// #7240: imported constructor receiver proofs change dispatch answers.
+// #8264: predeclared Go modeled result types gain universe type identities.
+// #7509 G1b-3 B: the Go pointer result-field proof reads the selected model callable;
+// promoted fields and owners with unidentified promotion copies stay open.
+// #8147 M4a: C# chains decided by file-local assignments or literal expressions change declarations and sites.
+// #8290: a repeated read through one forward operation keeps the closed root's
+// closure discharges, so warm binding answers become complete.
 pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v149";
+    b"bifrost-icfg-provider/workspace-behavior/v213";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
@@ -208,6 +223,7 @@ pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // #7578: rotate read-side reuse with requirement-writer reachability.
 // #7619: invalidate read-side reuse for inherited external call binding.
 // #7620: read identities also invalidate Java wildcard call proofs.
+// #6234: invalidate read reuse for implicit receiver value bindings.
 // #7509 M3a: rotate read-side reuse with the Go declaration value types.
 // #3494: read identities also invalidate Ruby closed member selections.
 // #7789: read identities also invalidate JVM import destinations.
@@ -227,8 +243,19 @@ pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // #8036: invalidate reads for native Go external receiver call identities.
 // #7968: rotate read-side reuse with shared Go satisfaction membership.
 // #7509 G1b-1: rotate read-side reuse with native owners behind incomplete Go imports.
+// #7362: forward query obligations change query-time bindings and diagnostics.
+// #6664: invalidate reads that took a failed descendant read as a complete empty set.
+// #8153: rotate read-side reuse with overload-ambiguous incoming call targets.
+// #8000: invalidate read reuse when selected JVM on-demand candidates bind.
+// #7509 G1b-2: rotate read-side reuse with native Go modeled callable results.
+// #6945: invalidate read-side reuse for curated Python star child bindings.
+// #7240: invalidate read-side reuse for imported constructor receiver proofs.
+// #8264: rotate read-side reuse with predeclared Go modeled result types.
+// #7509 G1b-3 B: rotate read-side reuse with the selected-callable pointer-field proof.
+// #8147 M4a: rotate read-side reuse with C# preprocessor decisions.
+// #8290: invalidate read reuse taken from warm reads that lost closure discharges.
 pub const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v148";
+    b"bifrost-icfg-provider/workspace-read-behavior/v212";
 
 #[cfg(test)]
 mod domain_tests {

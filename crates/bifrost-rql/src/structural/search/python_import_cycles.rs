@@ -46,6 +46,7 @@ pub(super) fn reverse_import_reachability(
     if module_identity_is_limited(imported_file.rel_path()) {
         report_incomplete(
             diagnostics,
+            Incompleteness::Content,
             "Python package module identity is path-derived and remains incomplete until #3673 supplies snapshot-consistent source roots.",
         );
         result.complete = false;
@@ -68,7 +69,11 @@ pub(super) fn reverse_import_reachability(
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
         {
-            report_incomplete(diagnostics, "Python import-cycle traversal was cancelled.");
+            report_incomplete(
+                diagnostics,
+                Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+                "Python import-cycle traversal was cancelled.",
+            );
             result.complete = false;
             break;
         }
@@ -94,6 +99,7 @@ pub(super) fn reverse_import_reachability(
                 if module_identity_is_limited(importer.rel_path()) {
                     report_incomplete(
                         diagnostics,
+                        Incompleteness::Content,
                         "Python package module identity is path-derived and remains incomplete until #3673 supplies snapshot-consistent source roots.",
                     );
                     result.complete = false;
@@ -118,8 +124,10 @@ pub(super) fn reverse_import_reachability(
             }
         }
         if !context.analyzer.workspace_content_matches(identity) {
+            context.analyzer.mark_execution_dependent();
             report_incomplete(
                 diagnostics,
+                Incompleteness::Operational(DerivationExecutionCause::Snapshot),
                 "workspace content changed during Python import-cycle traversal.",
             );
             result.complete = false;
@@ -150,6 +158,7 @@ pub(super) fn annotate_import_site(
     if module_identity_is_limited(importer.rel_path()) {
         report_incomplete(
             diagnostics,
+            Incompleteness::Content,
             "Python package module identity is path-derived and remains incomplete until #3673 supplies snapshot-consistent source roots.",
         );
         summarize_cycle_state(site);
@@ -161,6 +170,7 @@ pub(super) fn annotate_import_site(
         if leaf.target_status != "resolved_local" || leaf.target_paths.len() != 1 {
             report_incomplete(
                 diagnostics,
+                Incompleteness::Content,
                 "Python import cycle has an unresolved, external, ambiguous, or unavailable target.",
             );
             continue;
@@ -169,6 +179,7 @@ pub(super) fn annotate_import_site(
         if target.language() != Language::Python || module_identity_is_limited(target.rel_path()) {
             report_incomplete(
                 diagnostics,
+                Incompleteness::Content,
                 "Python package module identity is path-derived and remains incomplete until #3673 supplies snapshot-consistent source roots.",
             );
             continue;
@@ -199,12 +210,19 @@ pub(super) fn annotate_import_site(
         return;
     }
 
+    let mut traversal_incompleteness = Incompleteness::Content;
     while !frontier.is_empty() && !remaining_targets.is_empty() {
         if context
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
         {
-            report_incomplete(diagnostics, "Python import cycle traversal was cancelled.");
+            report_incomplete(
+                diagnostics,
+                Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+                "Python import cycle traversal was cancelled.",
+            );
+            traversal_incompleteness =
+                Incompleteness::Operational(DerivationExecutionCause::Cancelled);
             incomplete = true;
             break;
         }
@@ -212,6 +230,8 @@ pub(super) fn annotate_import_site(
         let Some(adjacency) =
             read_reverse_adjacency(context, content_identity, &frontier, cache, diagnostics)
         else {
+            traversal_incompleteness =
+                Incompleteness::Operational(DerivationExecutionCause::Provider);
             incomplete = true;
             break;
         };
@@ -235,6 +255,8 @@ pub(super) fn annotate_import_site(
                     continue;
                 }
                 if charge_import_file(context).is_none() {
+                    traversal_incompleteness =
+                        Incompleteness::Operational(DerivationExecutionCause::Budget);
                     incomplete = true;
                     break;
                 }
@@ -246,15 +268,21 @@ pub(super) fn annotate_import_site(
         }
 
         if !context.analyzer.workspace_content_matches(content_identity) {
+            context.analyzer.mark_execution_dependent();
             report_incomplete(
                 diagnostics,
+                Incompleteness::Operational(DerivationExecutionCause::Snapshot),
                 "workspace content changed during Python import cycle traversal.",
             );
+            traversal_incompleteness =
+                Incompleteness::Operational(DerivationExecutionCause::Snapshot);
             incomplete = true;
             break;
         }
         if adjacency.exhausted {
             report_budget_exhausted(diagnostics, "edge");
+            traversal_incompleteness =
+                Incompleteness::Operational(DerivationExecutionCause::Budget);
             incomplete = true;
             break;
         }
@@ -277,6 +305,7 @@ pub(super) fn annotate_import_site(
     if !remaining_targets.is_empty() || incomplete {
         report_incomplete(
             diagnostics,
+            traversal_incompleteness,
             "No persisted Python import path was found; unresolved, external, dynamic, and path-derived package edges keep absence incomplete.",
         );
     }
@@ -299,6 +328,7 @@ pub(super) fn cycle_content_identity(
             if !context.access_mode.permits_persisted_import_graph() {
                 report_incomplete(
                     diagnostics,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     "Python import graph access is unavailable in this query mode.",
                 );
                 return None;
@@ -310,6 +340,7 @@ pub(super) fn cycle_content_identity(
             let Some(identity) = *content_identity else {
                 report_incomplete(
                     diagnostics,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     "Python import graph has no workspace content identity.",
                 );
                 return None;
@@ -321,6 +352,7 @@ pub(super) fn cycle_content_identity(
                 .or_else(|| {
                     report_incomplete(
                         diagnostics,
+                        Incompleteness::Operational(DerivationExecutionCause::Snapshot),
                         "workspace content changed before Python import cycle traversal.",
                     );
                     None
@@ -374,9 +406,10 @@ pub(super) fn read_reverse_adjacency(
             Some(adjacency)
         }
         Ok(Some(_)) => {
+            context.analyzer.mark_execution_dependent();
             report_incomplete(
                 diagnostics,
-                "workspace content changed during Python import cycle read.",
+                Incompleteness::Operational(DerivationExecutionCause::Snapshot), "workspace content changed during Python import cycle read.",
             );
             None
         }
@@ -410,9 +443,10 @@ pub(super) fn read_reverse_adjacency(
                         .import_edges_resolved
                         .saturating_add(refresh.recomputed_edges);
                     if !context.analyzer.workspace_content_matches(identity) {
+                        context.analyzer.mark_execution_dependent();
                         report_incomplete(
                             diagnostics,
-                            "workspace content changed while refreshing the Python import graph.",
+                            Incompleteness::Operational(DerivationExecutionCause::Snapshot), "workspace content changed while refreshing the Python import graph.",
                         );
                         return None;
                     }
@@ -433,16 +467,17 @@ pub(super) fn read_reverse_adjacency(
                             Some(adjacency)
                         }
                         Ok(Some(_)) => {
+                            context.analyzer.mark_execution_dependent();
                             report_incomplete(
                                 diagnostics,
-                                "workspace content changed during Python import cycle read.",
+                                Incompleteness::Operational(DerivationExecutionCause::Snapshot), "workspace content changed during Python import cycle read.",
                             );
                             None
                         }
                         Ok(None) => {
                             report_incomplete(
                                 diagnostics,
-                                "persisted Python import graph does not cover the current file.",
+                                Incompleteness::Operational(DerivationExecutionCause::Provider), "persisted Python import graph does not cover the current file.",
                             );
                             None
                         }
@@ -455,7 +490,7 @@ pub(super) fn read_reverse_adjacency(
                 Ok(None) => {
                     report_incomplete(
                         diagnostics,
-                        "persisted Python import graph is unavailable for this workspace.",
+                        Incompleteness::Operational(DerivationExecutionCause::Provider), "persisted Python import graph is unavailable for this workspace.",
                     );
                     None
                 }
@@ -468,7 +503,7 @@ pub(super) fn read_reverse_adjacency(
         Ok(None) => {
             report_incomplete(
                 diagnostics,
-                "persisted Python import graph does not cover the current file.",
+                Incompleteness::Operational(DerivationExecutionCause::Provider), "persisted Python import graph does not cover the current file.",
             );
             None
         }
@@ -483,7 +518,12 @@ pub(super) fn read_reverse_adjacency(
 }
 
 pub(super) fn charge_import_file(context: &mut PythonImportCycleContext<'_>) -> Option<()> {
-    if context.budget.import_files_resolved >= context.limits.max_scanned_files {
+    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        context.budget.import_files_resolved,
+        context.limits.max_scanned_files,
+    )
+    .allows(1)
+    {
         return None;
     }
     context.budget.import_files_resolved = context.budget.import_files_resolved.saturating_add(1);
@@ -509,17 +549,25 @@ fn summarize_cycle_state(site: &mut CodeQueryPythonImportSite) {
 }
 
 pub(super) fn report_budget_exhausted(diagnostics: &mut Vec<CodeQueryDiagnostic>, dimension: &str) {
+    // Persisted adjacency reports its row cap after the bounded store read.
+    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
     push_cycle_diagnostic(
         diagnostics,
         CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
+        Incompleteness::Operational(DerivationExecutionCause::Budget),
         format!("Python import-cycle {dimension} budget was exhausted."),
     );
 }
 
-pub(super) fn report_incomplete(diagnostics: &mut Vec<CodeQueryDiagnostic>, message: &str) {
+pub(super) fn report_incomplete(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    incompleteness: Incompleteness,
+    message: &str,
+) {
     push_cycle_diagnostic(
         diagnostics,
         CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+        incompleteness,
         message.to_owned(),
     );
 }
@@ -529,6 +577,7 @@ fn report_graph_read_error(
     error: crate::analyzer::store::StoreError,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
+    context.analyzer.record_query_failure(error.clone());
     let message = format!("reading persisted Python import graph failed: {error}");
     crate::profiling::note(format!("query_code {message}"));
     if context.access_mode == StructuralAccessMode::IndexedRequired {
@@ -536,12 +585,17 @@ fn report_graph_read_error(
             .access_failure
             .get_or_insert_with(|| message.clone());
     }
-    report_incomplete(diagnostics, &message);
+    report_incomplete(
+        diagnostics,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+        &message,
+    );
 }
 
 fn push_cycle_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     code: CodeQueryDiagnosticCode,
+    incompleteness: Incompleteness,
     message: String,
 ) {
     if diagnostics.iter().any(|diagnostic| {
@@ -551,7 +605,8 @@ fn push_cycle_diagnostic(
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         related: Vec::new(),
         source: None,
         code,
@@ -561,5 +616,5 @@ fn push_cycle_diagnostic(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }

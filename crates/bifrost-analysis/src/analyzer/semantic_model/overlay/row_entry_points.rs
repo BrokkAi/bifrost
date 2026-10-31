@@ -38,6 +38,20 @@ pub(super) struct RowOverlay {
 }
 
 impl RowOverlay {
+    pub(super) fn declaration_type_names(
+        &self,
+    ) -> Result<Vec<(String, String)>, SemanticModelOverlayBuildError> {
+        Ok(selected_question(
+            "ALL_TYPES",
+            "active-set",
+            self.reads().types(questions::ALL_TYPES, &[]),
+        )?
+        .into_iter()
+        .filter(|r| r.record.type_kind != crate::analyzer::semantic_model::TypeKind::Module)
+        .map(|r| (r.shard.manifest.language.clone(), r.record.name.clone()))
+        .collect())
+    }
+
     /// These are activation-lifetime originals, not evictable cache entries.
     /// Estimate each fact exactly as the eager overlay does, and include spare
     /// vector capacity and the anchor map's owned keys and values.

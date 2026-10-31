@@ -22,13 +22,22 @@ export const RELEASE_DOCUMENTS = [
 
 export const PLATFORMS = [
   {
-    packageName: "@brokkai/bifrost-darwin-universal",
-    target: "universal-apple-darwin",
+    packageName: "@brokkai/bifrost-darwin-arm64",
+    target: "aarch64-apple-darwin",
     extension: ".tar.gz",
     binary: "bifrost",
-    description: "Native universal macOS bundle for @brokkai/bifrost",
+    description: "Native macOS Apple silicon bundle for @brokkai/bifrost",
     os: ["darwin"],
-    cpu: ["x64", "arm64"],
+    cpu: ["arm64"],
+  },
+  {
+    packageName: "@brokkai/bifrost-darwin-x64",
+    target: "x86_64-apple-darwin",
+    extension: ".tar.gz",
+    binary: "bifrost",
+    description: "Native macOS Intel bundle for @brokkai/bifrost",
+    os: ["darwin"],
+    cpu: ["x64"],
   },
   {
     packageName: "@brokkai/bifrost-linux-x64-gnu",

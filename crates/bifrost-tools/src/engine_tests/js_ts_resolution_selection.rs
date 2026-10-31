@@ -32,8 +32,10 @@ mod js_ts_selection_tests {
                         store
                             .write_parsed_blob_at_generation(
                                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                                git2::Oid::from_str(oid).unwrap(),
-                                storage_language,
+                                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                    git2::Oid::from_str(oid).unwrap(),
+                                    storage_language,
+                                ),
                                 generation,
                                 &TypescriptAdapter,
                                 &state,
@@ -50,8 +52,10 @@ mod js_ts_selection_tests {
                         store
                             .write_parsed_blob_at_generation(
                                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                                git2::Oid::from_str(oid).unwrap(),
-                                storage_language,
+                                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                    git2::Oid::from_str(oid).unwrap(),
+                                    storage_language,
+                                ),
                                 generation,
                                 &adapter,
                                 &state,

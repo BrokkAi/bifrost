@@ -6,6 +6,7 @@
 //! walk reads through [`JavaHierarchyFact`], and the query-count test hooks.
 
 use crate::analyzer::jvm::hierarchy::JvmHierarchyFact;
+use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use crate::analyzer::java::*;
 
@@ -35,8 +36,6 @@ use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
 
 use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
 
-use brokk_bifrost_core::analyzer::capabilities::descendants_from_variant_index;
-
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_jvm::java::hierarchy::{
     JavaExternalRootHierarchyAnswer, JavaExternalRootHierarchyIncompleteReason,
@@ -54,15 +53,15 @@ use brokk_bifrost_jvm::java::graph_support::{
 };
 
 impl TypeHierarchyProvider for JavaAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        crate::analyzer::jvm::hierarchy::memoized_ancestors(
+        HierarchyAnswer::complete(crate::analyzer::jvm::hierarchy::memoized_ancestors(
             &self.memo_caches.direct_ancestors,
             self,
             code_unit,
             || java_direct_ancestors(self, token, code_unit),
-        )
+        ))
     }
 
     fn member_family_ancestors(&self, owner: &CodeUnit) -> MemberFamilyAncestors {
@@ -107,7 +106,8 @@ impl TypeHierarchyProvider for JavaAnalyzer {
             });
         }
         MemberFamilyAncestors {
-            resolved: self.get_direct_ancestors(owner),
+            // S2b: MemberFamilyAncestors has no hierarchy ambiguity channel.
+            resolved: self.get_direct_ancestors(owner).definite().to_vec(),
             unread,
         }
     }
@@ -152,47 +152,38 @@ impl TypeHierarchyProvider for JavaAnalyzer {
         })
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let uncancelled = CancellationToken::default();
         self.get_direct_descendants_within(
             code_unit,
             &DescendantIndexScope::whole_workspace(&uncancelled),
         )
-        .expect("a descendant index that cannot stop always completes")
+        .expect("an uncancelled descendant query cannot be cancelled")
     }
 
     fn get_direct_descendants_within(
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         crate::analyzer::jvm::authority::source_read(
             self,
             brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JavaDescendantIndex,
         );
-
-        let descendants = descendants_from_variant_index(
-            &self.memo_caches.direct_descendant_index,
+        brokk_bifrost_analysis::analyzer::common::complete_descendant_query(
+            self,
             scope,
             code_unit,
-            || {
-                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                    self.build_direct_descendant_index(scope)
-                })
-                .ok()
-                .flatten()
+            &self.memo_caches.direct_descendant_index,
+            || self.build_direct_descendant_index(scope),
+            |descendants| {
+                self.inner.record_read_key(ReadKey::lookup(
+                    LookupKind::Descendants,
+                    LookupQuestion::declaration(code_unit),
+                    declaration_set_digest(descendants),
+                ));
             },
-        );
-        if !scope.cancellation().is_cancelled()
-            && let Some(descendants) = descendants.as_ref()
-        {
-            self.inner.record_read_key(ReadKey::lookup(
-                LookupKind::Descendants,
-                LookupQuestion::declaration(code_unit),
-                declaration_set_digest(descendants),
-            ));
-        }
-        descendants
+        )
     }
 }
 

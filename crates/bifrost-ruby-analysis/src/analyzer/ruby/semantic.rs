@@ -94,7 +94,7 @@ use brokk_bifrost_core::hash::HashSet;
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
 // The lowerer reaches receiverless-loop recognition: a declared loop is not Kernel#loop.
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v14";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v15";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -4313,9 +4313,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .and_then(|operator| node_text(self.source, operator))
             == Some("&.");
         if safe_navigation {
+            let nil_result = self.session.add_node_point(builder, node, Vec::new())?;
             self.session.record_gap(
                 builder,
-                invoke,
+                nil_result,
                 SemanticGapSubject::Value(result),
                 SemanticCapability::Values,
                 SemanticGapKind::Unknown,
@@ -4335,10 +4336,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 decision,
                 EdgeTarget {
-                    point: next.point,
+                    point: nil_result,
                     kind: ControlEdgeKind::ConditionalFalse,
                 },
             )?;
+            self.session.add_target_edge(builder, nil_result, next)?;
             if let Some(receiver) = receiver_node {
                 stack.push(Work::Expression {
                     node: receiver,

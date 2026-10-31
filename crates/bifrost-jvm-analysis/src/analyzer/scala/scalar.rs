@@ -67,11 +67,9 @@ fn scala_boolean_literal(source: &str, node: Node<'_>) -> Option<bool> {
     if negative || node.kind() != "boolean_literal" {
         return None;
     }
-    match source.get(node.byte_range())? {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::boolean_literal_value(
+        source.get(node.byte_range())?,
+    )
 }
 
 /// The semantic value kind of a Scala decimal integer or Boolean literal.
@@ -102,10 +100,9 @@ pub(crate) fn scala_scalar_type_for_literal(
     source: &str,
     node: Node<'_>,
 ) -> Option<DeclaredScalarType> {
-    match scala_literal_type_name(source, node)? {
-        "Int" => Some(DeclaredScalarType::Signed(32)),
-        "Long" => Some(DeclaredScalarType::Signed(64)),
-        "Boolean" => Some(DeclaredScalarType::Boolean),
+    let name = scala_literal_type_name(source, node)?;
+    match name {
+        "Int" | "Long" | "Boolean" => scala_scalar_type_for_primitive_name(name),
         _ => None,
     }
 }
@@ -125,17 +122,26 @@ pub(crate) fn scala_scalar_type_for_type(
     {
         return None;
     }
-    match scala_type_lookup_segments(type_node, source)
+    let segments = scala_type_lookup_segments(type_node, source);
+    let name = match segments
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["Int"] | ["scala", "Int"] => Some(DeclaredScalarType::Signed(32)),
-        ["Long"] | ["scala", "Long"] => Some(DeclaredScalarType::Signed(64)),
-        ["Short"] | ["scala", "Short"] => Some(DeclaredScalarType::Signed(16)),
-        ["Byte"] | ["scala", "Byte"] => Some(DeclaredScalarType::Signed(8)),
-        ["Boolean"] | ["scala", "Boolean"] => Some(DeclaredScalarType::Boolean),
+        [name] | ["scala", name] => *name,
+        _ => return None,
+    };
+    scala_scalar_type_for_primitive_name(name)
+}
+
+fn scala_scalar_type_for_primitive_name(name: &str) -> Option<DeclaredScalarType> {
+    match name {
+        "Int" => Some(DeclaredScalarType::Signed(32)),
+        "Long" => Some(DeclaredScalarType::Signed(64)),
+        "Short" => Some(DeclaredScalarType::Signed(16)),
+        "Byte" => Some(DeclaredScalarType::Signed(8)),
+        "Boolean" => Some(DeclaredScalarType::Boolean),
         _ => None,
     }
 }

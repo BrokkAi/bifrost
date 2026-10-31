@@ -3546,6 +3546,14 @@ fn canonical_json_round_trips() {
         "limit": 50
     });
     let canonical = parse_ok(original).to_canonical_json();
+    assert_eq!(
+        canonical["inside"],
+        json!({"kind": ["function", "method"], "capture": "fn"})
+    );
+    assert_eq!(
+        canonical["not_inside"],
+        json!({"kind": "class", "not_kind": "declaration"})
+    );
     let reparsed = parse_ok(canonical.clone());
     assert_eq!(reparsed.to_canonical_json(), canonical);
 }

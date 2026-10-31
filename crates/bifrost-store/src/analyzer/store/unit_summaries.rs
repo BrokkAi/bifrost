@@ -409,7 +409,7 @@ pub(crate) const UNIT_GRAPH_JOIN_SQL: &str =
 /// header whose rows are gone, and falls back until the next reconcile derives
 /// the unit again. Closed rows go too, because a reader selecting an older
 /// revision would otherwise read the same hollow summary. The statement seeks
-/// `blobs(blob_oid, lang)`, `resolution_unit_summary_members(blob_id)` and
+/// `blobs(blob_oid, lang, parse_variant)`, `resolution_unit_summary_members(blob_id)` and
 /// `resolution_unit_summary_versions(summary_id)`.
 pub(super) const WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL: &str =
     "DELETE FROM resolution_unit_summary_versions
@@ -417,7 +417,7 @@ pub(super) const WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL: &str =
        SELECT members.summary_id
        FROM blobs
        JOIN resolution_unit_summary_members AS members ON members.blob_id = blobs.id
-       WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2)";
+       WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2 AND blobs.parse_variant = ?3)";
 
 /// Withdraw one workspace's version rows (`delete_workspace_projection`).
 pub(super) const DELETE_WORKSPACE_VERSIONS_SQL: &str =

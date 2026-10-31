@@ -96,7 +96,7 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
         // a `Vec`, a rebase, and an allocated storage-language key per path per
         // row, twice over, which issue #1928 measured as malloc/free and path
         // re-parsing dominating a chromium probe phase.
-        let mut paths_by_row: HashMap<(Oid, &str), Vec<ProjectFile>> = HashMap::default();
+        let mut paths_by_row: HashMap<super::BlobKey, Vec<ProjectFile>> = HashMap::default();
         for (row, _) in &rows {
             if !continue_query() {
                 return LimitedQueryRows::incomplete(Vec::new(), inspected);
@@ -213,6 +213,7 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
                 out.push(SearchCandidateKey {
                     lang_index: row.lang_index,
                     blob_oid: row.blob_oid,
+                    variant: row.variant,
                     unit_key: row.unit_key,
                 });
             }
@@ -243,13 +244,17 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
     }
 
     /// [`Self::paths_for_row`] answered once per `(blob, storage language)`.
-    fn paths_for_row_memoized<'r, 'm>(
+    fn paths_for_row_memoized<'m>(
         &self,
-        row: &'r HydratedCandidateRow,
-        memo: &'m mut HashMap<(Oid, &'r str), Vec<ProjectFile>>,
+        row: &HydratedCandidateRow,
+        memo: &'m mut HashMap<super::BlobKey, Vec<ProjectFile>>,
     ) -> &'m [ProjectFile] {
-        memo.entry((row.blob_oid, row.lang.as_str()))
-            .or_insert_with(|| self.paths_for_row(row))
+        memo.entry(super::BlobKey {
+            oid: row.blob_oid,
+            lang: row.lang.clone(),
+            variant: row.variant,
+        })
+        .or_insert_with(|| self.paths_for_row(row))
     }
 
     fn rebase_to_project_root(&self, file: &ProjectFile) -> Option<ProjectFile> {

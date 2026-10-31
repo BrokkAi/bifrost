@@ -478,18 +478,18 @@ fn python_duplicate_dictionary_key(node: Node<'_>, source: &str) -> Option<bool>
 }
 
 #[derive(Clone, Copy)]
-struct PythonComparisonShape<'tree> {
-    operator_count: usize,
-    operand_count: usize,
-    left: Option<Node<'tree>>,
-    right: Option<Node<'tree>>,
-    operator: Option<Node<'tree>>,
+pub struct PythonComparisonShape<'tree> {
+    pub operator_count: usize,
+    pub operand_count: usize,
+    pub left: Option<Node<'tree>>,
+    pub right: Option<Node<'tree>>,
+    pub operator: Option<Node<'tree>>,
 }
 
 /// Read comparison operands and operator tokens from the grammar node. Python
 /// comparison operators are repeated fields; named operator aliases such as
 /// `is not` are distinguished from operands by their field name.
-fn python_comparison_shape(node: Node<'_>) -> PythonComparisonShape<'_> {
+pub fn python_comparison_shape(node: Node<'_>) -> PythonComparisonShape<'_> {
     let mut operator_count = 0usize;
     let mut operand_count = 0usize;
     let mut left = None;

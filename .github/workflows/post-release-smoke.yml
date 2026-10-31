@@ -91,6 +91,8 @@ jobs:
             done
 
           for required in \
+            "bifrost-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz" \
+            "bifrost-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz" \
             "bifrost-agent-${RELEASE_TAG}.tar.gz" \
             "brokk-bifrost-agent-${RELEASE_VERSION}.tgz" \
             "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz" \
@@ -251,7 +253,8 @@ jobs:
       RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
       NPM_PACKAGES: |
         @brokkai/bifrost
-        @brokkai/bifrost-darwin-universal
+        @brokkai/bifrost-darwin-arm64
+        @brokkai/bifrost-darwin-x64
         @brokkai/bifrost-linux-x64-gnu
         @brokkai/bifrost-linux-arm64-gnu
         @brokkai/bifrost-android-arm64
@@ -390,7 +393,8 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macos-latest is Apple silicon; macos-15-intel covers the x64 package.
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
     env:
       RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
     steps:
@@ -406,6 +410,21 @@ jobs:
           selected="$(npm exec --prefix "$install_dir" --no -- bifrost --version)"
           echo "$selected"
           grep -F "$RELEASE_VERSION" <<< "$selected"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            case "$RUNNER_ARCH" in
+              ARM64) cpu=arm64 other=x64 slice=arm64 ;;
+              X64) cpu=x64 other=arm64 slice=x86_64 ;;
+              *) echo "unexpected macOS runner architecture $RUNNER_ARCH" >&2; exit 1 ;;
+            esac
+            packages="$install_dir/node_modules/@brokkai"
+            archs="$(lipo -archs "$packages/bifrost-darwin-${cpu}/bin/bifrost")"
+            if [[ "$archs" != "$slice" ]]; then
+              echo "@brokkai/bifrost-darwin-${cpu} carries architectures '$archs', expected '$slice'" >&2
+              exit 1
+            fi
+            test ! -e "$packages/bifrost-darwin-${other}"
+            echo "Selected @brokkai/bifrost-darwin-${cpu} ($archs)"
+          fi
 
   mcp:
     name: published Codex and Claude MCP list_policies smoke

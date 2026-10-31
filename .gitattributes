@@ -1,5 +1,6 @@
 # SQL resources are included as source text; planner-statistics needles split on LF.
 *.sql text eol=lf
+crates/bifrost-core/migrations/cache/0225-blob-parse-variant.sql text eol=lf
 
 # Policy sources and formatter golds are compared with exact byte ranges.
 *.rqlp text eol=lf
@@ -94,6 +95,7 @@ tests/fixtures/golden/**/*.cc text eol=lf
 tests/fixtures/golden/**/*.config text eol=lf
 tests/fixtures/golden/**/*.cpp text eol=lf
 tests/fixtures/golden/**/*.cs text eol=lf
+tests/fixtures/golden/**/*.csproj text eol=lf
 tests/fixtures/golden/**/*.go text eol=lf
 # The offline Go module-cache fixture has checksums over these exact bytes.
 tests/fixtures/golden/go-graph-admission/type-first/external/module.txt text eol=lf
@@ -110,6 +112,7 @@ tests/fixtures/golden/**/*.lock text eol=lf
 tests/fixtures/golden/**/*.mod text eol=lf
 tests/fixtures/golden/**/*.php text eol=lf
 tests/fixtures/golden/**/*.properties text eol=lf
+tests/fixtures/golden/**/*.props text eol=lf
 tests/fixtures/golden/**/*.py text eol=lf
 tests/fixtures/golden/**/*.rb text eol=lf
 tests/fixtures/golden/**/*.rql text eol=lf
@@ -132,10 +135,19 @@ tests/fixtures/rust-codeql-parity/**/*.rs text eol=lf
 # against rows joined by "\n", so a CRLF checkout must not change its bytes.
 crates/bifrost-rust/tests/fixtures/cargo-matrix/expected.txt text eol=lf
 
+# The Rune rendering golden is read with fs::read_to_string and compared
+# exactly with output written by writeln!, so a CRLF checkout must not change
+# its bytes.
+crates/bifrost-rql/src/structural/search/tests/rune_rendering.expected.txt text eol=lf
+
 # The C# compilation-metadata golden is read with fs::read_to_string and
 # compared exactly with output joined by "\n"; its MSBuild inputs are pinned
 # with it so the analyzed project bytes match on every checkout.
 crates/bifrost-csharp-analysis/tests/fixtures/compilation-metadata/** text eol=lf
+
+# The C# compilation-symbols golden is likewise compared exactly with output
+# written by writeln!, and its MSBuild and source inputs are analyzed as bytes.
+crates/bifrost-csharp-analysis/tests/fixtures/golden/compilation-symbols/** text eol=lf
 
 # The generated JVM intrinsic inventory is hashed into the JVM language epochs
 # with include_str!, so a CRLF checkout must not change its bytes.
@@ -181,3 +193,5 @@ tests/suite_cross_language/workspace_authority_classification.tsv text eol=lf
 
 # The planner-statistics seek-plan test parses this source with include_str!.
 crates/bifrost-store/src/analyzer/store/mod.rs text eol=lf
+
+crates/bifrost-core/migrations/cache/0224-csharp-compilation-symbols.sql text eol=lf

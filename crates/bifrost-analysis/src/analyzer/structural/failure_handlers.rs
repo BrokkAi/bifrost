@@ -293,48 +293,22 @@ fn csharp_catch_rethrow_kind(syntax: &PreparedSyntaxTree, catch: Range) -> Handl
     let Some(body) = catch_node.child_by_field_name("body") else {
         return HandlerRethrowKind::Unknown;
     };
-    let caught_name = named_child_kind(catch_node, "catch_declaration")
-        .and_then(|declaration| declaration.child_by_field_name("name"))
-        .map(|name| {
-            name.utf8_text(syntax.source().as_bytes())
-                .unwrap_or_default()
-        });
     let mut has_bare = false;
     let mut has_caught_variable = false;
     let mut stack = vec![body];
     while let Some(node) = stack.pop() {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if matches!(
-                child.kind(),
-                "catch_clause"
-                    | "method_declaration"
-                    | "constructor_declaration"
-                    | "local_function_statement"
-                    | "lambda_expression"
-                    | "anonymous_method_expression"
-            ) {
-                continue;
-            }
-            if child.kind() == "throw_statement" {
-                let mut expression_cursor = child.walk();
-                match child.named_children(&mut expression_cursor).next() {
-                    None => has_bare = true,
-                    Some(expression)
-                        if expression.kind() == "identifier"
-                            && caught_name.is_some_and(|name| {
-                                expression
-                                    .utf8_text(syntax.source().as_bytes())
-                                    .is_ok_and(|value| value == name)
-                            }) =>
-                    {
-                        has_caught_variable = true;
-                    }
-                    Some(_) => {}
-                }
-            }
-            stack.push(child);
+        if csharp_failure_boundary(node) {
+            continue;
         }
+        if node.kind() == "throw_statement" && csharp_throw_owner(node) == Some(catch_node) {
+            match csharp_throw_relation(syntax, node, Some(catch_node)) {
+                ThrowRelation::Bare => has_bare = true,
+                ThrowRelation::CaughtVariable => has_caught_variable = true,
+                ThrowRelation::Other | ThrowRelation::NoOwner => {}
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
     }
     match (has_bare, has_caught_variable) {
         (true, true) => HandlerRethrowKind::Both,
@@ -342,6 +316,127 @@ fn csharp_catch_rethrow_kind(syntax: &PreparedSyntaxTree, catch: Range) -> Handl
         (false, true) => HandlerRethrowKind::CaughtVariable,
         (false, false) => HandlerRethrowKind::None,
     }
+}
+
+fn csharp_failure_boundary(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "catch_clause"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "destructor_declaration"
+            | "operator_declaration"
+            | "conversion_operator_declaration"
+            | "accessor_declaration"
+            | "local_function_statement"
+            | "lambda_expression"
+            | "anonymous_method_expression"
+    )
+}
+
+/// Find the nearest catch body without crossing a callable boundary.
+fn csharp_throw_owner(node: Node<'_>) -> Option<Node<'_>> {
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        if csharp_failure_boundary(parent) {
+            return (parent.kind() == "catch_clause"
+                && parent.child_by_field_name("body") == Some(child))
+            .then_some(parent);
+        }
+        child = parent;
+    }
+    None
+}
+
+/// Relation of a throw operand to its nearest owning catch variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrowRelation {
+    CaughtVariable,
+    Bare,
+    Other,
+    NoOwner,
+}
+
+impl ThrowRelation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CaughtVariable => "caught_variable",
+            Self::Bare => "bare",
+            Self::Other => "other",
+            Self::NoOwner => "no_owner",
+        }
+    }
+}
+
+fn csharp_throw_relation(
+    syntax: &PreparedSyntaxTree,
+    node: Node<'_>,
+    owner: Option<Node<'_>>,
+) -> ThrowRelation {
+    let Some(owner) = owner else {
+        return ThrowRelation::NoOwner;
+    };
+    let mut cursor = node.walk();
+    let Some(expression) = node
+        .named_children(&mut cursor)
+        .find(|node| !node.is_extra())
+    else {
+        return ThrowRelation::Bare;
+    };
+    let expression = brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression_with(
+        expression,
+        |node| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| !child.is_extra())
+        },
+    );
+    let name = named_child_kind(owner, "catch_declaration")
+        .and_then(|declaration| declaration.child_by_field_name("name"));
+    // C# CS0136 forbids shadowing a catch variable within its body. Callable
+    // boundaries are excluded by the owner walk, so name equality identifies it.
+    // Compare lookup names, so `@e` and `e` are the same variable.
+    let lookup_name = |node: Node<'_>| {
+        brokk_bifrost_csharp::syntax::csharp_lookup_identifier(
+            node.utf8_text(syntax.source().as_bytes())
+                .expect("identifier is UTF-8 source"),
+        )
+    };
+    if expression.kind() == "identifier"
+        && name.is_some_and(|name| lookup_name(name) == lookup_name(expression))
+    {
+        ThrowRelation::CaughtVariable
+    } else {
+        ThrowRelation::Other
+    }
+}
+
+/// Classify an exact throw statement and return its owning catch range.
+/// Recovery is distinct from a proven absence of an owner.
+pub fn csharp_throw_facts(
+    syntax: &PreparedSyntaxTree,
+    range: Range,
+) -> Option<(Option<Range>, ThrowRelation)> {
+    let node = syntax
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    if node.kind() != "throw_statement"
+        || node.start_byte() != range.start_byte
+        || node.end_byte() != range.end_byte
+        || node.has_error()
+        || has_error_ancestor(node)
+    {
+        return None;
+    }
+    let owner = csharp_throw_owner(node);
+    if owner.is_some_and(|owner| owner.has_error()) {
+        return None;
+    }
+    Some((
+        owner.map(brokk_bifrost_core::analyzer::tree_walk::node_range),
+        csharp_throw_relation(syntax, node, owner),
+    ))
 }
 
 /// Classify an exact PHP `catch` clause.

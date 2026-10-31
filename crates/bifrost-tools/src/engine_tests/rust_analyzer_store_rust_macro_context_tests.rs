@@ -208,7 +208,11 @@ passthrough! {
         let path = fixture.root().join("rust-macro-contexts.db");
         let store = AnalyzerStore::open_persistent(&path).expect("persistent macro context store");
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect("publish macro context fixture");
         let generation = store.current_generation("rust").unwrap();
         drop(state);
@@ -249,7 +253,7 @@ passthrough! {
 
         let actual_primary = reopened
             .rust_primary_contexts_at(
-                oid,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 generation,
                 MACRO_CONTEXT_SOURCE.find("module_macro").unwrap(),
                 &|| true,
@@ -269,7 +273,11 @@ passthrough! {
         let oid = oid_for(MACRO_CONTEXT_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let generation = store.current_generation("rust").unwrap();
         let point = MACRO_CONTEXT_SOURCE.find("module_macro").unwrap();
@@ -283,13 +291,22 @@ passthrough! {
         );
         assert!(
             store
-                .rust_primary_contexts_at(oid, generation, point, &|| true)
+                .rust_primary_contexts_at(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    point,
+                    &|| true
+                )
                 .is_err(),
             "stale macro context marker must block primary context selection"
         );
 
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let repaired = store
             .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
@@ -298,7 +315,12 @@ passthrough! {
         assert!(!repaired.items.macro_definitions.is_empty());
         assert!(
             !store
-                .rust_primary_contexts_at(oid, generation, point, &|| true)
+                .rust_primary_contexts_at(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    point,
+                    &|| true
+                )
                 .unwrap()
                 .unwrap()
                 .is_empty()
@@ -313,7 +335,11 @@ passthrough! {
         let oid = oid_for(b"");
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let generation = store.current_generation("rust").unwrap();
         let fresh = store
@@ -329,7 +355,11 @@ passthrough! {
                 .is_err()
         );
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let repaired = store
             .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)

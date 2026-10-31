@@ -2038,7 +2038,10 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
 
     assert_eq!(
         store
-            .semantic_ir_publication(oid, row_fixture::LANG)
+            .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                row_fixture::LANG
+            ))
             .unwrap(),
         Some(SemanticIrPublication {
             blob_id,
@@ -2172,7 +2175,10 @@ fn semantic_ir_publication_round_trips_every_head_only_outcome() {
         assert_eq!(prepared.logical_rows(), 1, "{expected:?}");
         let (oid, blob_id) = row_fixture::insert(&store, &format!("outcome {index}"), &prepared);
         let publication = store
-            .semantic_ir_publication(oid, row_fixture::LANG)
+            .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                row_fixture::LANG,
+            ))
             .unwrap()
             .unwrap();
         assert_eq!(publication.blob_id, blob_id);

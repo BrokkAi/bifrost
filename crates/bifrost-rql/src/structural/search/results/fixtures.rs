@@ -450,7 +450,10 @@ pub fn code_query_result_fixtures_json() -> Value {
             .collect(),
         truncated: false,
         session_subset: None,
-        diagnostics: vec![CodeQueryDiagnostic {
+        diagnostics: vec![CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+            ),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::InvalidPlan,
@@ -460,7 +463,7 @@ pub fn code_query_result_fixtures_json() -> Value {
             message: "fixture diagnostic".to_owned(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }],
+        })],
     };
     let serialized =
         serde_json::to_value(result).expect("the canonical Rust result fixtures are serializable");

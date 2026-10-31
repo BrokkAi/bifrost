@@ -70,9 +70,11 @@ use brokk_bifrost_core::analyzer::tree_walk::named_children_iter;
 
 use brokk_bifrost_core::hash::HashMap;
 
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_jvm::java::declarations::{
-    determine_package_name, java_modifier_keywords, node_text, parse_tree,
+    determine_package_name, explicit_java_source_visibility, java_modifier_keywords, node_text,
+    parse_tree,
 };
 use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
@@ -1828,15 +1830,11 @@ fn source_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 fn source_visibility(node: Node<'_>, default: Visibility) -> Visibility {
-    let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
-    if modifiers.contains(&"public") {
-        Visibility::Public
-    } else if modifiers.contains(&"protected") {
-        Visibility::Protected
-    } else if modifiers.contains(&"private") {
-        Visibility::Private
-    } else {
-        default
+    match explicit_java_source_visibility(node) {
+        Some(DeclaredVisibility::Public) => Visibility::Public,
+        Some(DeclaredVisibility::Protected) => Visibility::Protected,
+        Some(DeclaredVisibility::Private) => Visibility::Private,
+        _ => default,
     }
 }
 

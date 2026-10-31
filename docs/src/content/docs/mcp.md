@@ -428,6 +428,20 @@ The other arguments match the CLI policy flags:
 - `policy_cost_hints` is an optional JSON object from non-empty policy IDs to
   non-negative integer milliseconds. Parallel batches start unknown policies first,
   then hinted policies from longest to shortest; hints never change the report.
+- `policy_deadlines_ms` is an optional JSON object from non-empty policy IDs to
+  integer milliseconds of at least 1. Each listed policy may run that long from
+  when it starts. A policy that reaches its limit ends `inconclusive` with reason
+  `rule_deadline_exceeded` and makes the exit status unreliable, while the other
+  policies continue. The request budget still bounds the whole call.
+- `stream_runs` (default `false`), with a `progressToken` on the request, sends
+  each policy's run as soon as that policy finishes, so a caller can store
+  results and start triage before the batch ends. Each run arrives as a
+  `notifications/progress` whose `_meta["io.bifrost/policy-run"]` is
+  `{policy_id, progress, run}`, in the order policies finish and before the
+  result. A streamed run is not yet reviewed: suppressions, the scope file, the
+  baseline and the `diff_base` classification appear only in the final report,
+  which stays authoritative. Delivery is best effort; a client that cannot keep
+  up may miss one. A call run as an MCP task streams nothing.
 - `include_stage_timings` (default `false`) adds a `stage_timings` field with
   the wall-clock time of each evaluation stage.
 

@@ -1815,3 +1815,85 @@ fn a_persisted_row_replays_the_coverage_the_live_row_published() {
         envelope_of_complete_query(&rows)
     );
 }
+
+#[test]
+fn unavailable_conversion_inputs_survive_join_without_a_definite_assertion() {
+    use brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionUnknown;
+    use brokk_bifrost_rql::structural::search::{
+        CodeQueryRowFieldUnknownReason, UnitRowUnknownField,
+    };
+
+    let source = |id, name: &str| {
+        let schema = domain_schema(name, DetailedCodeQueryDomain::CallBinding);
+        IrRelation {
+            id: IrRelationId(id),
+            name: name.into(),
+            op: IrRelationOp::Source {
+                binding: binding(name),
+                schema: schema.clone(),
+            },
+            schema,
+        }
+    };
+    let left = source(0, "left");
+    let right = source(1, "right");
+    let joined = join(
+        2,
+        &left,
+        &right,
+        IrJoinKind::Inner,
+        vec![IrEquiKey {
+            left: column("left", "conversion"),
+            right: column("right", "conversion"),
+        }],
+    );
+    let grouped = group(
+        3,
+        "by-site",
+        &joined,
+        vec![column("left", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion("unknown", &grouped, "calls", AssertCardinality::Exactly(1));
+    let plan = plan(vec![left, right, joined, grouped], vec![assertion]);
+    let rows = (0..2)
+        .map(|index| UnitRowItem {
+            domain: DetailedCodeQueryDomain::CallBinding,
+            path: "app.cs".into(),
+            range: None,
+            evidence: None,
+            coverage: None,
+            fields: vec![UnitRowField {
+                name: "site_id".into(),
+                value: UnitRowScalar::StableId(format!("site-{index}").into()),
+            }],
+            projected_field_names: vec![],
+            unknown_fields: vec![UnitRowUnknownField {
+                name: "conversion".into(),
+                reason: CodeQueryRowFieldUnknownReason::CallConversion(
+                    ConversionUnknown::UnresolvedSourceType,
+                ),
+            }],
+            terminal: None,
+            provenance: vec![],
+            provenance_truncated: false,
+        })
+        .collect::<Vec<_>>();
+    let result = evaluate(
+        &plan,
+        &[
+            ("left", &rows, RelationCoverage::exhaustive()),
+            ("right", &rows, RelationCoverage::exhaustive()),
+        ],
+    );
+    assert_eq!(result.work.input_rows, 4, "{result:?}");
+    assert!(!result.exhaustive, "{result:?}");
+    assert!(result.violations.is_empty(), "{result:?}");
+    assert!(result.vacuous_assertions.is_empty(), "{result:?}");
+    assert!(!result.unmet_obligations.is_empty(), "{result:?}");
+    assert_eq!(
+        result.incomplete_reasons,
+        vec![PolicyIncompleteReason::CapabilityIncomplete],
+        "{result:?}"
+    );
+}

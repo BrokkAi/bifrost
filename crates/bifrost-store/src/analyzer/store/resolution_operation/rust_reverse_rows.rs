@@ -184,7 +184,7 @@ WITH source(blob_id,persisted_relative_path) AS (
   CROSS JOIN workspace_file_versions AS version
     ON version.file_version_id=mask.masked_file_version_id
   CROSS JOIN blobs AS blob
-    ON blob.blob_oid=version.blob_oid AND blob.lang=version.lang
+    ON blob.blob_oid=version.blob_oid AND blob.lang=version.lang AND blob.parse_variant=x''
    AND blob.generation=version.generation
   WHERE mask.storage_language='rust' AND mask.persisted_relative_path=?1
 )
@@ -1361,7 +1361,7 @@ fn target_scoped_reference_inventory_gaps(
     Ok((completion, locators))
 }
 
-pub(crate) const MASKED_BLOB_SQL: &str = "SELECT blob.id FROM temp.selected_resolution_overlay_masks AS mask CROSS JOIN workspace_file_versions AS version ON version.file_version_id=mask.masked_file_version_id CROSS JOIN blobs AS blob ON blob.blob_oid=version.blob_oid AND blob.lang=version.lang AND blob.generation=version.generation WHERE mask.storage_language='rust' AND mask.persisted_relative_path=?1";
+pub(crate) const MASKED_BLOB_SQL: &str = "SELECT blob.id FROM temp.selected_resolution_overlay_masks AS mask CROSS JOIN workspace_file_versions AS version ON version.file_version_id=mask.masked_file_version_id CROSS JOIN blobs AS blob ON blob.blob_oid=version.blob_oid AND blob.lang=version.lang AND blob.parse_variant=x'' AND blob.generation=version.generation WHERE mask.storage_language='rust' AND mask.persisted_relative_path=?1";
 pub(crate) const BLOB_DEFINITION_SITE_SQL: &str = "SELECT source_site FROM resolution_semantic_sites WHERE blob_id=?1 AND semantic_key=?2 AND semantic_role='definition'";
 
 /// Read a field's source provenance without expanding its occurrence arena.

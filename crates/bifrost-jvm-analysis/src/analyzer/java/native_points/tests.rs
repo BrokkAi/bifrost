@@ -55,6 +55,41 @@ fn site(source: &str) -> ResolvedReferenceSite {
     )
 }
 
+#[track_caller]
+fn assert_cancellation_and_budget<T: std::fmt::Debug>(
+    query: BoundedReceiverQuery<'_>,
+    resolve: impl for<'a, 'b> Fn(BoundedReceiverQuery<'a>, &'b dyn Fn()) -> BoundedResolution<T>,
+) {
+    let cancellation = CancellationToken::new();
+    let cancel_after_open = || cancellation.cancel();
+    let result = resolve(
+        BoundedReceiverQuery {
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: Some(&cancellation),
+            ..query
+        },
+        &cancel_after_open,
+    );
+    assert!(
+        matches!(result, BoundedResolution::Cancelled { .. }),
+        "{result:?}"
+    );
+
+    let no_op = || {};
+    let result = resolve(
+        BoundedReceiverQuery {
+            budget: ReceiverAnalysisBudget::tiny(),
+            cancellation: None,
+            ..query
+        },
+        &no_op,
+    );
+    assert!(
+        matches!(result, BoundedResolution::Exceeded { .. }),
+        "{result:?}"
+    );
+}
+
 fn complete(result: BoundedResolution<DefinitionLookupOutcome>) -> DefinitionLookupOutcome {
     let BoundedResolution::Complete { value, .. } = result else {
         panic!("{result:?}")
@@ -678,8 +713,7 @@ fn java_native_point_obeys_cancellation_and_budget() {
     let (fixture, analyzer) = fixture();
     let file = fixture.file(CALLER_PATH);
     let site = site(CALLER);
-    let cancellation = CancellationToken::new();
-    let result = resolve_java_definition_bounded(
+    assert_cancellation_and_budget(
         BoundedReceiverQuery {
             analyzer: &analyzer,
             file: &file,
@@ -687,29 +721,9 @@ fn java_native_point_obeys_cancellation_and_budget() {
             tree: None,
             site: &site,
             budget: ReceiverAnalysisBudget::default(),
-            cancellation: Some(&cancellation),
-        },
-        || cancellation.cancel(),
-    );
-    assert!(
-        matches!(result, BoundedResolution::Cancelled { .. }),
-        "{result:?}"
-    );
-    let result = resolve_java_definition_bounded(
-        BoundedReceiverQuery {
-            analyzer: &analyzer,
-            file: &file,
-            source: CALLER,
-            tree: None,
-            site: &site,
-            budget: ReceiverAnalysisBudget::tiny(),
             cancellation: None,
         },
-        || {},
-    );
-    assert!(
-        matches!(result, BoundedResolution::Exceeded { .. }),
-        "{result:?}"
+        |query, after_open| resolve_java_definition_bounded(query, after_open),
     );
 }
 
@@ -982,7 +996,6 @@ fn java_native_type_preserves_cancellation_budget_and_source_admission() {
     let (fixture, analyzer) = fixture();
     let file = fixture.file(CALLER_PATH);
     let site = site(CALLER);
-    let cancellation = CancellationToken::new();
     let query = BoundedReceiverQuery {
         analyzer: &analyzer,
         file: &file,
@@ -992,26 +1005,9 @@ fn java_native_type_preserves_cancellation_budget_and_source_admission() {
         budget: ReceiverAnalysisBudget::default(),
         cancellation: None,
     };
-    assert!(matches!(
-        resolve_java_type_bounded(
-            BoundedReceiverQuery {
-                cancellation: Some(&cancellation),
-                ..query
-            },
-            || cancellation.cancel()
-        ),
-        BoundedResolution::Cancelled { .. }
-    ));
-    assert!(matches!(
-        resolve_java_type_bounded(
-            BoundedReceiverQuery {
-                budget: ReceiverAnalysisBudget::tiny(),
-                ..query
-            },
-            || {}
-        ),
-        BoundedResolution::Exceeded { .. }
-    ));
+    assert_cancellation_and_budget(query, |query, after_open| {
+        resolve_java_type_bounded(query, after_open)
+    });
     let result = resolve_java_type_bounded(
         BoundedReceiverQuery {
             source: "class Changed {}",
@@ -2553,8 +2549,14 @@ fn java_native_nested_argument_budget_stop_keeps_outer_point_incomplete() {
     reset_native_point_operation_open_count_for_test();
     for _ in 0..2 {
         let before = native_point_operation_open_count_for_test();
+        let (outcome, receipt) =
+            brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(&analyzer, || {
+                resolve_java_definition_with_evidence_in_batch(constrained, Some(&batch), || {})
+            });
+        assert!(receipt.execution_dependences() > 0);
+        assert!(!receipt.is_bounded());
         assert!(matches!(
-            resolve_java_definition_with_evidence_in_batch(constrained, Some(&batch), || {}),
+            outcome,
             BoundedResolution::Exceeded {
                 limit: ReceiverBudgetLimit::ScopeNodes,
                 ..
@@ -2628,5 +2630,285 @@ fn java_native_batch_hits_replay_captured_reads() {
         native_point_operation_open_count_for_test(),
         operations,
         "the repeated point must hit without opening another operation"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8127: batch point operations repeated identical import-binding and evidence reads per point"
+)]
+fn java_native_batch_persisted_reads_keep_operation_ledgers() {
+    use brokk_bifrost_analysis::analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::native_points::{
+        native_point_operation_open_count_for_test,
+        reset_native_point_operation_open_count_for_test,
+    };
+
+    const CALLER: &str = "package use; import dep.*; class Use { Target field; }";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(CALLER_PATH, CALLER)
+        .file(PROVIDER_PATH, "package dep; public class Target {}")
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let _inventory = analyzer.external_declaration_index();
+    let file = fixture.file(CALLER_PATH);
+    let site = site(CALLER);
+    let tree = brokk_bifrost_jvm::java::declarations::parse_tree(CALLER).unwrap();
+    let query = BoundedReceiverQuery {
+        analyzer: &analyzer,
+        file: &file,
+        source: CALLER,
+        tree: Some(&tree),
+        site: &site,
+        budget: Default::default(),
+        cancellation: None,
+    };
+    let batch = NativePointBatch::new(
+        &analyzer.inner,
+        &analyzer,
+        file.clone(),
+        CALLER.into(),
+        None,
+    )
+    .unwrap()
+    .expect("selected batch inputs are ready");
+    reset_native_point_operation_open_count_for_test();
+    let (first, reads) = capture_query_reads(&analyzer, || {
+        complete_with_evidence(resolve_java_definition_with_evidence_uncached(
+            query,
+            Some(&batch),
+            || {},
+        ))
+    });
+    assert_eq!(first.outcome.status, DefinitionLookupStatus::Resolved);
+    let operations = native_point_operation_open_count_for_test();
+    assert!(operations > 0, "the cold point opens an operation");
+    assert!(!reads.keys().is_empty(), "the fill must record real reads");
+    let cold_counts = batch.persisted_read_counts_for_test();
+    assert!(
+        cold_counts.0 > 0 && cold_counts.1 > 0,
+        "both SQL families ran: {cold_counts:?}"
+    );
+    let (second, later_reads) = capture_query_reads(&analyzer, || {
+        complete_with_evidence(resolve_java_definition_with_evidence_uncached(
+            query,
+            Some(&batch),
+            || {},
+        ))
+    });
+    assert_eq!(
+        batch.persisted_read_counts_for_test(),
+        cold_counts,
+        "warm point executes neither persisted SQL family"
+    );
+    assert_eq!(cold_counts.2, 0);
+    assert_eq!(second.outcome.status, first.outcome.status);
+    assert_eq!(later_reads.keys(), reads.keys());
+    assert_eq!(later_reads.unattributed_reads(), reads.unattributed_reads());
+    assert_eq!(
+        native_point_operation_open_count_for_test(),
+        operations * 2,
+        "each point keeps its own operation"
+    );
+}
+
+#[test]
+fn native_batch_hit_replays_fill_query_obligations() {
+    use brokk_bifrost_analysis::analyzer::native_points::{map_bounded, probe_native_definition};
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution;
+    use brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest;
+
+    // Scala's intrinsic owner fixes this member identity while the unacquired
+    // default-import environment remains an independent query obligation.
+    let source = "class ScalaProbe extends AnyRef { def inherited() = getClass() }";
+    let path = "Probe.scala";
+    let fixture = InlineTestProject::with_language(Language::Scala)
+        .file(path, source)
+        .file(
+            ".bifrost/packs.json",
+            r#"{"schema_version":1,"ecosystems":[],"enable":[]}"#,
+        )
+        .build();
+    let empty_repository = tempfile::tempdir().unwrap();
+    let mut config = brokk_bifrost_analysis::test_support::hermetic_jvm_config();
+    config.jvm.external_dependencies.repository_roots = vec![empty_repository.path().to_path_buf()];
+    config.jvm.external_dependencies.gradle_cache_roots =
+        vec![empty_repository.path().to_path_buf()];
+    // Direct construction has no host pack activation; the fixture also
+    // explicitly disables workspace dependency-pack activation.
+    let analyzer = crate::analyzer::ScalaAnalyzer::new_with_config(fixture.project_dyn(), config);
+    assert!(
+        brokk_bifrost_analysis::analyzer::IAnalyzer::semantic_model_overlay(&analyzer).is_none()
+    );
+    let _inventory = analyzer.external_declaration_index();
+    let inner = analyzer.tree_sitter_analyzer();
+    let file = fixture.file(path);
+    let tree = brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language(
+        &file,
+        Language::Scala,
+        source,
+    )
+    .unwrap();
+    let start = source.find("getClass").unwrap();
+    let site = ResolvedReferenceSite {
+        path: path.into(),
+        text: "getClass".into(),
+        range: Range {
+            start_byte: start,
+            end_byte: start + 8,
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte: start,
+        focus_end_byte: start + 8,
+    };
+    let query = BoundedReceiverQuery {
+        analyzer: &analyzer,
+        file: &file,
+        source,
+        tree: Some(&tree),
+        site: &site,
+        budget: Default::default(),
+        cancellation: None,
+    };
+    let batch = NativePointBatch::new(inner, &analyzer, file.clone(), source.into(), None)
+        .unwrap()
+        .expect("selected batch inputs are ready");
+    let request = SourceLocationRequest {
+        file: file.clone(),
+        line: None,
+        column: None,
+        start_byte: Some(start),
+        end_byte: Some(start + 8),
+    };
+    let cold = batch.definition(inner, query, || {
+        map_bounded(
+            probe_native_definition(
+                &analyzer,
+                &request,
+                source,
+                Default::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap(),
+            |outcome| DefinitionResolution {
+                outcome,
+                evidence: Default::default(),
+            },
+        )
+    });
+    let BoundedResolution::Complete { value: cold, .. } = cold else {
+        panic!("cold fill must complete")
+    };
+    let obligations = |outcome: &DefinitionLookupOutcome| {
+        outcome
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == "query_obligation")
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>()
+    };
+    let cold_obligations = obligations(&cold.outcome);
+    assert_eq!(
+        cold_obligations,
+        ["jvm-default-import-package-open:scala:unacquired"],
+        "{:?}",
+        cold.outcome
+    );
+    let warm = batch.definition(inner, query, || panic!("expected a memo hit"));
+    let BoundedResolution::Complete { value: warm, .. } = warm else {
+        panic!("memo hit must complete")
+    };
+    assert_eq!(cold_obligations, obligations(&warm.outcome));
+}
+
+#[test]
+fn kotlin_unbound_call_keeps_default_gap_with_unindexed_supertype() {
+    use brokk_bifrost_analysis::analyzer::native_points::probe_native_definition;
+    use brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest;
+
+    // An explicit supertype import fixes Closeable's identity, not the bare
+    // call's identity. Its demanded closure must not retire the call's gaps.
+    let source = "import java.io.Closeable\nclass Probe : Closeable {\n  private val names = mutableSetOf<String>()\n}\n";
+    let path = "Probe.kt";
+    let fixture = InlineTestProject::with_language(Language::Kotlin)
+        .file(path, source)
+        .file(
+            ".bifrost/packs.json",
+            r#"{"schema_version":1,"ecosystems":[],"enable":[]}"#,
+        )
+        .build();
+    let empty_repository = tempfile::tempdir().unwrap();
+    let mut config = brokk_bifrost_analysis::test_support::hermetic_jvm_config();
+    config.jvm.external_dependencies.repository_roots = vec![empty_repository.path().to_path_buf()];
+    config.jvm.external_dependencies.gradle_cache_roots =
+        vec![empty_repository.path().to_path_buf()];
+    let analyzer = crate::analyzer::KotlinAnalyzer::new_with_config(fixture.project_dyn(), config);
+    assert!(
+        brokk_bifrost_analysis::analyzer::IAnalyzer::semantic_model_overlay(&analyzer).is_none()
+    );
+    let _inventory = analyzer.external_declaration_index();
+    let start = source.find("mutableSetOf").unwrap();
+    let request = SourceLocationRequest {
+        file: fixture.file(path),
+        line: None,
+        column: None,
+        start_byte: Some(start),
+        end_byte: Some(start + "mutableSetOf".len()),
+    };
+    let outcome = complete(
+        probe_native_definition(
+            &analyzer,
+            &request,
+            source,
+            Default::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Incomplete,
+        "{outcome:#?}"
+    );
+    assert!(outcome.definitions.is_empty(), "{outcome:#?}");
+    let default_gaps = outcome
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.kind == "jvm-default-import-package-open"
+                && diagnostic.message.contains("kotlin.collections")
+                && diagnostic.message.contains("mutableSetOf")
+        })
+        .count();
+    assert!(
+        default_gaps > 0,
+        "the call's default-import gap must survive: {outcome:#?}"
+    );
+    assert!(
+        outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "jvm-import-owner-open"
+                && diagnostic.message.contains("java.io")
+                && diagnostic.message.contains("Closeable")
+        }),
+        "the supertype import must remain unindexed: {outcome:#?}"
+    );
+    let incomplete = outcome
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.kind == "incomplete_binding")
+        .unwrap();
+    assert_eq!(
+        incomplete.message.matches("OpenBoundary:").count(),
+        default_gaps + 1,
+        "each default-import gap and the supertype import keep their boundary: {outcome:#?}"
+    );
+    assert!(
+        !outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "query_obligation"
+                && diagnostic.message
+                    == "jvm-default-import-package-open:kotlin.collections:unacquired"
+        }),
+        "an unbound call cannot lift its default-import gap: {outcome:#?}"
     );
 }

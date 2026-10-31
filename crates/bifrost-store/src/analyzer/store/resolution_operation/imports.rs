@@ -273,8 +273,22 @@ pub(super) fn import_bindings_for_lookup<R: ImportBindingRules>(
     binders.dedup();
     // SyntheticReference publishes no site kind or authored metadata.
     // Only published, lowered sites can enter the lexical metadata reader.
-    let mut statement = connection.prepare_cached(
-        "SELECT DISTINCT semantic.semantic_key
+    let key = (
+        record.blob_id(),
+        record.blob_oid(),
+        lookup.name_digest().to_vec(),
+    );
+    let cached = ready
+        .point_read_memos
+        .import_references
+        .borrow()
+        .get(&key)
+        .cloned();
+    let references = if let Some(rows) = cached {
+        rows
+    } else {
+        let mut statement = connection.prepare_cached(
+            "SELECT DISTINCT semantic.semantic_key
              FROM main.resolution_identities AS lookup
              CROSS JOIN main.resolution_paths AS path
                ON path.blob_id=?1 AND path.end_lead_identity=lookup.id
@@ -287,17 +301,29 @@ pub(super) fn import_bindings_for_lookup<R: ImportBindingRules>(
                ON authored.blob_id=semantic.blob_id AND authored.site=semantic.source_site
               AND authored.site_kind IS NOT NULL
              WHERE lookup.identity_digest=?2",
-    )?;
-    let references = statement.query_map(
-        rusqlite::params![record.blob_id(), lookup.name_digest().as_slice()],
-        |row| row.get::<_, u32>(0),
-    )?;
+        )?;
+        let references = statement
+            .query_map(
+                rusqlite::params![record.blob_id(), lookup.name_digest().as_slice()],
+                |row| row.get::<_, u32>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        ready
+            .point_read_memos
+            .import_references
+            .borrow_mut()
+            .insert_bounded(key, references.clone());
+        references
+    };
     let mut result = Vec::new();
     for reference in references {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let reference = SemanticId::local(mount.get(), reference?);
+        let reference = SemanticId::local(mount.get(), reference);
         let Some(evidence) =
             authored_reference_local_path_evidence(ready, reference, cancellation)?
         else {

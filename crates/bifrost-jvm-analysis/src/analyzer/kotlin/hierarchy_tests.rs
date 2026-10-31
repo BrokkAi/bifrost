@@ -15,7 +15,6 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 use brokk_bifrost_core::analyzer::CodeUnitIndex;
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
-use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeSet;
 
 fn fixture() -> (BuiltInlineTestProject, ProjectFile, KotlinAnalyzer) {
@@ -66,7 +65,7 @@ fn class_unit(analyzer: &KotlinAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("fixture declares {fq_name}"))
 }
 
-fn sorted_names(units: HashSet<CodeUnit>) -> Vec<String> {
+fn sorted_names(units: Vec<CodeUnit>) -> Vec<String> {
     let mut names: Vec<String> = units.iter().map(CodeUnit::fq_name).collect();
     names.sort();
     names
@@ -82,7 +81,7 @@ fn kotlin_descendant_index_populates_the_ancestor_memo() {
     let (_project, wild, analyzer) = fixture();
     let base = base_unit(&analyzer);
 
-    let whole = sorted_names(analyzer.get_direct_descendants(&base));
+    let whole = sorted_names(analyzer.get_direct_descendants(&base).definite().to_vec());
     assert_eq!(
         whole,
         vec!["app.First".to_string(), "wild.Wildcard".to_string(),]
@@ -95,7 +94,8 @@ fn kotlin_descendant_index_populates_the_ancestor_memo() {
     let production = sorted_names(
         analyzer
             .get_direct_descendants_within(&base, &scope)
-            .expect("the production-only descendant index completes"),
+            .expect("the production-only descendant index completes")
+            .edges,
     );
     assert_eq!(
         production,
@@ -109,7 +109,7 @@ fn kotlin_descendant_index_populates_the_ancestor_memo() {
         "the descendant-index build must publish per-class ancestry into the \
          analyzer's ancestor memo"
     );
-    let warm_ancestors = analyzer.get_direct_ancestors(&first);
+    let warm_ancestors = analyzer.get_direct_ancestors(&first).definite().to_vec();
     let mut warm_names = warm_ancestors
         .iter()
         .map(CodeUnit::fq_name)
@@ -142,11 +142,14 @@ fn ancestor_hits_replay_inputs_in_successive_captures() {
     use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
     let (_project, _, analyzer) = fixture();
     let child = class_unit(&analyzer, "app.First");
-    let expected = analyzer.get_direct_ancestors(&child);
+    let expected = analyzer.get_direct_ancestors(&child).definite().to_vec();
     assert_eq!(expected.len(), 2);
-    let (first, reads) = capture_query_reads(&analyzer, || analyzer.get_direct_ancestors(&child));
-    let (second, second_reads) =
-        capture_query_reads(&analyzer, || analyzer.get_direct_ancestors(&child));
+    let (first, reads) = capture_query_reads(&analyzer, || {
+        analyzer.get_direct_ancestors(&child).definite().to_vec()
+    });
+    let (second, second_reads) = capture_query_reads(&analyzer, || {
+        analyzer.get_direct_ancestors(&child).definite().to_vec()
+    });
     assert_eq!(first, expected);
     assert_eq!(second, expected);
     assert_eq!(reads.unattributed_reads(), 0);

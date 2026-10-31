@@ -305,7 +305,9 @@ mod cpp_extraction_tests {
                     analyzer
                         .store_context
                         .store
-                        .contains_parsed_blob(oid, "cpp")
+                        .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                            oid, "cpp"
+                        ))
                         .unwrap()
                 );
                 assert_eq!(analyzer.fetch_file_state(&file).unwrap().source, source);
@@ -404,7 +406,9 @@ mod cpp_extraction_tests {
                 !analyzer
                     .store_context
                     .store
-                    .contains_parsed_blob(oid, "cpp")
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "cpp"
+                    ))
                     .unwrap()
             );
         }
@@ -583,11 +587,19 @@ mod cpp_extraction_tests {
             {
                 let store = AnalyzerStore::open_persistent(&db_path).unwrap();
                 store
-                    .write_parsed_blob(oid, "cpp", &CppAdapter, &parsed)
+                    .write_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                        &CppAdapter,
+                        &parsed,
+                    )
                     .unwrap();
                 assert!(
                     store
-                        .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
+                        .hydrate_file_state(
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                            &CppAdapter,
+                            &file
+                        )
                         .unwrap()
                         .is_some()
                 );
@@ -664,10 +676,18 @@ mod cpp_extraction_tests {
             let oid = oid_for(file.read_to_string().unwrap().as_bytes());
             let store = AnalyzerStore::open_ephemeral().unwrap();
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, parsed)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    parsed,
+                )
                 .unwrap();
             store
-                .hydrate_file_state(oid, "cpp", &CppAdapter, file)
+                .hydrate_file_state(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    file,
+                )
                 .unwrap()
                 .unwrap()
         }
@@ -721,10 +741,18 @@ mod cpp_extraction_tests {
             let store = AnalyzerStore::open_ephemeral().unwrap();
             let oid = oid_for(file.read_to_string().unwrap().as_bytes());
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &parsed)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &parsed,
+                )
                 .unwrap();
             let persisted = store
-                .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
+                .hydrate_file_state(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &file,
+                )
                 .unwrap()
                 .unwrap()
                 .cpp_template_metadata;
@@ -819,8 +847,7 @@ mod cpp_extraction_tests {
                 store
                     .write_parsed_blob_at_generation(
                         &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                        oid,
-                        "cpp:c",
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp:c"),
                         generation,
                         &CppAdapter,
                         &state,
@@ -843,8 +870,7 @@ mod cpp_extraction_tests {
 
                 let hydrated = store
                     .hydrate_file_state_with_source(
-                        oid,
-                        "cpp:c",
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp:c"),
                         generation,
                         &CppAdapter,
                         &file,
@@ -918,16 +944,27 @@ mod cpp_extraction_tests {
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    oid,
-                    "cpp:c",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp:c"),
                     generations["cpp:c"],
                     &CppAdapter,
                     state.as_ref(),
                 )
                 .unwrap();
 
-            assert!(store.contains_parsed_blob(oid, "cpp:c").unwrap());
-            assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+            assert!(
+                store
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "cpp:c"
+                    ))
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "cpp"
+                    ))
+                    .unwrap()
+            );
         }
         #[test]
         fn cpp_abstract_reference_declarator_epoch_invalidates_prior_parsed_blobs() {
@@ -1429,32 +1466,59 @@ mod cpp_extraction_tests {
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    oid,
-                    "cpp",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
                     prior_generation,
                     &CppAdapter,
                     &state,
                 )
                 .unwrap();
-            assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+            assert!(
+                store
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "cpp"
+                    ))
+                    .unwrap()
+            );
 
             let current = store
                 .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
                 .unwrap();
             assert_ne!(current, prior_generation);
-            assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+            assert!(
+                !store
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "cpp"
+                    ))
+                    .unwrap()
+            );
             assert_eq!(
                 store
-                    .missing_parsed_blob_keys(&[(oid, "cpp".to_owned())])
+                    .missing_parsed_blob_keys(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "cpp"
+                    )])
                     .unwrap(),
-                vec![(oid, "cpp".to_owned())]
+                vec![brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp")]
             );
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &state,
+                )
                 .unwrap();
-            assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+            assert!(
+                store
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "cpp"
+                    ))
+                    .unwrap()
+            );
             let imports = store
-                .hydrate_import_infos(&[(file.clone(), oid)], "cpp", &CppAdapter)
+                .hydrate_import_infos(
+                    &[(file.clone(), oid)],
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "cpp"),
+                    &CppAdapter,
+                )
                 .unwrap();
             assert_eq!(imports.get(&file), Some(&state.imports));
             assert_eq!(
@@ -1768,7 +1832,11 @@ mod cpp_extraction_tests {
             let oid = oid_for(source.as_bytes());
             let store = AnalyzerStore::open_ephemeral().unwrap();
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &parse_state(&CppAdapter, &file),
+                )
                 .unwrap();
 
             {
@@ -1805,17 +1873,27 @@ mod cpp_extraction_tests {
                 assert!(surviving > 0, "the orphaned fact rows must survive");
             }
 
-            assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+            assert!(
+                !store
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "cpp"
+                    ))
+                    .unwrap()
+            );
             assert!(
                 store
-                    .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
+                    .hydrate_file_state(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                        &CppAdapter,
+                        &file
+                    )
                     .unwrap()
                     .is_none()
             );
             let hydrated = store
                 .hydrate_file_states(
                     &[(file.clone(), oid)],
-                    "cpp",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "cpp"),
                     &CppAdapter,
                     &HashMap::from_iter([(file.clone(), source)]),
                 )
@@ -1833,7 +1911,11 @@ mod cpp_extraction_tests {
             let oid = oid_for(file.read_to_string().unwrap().as_bytes());
             let store = AnalyzerStore::open_ephemeral().unwrap();
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &parse_state(&CppAdapter, &file),
+                )
                 .unwrap();
 
             let candidates = store.search_candidate_rows_by_lang("cpp").unwrap();
@@ -2032,7 +2114,11 @@ namespace fast = ns::detail;
             {
                 let store = AnalyzerStore::open_persistent(&path).unwrap();
                 store
-                    .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+                    .write_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                        &CppAdapter,
+                        &state,
+                    )
                     .unwrap();
             }
             std::fs::remove_file(file.abs_path()).unwrap();
@@ -2179,12 +2265,20 @@ namespace fast = ns::detail;
             let generation = store.current_generation("cpp").unwrap();
             let oid = oid_for(SOURCE.as_bytes());
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &state,
+                )
                 .unwrap();
             for index in 0..32 {
                 let other = oid_for(format!("planner publication {index}").as_bytes());
                 store
-                    .write_parsed_blob(other, "cpp", &CppAdapter, &state)
+                    .write_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(other, "cpp"),
+                        &CppAdapter,
+                        &state,
+                    )
                     .unwrap();
             }
             brokk_bifrost_analysis::analyzer::store::source_facts::assert_source_lookup_plan(
@@ -2245,12 +2339,20 @@ namespace fast = ns::detail;
             let facts = state.source_facts.as_mut().unwrap().cpp.take().unwrap();
             assert!(
                 store
-                    .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+                    .write_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                        &CppAdapter,
+                        &state
+                    )
                     .is_err()
             );
             state.source_facts.as_mut().unwrap().cpp = Some(facts);
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &state,
+                )
                 .unwrap();
             let read = store
                 .cpp_source_facts(oid, generation, "cpp", &CppAdapter, &file, &|| true)
@@ -2288,7 +2390,11 @@ namespace fast = ns::detail;
                     .is_none()
             );
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &state,
+                )
                 .unwrap();
             assert!(
                 store
@@ -2308,7 +2414,11 @@ namespace fast = ns::detail;
             let store = AnalyzerStore::open_ephemeral().unwrap();
             let generation = store.current_generation("cpp").unwrap();
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &state,
+                )
                 .unwrap();
             brokk_bifrost_analysis::analyzer::store::source_facts::assert_reader_rejects_tampering(
                 || {
@@ -2342,7 +2452,11 @@ namespace fast = ns::detail;
             let store = AnalyzerStore::open_ephemeral().unwrap();
             let generation = store.current_generation("cpp").unwrap();
             store
-                .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                    &CppAdapter,
+                    &state,
+                )
                 .unwrap();
             brokk_bifrost_analysis::analyzer::store::source_facts::assert_reader_rejects_tampering(
                 || {

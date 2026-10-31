@@ -117,6 +117,7 @@ pub fn project_native_model_member_selection(
 
 #[doc(hidden)]
 pub struct SelectedNativeReferenceUnits {
+    pub query_obligations: crate::analyzer::resolution::QueryObligations,
     #[doc(hidden)]
     pub answer: FactResolutionAnswer,
     #[doc(hidden)]
@@ -1328,6 +1329,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     Ok((semantic, identity))
                 }).collect::<Result<Vec<_>>>()?;
                 Ok(SelectedNativeReferenceUnits {
+                    query_obligations: answer.query_obligations.clone(),
                     answer,
                     definitions,
                     external_members,

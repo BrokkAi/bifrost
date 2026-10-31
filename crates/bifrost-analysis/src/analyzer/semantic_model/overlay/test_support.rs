@@ -34,6 +34,7 @@ pub fn overlay(
         active_models: None,
         row_source: None,
         selected_source: None,
+        declared_type_names: Default::default(),
         active_model_set_hash: "test".to_string(),
         model_member_cache: moka::sync::Cache::new(128),
         model_result_cache: moka::sync::Cache::new(128),

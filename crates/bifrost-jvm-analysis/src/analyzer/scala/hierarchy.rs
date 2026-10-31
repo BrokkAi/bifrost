@@ -1,4 +1,5 @@
 use crate::analyzer::scala::*;
+use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 
@@ -59,18 +60,18 @@ enum ScalaExternalRootLanding {
 }
 
 impl TypeHierarchyProvider for ScalaAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        crate::analyzer::jvm::hierarchy::memoized_ancestors(
+        HierarchyAnswer::complete(crate::analyzer::jvm::hierarchy::memoized_ancestors(
             &self.direct_ancestors,
             self,
             code_unit,
             || self.resolve_direct_ancestors(token, code_unit),
-        )
+        ))
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let uncancelled = brokk_bifrost_core::cancellation::CancellationToken::default();
         self.get_direct_descendants_within(
             code_unit,
@@ -78,7 +79,7 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
                 &uncancelled,
             ),
         )
-        .expect("a descendant walk that cannot stop always completes")
+        .expect("an uncancelled descendant query cannot be cancelled")
     }
 
     /// Scala keeps one index, not one per [`brokk_bifrost_analysis::analyzer::DescendantIndexVariant`].
@@ -94,11 +95,11 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
         &self,
         code_unit: &CodeUnit,
         scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
         if scope.cancellation().is_cancelled() {
-            return None;
+            return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
         }
         self.lazy_hierarchy_index.read(
             &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
@@ -115,7 +116,11 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
                     Language::Scala,
                 ])
             },
-        )
+        ).ok_or(brokk_bifrost_core::analyzer::capabilities::Cancelled).map(|descendants| {
+            let mut edges: Vec<_> = descendants.into_iter().collect();
+            edges.sort();
+            HierarchyAnswer::complete(edges)
+        })
     }
 }
 
@@ -1145,7 +1150,7 @@ trait External
         .expect("a reference index that cannot stop always completes")
     }
 
-    fn sorted_fq_names(units: &brokk_bifrost_core::hash::HashSet<CodeUnit>) -> Vec<String> {
+    fn sorted_fq_names(units: &[CodeUnit]) -> Vec<String> {
         let mut names: Vec<String> = units.iter().map(CodeUnit::fq_name).collect();
         names.sort();
         names
@@ -1207,8 +1212,9 @@ trait External
 
         let mut agreements = 0usize;
         for unit in &all_classes {
-            let lazy = sorted_fq_names(&analyzer.get_direct_descendants(unit));
-            let reference = sorted_fq_names(&eager.descendants(unit));
+            let lazy = sorted_fq_names(&analyzer.get_direct_descendants(unit).edges);
+            let reference =
+                sorted_fq_names(&eager.descendants(unit).into_iter().collect::<Vec<_>>());
             assert_eq!(
                 lazy,
                 reference,

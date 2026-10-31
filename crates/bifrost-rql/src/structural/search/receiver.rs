@@ -486,7 +486,12 @@ pub(super) fn receiver_analysis_expansions_for_pipeline_row(
     shared_budget_exhausted: &mut bool,
     receiver_truncated: &mut bool,
 ) -> Vec<PipelineExpansion> {
-    if budget.pipeline_rows >= limits.max_pipeline_rows {
+    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        budget.pipeline_rows,
+        limits.max_pipeline_rows,
+    )
+    .allows(1)
+    {
         *shared_budget_exhausted = true;
         *receiver_truncated = true;
         if !ranges.is_empty() {
@@ -568,7 +573,12 @@ pub(super) fn receiver_analysis_expansions(
     let mut expansions = Vec::with_capacity(ranges.len());
     let range_count = ranges.len();
     for (range_index, range) in ranges.into_iter().enumerate() {
-        if budget.pipeline_rows >= limits.max_pipeline_rows {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            budget.pipeline_rows,
+            limits.max_pipeline_rows,
+        )
+        .allows(1)
+        {
             *shared_budget_exhausted = true;
             *receiver_truncated = true;
             record_receiver_pipeline_output_omission(
@@ -640,8 +650,16 @@ pub(super) fn receiver_analysis_expansions(
             .pipeline_rows
             .saturating_add(1)
             .saturating_add(candidate_count);
-        if budget.fact_nodes.saturating_add(budget.examined_references) > limits.max_fact_nodes
-            || budget.pipeline_rows > limits.max_pipeline_rows
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            budget.fact_nodes.saturating_add(budget.examined_references),
+            limits.max_fact_nodes,
+        )
+        .allows(0)
+            || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                budget.pipeline_rows,
+                limits.max_pipeline_rows,
+            )
+            .allows(0)
         {
             *shared_budget_exhausted = true;
         }

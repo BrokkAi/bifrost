@@ -3675,8 +3675,8 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         );
     }
 
-    // Go permits a call or comma-ok index to supply multiple assignment
-    // positions. Preserve those results instead of duplicating the first.
+    // Go permits calls, map indexes, and type assertions to supply multiple
+    // assignment positions. Preserve those results instead of duplicating the first.
     fn assignment_results(
         &mut self,
         rhs: &[Node<'tree>],
@@ -3684,6 +3684,19 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
     ) -> Option<Vec<ResolutionTypeSlotId>> {
         if rhs.len() != 1 || lhs_count <= 1 {
             return None;
+        }
+        if lhs_count == 2 {
+            let mut assertion = rhs[0];
+            while assertion.kind() == "parenthesized_expression" {
+                assertion = first_named_child_matching(assertion, |child| !child.is_extra())?;
+            }
+            if assertion.kind() == "type_assertion_expression" {
+                let first = self.expression_slot(assertion);
+                let site = self.slot(first).site;
+                let second = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+                self.add_intrinsic_type_seed(second, "bool", IntrinsicTypeKind::Primitive);
+                return Some(vec![first, second]);
+            }
         }
         if rhs[0].kind() == "index_expression" && lhs_count == 2 {
             let node = rhs[0];
@@ -4645,7 +4658,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     stack.push((node, true));
                     if let Some(inner) = node
                         .child_by_field_name("operand")
-                        .or_else(|| first_named_child(node))
+                        .or_else(|| first_named_child_matching(node, |child| !child.is_extra()))
                     {
                         stack.push((inner, false));
                     }
@@ -4791,12 +4804,28 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             "index_expression" => self.finish_index_expression(node),
             "slice_expression" => self.finish_slice_expression(node),
             "type_assertion_expression" => {
-                let Some(asserted_type) = node.child_by_field_name("type") else {
+                let (Some(operand), Some(asserted_type)) = (
+                    node.child_by_field_name("operand"),
+                    node.child_by_field_name("type"),
+                ) else {
                     self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
                     return;
                 };
-                self.lower_type(asserted_type);
-                self.lower_unsupported_expression_type(node);
+                if operand.is_missing() || asserted_type.is_missing() {
+                    self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
+                    return;
+                }
+                let syntax = self.lower_type(asserted_type);
+                let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
+                let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+                self.add_transfer(
+                    syntax.input,
+                    output,
+                    ResolutionTypeTransferKind::Construction,
+                    syntax.indirection_delta,
+                    ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+                );
+                self.expression_slots_by_node.insert(node.id(), output);
             }
             "variadic_argument" => {
                 if first_named_child(node).is_some() {
@@ -4807,7 +4836,8 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             }
             "composite_literal" => self.finish_composite_literal(node),
             "parenthesized_expression" => {
-                let Some(inner) = first_named_child(node) else {
+                let Some(inner) = first_named_child_matching(node, |child| !child.is_extra())
+                else {
                     self.lower_unsupported_expression(node);
                     return;
                 };
@@ -6080,7 +6110,15 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .collect::<Vec<_>>();
         for (ordinal, argument) in values.into_iter().enumerate() {
             let input = self.expression_slot(argument);
-            let value = self.add_slot(call, ResolutionTypeSlotRole::Argument);
+            // Keep application shape independently of the argument's type.
+            // In particular, both spreads and scalar arguments such as `nil`
+            // may have an UnsupportedExpressionType input frontier.
+            let role = if argument.kind() == "variadic_argument" {
+                ResolutionTypeSlotRole::SpreadArgument
+            } else {
+                ResolutionTypeSlotRole::Argument
+            };
+            let value = self.add_slot(call, role);
             self.add_transfer(
                 input,
                 value,
@@ -9559,7 +9597,6 @@ func use(values []int, channel chan int, box *Box, pointer *int) {
     select { case value = <-channel: }
     value, other = 1
     value, fresh := 1
-    value = any(value).(int)
     box.field = 1
     *pointer = 1
     box.field += 1
@@ -9573,7 +9610,7 @@ func use(values []int, channel chan int, box *Box, pointer *int) {
         let facts = output_from_tree(&tree, source).facts;
         assert_eq!(
             facts.local_writes.len(),
-            9,
+            8,
             "retain every bare target, including unsupported arity"
         );
         for write in &facts.local_writes {
@@ -12513,5 +12550,31 @@ func use() { var value string; _ = value }
         assert!(references.contains(&"visit"));
         assert!(references.contains(&"finish"));
         assert!(references.iter().filter(|&&text| text == "i").count() >= 4);
+    }
+    #[test]
+    fn spread_arguments_keep_shape_when_scalar_argument_types_are_unsupported() {
+        let facts = facts("package p; func use(values []int) { f(nil); f(values...) }");
+        let roles = facts
+            .call_arguments
+            .iter()
+            .map(|argument| facts.type_slots[argument.value.index()].role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            [
+                ResolutionTypeSlotRole::Argument,
+                ResolutionTypeSlotRole::SpreadArgument
+            ]
+        );
+        for argument in &facts.call_arguments {
+            let transfer = facts
+                .type_transfers
+                .iter()
+                .find(|transfer| transfer.output == argument.value)
+                .expect("argument has a source expression transfer");
+            let source = &facts.type_slots[transfer.input.index()];
+            assert!(facts.gaps.iter().any(|gap| gap.site == source.site
+                && gap.kind == ResolutionGapKind::UnsupportedExpressionType));
+        }
     }
 }

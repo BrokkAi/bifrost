@@ -18,7 +18,6 @@ mod go_extraction_tests_extra {
 
         pub(super) use brokk_bifrost_analysis::analyzer::semantic_model::overlay::test_support::overlay;
 
-        use brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::signature;
         fn go_package_function(
             owner: &SemanticModelSymbol,
             id: &str,
@@ -143,8 +142,6 @@ mod go_extraction_tests_extra {
             use brokk_bifrost_go_analysis::analyzer::go::package_identity::GoModeledNominalType;
 
             use brokk_bifrost_go_analysis::analyzer::go::package_identity::GoOverlayPackages;
-
-            use brokk_bifrost_go_analysis::analyzer::go::package_identity::modeled_go_callable_result_pointer_field;
 
             let mut package = class("example.com/external", "go");
             package.kind = SemanticModelSymbolKind::Module;
@@ -318,39 +315,6 @@ mod go_extraction_tests_extra {
                 }),
                 "a unique positive fact remains usable from a partial package"
             );
-            assert!(modeled_go_callable_result_pointer_field(
-                Some(&overlay),
-                "example.com/external",
-                "MakePair",
-                false,
-                0,
-                0,
-                "Name",
-            ));
-            assert!(
-                !modeled_go_callable_result_pointer_field(
-                    Some(&overlay),
-                    "example.com/external",
-                    "MakePair",
-                    false,
-                    0,
-                    0,
-                    "Missing",
-                ),
-                "a missing field in the partial result-type pack is not negative evidence"
-            );
-            assert!(
-                !modeled_go_callable_result_pointer_field(
-                    Some(&overlay),
-                    "example.com/external",
-                    "MakePair",
-                    false,
-                    0,
-                    1,
-                    "Label",
-                ),
-                "a declared field on a value-struct result does not prove a non-null precondition"
-            );
             assert_eq!(
                 packages.callable_result_nominal_type(
                     "example.com/external",
@@ -480,123 +444,6 @@ mod go_extraction_tests_extra {
                     .callable_result_nominal_type("example.com/forged", "Make", false, 0, 0)
                     .is_none(),
                 "a forged callable symbol cannot become a modeled nominal result"
-            );
-        }
-        #[test]
-        fn go_pointer_field_proof_abstains_on_same_name_wrong_shape_facts() {
-            use brokk_bifrost_go_analysis::analyzer::go::package_identity::modeled_go_callable_result_pointer_field;
-
-            let mut package = class("example.com/external", "go");
-            package.kind = SemanticModelSymbolKind::Module;
-            package.visibility = Visibility::Package;
-            package.provenance.completeness = SemanticModelCompleteness::Partial;
-            let mut result = class("testing.T", "go");
-            result.kind = SemanticModelSymbolKind::Struct;
-            result.provenance.completeness = SemanticModelCompleteness::Partial;
-            let returns = TypeRef::Pointer {
-                element: Box::new(TypeRef::Declared {
-                    id: result.id.clone(),
-                    arguments: Vec::new(),
-                    nullable: false,
-                }),
-            };
-            let mut callable =
-                go_package_function(&package, "member.make.valid", "Make", returns.clone());
-            callable.provenance.completeness = SemanticModelCompleteness::Partial;
-            let mut field = method(
-                &result,
-                "member.testing-t-name",
-                "Name",
-                Some(Signature {
-                    type_parameters: Vec::new(),
-                    parameters: Vec::new(),
-                    returns: Some(TypeRef::Named {
-                        name: "string".to_owned(),
-                        arguments: Vec::new(),
-                        nullable: false,
-                    }),
-                }),
-            );
-            field.kind = SemanticModelSymbolKind::Field;
-            field.receiver = None;
-            field.provenance.completeness = SemanticModelCompleteness::Partial;
-
-            let proves = |conflict: Option<SemanticModelSymbol>| {
-                let mut symbols = vec![
-                    package.clone(),
-                    result.clone(),
-                    callable.clone(),
-                    field.clone(),
-                ];
-                symbols.extend(conflict);
-                let overlay = overlay(symbols, Vec::new());
-                modeled_go_callable_result_pointer_field(
-                    Some(&overlay),
-                    "example.com/external",
-                    "Make",
-                    false,
-                    0,
-                    0,
-                    "Name",
-                )
-            };
-            assert!(
-                proves(None),
-                "one partial positive callable and field remain usable"
-            );
-
-            let mut wrong_arity = method(
-                &package,
-                "member.make.wrong-arity",
-                "Make",
-                Some(Signature {
-                    type_parameters: Vec::new(),
-                    parameters: signature(&[Some("value")], false).parameters,
-                    returns: Some(returns.clone()),
-                }),
-            );
-            wrong_arity.kind = SemanticModelSymbolKind::Function;
-            wrong_arity.is_static = true;
-            assert!(
-                !proves(Some(wrong_arity)),
-                "a same-name wrong-arity callable is a Go declaration conflict"
-            );
-
-            let mut wrong_kind = method(&package, "member.make.wrong-kind", "Make", None);
-            wrong_kind.kind = SemanticModelSymbolKind::Constant;
-            wrong_kind.is_static = true;
-            assert!(
-                !proves(Some(wrong_kind)),
-                "a same-name non-callable is a Go declaration conflict"
-            );
-
-            let mut method_conflict = method(
-                &result,
-                "member.testing-t-name-method",
-                "Name",
-                Some(Signature {
-                    type_parameters: Vec::new(),
-                    parameters: Vec::new(),
-                    returns: Some(TypeRef::Named {
-                        name: "string".to_owned(),
-                        arguments: Vec::new(),
-                        nullable: false,
-                    }),
-                }),
-            );
-            method_conflict.receiver = Some(ReceiverFact { pointer: true });
-            assert!(
-                !proves(Some(method_conflict)),
-                "a same-name method conflicts with the field fact"
-            );
-
-            let mut property_conflict =
-                method(&result, "member.testing-t-name-property", "Name", None);
-            property_conflict.kind = SemanticModelSymbolKind::Property;
-            property_conflict.receiver = None;
-            assert!(
-                !proves(Some(property_conflict)),
-                "a same-name property conflicts with the field fact"
             );
         }
     }

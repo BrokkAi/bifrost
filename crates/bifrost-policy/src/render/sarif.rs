@@ -1402,8 +1402,7 @@ mod tests {
                 Some(crate::PolicyExecutionTermination::DeadlineExceeded),
                 Some(crate::PolicyExecutionStage::WorkspaceSnapshot),
                 None,
-                Vec::new(),
-                Vec::new(),
+                crate::PolicyExecutionProgress::default(),
             )
             .unwrap(),
         );

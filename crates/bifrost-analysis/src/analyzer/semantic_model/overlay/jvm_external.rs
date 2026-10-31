@@ -3,6 +3,17 @@
 impl crate::analyzer::store::resolution_operation::SelectedModelAuthority
     for crate::analyzer::semantic_model::SemanticModelOverlay
 {
+    fn model_declared_types_named(
+        &self,
+        language: &str,
+        names: &[&str],
+    ) -> Result<
+        std::sync::Arc<std::collections::HashSet<(String, String)>>,
+        super::SemanticModelOverlayBuildError,
+    > {
+        self.model_declared_types_named(language, names)
+    }
+
     fn active_models(&self) -> Option<std::sync::Arc<super::ResolvedActiveSemanticModels>> {
         self.active_models.clone()
     }

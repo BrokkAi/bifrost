@@ -1,48 +1,80 @@
 use super::*;
 
+const PYTHON_RECEIVER_SOURCE: &str = concat!(
+    "class Factory:\n",
+    "    @staticmethod\n",
+    "    def static(value):\n",
+    "        return value\n",
+    "    @classmethod\n",
+    "    def wrong_classmethod(wrong):\n",
+    "        return wrong\n",
+    "    @classmethod\n",
+    "    def empty_classmethod():\n",
+    "        return 1\n",
+    "    def instance(wrong):\n",
+    "        return wrong\n",
+    "    def static_assigned(wrong):\n",
+    "        return wrong\n",
+    "    static_assigned = staticmethod(static_assigned)\n",
+    "    def class_assigned(wrong):\n",
+    "        return wrong\n",
+    "    class_assigned = classmethod(class_assigned)\n",
+    "class Meta(type):\n",
+    "    def meta_receiver(wrong):\n",
+    "        return wrong\n",
+    "class Helpers:\n",
+    "    def helper(value):\n",
+    "        return value\n",
+    "    helper(1)\n",
+    "    @helper()\n",
+    "    def decorated(self):\n",
+    "        return self\n",
+    "import zope.interface\n",
+    "class ZopeRoot(zope.interface.Interface):\n",
+    "    def interface_method(argument):\n",
+    "        return argument\n",
+    "class ObjectRoot(object):\n",
+    "    def object_method(argument):\n",
+    "        return argument\n",
+);
+
 #[test]
 #[brokk_bifrost_test_macros::hardwon(
     "#4644: static and class receivers collapsed in method policy evidence"
 )]
 fn callable_signature_rows_preserve_python_receiver_kind_and_source_evidence() {
-    let source = concat!(
-        "class Factory:\n",
-        "    @staticmethod\n",
-        "    def static(value):\n",
-        "        return value\n",
-        "    @classmethod\n",
-        "    def wrong_classmethod(wrong):\n",
-        "        return wrong\n",
-        "    @classmethod\n",
-        "    def empty_classmethod():\n",
-        "        return 1\n",
-        "    def instance(wrong):\n",
-        "        return wrong\n",
-        "    def static_assigned(wrong):\n",
-        "        return wrong\n",
-        "    static_assigned = staticmethod(static_assigned)\n",
-        "    def class_assigned(wrong):\n",
-        "        return wrong\n",
-        "    class_assigned = classmethod(class_assigned)\n",
-        "class Meta(type):\n",
-        "    def meta_receiver(wrong):\n",
-        "        return wrong\n",
-        "class Helpers:\n",
-        "    def helper(value):\n",
-        "        return value\n",
-        "    helper(1)\n",
-        "    @helper()\n",
-        "    def decorated(self):\n",
-        "        return self\n",
-        "import zope.interface\n",
-        "class ZopeRoot(zope.interface.Interface):\n",
-        "    def interface_method(argument):\n",
-        "        return argument\n",
-        "class ObjectRoot(object):\n",
-        "    def object_method(argument):\n",
-        "        return argument\n",
+    let (_project, workspace) =
+        inline_project::python_workspace(&[("src/main.py", PYTHON_RECEIVER_SOURCE)]);
+    assert_python_receiver_evidence(&workspace);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7347: Python import hydration reacquired the single store connection"
+)]
+fn python_receiver_evidence_on_single_connection_store() {
+    use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_store;
+
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/main.py", PYTHON_RECEIVER_SOURCE)
+        .build();
+    let context = store_context_from_store(
+        project.project_dyn().as_ref(),
+        AnalyzerStore::open_in_memory_single_connection().unwrap(),
+        false,
     );
-    let (_project, workspace) = inline_project::python_workspace(&[("src/main.py", source)]);
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        project.project_dyn(),
+        AnalyzerConfig::default(),
+        context,
+    )
+    .expect("Python workspace on the single connection store");
+    assert_python_receiver_evidence(&workspace);
+}
+
+fn assert_python_receiver_evidence(workspace: &WorkspaceAnalyzer) {
+    let source = PYTHON_RECEIVER_SOURCE;
     let query =
         CodeQuery::from_source("(callable-signature (enclosing-decl (language python (method))))")
             .expect("callable-signature query");

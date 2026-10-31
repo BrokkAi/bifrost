@@ -104,7 +104,7 @@ fn python_module_components_from_root(file: &ProjectFile, import_root_rel: &Path
 /// Structured, selected inputs to the shared Python packaging-root algorithm.
 pub trait PythonImportRootInputs {
     fn contains(&self, relative_path: &Path) -> bool;
-    fn configuration_source(&self, relative_path: &Path) -> Option<Cow<'_, str>>;
+    fn configuration_source(&self, relative_path: &Path) -> std::io::Result<Option<Cow<'_, str>>>;
 }
 
 struct ProjectImportRootInputs<'a>(&'a dyn Project);
@@ -112,9 +112,12 @@ impl PythonImportRootInputs for ProjectImportRootInputs<'_> {
     fn contains(&self, relative_path: &Path) -> bool {
         self.0.file_by_rel_path(relative_path).is_some()
     }
-    fn configuration_source(&self, relative_path: &Path) -> Option<Cow<'_, str>> {
-        let file = self.0.file_by_rel_path(relative_path)?;
-        self.0.read_source(&file).ok().map(Cow::Owned)
+    fn configuration_source(&self, relative_path: &Path) -> std::io::Result<Option<Cow<'_, str>>> {
+        Ok(self
+            .0
+            .file_by_rel_path(relative_path)
+            .and_then(|file| self.0.read_source(&file).ok())
+            .map(Cow::Owned))
     }
 }
 
@@ -135,6 +138,7 @@ pub fn python_import_root(project: &dyn Project, file: &ProjectFile) -> PathBuf 
         file.rel_path(),
         &ProjectImportRootInputs(project),
     )
+    .expect("raw project import-root inputs are infallible")
 }
 
 /// Select a root using configuration bytes and membership from one snapshot.
@@ -142,15 +146,15 @@ pub fn python_import_root_with_inputs(
     root: &Path,
     relative_path: &Path,
     inputs: &impl PythonImportRootInputs,
-) -> PathBuf {
+) -> std::io::Result<PathBuf> {
     let Some(parent_rel) = relative_path.parent() else {
-        return PathBuf::new();
+        return Ok(PathBuf::new());
     };
     if parent_rel.as_os_str().is_empty() {
-        return PathBuf::new();
+        return Ok(PathBuf::new());
     }
-    if let Some(import_root_rel) = python_configured_import_root(root, parent_rel, inputs) {
-        return import_root_rel;
+    if let Some(import_root_rel) = python_configured_import_root(root, parent_rel, inputs)? {
+        return Ok(import_root_rel);
     }
     let mut effective_package_root_rel: Option<&Path> = None;
     for path in parent_rel.ancestors() {
@@ -158,10 +162,10 @@ pub fn python_import_root_with_inputs(
             effective_package_root_rel = Some(path);
         }
     }
-    effective_package_root_rel
+    Ok(effective_package_root_rel
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new(""))
-        .to_path_buf()
+        .to_path_buf())
 }
 
 fn python_package_components_for_file(file: &ProjectFile, import_root_rel: &Path) -> Vec<String> {
@@ -187,12 +191,12 @@ fn python_configured_import_root(
     workspace_root: &Path,
     parent_rel: &Path,
     inputs: &impl PythonImportRootInputs,
-) -> Option<PathBuf> {
+) -> std::io::Result<Option<PathBuf>> {
     let mut manifest_dir_rel = Some(parent_rel);
     while let Some(directory) = manifest_dir_rel {
         let manifest_dir = workspace_root.join(directory);
         let mut roots = inputs
-            .configuration_source(&directory.join("pyproject.toml"))
+            .configuration_source(&directory.join("pyproject.toml"))?
             .map(|source| parse_setuptools_where_entries(&source))
             .unwrap_or_default()
             .iter()
@@ -206,22 +210,22 @@ fn python_configured_import_root(
             .collect::<Vec<_>>();
         roots.sort_by_key(|root| root.components().count());
         if let Some(root) = roots.pop() {
-            return Some(root);
+            return Ok(Some(root));
         }
         if let Some(package_dir) = inputs
-            .configuration_source(&directory.join("setup.py"))
+            .configuration_source(&directory.join("setup.py"))?
             .and_then(|source| parse_setuptools_setup_py_import_root(&source))
         {
             let root = manifest_dir.join(package_dir).normalize();
             if let Ok(root) = root.strip_prefix(workspace_root)
                 && parent_rel.starts_with(root)
             {
-                return Some(root.to_path_buf());
+                return Ok(Some(root.to_path_buf()));
             }
         }
         manifest_dir_rel = directory.parent();
     }
-    None
+    Ok(None)
 }
 
 /// The root a packaging manifest declares for this file, whether that root is
@@ -241,6 +245,7 @@ pub fn python_declared_import_root(project: &dyn Project, file: &ProjectFile) ->
         return None;
     }
     python_configured_import_root(file.root(), parent_rel, &ProjectImportRootInputs(project))
+        .expect("raw project import-root inputs are infallible")
 }
 
 /// The directory the package a repeated spelling starts from has to add to its
@@ -1796,17 +1801,37 @@ pub fn python_module_name(project: &dyn Project, file: &ProjectFile) -> String {
     python_module_components(project, file).join(".")
 }
 
+/// Select module components using caller-owned configuration and package membership.
+/// Hydration can supply the open SQL read without changing root selection.
+pub fn python_module_components_with_inputs(
+    file: &ProjectFile,
+    inputs: &impl PythonImportRootInputs,
+) -> std::io::Result<Vec<String>> {
+    let root = python_import_root_with_inputs(file.root(), file.rel_path(), inputs)?;
+    Ok(python_module_components_from_root(file, &root))
+}
+
 /// Hydrate a module unit using its already published identity.
 pub fn module_code_unit_from_name(file: &ProjectFile, name: &str) -> Option<CodeUnit> {
     let components = python_module_components_from_name(file, name)?;
-    let fq = FqName::from_package_components(&components);
-    module_code_unit_from_fq(file, &components, fq)
+    module_code_unit_from_components(file, &components)
 }
 
 pub fn module_code_unit(project: &dyn Project, file: &ProjectFile) -> Option<CodeUnit> {
     let components = python_module_components(project, file);
-    let structured_fq = FqName::from_package_components(&components);
-    module_code_unit_from_fq(file, &components, structured_fq)
+    module_code_unit_from_components(file, &components)
+}
+
+/// Build a path module without rendering and reparsing its selected components.
+pub fn module_code_unit_from_components(
+    file: &ProjectFile,
+    components: &[String],
+) -> Option<CodeUnit> {
+    module_code_unit_from_fq(
+        file,
+        components,
+        FqName::from_package_components(components),
+    )
 }
 
 fn module_code_unit_from_fq(

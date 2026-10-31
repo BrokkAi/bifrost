@@ -2,12 +2,11 @@
 //! [`brokk_bifrost_ruby::hierarchy`].
 
 use crate::analyzer::ruby::*;
+use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
 
 use brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index;
-
-use brokk_bifrost_core::analyzer::capabilities::descendants_from_variant_index;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_ruby::hierarchy::{
@@ -36,7 +35,7 @@ impl TypeHierarchyProvider for RubyAnalyzer {
         ruby_supports_type_hierarchy(code_unit)
     }
 
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let ancestors = self
             .direct_ancestors
             .read(&memo_attribution(self), |cache, capture| {
@@ -56,33 +55,33 @@ impl TypeHierarchyProvider for RubyAnalyzer {
                 }))
             })
             .expect("ancestor memo build is infallible");
-        (**ancestors).clone()
+        HierarchyAnswer::complete((**ancestors).clone())
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let uncancelled = CancellationToken::default();
         self.get_direct_descendants_within(
             code_unit,
             &DescendantIndexScope::whole_workspace(&uncancelled),
         )
-        .expect("a descendant index that cannot stop always completes")
+        .expect("a whole-workspace descendant query cannot be cancelled")
     }
     fn get_direct_descendants_within(
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         self.direct_descendant_index.read(
             &memo_attribution(self),
             |memo| {
-                descendants_from_variant_index(memo, scope, code_unit, || {
-                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
-                        self,
-                        || build_direct_descendant_index(self, self, scope),
-                    )
-                    .ok()
-                    .flatten()
-                })
+                brokk_bifrost_analysis::analyzer::common::complete_descendant_query(
+                    self,
+                    scope,
+                    code_unit,
+                    memo,
+                    || build_direct_descendant_index(self, self, scope),
+                    |_| {},
+                )
             },
             |_| self.authority_inputs(),
         )

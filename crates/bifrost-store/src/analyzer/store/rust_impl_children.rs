@@ -77,8 +77,8 @@ impl AnalyzerStore {
                 |row| {
                     Ok(MountedCandidatePrimaryRangeRow {
                         candidate: candidate_row_from_row(row)?,
-                        rel_path: row.get(19)?,
-                        primary_range: primary_range_from_row(row, 20)?,
+                        rel_path: row.get(20)?,
+                        primary_range: primary_range_from_row(row, 21)?,
                     })
                 },
             )?

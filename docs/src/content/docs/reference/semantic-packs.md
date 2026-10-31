@@ -300,6 +300,12 @@ effects; those require separate behavior evidence.
 
 A `TypeRef` is tagged by `kind`. Type nesting is limited to depth 64.
 
+A Go `TypeFact.name` is `<import path>.<Name>` (for example,
+`gopkg.in/yaml.v3.Node`). A reference to a type declared in the same Go package
+must use `declared` with its declaration ID. Validation reports
+`go.local_type_bare_reference` for a bare `named` reference to such a local
+type. A bare `named` spelling of a Go universe type means the universe type.
+
 | `kind` | Fields | Meaning |
 | --- | --- | --- |
 | `unknown` | none | The type is not known. This preserves a present parameter or result port without asserting a concrete type or that every type is allowed. Added in schema version 9. |
@@ -1372,7 +1378,7 @@ pins for authored semantic models.
 | `provenance`, `license`, `safety` | As in the pack envelope. |
 | `notices` | Notice files to include. |
 | `measurement_activation` | One activation selector used for measurement. |
-| `measurement_queries` | Lookups used to measure the result: `type` (`name`), `member` (`owner`, `name`), or `procedure` (`language`, `owner`, `name`, `has_receiver`, `parameter_count`). |
+| `measurement_queries` | Lookups used to measure the result: `type` (`name`), `member` (`owner`, `name`), `procedure` (`language`, `owner`, `name`, `has_receiver`, `parameter_count`), `rule` (`id`), or `runtime_exposure` (`exposure_id`). Each lookup must resolve at least one record, so a model that carries only generator rules or only runtime values names a `rule` or `runtime_exposure` lookup. |
 
 Every version requirement in `compatibility.toolchains` and in activation
 selector coordinates must have an upper bound. `generate` rejects an open
@@ -1495,3 +1501,5 @@ These variables change pack behavior. The
 | `BIFROST_POLICY_PACK_ROOT` | An extracted policy rules directory that replaces the embedded policy catalog. See the [policy reference](/reference/policies/). |
 | `BIFROST_WORKSPACE_SEMANTIC_MODELS` | Read by every `SearchToolsService` session: the MCP server, one-shot `--tool` and `--query-file` runs, a policy run with `--sources`, and the Rust and Python libraries. `on`, `1`, or `enabled` registers `.bifrost/semantic-models/` when the session activates packs; `off`, `0`, or `disabled` (the default) does not. Any other value is an error. A CLI policy run without `--sources` reads the directory whether or not this variable is set. |
 | `BIFROST_SEMANTIC_PACK_CATALOG`, `BIFROST_SEMANTIC_PACK_EVIDENCE` | Legacy. Read by every `SearchToolsService` session. Set both or neither. The catalog is opened read-only. The evidence is a non-empty JSON array of rows with `language`, `ecosystem`, and optional `package`, `module`, `toolchain` (`{name, version?}`), `target`, `configuration`, and `artifactSha256`. This route supplies no `enable` controls, and it fails when `.bifrost/packs.json` exists. |
+
+Go universe type references remain open when another active provider declares the same simple type name in the owning package.

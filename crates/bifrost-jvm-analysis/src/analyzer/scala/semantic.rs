@@ -667,14 +667,16 @@ fn callable_shape<'tree>(
 
 fn enclosing_template_kind(mut node: Node<'_>) -> Option<&'static str> {
     while let Some(parent) = node.parent() {
-        match parent.kind() {
-            "class_definition" => return Some("class_definition"),
-            "object_definition" => return Some("object_definition"),
-            "trait_definition" => return Some("trait_definition"),
-            "enum_definition" => return Some("enum_definition"),
-            "function_definition" | "lambda_expression" | "case_block" => return None,
-            _ => node = parent,
+        if let Some(kind) = crate::analyzer::scala::syntax::template_kind(parent.kind()) {
+            return Some(kind);
         }
+        if matches!(
+            parent.kind(),
+            "function_definition" | "lambda_expression" | "case_block"
+        ) {
+            return None;
+        }
+        node = parent;
     }
     None
 }
@@ -722,6 +724,141 @@ struct LoweringContext<'tree, 'targets, 'catalog> {
     /// The exception binder each catch dispatcher binds the thrown value to,
     /// for the precise single-catch shape only. Java keeps the same map.
     catch_binders: HashMap<ProgramPointId, ValueId>,
+}
+
+/// Prepared call identities, published at the callers' existing stage boundaries.
+struct ScalaCallFrame {
+    invoke: ProgramPointId,
+    normal: ProgramPointId,
+    exceptional: ProgramPointId,
+    callee: ValueId,
+    result: ValueId,
+    thrown: ValueId,
+    resolution: CallableTargetResolution,
+}
+
+impl ScalaCallFrame {
+    #[track_caller]
+    fn prepare<'tree>(
+        context: &mut LoweringContext<'tree, '_, '_>,
+        builder: &mut ProcedureCfgBuilder,
+        source_node: Node<'tree>,
+        function: Node<'tree>,
+    ) -> Result<Self, ScalaLoweringError> {
+        let invoke = context
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let normal = context
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let exceptional = context
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let callee = context.source_value(builder, function, SemanticValueKind::Callable)?;
+        let result =
+            context.expression_value(builder, source_node, SemanticValueKind::Temporary)?;
+        let thrown = context.source_value(builder, function, SemanticValueKind::Exception)?;
+        Ok(Self {
+            invoke,
+            normal,
+            exceptional,
+            callee,
+            result,
+            thrown,
+            resolution: CallableTargetResolution::Unknown,
+        })
+    }
+
+    #[track_caller]
+    fn publish_reference(
+        &self,
+        context: &LoweringContext<'_, '_, '_>,
+        builder: &mut ProcedureCfgBuilder,
+        callable_kind: CallableReferenceKind,
+        receiver: Option<ValueId>,
+    ) -> Result<(), ScalaLoweringError> {
+        let metadata = context.metadata(self.invoke)?;
+        context.append_effect(
+            builder,
+            self.invoke,
+            SemanticEffect::CallableReference {
+                result: self.callee,
+                callable: CallableValue {
+                    kind: callable_kind,
+                    targets: self.resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: receiver,
+                    environment: None,
+                },
+            },
+        )
+    }
+
+    #[track_caller]
+    fn publish_call_site(
+        &self,
+        context: &mut LoweringContext<'_, '_, '_>,
+        builder: &mut ProcedureCfgBuilder,
+        receiver: Option<ValueId>,
+        arguments: Box<[SemanticCallArgument]>,
+    ) -> Result<CallSiteId, ScalaLoweringError> {
+        context.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: self.invoke,
+                callee: self.callee,
+                receiver,
+                member_selection: None,
+                arguments,
+                normal_results: Box::new([]),
+                result: Some(self.result),
+                thrown: Some(self.thrown),
+                declared_targets: self.resolution.clone(),
+                normal_continuation: self.normal,
+                exceptional_continuation: self.exceptional,
+            },
+        )
+    }
+
+    #[track_caller]
+    fn finish<'tree>(
+        &self,
+        context: &mut LoweringContext<'tree, '_, '_>,
+        builder: &mut ProcedureCfgBuilder,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        call_site: CallSiteId,
+    ) -> Result<(), ScalaLoweringError> {
+        context
+            .session
+            .add_target_edge(builder, self.invoke, EdgeTarget::normal(self.normal))?;
+        context.session.add_target_edge(
+            builder,
+            self.invoke,
+            EdgeTarget {
+                point: self.exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        context
+            .session
+            .add_target_edge(builder, self.normal, next)?;
+        context.abrupt(
+            builder,
+            self.exceptional,
+            scope,
+            CompletionKind::Throw,
+            stack,
+        )?;
+        context.resolution_gaps(
+            builder,
+            self.invoke,
+            self.callee,
+            call_site,
+            &self.resolution,
+        )
+    }
 }
 
 impl<'tree, 'targets, 'catalog> ProcedureWorkHandler<'tree>
@@ -3729,25 +3866,15 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
             },
         )?;
         if let ScalaConversionCallableKind::Constructor { value_class } = callable {
-            self.append_effect(
+            self.session.append_assignment_value_flow(
                 builder,
                 invoke,
-                SemanticEffect::Assignment {
-                    target: result,
-                    value: source,
-                },
-            )?;
-            self.append_effect(
-                builder,
-                invoke,
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(ValueTransfer {
-                        kind: TransferKind::Boxing,
-                        operation: TransferOperation::CallSite(call_site),
-                    }),
-                    source,
-                    target: result,
-                },
+                ValueFlowKind::Transfer(ValueTransfer {
+                    kind: TransferKind::Boxing,
+                    operation: TransferOperation::CallSite(call_site),
+                }),
+                source,
+                result,
             )?;
             if !value_class {
                 self.session
@@ -3893,25 +4020,15 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 exceptional_continuation: exceptional,
             },
         )?;
-        self.append_effect(
+        self.session.append_assignment_value_flow(
             builder,
             invoke,
-            SemanticEffect::Assignment {
-                target: result,
-                value: payload,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            invoke,
-            SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::Transfer(ValueTransfer {
-                    kind: TransferKind::Boxing,
-                    operation: TransferOperation::CallSite(call_site),
-                }),
-                source: payload,
-                target: result,
-            },
+            ValueFlowKind::Transfer(ValueTransfer {
+                kind: TransferKind::Boxing,
+                operation: TransferOperation::CallSite(call_site),
+            }),
+            payload,
+            result,
         )?;
         self.session.add_target_edge(builder, invoke, next)?;
         self.session.add_target_edge(
@@ -4928,12 +5045,10 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         let has_implicit_arguments = argument_lists
             .iter()
             .any(|arguments| contains_token(*arguments, "using"));
-        let invoke = self.session.add_node_point(builder, node, Vec::new())?;
-        let normal = self.session.add_node_point(builder, node, Vec::new())?;
-        let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
-        let callee = self.source_value(builder, callable, SemanticValueKind::Callable)?;
-        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
-        let thrown = self.source_value(builder, callable, SemanticValueKind::Exception)?;
+        let frame = ScalaCallFrame::prepare(self, builder, node, callable)?;
+        let invoke = frame.invoke;
+        let normal = frame.normal;
+        let result = frame.result;
         let receiver_node = (!constructor_application)
             .then(|| scala_bound_receiver(callable))
             .flatten();
@@ -4949,22 +5064,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         } else {
             CallableReferenceKind::Function
         };
-        let resolution = CallableTargetResolution::Unknown;
-        let metadata = self.metadata(invoke)?;
-        self.append_effect(
-            builder,
-            invoke,
-            SemanticEffect::CallableReference {
-                result: callee,
-                callable: CallableValue {
-                    kind: callable_kind,
-                    targets: resolution.clone(),
-                    target_evidence: metadata.evidence,
-                    bound_receiver: receiver,
-                    environment: None,
-                },
-            },
-        )?;
+        frame.publish_reference(self, builder, callable_kind, receiver)?;
         let arguments = argument_nodes
             .iter()
             .map(
@@ -4980,39 +5080,12 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 },
             )
             .collect::<Result<Vec<_>, _>>()?;
-        let call_site = self.session.add_call_site(
-            builder,
-            CallSiteScaffold {
-                point: invoke,
-                callee,
-                receiver,
-                member_selection: None,
-                arguments: arguments.into(),
-                normal_results: Box::new([]),
-                result: Some(result),
-                thrown: Some(thrown),
-                declared_targets: resolution.clone(),
-                normal_continuation: normal,
-                exceptional_continuation: exceptional,
-            },
-        )?;
+        let call_site = frame.publish_call_site(self, builder, receiver, arguments.into())?;
         if constructor_application {
             self.session
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
-        self.session
-            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.session.add_target_edge(
-            builder,
-            invoke,
-            EdgeTarget {
-                point: exceptional,
-                kind: ControlEdgeKind::Exceptional,
-            },
-        )?;
-        self.session.add_target_edge(builder, normal, next)?;
-        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
-        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        frame.finish(self, builder, next, scope, stack, call_site)?;
 
         if !constructor_application {
             self.session.record_gap(
@@ -5484,18 +5557,10 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         evaluations: &[Node<'tree>],
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), ScalaLoweringError> {
-        let invoke = self
-            .session
-            .add_node_point(builder, source_node, Vec::new())?;
-        let normal = self
-            .session
-            .add_node_point(builder, source_node, Vec::new())?;
-        let exceptional = self
-            .session
-            .add_node_point(builder, source_node, Vec::new())?;
-        let callee = self.source_value(builder, function, SemanticValueKind::Callable)?;
-        let result = self.expression_value(builder, source_node, SemanticValueKind::Temporary)?;
-        let thrown = self.source_value(builder, function, SemanticValueKind::Exception)?;
+        let frame = ScalaCallFrame::prepare(self, builder, source_node, function)?;
+        let invoke = frame.invoke;
+        let normal = frame.normal;
+        let result = frame.result;
         let receiver_node = (callable_kind == CallableReferenceKind::BoundMethod)
             .then(|| scala_call_like_receiver(source_node, function, self.prepared.source()))
             .flatten();
@@ -5504,59 +5569,17 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 self.expression_value(builder, receiver, expression_value_kind(receiver))
             })
             .transpose()?;
-        let resolution = CallableTargetResolution::Unknown;
-        let metadata = self.metadata(invoke)?;
-        self.append_effect(
-            builder,
-            invoke,
-            SemanticEffect::CallableReference {
-                result: callee,
-                callable: CallableValue {
-                    kind: callable_kind,
-                    targets: resolution.clone(),
-                    target_evidence: metadata.evidence,
-                    bound_receiver: receiver,
-                    environment: None,
-                },
-            },
-        )?;
+        frame.publish_reference(self, builder, callable_kind, receiver)?;
         let arguments = argument_nodes
             .iter()
             .map(|argument| self.call_argument(builder, *argument))
             .collect::<Result<Vec<_>, _>>()?;
-        let call_site = self.session.add_call_site(
-            builder,
-            CallSiteScaffold {
-                point: invoke,
-                callee,
-                receiver,
-                member_selection: None,
-                arguments: arguments.into(),
-                normal_results: Box::new([]),
-                result: Some(result),
-                thrown: Some(thrown),
-                declared_targets: resolution.clone(),
-                normal_continuation: normal,
-                exceptional_continuation: exceptional,
-            },
-        )?;
+        let call_site = frame.publish_call_site(self, builder, receiver, arguments.into())?;
         if callable_kind == CallableReferenceKind::Constructor {
             self.session
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
-        self.session
-            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.session.add_target_edge(
-            builder,
-            invoke,
-            EdgeTarget {
-                point: exceptional,
-                kind: ControlEdgeKind::Exceptional,
-            },
-        )?;
-        self.session.add_target_edge(builder, normal, next)?;
-        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
-        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        frame.finish(self, builder, next, scope, stack, call_site)?;
         if receiver.is_some() {
             self.session.record_gap(
                 builder,

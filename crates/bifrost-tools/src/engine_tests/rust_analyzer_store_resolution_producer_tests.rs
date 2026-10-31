@@ -116,8 +116,7 @@ fn bench() {}
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    content_oid,
-                    "rust",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
                     generation,
                     &RustAdapter,
                     &state,
@@ -125,7 +124,11 @@ fn bench() {}
                 .unwrap();
             assert_eq!(
                 store
-                    .load_structural_facts_rows(content_oid, "rust", generation, version)
+                    .load_structural_facts_rows(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
+                        generation,
+                        version
+                    )
                     .unwrap(),
                 Some(expected.clone())
             );
@@ -150,16 +153,16 @@ fn bench() {}
                 shared > 0,
                 "native and structural readers must share actual source rows"
             );
-            assert!(matches!(store.load_structural_facts_rows_limited(
-            content_oid, "rust", generation, version, work_items - 1, None,
-        ).unwrap(), StructuralFactRowsRead::Exceeded { minimum_work_items } if minimum_work_items == work_items));
+            assert!(
+                matches!(store.load_structural_facts_rows_limited(&brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"), generation, version, work_items - 1, None,
+        ).unwrap(), StructuralFactRowsRead::Exceeded { minimum_work_items } if minimum_work_items == work_items)
+            );
             let cancellation = CancellationToken::default();
             cancellation.cancel();
             assert!(matches!(
                 store
                     .load_structural_facts_rows_limited(
-                        content_oid,
-                        "rust",
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
                         generation,
                         version,
                         work_items,
@@ -170,8 +173,7 @@ fn bench() {}
             ));
 
             let mut failed = AnalyzerStore::prepare_parsed_blob(
-                content_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
                 generation,
                 &RustAdapter,
                 Arc::clone(&state),
@@ -183,7 +185,11 @@ fn bench() {}
             assert!(outcomes[0].error.is_some());
             assert_eq!(
                 store
-                    .load_structural_facts_rows(content_oid, "rust", generation, version)
+                    .load_structural_facts_rows(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
+                        generation,
+                        version
+                    )
                     .unwrap(),
                 Some(expected.clone())
             );
@@ -191,7 +197,11 @@ fn bench() {}
         let reopened = AnalyzerStore::open_persistent(&db).unwrap();
         assert_eq!(
             reopened
-                .load_structural_facts_rows(content_oid, "rust", generation, version)
+                .load_structural_facts_rows(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
+                    generation,
+                    version
+                )
                 .unwrap(),
             Some(expected)
         );
@@ -320,7 +330,7 @@ fn bench() {}
         let oid_strings = oids.iter().map(Oid::to_string).collect::<Vec<_>>();
         let (placeholders, parameters) =
             brokk_bifrost_analysis::analyzer::store::rust_fact_oid_query_parameters(
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oids[0], "rust"),
                 generation,
                 &oid_strings,
             );
@@ -358,8 +368,7 @@ fn bench() {}
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    content_oid,
-                    "rust",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
                     generation,
                     &RustAdapter,
                     &state,
@@ -368,7 +377,11 @@ fn bench() {}
         }
 
         let present = store
-            .blobs_with_rust_facts("rust", generation, &[complete_oid, incomplete_oid])
+            .blobs_with_rust_facts(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                generation,
+                &[complete_oid, incomplete_oid],
+            )
             .expect("probe complete Rust publication");
         assert!(present.contains(&complete_oid));
         assert!(present.contains(&incomplete_oid));
@@ -404,9 +417,15 @@ fn bench() {}
             );
         }
 
-        store.mark_parsed_blob_incomplete_for_test(incomplete_oid, "rust");
+        store.mark_parsed_blob_incomplete_for_test(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(incomplete_oid, "rust"),
+        );
         let present = store
-            .blobs_with_rust_facts("rust", generation, &[complete_oid, incomplete_oid])
+            .blobs_with_rust_facts(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                generation,
+                &[complete_oid, incomplete_oid],
+            )
             .expect("probe incomplete parsed publication");
         assert!(present.contains(&complete_oid));
         assert!(!present.contains(&incomplete_oid));
@@ -416,7 +435,11 @@ fn bench() {}
         // that ordinal-zero route facts exist.
         store.delete_rust_facts_for_test("rust");
         let present = store
-            .blobs_with_rust_facts("rust", generation, &[complete_oid, incomplete_oid])
+            .blobs_with_rust_facts(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                generation,
+                &[complete_oid, incomplete_oid],
+            )
             .expect("probe missing Rust route witnesses");
         assert!(present.is_empty());
     }
@@ -632,6 +655,18 @@ fn bench() {}
             persist_alias_fixture(&store, content, "rust", &RustAdapter, "src/lib.rs", SOURCE);
         assert_eq!(snapshot.publication_state, "complete");
 
+        store.conn.execute(|conn| {
+            // Compilation configuration is not a per-blob resolution family.
+            // Explicitly account its schema and zero row cost for this Rust blob.
+            for table in ["csharp_compilations", "csharp_compilation_symbols"] {
+                let columns = conn.prepare("SELECT name FROM pragma_table_info(?1)").unwrap().query_map([table], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert!(!columns.iter().any(|column| column == "blob_id"), "{table}: {columns:?}");
+                let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap();
+                assert_eq!(count, 0, "{table} must not grow per Rust blob");
+            }
+            conn.prepare("SELECT configuration, target_framework, symbols_closed, open_reason, symbol_set_digest FROM csharp_compilations").unwrap();
+            conn.prepare("SELECT compilation_id, symbol, source FROM csharp_compilation_symbols").unwrap();
+        });
         let persisted = store.conn.execute(|conn| {
             let mut statement = conn
                 .prepare(
@@ -1106,8 +1141,7 @@ fn bench() {}
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    oid(source.as_bytes()),
-                    "rust",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(source.as_bytes()), "rust"),
                     generation,
                     &RustAdapter,
                     &state,

@@ -4738,6 +4738,103 @@ fn assert_progress_is_monotonic(notifications: &[Value]) {
     }
 }
 
+/// Issue #7557: with `stream_runs` and a progress token, each policy's run
+/// reaches the caller as soon as that policy finishes, before the result, and
+/// is the run the final report holds when nothing reviews it afterwards.
+#[test]
+fn run_policy_streams_each_finished_run_before_the_result() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .file(
+            "policies/dynamic-eval-copy.rqlp",
+            MCP_DYNAMIC_EVAL_POLICY.replace(
+                "\"bifrost.security.dynamic-eval\"",
+                "\"bifrost.security.dynamic-eval-copy\"",
+            ),
+        )
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let call = |id: i64, stream_runs: bool| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_files": [
+                        "policies/dynamic-eval.rqlp",
+                        "policies/dynamic-eval-copy.rqlp"
+                    ],
+                    "evaluation_date": "2026-07-27",
+                    "stream_runs": stream_runs
+                },
+                "_meta": { "progressToken": "runs" }
+            }
+        })
+    };
+    let streamed_runs = |progress: &[Value]| {
+        progress
+            .iter()
+            .filter_map(|notification| {
+                let streamed = &notification["_meta"]["io.bifrost/policy-run"];
+                (!streamed.is_null()).then(|| streamed.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    write_line(&mut stdin, call(2, true));
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let report = &response["result"]["structuredContent"]["report"];
+    let mut streamed = streamed_runs(&progress);
+    streamed.sort_by_key(|streamed| streamed["policy_id"].as_str().unwrap().to_string());
+    let policy_ids = streamed
+        .iter()
+        .map(|streamed| streamed["policy_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        policy_ids,
+        [
+            "bifrost.security.dynamic-eval",
+            "bifrost.security.dynamic-eval-copy"
+        ],
+        "{progress:?}"
+    );
+    for streamed in &streamed {
+        assert_eq!(streamed["progress"], "completed", "{streamed}");
+        let mut final_run = report["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["policy_id"] == streamed["policy_id"])
+            .expect("the report holds every streamed policy")
+            .clone();
+        // The report measures a run's retained bytes when it retains it.
+        let mut streamed_run = streamed["run"].clone();
+        for run in [&mut streamed_run, &mut final_run] {
+            run["work"]["retained_report_bytes"] = Value::Null;
+        }
+        assert_eq!(streamed_run, final_run);
+    }
+    assert_progress_is_monotonic(&progress);
+
+    // Without the opt-in, the same request streams no run.
+    write_line(&mut stdin, call(3, false));
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 3);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert!(streamed_runs(&progress).is_empty(), "{progress:?}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
 /// Issue #2005: a caller that supplies `progressToken` observes truthful
 /// phase progress -- readiness, admission, execution -- on its own request,
 /// with the token echoed exactly; a caller that omits the token gets nothing.

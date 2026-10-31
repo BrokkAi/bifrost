@@ -378,15 +378,6 @@ pub fn records_from_label(label: &str) -> impl Iterator<Item = PolicyRecord> + '
         .filter(move |record| record.labels().contains(&label))
 }
 
-pub fn applicable_records_from_label(
-    label: &str,
-    document: RqlpDocumentKind,
-    analysis: Option<PolicyAnalysisKind>,
-) -> impl Iterator<Item = PolicyRecord> + '_ {
-    records_from_label(label)
-        .filter(move |record| record.applicability().allows(document, analysis))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldPlacement {
     Keyword,

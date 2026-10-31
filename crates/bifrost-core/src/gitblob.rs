@@ -19,6 +19,60 @@ use growable_bloom_filter::GrowableBloom;
 use crate::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_string};
 use crate::path_normalization::NormalizePath;
 
+/// A parse product's content-derived identity. SQLite row IDs are not identities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlobKey {
+    pub oid: Oid,
+    pub lang: String,
+    pub variant: ParseVariant,
+}
+
+impl BlobKey {
+    /// Identify a parse that does not depend on a selected configuration.
+    pub fn unvaried(oid: Oid, lang: impl Into<String>) -> Self {
+        Self {
+            oid,
+            lang: lang.into(),
+            variant: ParseVariant::Empty,
+        }
+    }
+}
+
+/// The configuration-dependent component of a blob's parse identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParseVariant {
+    Empty,
+    Digest([u8; 32]),
+}
+
+impl ParseVariant {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Empty => &[],
+            Self::Digest(digest) => digest,
+        }
+    }
+}
+
+impl rusqlite::types::ToSql for ParseVariant {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_bytes().into())
+    }
+}
+
+impl rusqlite::types::FromSql for ParseVariant {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let bytes = value.as_blob()?;
+        if bytes.is_empty() {
+            Ok(Self::Empty)
+        } else {
+            bytes.try_into().map(Self::Digest).map_err(|_| {
+                rusqlite::types::FromSqlError::Other("invalid parse variant length".into())
+            })
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, String>;
 
 /// Workspace-local directory holding Bifrost's tracked project configuration.

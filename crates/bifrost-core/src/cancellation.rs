@@ -35,6 +35,9 @@ pub struct CancellationToken {
     /// reports the request's progress while it runs. See
     /// [`CancellationToken::with_phase_sink`].
     phase_sink: Option<PhaseSink>,
+    /// Where a finished part of the request's result is published before the
+    /// whole result is ready. See [`CancellationToken::with_result_sink`].
+    result_sink: Option<ResultSink>,
     #[cfg(any(test, feature = "test-support"))]
     cancel_after_checks: Option<Arc<AtomicUsize>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -82,6 +85,21 @@ impl PhaseSink {
     }
 }
 
+/// Delivers a finished part of a request's result to the host that owns the
+/// request, such as one policy's run while the rest of its batch still runs
+/// (#7557). Like [`PhaseSink`], a callback keeps this crate independent of the
+/// host's runtime.
+#[derive(Clone)]
+struct ResultSink(Arc<PublishResult>);
+
+type PublishResult = dyn Fn(&str, serde_json::Value) + Send + Sync;
+
+impl std::fmt::Debug for ResultSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResultSink")
+    }
+}
+
 impl std::fmt::Debug for PhaseSink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PhaseSink")
@@ -105,6 +123,7 @@ impl CancellationToken {
             parent: Some(Arc::new(self.clone())),
             phase: Arc::clone(&self.phase),
             phase_sink: self.phase_sink.clone(),
+            result_sink: self.result_sink.clone(),
             ..Self::default()
         }
     }
@@ -162,6 +181,39 @@ impl CancellationToken {
         self
     }
 
+    /// Also deliver every partial result published under this token to
+    /// `sink`, as `(kind, value)`, so a host can hand a finished part of the
+    /// result to its caller before the whole result is ready.
+    ///
+    /// `sink` runs on the analyzer thread that publishes, so it must not
+    /// block, and it must not drop a value: unlike a phase, a partial result
+    /// is not superseded by the next one. Clones and children carry it.
+    pub fn with_result_sink(
+        mut self,
+        sink: impl Fn(&str, serde_json::Value) + Send + Sync + 'static,
+    ) -> Self {
+        debug_assert!(
+            self.result_sink.is_none(),
+            "a token reports its partial results to one host"
+        );
+        self.result_sink = Some(ResultSink(Arc::new(sink)));
+        self
+    }
+
+    /// Whether a host listens for partial results, so work can skip building
+    /// one nobody receives.
+    pub fn delivers_results(&self) -> bool {
+        self.result_sink.is_some()
+    }
+
+    /// Publish one finished part of the request's result, of kind `kind`.
+    /// Nothing happens when no host listens.
+    pub fn publish_result(&self, kind: &str, value: serde_json::Value) {
+        if let Some(sink) = &self.result_sink {
+            (sink.0)(kind, value);
+        }
+    }
+
     /// The phase this token's work last entered, if any.
     pub fn phase(&self) -> Option<String> {
         self.phase
@@ -208,6 +260,14 @@ impl CancellationToken {
     ///
     /// Unlike a hard deadline, observing this value never cancels the token.
     pub fn soft_deadline_passed(&self) -> bool {
+        let passed = self.soft_deadline_passed_unrecorded();
+        if passed {
+            crate::analyzer::carried_context::mark_execution_dependent();
+        }
+        passed
+    }
+
+    fn soft_deadline_passed_unrecorded(&self) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(remaining) = &self.soft_deadline_after_checks {
             let previous = remaining
@@ -224,19 +284,31 @@ impl CancellationToken {
             || self
                 .parent
                 .as_ref()
-                .is_some_and(|parent| parent.soft_deadline_passed())
+                .is_some_and(|parent| parent.soft_deadline_passed_unrecorded())
     }
 
     /// Whether cancellation was triggered by this token's wall-clock deadline.
     pub fn is_timed_out(&self) -> bool {
-        self.timed_out.load(Ordering::Acquire)
+        let timed_out = self.timed_out.load(Ordering::Acquire)
             || self
                 .parent
                 .as_ref()
-                .is_some_and(|parent| parent.is_timed_out())
+                .is_some_and(|parent| parent.is_timed_out());
+        if timed_out {
+            crate::analyzer::carried_context::mark_execution_dependent();
+        }
+        timed_out
     }
 
     pub fn is_cancelled(&self) -> bool {
+        let cancelled = self.is_cancelled_unrecorded();
+        if cancelled {
+            crate::analyzer::carried_context::mark_execution_dependent();
+        }
+        cancelled
+    }
+
+    fn is_cancelled_unrecorded(&self) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(remaining) = &self.timeout_after_checks {
             let previous = remaining
@@ -275,12 +347,15 @@ impl CancellationToken {
         }
         // An explicit caller cancellation that arrived before the deadline
         // remains distinguishable from a timeout in the public response.
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.cancelled.load(Ordering::Relaxed) {
+            // Preserve publication of timeout/phase state on the slow path.
+            // A live token still pays for only one relaxed flag load.
+            std::sync::atomic::fence(Ordering::Acquire);
             return true;
         }
         self.parent
             .as_ref()
-            .is_some_and(|parent| parent.is_cancelled())
+            .is_some_and(|parent| parent.is_cancelled_unrecorded())
     }
 
     #[cfg(any(test, feature = "test-support"))]

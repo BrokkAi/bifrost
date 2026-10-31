@@ -125,8 +125,7 @@ mod ruby_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
                 generation,
                 &RubyAdapter,
                 &state,
@@ -146,7 +145,11 @@ mod ruby_extraction_tests {
         assert_eq!(usage_row.signature_metadata, None);
         assert_eq!(
             store
-                .signature_metadata_for_unit(oid, "ruby", generation, &target)
+                .signature_metadata_for_unit(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                    generation,
+                    &target
+                )
                 .unwrap(),
             metadata,
             "the unbounded callable reader must retain later alternatives"
@@ -181,8 +184,7 @@ mod ruby_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
                 generation,
                 &RubyAdapter,
                 &state,
@@ -222,8 +224,7 @@ mod ruby_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
                 generation,
                 &RubyAdapter,
                 &state,
@@ -231,7 +232,12 @@ mod ruby_extraction_tests {
             .unwrap();
 
         let limited = store
-            .signature_metadata_for_unit_limited(oid, "ruby", generation, &target, usize::MAX)
+            .signature_metadata_for_unit_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                generation,
+                &target,
+                usize::MAX,
+            )
             .unwrap();
         assert!(
             !limited.complete,
@@ -239,7 +245,11 @@ mod ruby_extraction_tests {
         );
         assert_eq!(
             store
-                .signature_metadata_for_unit(oid, "ruby", generation, &target)
+                .signature_metadata_for_unit(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                    generation,
+                    &target
+                )
                 .unwrap(),
             metadata,
             "the Vec API must preserve every alternative, without an implicit byte cutoff"
@@ -258,6 +268,7 @@ mod ruby_extraction_tests {
                     params![
                         oid.to_string(),
                         "ruby",
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty,
                         target.fq_name(),
                         code_unit_kind_to_i64(target.kind()),
                         target.short_name(),
@@ -332,8 +343,7 @@ mod ruby_extraction_tests {
             .unwrap();
 
         let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "ruby",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
             generation,
             &RubyAdapter,
             Arc::clone(&state),
@@ -360,8 +370,7 @@ mod ruby_extraction_tests {
         let write_error = store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
                 generation,
                 &RubyAdapter,
                 state.as_ref(),
@@ -374,7 +383,10 @@ mod ruby_extraction_tests {
         );
         assert!(
             !store
-                .contains_parsed_blob_at_generation(oid, "ruby", generation)
+                .contains_parsed_blob_at_generation(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                    generation
+                )
                 .unwrap(),
             "a rejected metadata row must roll back instead of publishing a complete omission"
         );
@@ -429,8 +441,7 @@ mod ruby_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
                 generation,
                 &RubyAdapter,
                 state.as_ref(),
@@ -438,7 +449,10 @@ mod ruby_extraction_tests {
             .expect("a clamped label must not fail the blob");
         assert!(
             store
-                .contains_parsed_blob_at_generation(oid, "ruby", generation)
+                .contains_parsed_blob_at_generation(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                    generation
+                )
                 .unwrap(),
             "the file must still index despite one pathological declaration"
         );
@@ -570,8 +584,7 @@ mod ruby_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
-                oid,
-                "python",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
                 &PythonAdapter::for_test_file(&python_file),
                 &parse_state(&PythonAdapter::for_test_file(&python_file), &python_file),
             )
@@ -683,8 +696,7 @@ mod ruby_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
                 generation,
                 &RubyAdapter,
                 &state,
@@ -692,7 +704,13 @@ mod ruby_extraction_tests {
             .unwrap();
 
         let hydrated = store
-            .hydrate_file_state_with_source(oid, "ruby", generation, &RubyAdapter, &file, &source)
+            .hydrate_file_state_with_source(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"),
+                generation,
+                &RubyAdapter,
+                &file,
+                &source,
+            )
             .unwrap()
             .expect("hydration should succeed");
         assert_eq!(
@@ -703,7 +721,7 @@ mod ruby_extraction_tests {
         let bulk = store
             .hydrate_file_states(
                 &[(file.clone(), oid)],
-                "ruby",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "ruby"),
                 &RubyAdapter,
                 &HashMap::from_iter([(file.clone(), source)]),
             )

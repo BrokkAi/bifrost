@@ -105,7 +105,11 @@ class Container {
         let store_path = fixture.root().join("java-shared-visibility.db");
         let store = AnalyzerStore::open_persistent(&store_path).expect("open visibility store");
         store
-            .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &JavaAdapter,
+                &state,
+            )
             .expect("publish shared producer output");
         drop(store);
         let reopened =
@@ -113,7 +117,7 @@ class Container {
         let hydrated = reopened
             .hydrate_file_states(
                 &[(file.clone(), oid)],
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "java"),
                 &JavaAdapter,
                 &HashMap::default(),
             )
@@ -136,7 +140,7 @@ class Container {
         let assert_no_publication_rows = |oid| {
             assert_eq!(
                 store
-                    .content_row_count(oid, "java")
+                    .content_row_count(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
                     .expect("content row count"),
                 0
             );
@@ -173,8 +177,7 @@ class Container {
 
         let cancelled_oid = oid_for(b"cancelled-java-publication");
         let cancelled = AnalyzerStore::prepare_parsed_blob(
-            cancelled_oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(cancelled_oid, "java"),
             generation,
             &JavaAdapter,
             Arc::clone(&state),
@@ -190,23 +193,32 @@ class Container {
         assert!(outcomes[0].error.is_some());
         assert!(
             !store
-                .contains_parsed_blob(cancelled_oid, "java")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    cancelled_oid,
+                    "java"
+                ))
                 .expect("check cancelled publication")
         );
         assert_no_publication_rows(cancelled_oid);
         store
-            .write_parsed_blob(cancelled_oid, "java", &JavaAdapter, state.as_ref())
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(cancelled_oid, "java"),
+                &JavaAdapter,
+                state.as_ref(),
+            )
             .expect("retry cancelled publication");
         assert!(
             store
-                .contains_parsed_blob(cancelled_oid, "java")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    cancelled_oid,
+                    "java"
+                ))
                 .expect("check cancelled retry")
         );
 
         let failed_oid = oid_for(b"failed-java-publication");
         let mut failed = AnalyzerStore::prepare_parsed_blob(
-            failed_oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(failed_oid, "java"),
             store
                 .current_generation("java")
                 .expect("current Java generation"),
@@ -220,16 +232,24 @@ class Container {
         assert!(outcomes[0].error.is_some());
         assert!(
             !store
-                .contains_parsed_blob(failed_oid, "java")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    failed_oid, "java"
+                ))
                 .expect("check failed publication")
         );
         assert_no_publication_rows(failed_oid);
         store
-            .write_parsed_blob(failed_oid, "java", &JavaAdapter, state.as_ref())
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(failed_oid, "java"),
+                &JavaAdapter,
+                state.as_ref(),
+            )
             .expect("retry failed publication");
         assert!(
             store
-                .contains_parsed_blob(failed_oid, "java")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    failed_oid, "java"
+                ))
                 .expect("check failed retry")
         );
     }
@@ -244,8 +264,7 @@ class Container {
             Some(brokk_bifrost_core::analyzer::go_facts::GoSourceFacts::default());
         let oid = oid_for(state.source.as_bytes());
         AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
             brokk_bifrost_analysis::analyzer::store::GenerationId::BOOTSTRAP,
             &JavaAdapter,
             Arc::new(state),
@@ -271,8 +290,7 @@ class Container {
         let state = parse_state(&JavaAdapter, &fixture.file("Empty.java"));
         let oid = oid_for(state.source.as_bytes());
         AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
             brokk_bifrost_analysis::analyzer::store::GenerationId::BOOTSTRAP,
             &SourceStorageFixtureAdapter(storage),
             Arc::new(state),

@@ -344,7 +344,7 @@ pub fn workspace_authority_file_input(
     rel_path: &str,
 ) -> Option<ReadKey> {
     let file = super::ProjectFile::new(analyzer.project().root().to_path_buf(), rel_path);
-    match analyzer.project().read_source_snapshot(&file) {
+    match analyzer.project().read_file_snapshot(&file) {
         Ok(snapshot) => Some(ReadKey::file(language, rel_path, snapshot.oid())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Some(ReadKey::path_absent(language, rel_path))

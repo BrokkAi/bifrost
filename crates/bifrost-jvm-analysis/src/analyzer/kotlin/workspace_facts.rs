@@ -204,7 +204,13 @@ mod tests {
             assert!(!kotlin.referencing_files_of(&file).is_empty());
             kotlin.same_package_reference_index();
             assert!(kotlin.imported_files_from_infos(&file, &[]).is_some());
-            assert!(!kotlin.get_direct_descendants(&owner).is_empty());
+            assert!(
+                !kotlin
+                    .get_direct_descendants(&owner)
+                    .definite()
+                    .to_vec()
+                    .is_empty()
+            );
         };
         read();
         let references = || {
@@ -220,7 +226,7 @@ mod tests {
             kotlin.imported_files_from_infos(&file, &[]);
         };
         let descendants = || {
-            kotlin.get_direct_descendants(&owner);
+            assert!(kotlin.get_direct_descendants(&owner).is_complete());
         };
         let readers: [&dyn Fn(); 5] = [
             &references,
@@ -266,7 +272,8 @@ mod tests {
                         Some(&realm),
                         &descendant_scope
                     )
-                    .is_some()
+                    .expect("uncancelled realm query")
+                    .is_complete()
             );
         };
         realm_read();

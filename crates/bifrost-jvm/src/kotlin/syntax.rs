@@ -92,6 +92,31 @@ pub fn kotlin_binding_node(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
+/// The value-producing expression a Kotlin property initializes with.
+///
+/// The caller selects the child stream, including its comment policy. This
+/// helper owns only the positional binding/initializer rules: declaration
+/// metadata and non-initializer property children are skipped, and an
+/// initializer is considered only after a binding has appeared.
+pub fn kotlin_property_initializer<'tree>(
+    children: impl IntoIterator<Item = Node<'tree>>,
+) -> Option<Node<'tree>> {
+    let mut seen_binding = false;
+    for child in children {
+        match child.kind() {
+            "modifiers" | "binding_pattern_kind" | "type_constraints" => continue,
+            "variable_declaration" | "multi_variable_declaration" => {
+                seen_binding = true;
+                continue;
+            }
+            "getter" | "setter" | "property_delegate" | "receiver_type" => continue,
+            _ if seen_binding => return Some(child),
+            _ => continue,
+        }
+    }
+    None
+}
+
 /// The expression a delegated Kotlin property supplies after `by`.
 pub fn kotlin_property_delegate_expression(property: Node<'_>) -> Option<Node<'_>> {
     let delegate = named_children(property)

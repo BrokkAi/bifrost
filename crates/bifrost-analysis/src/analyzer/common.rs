@@ -405,6 +405,48 @@ pub fn replayable_query_cache_fill<T>(
     }
 }
 
+/// Read a complete descendant memo, preserving refused-fill causes and receipts.
+#[doc(hidden)]
+pub fn complete_descendant_query(
+    analyzer: &dyn IAnalyzer,
+    scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
+    code_unit: &brokk_bifrost_core::analyzer::CodeUnit,
+    memo: &brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo<
+        brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant,
+        brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex,
+    >,
+    build: impl Fn() -> Option<brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex>,
+    record_complete: impl FnOnce(&crate::hash::HashSet<brokk_bifrost_core::analyzer::CodeUnit>),
+) -> Result<
+    brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+    brokk_bifrost_core::analyzer::capabilities::Cancelled,
+> {
+    use brokk_bifrost_core::analyzer::capabilities::{
+        Cancelled, HierarchyAnswer, HierarchyOpenReason, descendants_from_variant_index,
+    };
+    let descendants = descendants_from_variant_index(memo, scope, code_unit, || {
+        complete_query_cache_fill(analyzer, &build).ok().flatten()
+    });
+    if scope.cancellation().is_cancelled() {
+        analyzer
+            .record_query_incomplete(crate::analyzer::i_analyzer::QueryReadIncomplete::Cancelled);
+        analyzer.record_unattributed_read();
+        return Err(Cancelled);
+    }
+    if let Some(descendants) = descendants {
+        record_complete(&descendants);
+        let mut edges: Vec<_> = descendants.into_iter().collect();
+        edges.sort();
+        Ok(HierarchyAnswer::complete(edges))
+    } else {
+        crate::analyzer::record_descendant_query_failure(analyzer);
+        Ok(HierarchyAnswer {
+            open: vec![HierarchyOpenReason::DescendantIndexUnavailable],
+            ..HierarchyAnswer::default()
+        })
+    }
+}
+
 /// A scoped complete-only fill for accessors that compute before publishing.
 /// Its private ledger observes worker marks without losing enclosing reads.
 #[doc(hidden)]

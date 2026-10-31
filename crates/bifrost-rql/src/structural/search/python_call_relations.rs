@@ -1,5 +1,6 @@
 //! Bounded Python lifecycle and superclass-call facts over exact call shapes.
 
+use super::super::lexical_environment::{BindingOfOutcome, EnvironmentFileResult, binding_of};
 use super::super::occurrences::{OccurrenceClass, OccurrenceRole};
 use super::python_class_hierarchy::{
     HierarchyDecision, attach_hierarchy_premises, hierarchy_premise, override_premise,
@@ -29,12 +30,17 @@ struct CallSite {
     conditional: bool,
 }
 
+struct SuperAlias {
+    member: String,
+    start_class: Option<CodeUnit>,
+}
+
 struct LifecycleMethodCalls {
     calls: Vec<CallSite>,
     occurrences: Vec<crate::analyzer::structural::occurrence_rows::OccurrenceRow>,
     environment: std::sync::Arc<super::super::lexical_environment::EnvironmentFileResult>,
     facts: std::sync::Arc<FileFacts>,
-    super_aliases: HashMap<(usize, usize), String>,
+    super_aliases: HashMap<(usize, usize), SuperAlias>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +53,7 @@ struct ResolvedCall {
 /// Query-local topology and the exact member-selection prefix. Reaching the
 /// frontier means unknown member inventory, never a proved absence.
 struct LifecycleMroContext {
+    incompleteness: Incompleteness,
     topology: PythonHierarchyOutcome,
     source_prefix: Vec<CodeUnit>,
     frontier: Option<ClassIdentity>,
@@ -62,6 +69,7 @@ impl LifecycleMroContext {
             .find(|identity| !matches!(identity, ClassIdentity::Intrinsic { .. }))
             .cloned();
         Self {
+            incompleteness: super::python_class_hierarchy::hierarchy_incompleteness(answer.reason),
             topology: answer.outcome,
             source_prefix,
             frontier,
@@ -118,6 +126,18 @@ fn fact_expansion(
 ) -> PipelineExpansion {
     pipeline_expansion(PipelineValue::PythonHierarchyFact(Box::new(
         PythonHierarchyFactValue {
+            incompleteness: match reason {
+                Some("cancelled") => {
+                    Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+                }
+                Some("visit_limit") => {
+                    Incompleteness::Operational(DerivationExecutionCause::Budget)
+                }
+                _ if coverage == "open" => {
+                    Incompleteness::Operational(DerivationExecutionCause::Provider)
+                }
+                _ => Incompleteness::Content,
+            },
             root: root.clone(),
             root_id: root_id.to_owned(),
             ancestry_basis: PythonAncestryBasis::default(),
@@ -209,6 +229,9 @@ pub(super) fn expansions_for_declaration(
         )];
     }
 
+    let mut environment_cache = super::environment::EnvironmentTraversalCache::default();
+    let environment = environment_cache.environment_for(analyzer, declaration.unit.source());
+
     let (root, class_owner) = if declaration.unit.kind() == CodeUnitType::Class {
         (declaration.clone(), Some(declaration.unit.clone()))
     } else if let Some(owner) = analyzer
@@ -239,6 +262,7 @@ pub(super) fn expansions_for_declaration(
         .as_ref()
         .map(LifecycleMroContext::from_answer)
         .unwrap_or(LifecycleMroContext {
+            incompleteness: Incompleteness::Operational(DerivationExecutionCause::Provider),
             topology: PythonHierarchyOutcome::Unsupported,
             source_prefix: Vec::new(),
             frontier: None,
@@ -277,7 +301,6 @@ pub(super) fn expansions_for_declaration(
         if let Some(class) = &class_owner
             && declaration.unit.kind() == CodeUnitType::Class
         {
-            let mut environment_cache = super::environment::EnvironmentTraversalCache::default();
             for name in ["__init__", "__del__"] {
                 output.extend(lifecycle_facts_for_name(
                     analyzer,
@@ -307,7 +330,7 @@ pub(super) fn expansions_for_declaration(
                     cancellation,
                 ));
             } else {
-                output.push(fact_expansion(
+                let mut expansion = fact_expansion(
                     &root,
                     &root_id,
                     "call_lifecycle",
@@ -322,7 +345,11 @@ pub(super) fn expansions_for_declaration(
                     None,
                     Some("init_calls_subclass".to_owned()),
                     None,
-                ));
+                );
+                if let PipelineValue::PythonHierarchyFact(value) = &mut expansion.value {
+                    value.incompleteness = mro_context.incompleteness;
+                }
+                output.push(expansion);
             }
         }
 
@@ -333,6 +360,7 @@ pub(super) fn expansions_for_declaration(
             facts,
             &call_sites,
             &occurrence_rows,
+            &environment,
             &mro_context.source_prefix,
             hierarchy_complete,
             semantic,
@@ -483,7 +511,7 @@ fn lifecycle_facts_for_name(
     let mut premises = Vec::new();
     let mut output = (|| {
         if !mro_context.topology_complete() {
-            return vec![lifecycle_incomplete_fact(
+            let mut expansion = lifecycle_incomplete_fact(
                 root,
                 root_id,
                 class,
@@ -491,7 +519,11 @@ fn lifecycle_facts_for_name(
                 None,
                 "incomplete_hierarchy",
                 root.range,
-            )];
+            );
+            if let PipelineValue::PythonHierarchyFact(value) = &mut expansion.value {
+                value.incompleteness = mro_context.incompleteness;
+            }
+            return vec![expansion];
         }
         let Some(inherited) = inherited_methods(analyzer, class_mro, name) else {
             return vec![lifecycle_incomplete_fact(
@@ -783,14 +815,14 @@ fn lifecycle_facts_for_name(
                     &super_aliases,
                 );
                 if call.shape.outcome.callee_name.as_deref() != Some(name)
-                    && super_alias != Some(name)
+                    && super_alias.map(|alias| alias.member.as_str()) != Some(name)
                 {
                     continue;
                 }
-                let target = if super_alias == Some(name) {
+                let target = if super_alias.map(|alias| alias.member.as_str()) == Some(name) {
                     HierarchyDecision::plain(lifecycle_super_call_target(
                         analyzer,
-                        &method,
+                        super_alias.and_then(|alias| alias.start_class.as_ref()),
                         mro_context,
                         name,
                     ))
@@ -801,6 +833,7 @@ fn lifecycle_facts_for_name(
                         mro_context,
                         &call.shape,
                         &occurrences,
+                        &environment,
                         &facts,
                         name,
                         cancellation,
@@ -1118,7 +1151,13 @@ fn lifecycle_calls_for_method(
         .iter()
         .all(|role| occurrences.completeness.covers(*role))
         .then(|| {
-            let super_aliases = lifecycle_super_alias_bindings(analyzer, method, &occurrence_rows);
+            let super_aliases = lifecycle_super_alias_bindings(
+                analyzer,
+                method,
+                &occurrence_rows,
+                &environment,
+                &facts,
+            );
             LifecycleMethodCalls {
                 calls,
                 occurrences: occurrence_rows,
@@ -1133,7 +1172,9 @@ fn lifecycle_super_alias_bindings(
     analyzer: &dyn IAnalyzer,
     method: &CodeUnit,
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
-) -> HashMap<(usize, usize), String> {
+    environment: &EnvironmentFileResult,
+    facts: &FileFacts,
+) -> HashMap<(usize, usize), SuperAlias> {
     // CodeQL follows a local alias of `super().__init__` when computing the
     // transitive target set, so preserve its exact lexical binding position.
     let mut aliases = HashMap::default();
@@ -1197,10 +1238,24 @@ fn lifecycle_super_alias_bindings(
                 start_line: super_name.start_position().row.saturating_add(1),
                 end_line: super_name.end_position().row.saturating_add(1),
             };
-            if builtin_super_at(occurrences, super_range) != Some(true) {
+            if builtin_super_at(occurrences, environment, super_range) != Some(true) {
                 continue;
             }
-            aliases.insert((left.start_byte(), left.end_byte()), member.to_owned());
+            let receiver_range = Range {
+                start_byte: receiver.start_byte(),
+                end_byte: receiver.end_byte(),
+                start_line: receiver.start_position().row + 1,
+                end_line: receiver.end_position().row + 1,
+            };
+            let class = super_call_receiver(facts, method.source(), receiver_range)
+                .and_then(|shape| super_start_class(analyzer, method, facts, occurrences, &shape));
+            aliases.insert(
+                (left.start_byte(), left.end_byte()),
+                SuperAlias {
+                    member: member.to_owned(),
+                    start_class: class,
+                },
+            );
         }
     }
     aliases
@@ -1210,8 +1265,8 @@ fn lifecycle_super_alias_for_call<'a>(
     shape: &CallShapeReport,
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
     environment: &super::super::lexical_environment::EnvironmentFileResult,
-    aliases: &'a HashMap<(usize, usize), String>,
-) -> Option<&'a str> {
+    aliases: &'a HashMap<(usize, usize), SuperAlias>,
+) -> Option<&'a SuperAlias> {
     let callee = occurrence_at(occurrences, shape.outcome.callee_range?)?;
     let binding = match super::super::lexical_environment::binding_of(
         environment,
@@ -1226,9 +1281,7 @@ fn lifecycle_super_alias_for_call<'a>(
         super::super::lexical_environment::BindingOfOutcome::NoBinding
         | super::super::lexical_environment::BindingOfOutcome::Incomplete(_) => return None,
     };
-    aliases
-        .get(&(binding.range.start_byte, binding.range.end_byte))
-        .map(String::as_str)
+    aliases.get(&(binding.range.start_byte, binding.range.end_byte))
 }
 
 fn call_facts_for_method(
@@ -1308,13 +1361,16 @@ fn transitive_lifecycle_targets(
                     &super_aliases,
                 );
                 if call.shape.outcome.callee_name.as_deref() != Some(name)
-                    && super_alias != Some(name)
+                    && super_alias.map(|alias| alias.member.as_str()) != Some(name)
                 {
                     continue;
                 }
-                let target = if super_alias == Some(name) {
+                let target = if super_alias.map(|alias| alias.member.as_str()) == Some(name) {
                     HierarchyDecision::plain(lifecycle_super_call_target(
-                        analyzer, &method, mro, name,
+                        analyzer,
+                        super_alias.and_then(|alias| alias.start_class.as_ref()),
+                        mro,
+                        name,
                     ))
                 } else {
                     lifecycle_call_target(
@@ -1323,6 +1379,7 @@ fn transitive_lifecycle_targets(
                         mro,
                         &call.shape,
                         &occurrences,
+                        &environment,
                         &facts,
                         name,
                         cancellation,
@@ -1357,6 +1414,7 @@ fn lifecycle_call_target(
     mro: &LifecycleMroContext,
     shape: &CallShapeReport,
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
+    environment: &EnvironmentFileResult,
     facts: &FileFacts,
     name: &str,
     cancellation: Option<&CancellationToken>,
@@ -1373,8 +1431,12 @@ fn lifecycle_call_target(
             let Some(callee) = super_shape.outcome.callee_range else {
                 return LifecycleCallTarget::Unavailable;
             };
-            match builtin_super_at(occurrences, callee) {
-                Some(true) => return lifecycle_super_call_target(analyzer, method, mro, name),
+            match builtin_super_at(occurrences, environment, callee) {
+                Some(true) => {
+                    let class =
+                        super_start_class(analyzer, method, facts, occurrences, &super_shape);
+                    return lifecycle_super_call_target(analyzer, class.as_ref(), mro, name);
+                }
                 Some(false) => {}
                 None => return LifecycleCallTarget::Unavailable,
             }
@@ -1441,17 +1503,46 @@ fn lifecycle_call_target(
     HierarchyDecision { value, premises }
 }
 
-fn lifecycle_super_call_target(
+fn super_start_class(
     analyzer: &dyn IAnalyzer,
     method: &CodeUnit,
+    facts: &FileFacts,
+    occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
+    shape: &CallShapeReport,
+) -> Option<CodeUnit> {
+    if shape.outcome.coverage != CallShapeCoverage::Exact {
+        return None;
+    }
+    if shape.arguments.is_empty() {
+        return method_owner(analyzer, method);
+    }
+    let arguments = &shape.arguments;
+    if arguments.len() != 2 || arguments.iter().any(|argument| argument.name.is_some()) {
+        return None;
+    }
+    let class = arguments
+        .iter()
+        .find(|argument| argument.argument_index == 0)?;
+    let receiver = arguments
+        .iter()
+        .find(|argument| argument.argument_index == 1)?;
+    let formal = first_parameter_name(analyzer, facts, occurrences, method)?;
+    occurrence_is_bound_to_formal(occurrences, receiver.range, &formal)
+        .then(|| resolved_class_at(occurrences, class.range))
+        .flatten()
+}
+
+fn lifecycle_super_call_target(
+    analyzer: &dyn IAnalyzer,
+    owner: Option<&CodeUnit>,
     context: &LifecycleMroContext,
     name: &str,
 ) -> LifecycleCallTarget {
     let mro = &context.source_prefix;
-    let Some(owner) = analyzer.parent_of(method) else {
-        return LifecycleCallTarget::None;
+    let Some(owner) = owner else {
+        return LifecycleCallTarget::Unavailable;
     };
-    let Some(owner_rank) = mro.iter().position(|candidate| candidate == &owner) else {
+    let Some(owner_rank) = mro.iter().position(|candidate| candidate == owner) else {
         return if context.inventory_complete() {
             LifecycleCallTarget::None
         } else {
@@ -1734,10 +1825,9 @@ fn call_is_conditional(facts: &FileFacts, call: u32) -> bool {
     let mut parent = facts.node(call).parent;
     while let Some(id) = parent {
         let node = facts.node(id);
-        if matches!(
-            node.kind,
-            NormalizedKind::If | NormalizedKind::Loop | NormalizedKind::Catch
-        ) {
+        if matches!(node.kind, NormalizedKind::If | NormalizedKind::Catch)
+            || node.kind.satisfies(NormalizedKind::Loop)
+        {
             return true;
         }
         if node.kind.satisfies(NormalizedKind::Callable) {
@@ -1814,22 +1904,32 @@ fn occurrence_is_bound_to_formal(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn explicit_inherited_call_target(
     analyzer: &dyn IAnalyzer,
     facts: &FileFacts,
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
+    environment: &EnvironmentFileResult,
     shape: &CallShapeReport,
     method: &CodeUnit,
     inherited: &[(CodeUnit, CodeUnit, usize)],
+    mro: &[CodeUnit],
 ) -> Option<ResolvedCall> {
     let receiver = shape.outcome.receiver_range?;
-    if proven_super_receiver(facts, &shape.outcome.file, occurrences, receiver) == Some(true) {
+    if proven_super_receiver(
+        facts,
+        &shape.outcome.file,
+        occurrences,
+        environment,
+        receiver,
+    ) == Some(true)
+    {
         let super_shape = super_call_receiver(facts, &shape.outcome.file, receiver)?;
         if super_shape.outcome.coverage != CallShapeCoverage::Exact {
             return None;
         }
         let super_callee = super_shape.outcome.callee_range?;
-        if builtin_super_at(occurrences, super_callee) != Some(true) {
+        if builtin_super_at(occurrences, environment, super_callee) != Some(true) {
             return None;
         }
         let group = super_shape
@@ -1849,14 +1949,12 @@ fn explicit_inherited_call_target(
             return None;
         }
         let class = resolved_class_at(occurrences, arguments[0].range)?;
-        if method_owner(analyzer, method).as_ref() != Some(&class) {
-            return None;
-        }
+        let class_rank = mro.iter().position(|owner| owner == &class)?;
         let formal = first_parameter_name(analyzer, facts, occurrences, method)?;
         if !occurrence_is_bound_to_formal(occurrences, arguments[1].range, &formal) {
             return None;
         }
-        let (target, owner, rank) = inherited.first()?;
+        let (target, owner, rank) = inherited.iter().find(|(_, _, rank)| *rank > class_rank)?;
         return Some(ResolvedCall {
             target: target.clone(),
             owner: owner.clone(),
@@ -1909,17 +2007,19 @@ fn proven_super_receiver(
     facts: &FileFacts,
     file: &ProjectFile,
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
+    environment: &EnvironmentFileResult,
     range: Range,
 ) -> Option<bool> {
     let shape = super_call_receiver(facts, file, range)?;
     let callee = shape.outcome.callee_range?;
-    builtin_super_at(occurrences, callee)
+    builtin_super_at(occurrences, environment, callee)
 }
 
 fn implicit_super_receiver(
     facts: &FileFacts,
     file: &ProjectFile,
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
+    environment: &EnvironmentFileResult,
     range: Range,
 ) -> bool {
     let Some(shape) = super_call_receiver(facts, file, range) else {
@@ -1930,13 +2030,15 @@ fn implicit_super_receiver(
         && shape
             .outcome
             .callee_range
-            .is_some_and(|callee| builtin_super_at(occurrences, callee) == Some(true))
+            .is_some_and(|callee| builtin_super_at(occurrences, environment, callee) == Some(true))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lifecycle_receiver_is_exact(
     analyzer: &dyn IAnalyzer,
     facts: &FileFacts,
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
+    environment: &EnvironmentFileResult,
     shape: &CallShapeReport,
     method: &CodeUnit,
     target_owner: &CodeUnit,
@@ -1944,7 +2046,13 @@ fn lifecycle_receiver_is_exact(
     let Some(receiver) = shape.outcome.receiver_range else {
         return false;
     };
-    match proven_super_receiver(facts, &shape.outcome.file, occurrences, receiver) {
+    match proven_super_receiver(
+        facts,
+        &shape.outcome.file,
+        occurrences,
+        environment,
+        receiver,
+    ) {
         Some(true) => return true,
         Some(false) => {}
         None => return false,
@@ -1988,9 +2096,20 @@ fn resolved_class_at(
 
 fn builtin_super_at(
     rows: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
+    environment: &EnvironmentFileResult,
     range: Range,
 ) -> Option<bool> {
     let row = occurrence_at(rows, range)?;
+    match binding_of(
+        environment,
+        row.effective_spelling(),
+        range.start_byte,
+        Some(row.namespace),
+    ) {
+        BindingOfOutcome::Reached(_) | BindingOfOutcome::Shadowed { .. } => return Some(false),
+        BindingOfOutcome::Incomplete(_) => return None,
+        BindingOfOutcome::NoBinding => {}
+    }
     match &row.target {
         OccurrenceTarget::Resolved(targets) if targets.len() == 1 => {
             let target = targets.first()?;
@@ -2065,13 +2184,19 @@ fn init_calls_subclass_facts(
     };
     let token = cancellation.cloned().unwrap_or_default();
     let scope = DescendantIndexScope::whole_workspace(&token);
-    let Some(direct_descendants) = provider.get_direct_descendants_within(owner, &scope) else {
+    let direct = provider.get_direct_descendants_within(owner, &scope);
+    let direct_reason = if direct.is_err() {
+        "visit_limit"
+    } else {
+        "incomplete_hierarchy"
+    };
+    let Some(direct_descendants) = direct.ok().filter(|answer| answer.is_complete()) else {
         return vec![fact_expansion(
             root,
             root_id,
             "call_lifecycle",
             "incomplete",
-            Some("visit_limit"),
+            Some(direct_reason),
             "open",
             None,
             Some(root.range),
@@ -2084,7 +2209,7 @@ fn init_calls_subclass_facts(
         )];
     };
     let mut descendants = Vec::new();
-    let mut pending = direct_descendants.into_iter().collect::<Vec<_>>();
+    let mut pending = direct_descendants.definite().to_vec();
     let mut seen = HashSet::default();
     while let Some(class) = pending.pop() {
         if !seen.insert(class.clone()) {
@@ -2109,15 +2234,21 @@ fn init_calls_subclass_facts(
             )];
         }
         descendants.push(class.clone());
-        if let Some(next) = provider.get_direct_descendants_within(&class, &scope) {
-            pending.extend(next);
+        let next = provider.get_direct_descendants_within(&class, &scope);
+        let reason = if next.is_err() {
+            "visit_limit"
+        } else {
+            "incomplete_hierarchy"
+        };
+        if let Some(next) = next.ok().filter(|answer| answer.is_complete()) {
+            pending.extend(next.definite().iter().cloned());
         } else {
             return vec![fact_expansion(
                 root,
                 root_id,
                 "call_lifecycle",
                 "incomplete",
-                Some("visit_limit"),
+                Some(reason),
                 "open",
                 None,
                 Some(root.range),
@@ -2225,8 +2356,11 @@ fn init_calls_subclass_facts(
                 continue;
             }
             let name = call.shape.outcome.callee_name.as_deref().unwrap();
-            let dispatch =
-                semantic.dispatch_at_source(&call.shape.outcome.file, call.shape.outcome.range);
+            let (dispatch, dispatch_incompleteness) = semantic
+                .dispatch_at_source_with_cause(&call.shape.outcome.file, call.shape.outcome.range);
+            if dispatch_incompleteness.execution_cause().is_some() {
+                semantic.analyzer().mark_execution_dependent();
+            }
             let dispatch_reason = if !dispatch.coverage.is_exhaustive()
                 || dispatch.arms.len() != 1
                 || dispatch
@@ -2363,6 +2497,7 @@ fn context_facts(
     facts: &FileFacts,
     call_sites: &[CallSite],
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
+    environment: &EnvironmentFileResult,
     mro: &[CodeUnit],
     hierarchy_complete: bool,
     semantic: &mut super::semantic::SemanticQueryContext<'_>,
@@ -2392,7 +2527,7 @@ fn context_facts(
                 ));
                 continue;
             };
-            match builtin_super_at(occurrences, callee_range) {
+            match builtin_super_at(occurrences, environment, callee_range) {
                 Some(false) => continue,
                 None => {
                     output.push(fact_expansion(
@@ -2539,9 +2674,11 @@ fn context_facts(
                 analyzer,
                 facts,
                 occurrences,
+                environment,
                 &call.shape,
                 subject_method,
                 &inherited,
+                mro,
             )
         {
             output.push(fact_expansion(
@@ -2566,7 +2703,13 @@ fn context_facts(
             && hierarchy_complete
             && let Some(owner) = method_owner.as_ref()
             && call.shape.outcome.receiver_range.is_some_and(|receiver| {
-                implicit_super_receiver(facts, &call.shape.outcome.file, occurrences, receiver)
+                implicit_super_receiver(
+                    facts,
+                    &call.shape.outcome.file,
+                    occurrences,
+                    environment,
+                    receiver,
+                )
             })
             && first_parameter_name(analyzer, facts, occurrences, subject_method).is_some()
             && let Some((target, target_owner, rank)) = inherited_methods(analyzer, mro, "__del__")
@@ -2590,8 +2733,11 @@ fn context_facts(
             ));
             continue;
         }
-        let answer =
-            semantic.dispatch_at_source(&call.shape.outcome.file, call.shape.outcome.range);
+        let (answer, dispatch_incompleteness) = semantic
+            .dispatch_at_source_with_cause(&call.shape.outcome.file, call.shape.outcome.range);
+        if dispatch_incompleteness.execution_cause().is_some() {
+            semantic.analyzer().mark_execution_dependent();
+        }
         let exact = answer.coverage.is_exhaustive()
             && !answer.arms.is_empty()
             && answer
@@ -2631,6 +2777,7 @@ fn context_facts(
                             analyzer,
                             facts,
                             occurrences,
+                            environment,
                             &call.shape,
                             subject_method,
                             &target_owner,

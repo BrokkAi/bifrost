@@ -1034,23 +1034,37 @@ mod tests {
         }
     }
     impl TypeHierarchyProvider for Fixture {
-        fn get_direct_ancestors(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-            self.parsed
-                .raw_supertypes
-                .get(unit)
-                .into_iter()
-                .flatten()
-                .flat_map(|name| {
-                    self.parsed
-                        .declarations()
-                        .iter()
-                        .filter(move |candidate| candidate.identifier() == name)
-                        .cloned()
-                })
-                .collect()
+        fn get_direct_ancestors(
+            &self,
+            unit: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+            let edges: Vec<CodeUnit> = {
+                self.parsed
+                    .raw_supertypes
+                    .get(unit)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|name| {
+                        self.parsed
+                            .declarations()
+                            .iter()
+                            .filter(move |candidate| candidate.identifier() == name)
+                            .cloned()
+                    })
+                    .collect()
+            };
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
         }
-        fn get_direct_descendants(&self, _: &CodeUnit) -> HashSet<CodeUnit> {
-            HashSet::default()
+        fn get_direct_descendants(
+            &self,
+            _: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+            let edges: HashSet<CodeUnit> = { HashSet::default() };
+            {
+                let mut edges: Vec<_> = edges.into_iter().collect();
+                edges.sort();
+                brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
+            }
         }
     }
     impl PhpSourceFactProvider for Fixture {

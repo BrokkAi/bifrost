@@ -57,7 +57,7 @@ pub(crate) fn resolved_member_declarations(
                     .filter(|candidate| graph.index.parent_of(candidate).as_ref() == Some(&owner)),
             );
             if let Some(hierarchy) = graph.hierarchy {
-                next.extend(hierarchy.get_direct_ancestors(&owner));
+                next.extend(hierarchy.get_direct_ancestors(&owner).definite().to_vec());
             }
         }
         declarations.sort();

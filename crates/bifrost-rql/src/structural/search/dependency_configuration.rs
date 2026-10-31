@@ -131,7 +131,12 @@ pub(super) fn execute_dependency_configuration(
             {
                 return cancelled_plan_execution();
             }
-            if contributions.len() >= limits.max_pipeline_rows.min(4096) {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                contributions.len(),
+                limits.max_pipeline_rows.min(4096),
+            )
+            .allows(1)
+            {
                 reasons.push(ConfigurationIncompleteReason::ContributionBudgetExhausted);
                 gaps.push(format!(
                     "configuration contribution budget reached in {path}"
@@ -335,8 +340,11 @@ pub(super) fn execute_dependency_configuration(
             projected.retained_evidence_bytes = projected
                 .retained_evidence_bytes
                 .saturating_add(proof_bytes);
-            retain_proof = projected.retained_evidence_bytes
-                <= limits.semantic.max_retained_bytes.min(8 * 1024 * 1024);
+            retain_proof = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                projected.retained_evidence_bytes,
+                limits.semantic.max_retained_bytes.min(8 * 1024 * 1024),
+            )
+            .allows(0);
             if retain_proof && let Some(lease) = &state.parallel_seed_budget {
                 match lease.admit(projected) {
                     FairSeedBudgetAdmission::Admitted => {}

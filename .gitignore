@@ -20,6 +20,7 @@ bifrost_searchtools/*.so
 /licenses/THIRD_PARTY_LICENSES.html
 /packaging/bifrost-cli/.generated-licenses/
 /packaging/bifrost-cli/dist/
+/packaging/bifrost-cli/wheelhouse/
 /npm/dist/
 
 # One developer's or agent's working policy decisions. The checked-in

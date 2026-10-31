@@ -841,7 +841,8 @@ fn cvss_overlay_hash_uses_canonical_labels_and_utc_time() {
 
 #[test]
 fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive() {
-    let broad = CodeQueryDiagnostic {
+    let broad = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::BroadQuery,
@@ -851,7 +852,7 @@ fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive(
         message: "broad query".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    };
+    });
     assert!(certainty_reasons(std::slice::from_ref(&broad), &[]).is_empty());
     assert!(incomplete_reasons(&CodeQueryCompletion::Complete, false).is_empty());
     // A policy run drops the advisory entirely: it measures the execution that
@@ -902,7 +903,8 @@ fn secondary_incomplete_cause_does_not_corrupt_terminal_completion() {
 fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnostics() {
     // Any forwarded code will do; deliberately not `broad_query`, which a
     // policy run drops before it can be rejected for its length.
-    let rejected = CodeQueryDiagnostic {
+    let rejected = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
@@ -912,8 +914,9 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
         message: "x".repeat(4_097),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    };
-    let valid = CodeQueryDiagnostic {
+    });
+    let valid = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
@@ -923,7 +926,7 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
         message: "later valid diagnostic".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    };
+    });
 
     let adapted = adapt_query_diagnostics(&[rejected, valid], 1, 64);
 
@@ -938,16 +941,21 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
     "#6638: repeated per-site diagnostics filled the retention cap and hid later distinct causes"
 )]
 fn retained_query_diagnostics_are_a_function_of_the_set_raised() {
-    let diagnostic = |message: &str| CodeQueryDiagnostic {
-        related: Vec::new(),
-        source: None,
-        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: "python",
-        message: message.to_string(),
-        exhausted_roots: Vec::new(),
-        withheld_rows_path: None,
+    let diagnostic = |message: &str| {
+        CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+            ),
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "python",
+            message: message.to_string(),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        })
     };
     let repeated = diagnostic("dispatch outcome=unknown");
     let later = diagnostic("dispatch outcome=unproven");
@@ -1927,7 +1935,8 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
         },
         steps: Vec::new(),
     };
-    let diagnostic = CodeQueryDiagnostic {
+    let diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
@@ -1937,7 +1946,7 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
         message: "branch-local ambiguity".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    };
+    });
 
     let projected = |branch| UnitRowProvenance::project(&provenance(branch));
     assert_eq!(

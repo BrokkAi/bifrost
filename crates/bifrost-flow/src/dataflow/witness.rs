@@ -1276,6 +1276,11 @@ impl WitnessArena {
         {
             return Ok(WitnessAdmission::Duplicate);
         }
+        // A constant or query/policy-defined limit is part of the unit's
+        // identity: the same content selects the same output projection.
+        // Workspace-scaled limits, limits shared across units, and charges
+        // against work allowances are operational stops instead. This local
+        // alternative count selects a projection; it spends no work allowance.
         if alternatives.ids(quality).len() >= self.max_alternatives_per_quality() {
             alternatives.mark_truncated(quality);
             return Ok(WitnessAdmission::Truncated);
@@ -1283,21 +1288,32 @@ impl WitnessArena {
         if self.limits.is_best_effort()
             && (candidate_budget
                 .request_remaining_relations
-                .is_some_and(|remaining| staging.nodes.len() >= remaining)
+                .is_some_and(|remaining| {
+                    !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                        staging.nodes.len(),
+                        remaining,
+                    )
+                    .allows(1)
+                })
                 || self
                     .limits
                     .best_effort_max_relations()
                     .is_some_and(|limit| {
-                        self.nodes.len().saturating_add(staging.nodes.len()) >= limit
+                        !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                            self.nodes.len().saturating_add(staging.nodes.len()),
+                            limit,
+                        )
+                        .allows(1)
                     })
                 || self
                     .limits
                     .best_effort_max_retained_bytes()
                     .is_some_and(|limit| {
-                        self.retained_bytes
-                            .saturating_add(*staging.retained_bytes)
-                            .saturating_add(candidate_budget.retained_bytes)
-                            > limit
+                        !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                            self.retained_bytes.saturating_add(*staging.retained_bytes),
+                            limit,
+                        )
+                        .allows(candidate_budget.retained_bytes)
                     }))
         {
             return Ok(WitnessAdmission::Exhausted);
@@ -1495,7 +1511,12 @@ impl WitnessStore {
                     evidence: id,
                     suppress_relative_seed,
                 } => {
-                    if expansions >= limits.max_expansions() {
+                    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                        expansions,
+                        limits.max_expansions(),
+                    )
+                    .allows(1)
+                    {
                         truncation_cause = truncation_cause
                             .or(Some(WitnessTruncationCause::ReconstructionExpansionLimit));
                         omitted_steps_lower_bound = usize::from(!suppress_relative_seed)
@@ -1567,7 +1588,12 @@ impl WitnessStore {
                 }
                 Task::Emit(step) => {
                     let step = *step;
-                    if steps.len() >= limits.max_steps() {
+                    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                        steps.len(),
+                        limits.max_steps(),
+                    )
+                    .allows(1)
+                    {
                         truncation_cause = truncation_cause
                             .or(Some(WitnessTruncationCause::ReconstructionStepLimit));
                         omitted_steps_lower_bound = 1 + stack

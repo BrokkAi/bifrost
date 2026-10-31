@@ -276,6 +276,11 @@ pub(in crate::analyzer) trait NominalLanguageRules: Sync + 'static {
     fn implicit_root_providers(
         &self,
     ) -> &'static [crate::analyzer::resolution::JvmImplicitRootProvider];
+    /// Lower values shadow higher values. None keeps same-rank defaults.
+    fn implicit_root_precedence(
+        &self,
+        provider: crate::analyzer::resolution::JvmImplicitRootProvider,
+    ) -> Option<u32>;
     /// Required: source languages eligible for the exact package-peer provider.
     fn package_peer_languages(&self) -> &'static [Language];
     /// Required: the package declared by source clauses, or None when absent.
@@ -295,6 +300,9 @@ pub(in crate::analyzer) trait NominalLanguageRules: Sync + 'static {
     fn has_typed_prefix_deferral(&self) -> bool {
         false
     }
+    /// Whether an on-demand type owner can import its directly declared nested types.
+    fn imports_nested_types_on_demand(&self) -> bool;
+
     /// Feature entry: unqualified type references discover modeled implicit owners.
     fn has_unqualified_implicit_owners(&self) -> bool {
         false
@@ -511,6 +519,7 @@ struct JvmLanguageRules {
     ) -> Result<Vec<String>>,
     typed_prefix_deferral: bool,
     unqualified_implicit_owners: bool,
+    nested_types_on_demand: bool,
     unindexed_implicit_package: Option<&'static str>,
     language: Language,
     selected: SelectedImportContext,
@@ -637,6 +646,27 @@ impl NominalLanguageRules for JvmLanguageRules {
     ) -> &'static [crate::analyzer::resolution::JvmImplicitRootProvider] {
         crate::analyzer::resolution::language_implicit_root_providers(self.language)
     }
+    fn implicit_root_precedence(
+        &self,
+        provider: crate::analyzer::resolution::JvmImplicitRootProvider,
+    ) -> Option<u32> {
+        use crate::analyzer::resolution::JvmImplicitRootProvider;
+        match self.language {
+            Language::Scala => self
+                .implicit_root_providers()
+                .iter()
+                .rev()
+                .position(|root| *root == provider)
+                .map(|index| index as u32),
+            // The specification lists platform defaults without relative priority:
+            // https://kotlinlang.org/spec/packages-and-imports.html#importing
+            // Conservatively keep Kotlin roots above the Java platform root.
+            Language::Kotlin => Some(u32::from(
+                provider == JvmImplicitRootProvider::Package("java.lang"),
+            )),
+            _ => None,
+        }
+    }
     fn package_peer_languages(&self) -> &'static [Language] {
         self.package_peers
     }
@@ -660,6 +690,9 @@ impl NominalLanguageRules for JvmLanguageRules {
     }
     fn has_unqualified_implicit_owners(&self) -> bool {
         self.unqualified_implicit_owners
+    }
+    fn imports_nested_types_on_demand(&self) -> bool {
+        self.nested_types_on_demand
     }
     fn unindexed_implicit_owner_package(&self) -> Option<&'static str> {
         self.unindexed_implicit_package
@@ -859,6 +892,7 @@ static JAVA_RULES: JvmLanguageRules = JvmLanguageRules {
     lexical_import_package_prefixes: |_, _, _| Ok(Vec::new()),
     typed_prefix_deferral: true,
     unqualified_implicit_owners: true,
+    nested_types_on_demand: true,
     unindexed_implicit_package: Some("java.lang"),
 
     language: Language::Java,
@@ -926,6 +960,7 @@ static KOTLIN_RULES: JvmLanguageRules = JvmLanguageRules {
     lexical_import_package_prefixes: |_, _, _| Ok(Vec::new()),
     typed_prefix_deferral: false,
     unqualified_implicit_owners: false,
+    nested_types_on_demand: false,
     unindexed_implicit_package: None,
 
     language: Language::Kotlin,
@@ -992,6 +1027,7 @@ static SCALA_RULES: JvmLanguageRules = JvmLanguageRules {
     },
     typed_prefix_deferral: false,
     unqualified_implicit_owners: false,
+    nested_types_on_demand: false,
     unindexed_implicit_package: None,
 
     language: Language::Scala,

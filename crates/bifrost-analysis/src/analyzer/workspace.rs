@@ -266,6 +266,44 @@ impl Project for SelectedConfigurationProject {
             .selected_module_name(&self.snapshot, &crate::path_utils::rel_path_string(file))
             .map_err(std::io::Error::other)
     }
+    fn selected_module_name_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        file: &ProjectFile,
+    ) -> std::io::Result<Option<String>> {
+        if !crate::analyzer::store::store_language_support(self.language)
+            .expect("selected language has store support")
+            .publishes_own_module_file_anchors()
+        {
+            return self.project.selected_module_name_with_conn(conn, file);
+        }
+        crate::analyzer::store::AnalyzerStore::selected_module_name_with_conn(
+            conn,
+            &self.snapshot,
+            &crate::path_utils::rel_path_string(file),
+        )
+        .map_err(std::io::Error::other)
+    }
+    fn configuration_source_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        path: &Path,
+    ) -> std::io::Result<Option<String>> {
+        if !self.is_configuration(path) {
+            return self.project.configuration_source_with_conn(conn, path);
+        }
+        let file = ProjectFile::new(self.root(), path);
+        let source =
+            crate::analyzer::store::AnalyzerStore::selected_configuration_source_with_conn(
+                conn,
+                &self.snapshot,
+                &crate::path_utils::rel_path_string(&file),
+            )
+            .map_err(std::io::Error::other)?;
+        source
+            .map(brokk_bifrost_core::analyzer::project::decode_source_bytes)
+            .transpose()
+    }
     fn root(&self) -> &Path {
         self.project.root()
     }
@@ -393,6 +431,27 @@ impl Project for SelectedConfigurationProject {
                         .expect("hashing project source")
                 })
             },
+        )
+    }
+    fn read_file_snapshot(
+        &self,
+        file: &ProjectFile,
+    ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectFileSnapshot> {
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || {
+                if !self.is_configuration(file.rel_path()) {
+                    self.project.read_file_snapshot(file)
+                } else {
+                    self.read_source(file).map(|source| {
+                        brokk_bifrost_core::analyzer::project::ProjectFileSnapshot::disk(
+                            source.into_bytes(),
+                        )
+                    })
+                }
+            },
+            |snapshot| Some(snapshot.oid()),
         )
     }
     fn read_source_snapshot(
@@ -2034,13 +2093,10 @@ impl WorkspaceAnalyzer {
         }
         let blob_oid = git2::Oid::hash_object(git2::ObjectType::Blob, snapshot.source().as_bytes())
             .map_err(|error| {
-                crate::analyzer::semantic::SemanticProviderError::Internal(
-                    format!(
-                        "failed to derive analyzer-store blob identity for {}: {error}",
-                        key.path()
-                    )
-                    .into(),
-                )
+                crate::analyzer::semantic::SemanticProviderError::internal(format!(
+                    "failed to derive analyzer-store blob identity for {}: {error}",
+                    key.path()
+                ))
             })?;
         Ok(Some(
             crate::analyzer::store::class_set_summaries::ClassSetSummaryAttachment {

@@ -194,13 +194,17 @@ impl JdkJmodSetPackProducer {
         limits: &ArtifactProducerLimits,
         cancellation: Option<&CancellationToken>,
     ) -> Option<Vec<LoadedJmod>> {
+        let carried_context =
+            brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         install_on_dedicated_build_pool(|| {
             artifact
                 .source_entries()
                 .par_iter()
                 .map(|source_entry| {
-                    let mut budget = RecordBudget::new(limits);
-                    load_jmod_entry(source_entry, limits, cancellation, &mut budget)
+                    carried_context.run(|| {
+                        let mut budget = RecordBudget::new(limits);
+                        load_jmod_entry(source_entry, limits, cancellation, &mut budget)
+                    })
                 })
                 .collect::<Vec<_>>()
         })

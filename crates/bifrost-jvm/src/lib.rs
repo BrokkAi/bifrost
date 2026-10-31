@@ -53,6 +53,7 @@ pub mod realm;
 pub mod scala;
 mod synthetic_members;
 mod test_detection;
+mod type_parameters;
 
 pub(crate) fn source_header(source: &str, start_byte: usize, end_byte: usize) -> String {
     brokk_bifrost_core::analyzer::common::collapse_whitespace(
@@ -233,3 +234,14 @@ pub(crate) mod test_support {
 
 mod knowledge;
 pub use knowledge::{JavaKnowledge, KotlinKnowledge, ScalaKnowledge};
+
+/// Validate a syntax name before comparing or publishing its spelling.
+/// Quoted identifiers with no contents are empty names as well.
+pub(crate) fn recovered_name(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    node.is_missing()
+        || node.has_error()
+        || source[node.byte_range()]
+            .trim()
+            .trim_matches('`')
+            .is_empty()
+}

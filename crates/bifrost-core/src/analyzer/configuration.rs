@@ -12,7 +12,9 @@ use std::path::Path;
 ///
 /// Configuration formats are deliberately separate from programming
 /// [`Language`](crate::analyzer::Language). Membership here does not mean that
-/// an ingestion adapter is available.
+/// an ingestion adapter is available: a registered format without an adapter
+/// is still discovered, so a query that would read it reports the document as
+/// unread instead of answering as if the workspace held no configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ConfigurationFormat {
     Yaml,
@@ -20,15 +22,18 @@ pub enum ConfigurationFormat {
     Json,
     Xml,
     Properties,
+    /// Lightbend HOCON, the configuration format of Akka and Akka.NET.
+    Hocon,
 }
 
 impl ConfigurationFormat {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Yaml,
         Self::Toml,
         Self::Json,
         Self::Xml,
         Self::Properties,
+        Self::Hocon,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -38,6 +43,7 @@ impl ConfigurationFormat {
             Self::Json => "json",
             Self::Xml => "xml",
             Self::Properties => "properties",
+            Self::Hocon => "hocon",
         }
     }
 
@@ -48,6 +54,7 @@ impl ConfigurationFormat {
             Self::Json => &["json"],
             Self::Xml => &["xml", "config"],
             Self::Properties => &["properties"],
+            Self::Hocon => &["hocon", "conf"],
         }
     }
 

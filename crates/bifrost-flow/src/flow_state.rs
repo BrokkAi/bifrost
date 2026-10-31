@@ -8001,18 +8001,36 @@ struct BindingBases {
 }
 
 impl BindingBases {
+    /// A value read from a binding presents as that binding. A value loaded
+    /// from static storage (a Java or C# static, a Go package variable, a
+    /// Python module global) presents as the first value loaded from the
+    /// same location, the storage-rooted counterpart of a binding.
     fn build(procedure: &ProcedureSemantics) -> Self {
         let mut canonical = HashMap::default();
+        let mut static_roots = HashMap::<MemoryLocationId, ValueId>::default();
         for point in procedure.points() {
             for event in point.events.iter() {
-                let SemanticEffect::ValueFlow { source, target, .. } = &event.effect else {
-                    continue;
-                };
-                let Some(source_value) = procedure.value(*source) else {
-                    continue;
-                };
-                if source_value.kind.is_binding() {
-                    canonical.entry(*target).or_insert(*source);
+                match &event.effect {
+                    SemanticEffect::ValueFlow { source, target, .. } => {
+                        if procedure
+                            .value(*source)
+                            .is_some_and(|value| value.kind.is_binding())
+                        {
+                            canonical.entry(*target).or_insert(*source);
+                        }
+                    }
+                    SemanticEffect::MemoryLoad {
+                        location, result, ..
+                    } if procedure
+                        .memory_location(*location)
+                        .is_some_and(|location| {
+                            matches!(location.kind, MemoryLocationKind::Static { .. })
+                        }) =>
+                    {
+                        let root = *static_roots.entry(*location).or_insert(*result);
+                        canonical.entry(*result).or_insert(root);
+                    }
+                    _ => {}
                 }
             }
         }

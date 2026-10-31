@@ -2770,17 +2770,18 @@ macro_rules! impl_js_ts_type_flow_adapter {
     };
 }
 
+// #7240: imported constructor receivers change member-surface mutation targets.
 impl_js_ts_type_flow_adapter!(
     JavascriptSupport,
     Language::JavaScript,
     "javascript-type-flow",
-    b"javascript-type-flow-closed-surface-same-name-class-records-v7"
+    b"javascript-type-flow-imported-constructor-mutations-v8"
 );
 impl_js_ts_type_flow_adapter!(
     TypescriptSupport,
     Language::TypeScript,
     "typescript-type-flow",
-    b"typescript-type-flow-closed-surface-same-name-class-records-v7"
+    b"typescript-type-flow-imported-constructor-mutations-v8"
 );
 
 #[cfg(test)]

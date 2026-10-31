@@ -13,7 +13,6 @@ use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
 
 use brokk_bifrost_core::hash::HashMap;
-use git2::Oid;
 use std::sync::Arc;
 
 #[doc(hidden)]
@@ -22,7 +21,11 @@ pub trait JavaSourceFacts {
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>>;
@@ -33,7 +36,11 @@ impl JavaSourceFacts for TreeSitterAnalyzer<JavaAdapter> {
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>> {
@@ -63,7 +70,12 @@ impl JavaSourceFacts for TreeSitterAnalyzer<JavaAdapter> {
                 },
             ));
         }
-        let cache_key = reader.cache_key();
+        let (generation, oid, cache_file) = reader.cache_key();
+        let cache_key = (
+            generation,
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+            cache_file,
+        );
         if let Some(facts) = cache.get(&cache_key) {
             return Some(facts);
         }

@@ -661,10 +661,6 @@ impl<'a> SelectedBuiltInPolicy<'a> {
         self.source
     }
 
-    pub fn pack_id(self) -> &'a str {
-        self.pack_id
-    }
-
     pub const fn selection_provenance(self) -> super::finding::PolicySelectionProvenance {
         self.selection_provenance
     }
@@ -699,7 +695,7 @@ impl<'a> SelectedBuiltInPolicy<'a> {
     pub fn resolve(
         self,
         analyzer: &dyn IAnalyzer,
-    ) -> Result<ResolvedBuiltInPolicy<'a>, BuiltInPolicyError> {
+    ) -> Result<ResolvedBuiltInPolicy, BuiltInPolicyError> {
         let mut catalogs =
             TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
         let parsed = super::parse_rqlp_source(self.source, self.source_identity())
@@ -731,7 +727,6 @@ impl<'a> SelectedBuiltInPolicy<'a> {
             ));
         }
         Ok(ResolvedBuiltInPolicy {
-            selected: self,
             loaded: loaded.clone(),
             resolved_semantic_hash,
         })
@@ -764,31 +759,16 @@ const CHANGED_FAMILY_CODE: &str = "built-in-policy-changed-model-family";
 /// One built-in policy after every deferred locator resolved against the
 /// pinned active semantic-model snapshot.
 #[derive(Debug, Clone)]
-pub struct ResolvedBuiltInPolicy<'a> {
-    selected: SelectedBuiltInPolicy<'a>,
+pub struct ResolvedBuiltInPolicy {
     loaded: LoadedPolicy,
     resolved_semantic_hash: PolicySemanticHash,
 }
 
-impl<'a> ResolvedBuiltInPolicy<'a> {
-    pub fn selected(&self) -> SelectedBuiltInPolicy<'a> {
-        self.selected
-    }
-
-    /// The deterministic catalog identity, unchanged by activation.
-    pub fn authored_hash(&self) -> &str {
-        self.selected.authored_hash()
-    }
-
+impl ResolvedBuiltInPolicy {
     /// The executable identity. It varies with the active model family and
     /// provenance that resolved the deferred locators.
     pub const fn resolved_semantic_hash(&self) -> PolicySemanticHash {
         self.resolved_semantic_hash
-    }
-
-    /// The fully resolved policy plan and its resolved locator metadata.
-    pub fn loaded(&self) -> &LoadedPolicy {
-        &self.loaded
     }
 
     /// The resolved call and receiver locators, including the active

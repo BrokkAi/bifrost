@@ -377,7 +377,8 @@ fn diagnostic(
 ) {
     diagnostics.push(super::QueryExecutionState::diagnostic(
         analyzer,
-        CodeQueryDiagnostic {
+        CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete,
@@ -390,7 +391,7 @@ fn diagnostic(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        },
+        }),
         CodeQueryDiagnosticCode::from_execution_reason(
             CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete,
             reason,

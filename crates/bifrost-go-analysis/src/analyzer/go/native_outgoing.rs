@@ -448,7 +448,6 @@ fn resolve_outgoing(
         let mut receiver_candidate_calls = Vec::new();
         let mut files = HashSet::default();
         files.insert(file.clone());
-        let identities = operation.ready.context_identities.clone();
         let staged = operation.stage_go_reference_edge_batches_in_files(
             go,
             context.context_id,
@@ -545,9 +544,6 @@ fn resolve_outgoing(
                                 continue;
                             }
                             let model_selection = answer.answer().model_member_selection().and_then(|selection| brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::project_native_model_member_selection(selection, cancellation));
-                            let legacy_reasons = super::model_receiver::legacy_model_reasons(
-                                model_selection.as_deref(), answer.answer().completion(), &identities,
-                            );
                             let exact_external = exact_external_call(
                                 go,
                                 caller,
@@ -555,7 +551,6 @@ fn resolve_outgoing(
                                 &tree,
                                 &shapes[call_index],
                                 model_selection.as_deref(),
-                                &legacy_reasons,
                                 &selected_imports,
                                 &session,
                                 budget,
@@ -770,7 +765,6 @@ fn resolve_outgoing(
                     &tree,
                     shape,
                     None,
-                    &std::collections::BTreeSet::new(),
                     &selected_imports,
                     &session,
                     budget,
@@ -881,9 +875,6 @@ fn exact_external_call(
     tree: &tree_sitter::Tree,
     shape: &GoCallShape,
     model_selection: Option<&brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>,
-    legacy_reasons: &std::collections::BTreeSet<
-        brokk_bifrost_analysis::analyzer::resolution::seam_profile::GoModelLegacyReason,
-    >,
     selected_imports: &[brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoSelectedExternalImport],
     session: &ResolutionSession,
     budget: ReceiverAnalysisBudget,
@@ -926,14 +917,6 @@ fn exact_external_call(
                 return Some(proof);
             }
         }
-    }
-    if model_selection.is_none() && !legacy_reasons.is_empty() {
-        return crate::analyzer::usages::get_definition::go::go_g1b_legacy_model_receiver(
-            query,
-            session,
-            legacy_reasons,
-        )?
-        .external_call;
     }
     let selection = model_selection?;
     let descriptor = super::model_receiver::transient_selection(query, selection)?;
@@ -1244,7 +1227,6 @@ mod tests {
             &tree,
             &external_call,
             selected.model_member_selection.as_deref(),
-            &std::collections::BTreeSet::new(),
             &model_backed_imports,
             &ResolutionSession::unbounded(),
             ReceiverAnalysisBudget::default(),

@@ -85,7 +85,11 @@ fn host(value: u8) {
         let store = AnalyzerStore::open_persistent(&fixture.root().join("rust-contexts.db"))
             .expect("persistent context store");
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect("publish canonical context fixture");
         (fixture, store, oid)
     }
@@ -153,14 +157,24 @@ fn host(value: u8) {
         let reopened = AnalyzerStore::open_persistent(&fixture.root().join("rust-contexts.db"))
             .expect("reopen context store");
         let at_start = reopened
-            .rust_primary_contexts_at(oid, generation, target.start_byte, &|| true)
+            .rust_primary_contexts_at(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                generation,
+                target.start_byte,
+                &|| true,
+            )
             .unwrap()
             .unwrap()
             .into_iter()
             .collect::<HashSet<_>>();
         assert_eq!(at_start, expected_at_start);
         let at_end = reopened
-            .rust_primary_contexts_at(oid, generation, target.end_byte, &|| true)
+            .rust_primary_contexts_at(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                generation,
+                target.end_byte,
+                &|| true,
+            )
             .unwrap()
             .unwrap()
             .into_iter()
@@ -171,7 +185,12 @@ fn host(value: u8) {
             "the selected context must be end-exclusive"
         );
         let at_eof = reopened
-            .rust_primary_contexts_at(oid, generation, eof, &|| true)
+            .rust_primary_contexts_at(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                generation,
+                eof,
+                &|| true,
+            )
             .unwrap()
             .unwrap();
         assert!(
@@ -179,7 +198,12 @@ fn host(value: u8) {
             "EOF is outside every half-open span: {at_eof:?}"
         );
         let actual = reopened
-            .rust_primary_contexts_at(oid, generation, embedded_point, &|| true)
+            .rust_primary_contexts_at(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                generation,
+                embedded_point,
+                &|| true,
+            )
             .unwrap()
             .unwrap()
             .into_iter()
@@ -188,7 +212,10 @@ fn host(value: u8) {
         assert!(actual.is_disjoint(&excluded_embedded));
 
         let missing = reopened.rust_primary_contexts_at(
-            oid_for(b"unpublished context"),
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid_for(b"unpublished context"),
+                "rust",
+            ),
             generation,
             0,
             &|| true,
@@ -206,7 +233,12 @@ fn host(value: u8) {
         let state = parse_state(&RustAdapter, &file);
         let generation = store.current_generation("rust").unwrap();
         let expected = store
-            .rust_primary_contexts_at(oid, generation, 1, &|| true)
+            .rust_primary_contexts_at(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                generation,
+                1,
+                &|| true,
+            )
             .unwrap()
             .unwrap();
         assert!(!expected.is_empty());
@@ -225,15 +257,29 @@ fn host(value: u8) {
         });
         assert!(
             store
-                .rust_primary_contexts_at(oid, generation, 1, &|| true)
+                .rust_primary_contexts_at(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    1,
+                    &|| true
+                )
                 .is_err()
         );
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         assert_eq!(
             store
-                .rust_primary_contexts_at(oid, generation, 1, &|| true)
+                .rust_primary_contexts_at(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    1,
+                    &|| true
+                )
                 .unwrap()
                 .unwrap(),
             expected
@@ -265,17 +311,27 @@ fn host(value: u8) {
 
         assert!(
             store
-                .rust_primary_contexts_at(oid, generation, point, &|| false)
+                .rust_primary_contexts_at(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    point,
+                    &|| false
+                )
                 .unwrap()
                 .is_none(),
             "pre-cancelled context read must not open a result"
         );
         let checks = std::cell::Cell::new(0usize);
         let complete = store
-            .rust_primary_contexts_at(oid, generation, point, &|| {
-                checks.set(checks.get() + 1);
-                true
-            })
+            .rust_primary_contexts_at(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                generation,
+                point,
+                &|| {
+                    checks.set(checks.get() + 1);
+                    true
+                },
+            )
             .unwrap()
             .unwrap();
         assert!(!complete.is_empty());
@@ -288,10 +344,15 @@ fn host(value: u8) {
             let checks = std::cell::Cell::new(0usize);
             assert!(
                 store
-                    .rust_primary_contexts_at(oid, generation, point, &|| {
-                        checks.set(checks.get() + 1);
-                        checks.get() < stop_at
-                    })
+                    .rust_primary_contexts_at(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                        generation,
+                        point,
+                        &|| {
+                            checks.set(checks.get() + 1);
+                            checks.get() < stop_at
+                        }
+                    )
                     .unwrap()
                     .is_none(),
                 "cancelled context read returned partial rows at checkpoint {stop_at}"
@@ -299,7 +360,12 @@ fn host(value: u8) {
         }
         assert_eq!(
             store
-                .rust_primary_contexts_at(oid, generation, point, &|| true)
+                .rust_primary_contexts_at(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    point,
+                    &|| true
+                )
                 .unwrap()
                 .unwrap(),
             complete,
@@ -396,7 +462,11 @@ fn host(value: u8) {
             let state = parse_state(&RustAdapter, &file);
             let oid = oid_for(source.as_bytes());
             store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    &RustAdapter,
+                    &state,
+                )
                 .unwrap_or_else(|error| panic!("populate context plan fixture {index}: {error}"));
             oids.push(oid);
         }
@@ -466,6 +536,7 @@ fn host(value: u8) {
             Value::Integer(macro_version),
             Value::Integer(type_version),
             Value::Integer(macro_context_version),
+            Value::Blob(Vec::new()),
         ];
         let manifest_blob: i64 = connection
         .query_row(

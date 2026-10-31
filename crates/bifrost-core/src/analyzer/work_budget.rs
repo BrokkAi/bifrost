@@ -84,6 +84,7 @@ impl<Work> BudgetLedger<Work> {
 
     #[track_caller]
     pub fn record_refusal(&self) {
+        super::carried_context::mark_execution_dependent();
         let origin = std::panic::Location::caller();
         crate::profiling::note_with(|| {
             format!(
@@ -405,5 +406,42 @@ mod work_budget_properties {
             prop_assert_eq!(charged.limits(), limits);
             prop_assert_eq!(ledger.used(), used);
         }
+    }
+}
+
+/// A query-local scalar allowance. Refusal is an execution input even when
+/// the caller catches it and returns a useful fallback.
+#[derive(Debug, Clone, Copy)]
+pub struct LimitedCounter {
+    used: usize,
+    limit: usize,
+}
+
+impl LimitedCounter {
+    pub fn from_usage(used: usize, limit: usize) -> Self {
+        Self { used, limit }
+    }
+
+    pub fn allows(&self, additional: usize) -> bool {
+        let fits = self
+            .used
+            .checked_add(additional)
+            .is_some_and(|used| used <= self.limit);
+        if !fits {
+            super::carried_context::mark_execution_dependent();
+        }
+        fits
+    }
+
+    pub fn charge(&mut self, additional: usize) -> bool {
+        if !self.allows(additional) {
+            return false;
+        }
+        self.used += additional;
+        true
+    }
+
+    pub fn used(&self) -> usize {
+        self.used
     }
 }

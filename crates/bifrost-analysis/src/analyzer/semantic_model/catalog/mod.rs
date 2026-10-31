@@ -5938,6 +5938,70 @@ pub(crate) mod native_compatibility_catalog_tests {
     }
 
     #[test]
+    fn procedure_summaries_match_full_validation_after_certified_catalog_reopen() {
+        use crate::analyzer::semantic_model::artifact::thread_shard_wire_read_count;
+
+        let pack = compile_source(
+            SourceFormat::Json,
+            include_bytes!("../../../../testdata/semantic-model-packs/procedure-summaries-v1.json"),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let catalog =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadWrite, CatalogOptions::default())
+                .unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "procedure-certificate-fixture".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(pack.shards.len(), 1);
+        let candidate = super::CatalogCandidate {
+            manifest_digest: pack.manifest.content_sha256.clone(),
+            shard_id: pack.shards[0].descriptor.shard_id.clone(),
+            descriptor: pack.shards[0].descriptor.clone(),
+            completeness: pack.manifest.completeness,
+            source_kind: super::CatalogPackSourceKind::Installed,
+            source_id: "procedure-certificate-fixture".into(),
+            location: super::CatalogCandidateLocation::Durable,
+        };
+        // Exercise ordinary catalog validation and let that read issue the
+        // certificate consumed by a fresh catalog instance below.
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM catalog_shard_validations", [])
+            .unwrap();
+        let validated = catalog.load_decoded_for_test(&candidate).unwrap();
+        assert_eq!(catalog.shard_validation_count(), 1);
+        let summaries = validated.decoded().payload().procedure_summaries().unwrap();
+        assert!(!summaries.is_empty());
+        let record_bytes = serde_json::to_vec(summaries).unwrap();
+        drop(catalog);
+
+        let reopened =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadOnly, CatalogOptions::default())
+                .unwrap();
+        let before = thread_shard_wire_read_count();
+        let hydrated = reopened.load_decoded_for_test(&candidate).unwrap();
+        assert_eq!(thread_shard_wire_read_count() - before, 1);
+        assert_eq!(reopened.shard_validation_count(), 0);
+        assert_eq!(hydrated.decoded(), validated.decoded());
+        let hydrated_summaries = hydrated.decoded().payload().procedure_summaries().unwrap();
+        assert_eq!(
+            serde_json::to_vec(hydrated_summaries).unwrap(),
+            record_bytes
+        );
+    }
+
+    #[test]
     #[hardwon("#3815: native pack admission incorrectly inherited the legacy engine-version gate")]
     fn schema_eight_ignores_engine_version_while_legacy_range_still_filters() {
         let root = tempfile::tempdir().unwrap();

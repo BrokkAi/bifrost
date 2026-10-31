@@ -33,8 +33,10 @@ pub mod model;
 pub mod mounted;
 #[doc(hidden)]
 pub mod precedence;
+pub mod query_obligations;
 #[doc(hidden)]
 pub mod remount;
+pub use query_obligations::{QueryObligation, QueryObligations};
 mod saturation;
 pub mod seam_profile;
 pub mod seed_key_profile;
@@ -601,7 +603,6 @@ pub(crate) use fact_resolution::CallCandidateApplicability;
 #[doc(hidden)]
 pub use fact_resolution::CallTypeSubstitution;
 pub(crate) use fact_resolution::DemandAcyclicOutcome;
-pub(crate) use fact_resolution::DemandClosureDischarges;
 pub(crate) use fact_resolution::DemandMemberSelection;
 pub(crate) use fact_resolution::DemandMemberSelectionOutcome;
 pub(crate) use fact_resolution::DemandMemberSelectionRequest;
@@ -620,6 +621,7 @@ pub use fact_resolution::InternedFactRow;
 pub(crate) use fact_resolution::SelectedDemandState;
 #[doc(hidden)]
 pub use fact_resolution::StateMap;
+pub(crate) use fact_resolution::{ClosedQueryScope, DemandClosureDischarges};
 
 pub use fact_resolution::FactBatchedReferenceAnswer;
 pub use fact_resolution::FactCallableCandidateApplicability;

@@ -59,6 +59,50 @@ impl LanguageAdapter for CSharpAdapter {
         csharp_included_ranges(source)
     }
 
+    fn preprocess(
+        &self,
+        _file: &ProjectFile,
+        source: &str,
+    ) -> Option<std::sync::Arc<dyn brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor>>
+    {
+        Some(std::sync::Arc::new(
+            brokk_bifrost_csharp::preprocessor::scan_preprocessor(source),
+        ))
+    }
+
+    fn parse_file_preprocessed(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        preprocessor: Option<
+            &dyn brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor,
+        >,
+    ) -> (
+        brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+        Vec<(
+            &'static str,
+            brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+        )>,
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        if super::trial_native_csharp_selected() {
+            let scan = preprocessor
+                .expect("C# preprocessing precedes parsing")
+                .as_any()
+                .downcast_ref::<brokk_bifrost_csharp::preprocessor::PreprocessorScan>()
+                .expect("C# scan");
+            return (
+                brokk_bifrost_csharp::declarations::parse_csharp_file_with_native_facts(
+                    file, source, tree, scan,
+                ),
+                Vec::new(),
+            );
+        }
+        let _ = preprocessor;
+        (parse_csharp_file(file, source, tree), Vec::new())
+    }
+
     fn visibility_containers(&self, unit: &CodeUnit) -> Vec<FqName> {
         let Some(last) = unit.fq().last() else {
             return Vec::new();
@@ -114,12 +158,6 @@ impl LanguageAdapter for CSharpAdapter {
         source: &str,
         tree: &Tree,
     ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
-        #[cfg(any(test, feature = "test-support"))]
-        if super::trial_native_csharp_selected() {
-            return brokk_bifrost_csharp::declarations::parse_csharp_file_with_native_facts(
-                file, source, tree,
-            );
-        }
         parse_csharp_file(file, source, tree)
     }
 

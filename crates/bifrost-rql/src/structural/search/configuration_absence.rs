@@ -18,6 +18,7 @@ pub(super) fn expansions(
     if value.index != 0 || !matches!(value.fact().kind(), ConfigurationNodeKind::Document { .. }) {
         diagnostics.push(incomplete_diagnostic(
             CodeQueryDiagnosticCode::InvalidPlan,
+            brokk_bifrost_rql::Incompleteness::Content,
             "workspace",
             format!(
                 "configuration_absence requires a document-root configuration_fact input; {} is not a document root",
@@ -34,6 +35,7 @@ pub(super) fn expansions(
         // another branch.
         diagnostics.push(incomplete_diagnostic(
             CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            brokk_bifrost_rql::Incompleteness::Content,
             "workspace",
             format!(
                 "configuration_absence cannot prove absence in partly recovered document {}",

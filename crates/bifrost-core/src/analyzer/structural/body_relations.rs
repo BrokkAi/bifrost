@@ -237,17 +237,50 @@ pub fn if_arm_state(
     regions: &ConditionalRegions,
 ) -> Option<BodyStateAnswer> {
     let syntax = syntax_for(language)?;
-    if syntax.empty_statement_kinds.contains(&node.kind()) {
-        Some(BodyStateAnswer::Decided(BodyState::Empty))
-    } else if syntax.block_kinds.contains(&node.kind()) {
-        Some(body_state(node, regions))
-    } else {
-        Some(match regions.activation_at(node.start_byte()) {
-            Activation::CertainActive => BodyStateAnswer::Decided(BodyState::Code),
-            Activation::DecidedInactive => BodyStateAnswer::Decided(BodyState::Empty),
-            Activation::Uncertain => BodyStateAnswer::Undecided,
-        })
-    }
+    let mut uncertain = false;
+    let mut arm = node;
+    let state = loop {
+        if syntax.empty_statement_kinds.contains(&arm.kind()) {
+            break BodyStateAnswer::Decided(BodyState::Empty);
+        }
+        if !syntax.block_kinds.contains(&arm.kind()) {
+            break match regions.activation_at(arm.start_byte()) {
+                Activation::CertainActive => BodyStateAnswer::Decided(BodyState::Code),
+                Activation::DecidedInactive => BodyStateAnswer::Decided(BodyState::Empty),
+                Activation::Uncertain => BodyStateAnswer::Undecided,
+            };
+        }
+        match body_state(arm, regions) {
+            BodyStateAnswer::Decided(BodyState::Code) => {}
+            state => break state,
+        }
+        let statements: Vec<_> = named_children_iter(arm)
+            .filter(|child| {
+                !child.is_extra()
+                    && !is_comment_kind(child.kind())
+                    && !child.kind().starts_with("preproc_")
+            })
+            .collect();
+        let mut certain = statements
+            .iter()
+            .copied()
+            .filter(|child| regions.activation_at(child.start_byte()) == Activation::CertainActive);
+        let statement = certain
+            .next()
+            .expect("body_state Code has a certainly active statement");
+        if certain.next().is_some() {
+            break BodyStateAnswer::Decided(BodyState::Code);
+        }
+        uncertain |= statements
+            .iter()
+            .any(|child| regions.activation_at(child.start_byte()) == Activation::Uncertain)
+            || regions.has_uncertain_omission(arm.byte_range());
+        arm = statement;
+    };
+    Some(match state {
+        BodyStateAnswer::Decided(BodyState::Empty) if uncertain => BodyStateAnswer::Undecided,
+        state => state,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

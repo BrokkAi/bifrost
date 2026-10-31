@@ -304,6 +304,7 @@ fn push_incomplete(
     }
     diagnostics.push(incomplete_diagnostic(
         CodeQueryDiagnosticCode::JsxProjectionIncomplete,
+        brokk_bifrost_rql::Incompleteness::Content,
         language.config_label(),
         message.to_string(),
         Vec::new(),

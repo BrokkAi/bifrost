@@ -28,13 +28,13 @@ pub(crate) struct JavaMemoCaches {
     pub(crate) source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
-            git2::Oid,
+            brokk_bifrost_core::gitblob::BlobKey,
             ProjectFile,
         ),
         Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
     >,
     pub(crate) statement_facts: crate::analyzer::jvm::hierarchy::DerivedMemo<
-        (git2::Oid, ProjectFile),
+        (git2::Oid, ProjectFile, Option<[u8; 32]>),
         brokk_bifrost_core::analyzer::statement_facts::StatementFactRows,
     >,
     pub(crate) package_names: Cache<ProjectFile, Arc<str>>,

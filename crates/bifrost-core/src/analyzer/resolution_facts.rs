@@ -421,6 +421,15 @@ labelled_enum! {
         Argument => "argument",
         CallResult => "call_result",
         ExpressionValue => "expression_value",
+    /// One argument written with explicit spread/expansion syntax. Its type
+    /// may be unknown independently of this proven application shape.
+        SpreadArgument => "spread_argument",
+    }
+}
+
+impl ResolutionTypeSlotRole {
+    pub const fn is_call_argument(self) -> bool {
+        matches!(self, Self::Argument | Self::SpreadArgument)
     }
 }
 
@@ -2377,6 +2386,17 @@ pub fn source_owned_package_references(
 }
 
 impl FileResolutionFacts {
+    /// Bare lexical demands can retain their source-owned package lookup.
+    pub fn is_bare_lexical_root(&self, root: &ResolutionRootReferenceFact) -> bool {
+        root.anchor == ResolutionRootImportAnchor::Lexical
+            && root.prefix_reference.is_none()
+            && !root.owner_continued
+            && !self
+                .root_reference_segments
+                .iter()
+                .any(|segment| segment.reference == root.reference)
+    }
+
     /// Give an authored module its definition namespace and optional body scope.
     /// Languages supply the declaration's source identity, namespace, and scope
     /// construction; an external module declaration need not have a body here.
@@ -2814,6 +2834,7 @@ impl FileResolutionFacts {
         let qualified = self
             .root_references
             .iter()
+            .filter(|root| !self.is_bare_lexical_root(root))
             .map(|fact| fact.reference)
             .collect::<HashSet<_>>();
         let explicit_receiver_calls = self

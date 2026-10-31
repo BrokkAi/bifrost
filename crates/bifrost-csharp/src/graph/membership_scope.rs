@@ -291,6 +291,8 @@ impl<'a> MembershipScopedSource<'a> {
                 self.admit(descendant)
                     && self
                         .get_direct_ancestors(descendant)
+                        .definite()
+                        .to_vec()
                         .iter()
                         .any(|candidate| candidate.fq_name() == fqn)
             })
@@ -844,36 +846,50 @@ impl ImportAnalysisProvider for MembershipScopedSource<'_> {
 /// names the ancestor. Transitive walks and scoped variants use the trait
 /// defaults over these two.
 impl TypeHierarchyProvider for MembershipScopedSource<'_> {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.direct_ancestors.read(
-            &self.read_capability.memo_attribution(),
-            |direct_ancestors_memo| {
-                let cached = direct_ancestors_memo
-                    .lock()
-                    .expect("direct ancestor cache poisoned")
-                    .get(code_unit)
-                    .cloned();
-                if let Some((ancestors, doubted)) = cached {
-                    self.replay(doubted);
-                    return ancestors;
-                }
-                let (ancestors, doubted) =
-                    self.measured(|| self.inner.direct_ancestors_through(self, code_unit));
-                direct_ancestors_memo
-                    .lock()
-                    .expect("direct ancestor cache poisoned")
-                    .insert(code_unit.clone(), (ancestors.clone(), doubted));
-                ancestors
-            },
-        )
+    fn get_direct_ancestors(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+        let edges: Vec<CodeUnit> = {
+            self.direct_ancestors.read(
+                &self.read_capability.memo_attribution(),
+                |direct_ancestors_memo| {
+                    let cached = direct_ancestors_memo
+                        .lock()
+                        .expect("direct ancestor cache poisoned")
+                        .get(code_unit)
+                        .cloned();
+                    if let Some((ancestors, doubted)) = cached {
+                        self.replay(doubted);
+                        return ancestors;
+                    }
+                    let (ancestors, doubted) =
+                        self.measured(|| self.inner.direct_ancestors_through(self, code_unit));
+                    direct_ancestors_memo
+                        .lock()
+                        .expect("direct ancestor cache poisoned")
+                        .insert(code_unit.clone(), (ancestors.clone(), doubted));
+                    ancestors
+                },
+            )
+        };
+        brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        let mut descendants = HashSet::default();
+    fn get_direct_descendants(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+        let mut answer = brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::default();
         for part in self.physical_parts(code_unit) {
-            descendants.extend(self.inner.get_direct_descendants(&part));
+            answer.merge(self.inner.get_direct_descendants(&part));
         }
-        self.descendants_seen_here(code_unit, descendants)
+        answer.edges = self
+            .descendants_seen_here(code_unit, answer.edges.into_iter().collect())
+            .into_iter()
+            .collect();
+        answer.edges.sort();
+        answer
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
@@ -884,24 +900,36 @@ impl TypeHierarchyProvider for MembershipScopedSource<'_> {
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
-        let mut descendants = HashSet::default();
+    ) -> Result<
+        brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+        brokk_bifrost_core::analyzer::capabilities::Cancelled,
+    > {
+        let mut answer = brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::default();
         for part in self.physical_parts(code_unit) {
-            descendants.extend(self.inner.get_direct_descendants_within(&part, scope)?);
+            answer.merge(self.inner.get_direct_descendants_within(&part, scope)?);
         }
-        Some(self.descendants_seen_here(code_unit, descendants))
+        answer.edges = self
+            .descendants_seen_here(code_unit, answer.edges.into_iter().collect())
+            .into_iter()
+            .collect();
+        answer.edges.sort();
+        Ok(answer)
     }
 
     fn get_polymorphic_matches<T: CodeUnitIndex>(
         &self,
         target: &CodeUnit,
         analyzer: &T,
-    ) -> Vec<CodeUnit> {
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
         if !target.is_function() {
-            return Vec::new();
+            return brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(
+                Vec::new(),
+            );
         }
         let Some(parent) = analyzer.parent_of(target) else {
-            return Vec::new();
+            return brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(
+                Vec::new(),
+            );
         };
         self.get_descendants(&parent)
     }

@@ -67,6 +67,7 @@ public class Base {
 }
 "#;
 
+#[track_caller]
 fn fixture() -> (BuiltInlineTestProject, JavaAnalyzer) {
     let fixture = InlineTestProject::with_language(Language::Java)
         .file(
@@ -99,6 +100,13 @@ fn fixture() -> (BuiltInlineTestProject, JavaAnalyzer) {
             "package client; import child.Child; class Inherited { void use(Child c) { c.method(); int x = c.field; } }",
         )
         .build();
+    analyzer_with_persisted_sources(fixture)
+}
+
+#[track_caller]
+fn analyzer_with_persisted_sources(
+    fixture: BuiltInlineTestProject,
+) -> (BuiltInlineTestProject, JavaAnalyzer) {
     let analyzer = JavaAnalyzer::new(fixture.project_dyn());
     for file in analyzer.get_analyzed_files() {
         assert!(
@@ -112,6 +120,7 @@ fn fixture() -> (BuiltInlineTestProject, JavaAnalyzer) {
     (fixture, analyzer)
 }
 
+#[track_caller]
 fn fixture_with_java_sources(files: &[(&str, &str)]) -> (BuiltInlineTestProject, JavaAnalyzer) {
     let mut builder = InlineTestProject::with_language(Language::Java).file(
         "pom.xml",
@@ -121,17 +130,7 @@ fn fixture_with_java_sources(files: &[(&str, &str)]) -> (BuiltInlineTestProject,
         builder = builder.file(path, *source);
     }
     let fixture = builder.build();
-    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
-    for file in analyzer.get_analyzed_files() {
-        assert!(
-            analyzer
-                .inner
-                .write_live_file_to_store_for_test(&file)
-                .is_some(),
-            "persist Java resolution facts for {file}"
-        );
-    }
-    (fixture, analyzer)
+    analyzer_with_persisted_sources(fixture)
 }
 
 fn target(

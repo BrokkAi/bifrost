@@ -1785,7 +1785,11 @@ fn exception_status(
     let Some(provider) = analyzer.type_hierarchy_provider() else {
         return ExceptionStatus::Unknown;
     };
-    let ancestors = provider.get_ancestors(class);
+    let answer = provider.get_ancestors(class);
+    if !answer.is_complete() {
+        return ExceptionStatus::Unknown;
+    }
+    let ancestors = answer.definite();
     if ancestors
         .iter()
         .any(|ancestor| known_unchecked(ancestor.terminal_name()))

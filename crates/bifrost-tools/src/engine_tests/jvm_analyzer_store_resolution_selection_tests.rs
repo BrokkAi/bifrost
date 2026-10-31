@@ -1792,6 +1792,7 @@ mod jvm_extraction_tests {
                             "sqlite_autoindex_blobs_1",
                             "blob_oid=?",
                             "lang=?",
+                            "parse_variant=?",
                         ],
                     ),
                     (

@@ -196,7 +196,7 @@ fn str_format_rows(
     let environment = environment_cache.environment_for(analyzer, &seed.file);
     let initializers =
         environment_cache.python_initializer_proof_for(analyzer, &seed.file, &seed.facts);
-    let (receiver, builtin_format) = match function.kind() {
+    let receiver = match function.kind() {
         "attribute"
             if function
                 .child_by_field_name("attribute")
@@ -211,34 +211,7 @@ fn str_format_rows(
                         .map(|_| IssueState::Unknown("python_format_receiver_missing")),
                 );
             };
-            (receiver, false)
-        }
-        "identifier"
-            if node_text(source, function) == Some("format")
-                && matches!(
-                    binding_of(
-                        &environment,
-                        "format",
-                        function.start_byte(),
-                        Some(Namespace::Value),
-                    ),
-                    BindingOfOutcome::NoBinding
-                ) =>
-        {
-            let Some(receiver) = call.child_by_field_name("arguments").and_then(|arguments| {
-                let mut cursor = arguments.walk();
-                arguments
-                    .named_children(&mut cursor)
-                    .find(|argument| argument.kind() != "comment")
-            }) else {
-                return rows_for_states(
-                    seed,
-                    anchor,
-                    STR_FORMAT_RELATIONS
-                        .map(|_| IssueState::Unknown("python_format_receiver_missing")),
-                );
-            };
-            (receiver, true)
+            receiver
         }
         _ => return Vec::new(),
     };
@@ -290,27 +263,6 @@ fn str_format_rows(
                 states,
             );
         }
-    };
-    let arguments = if builtin_format {
-        let mut arguments = arguments;
-        if arguments.positional_nodes.is_empty() {
-            return rows_for_states_with_anchors(
-                seed,
-                [
-                    anchor.clone(),
-                    anchor.clone(),
-                    format_anchor.clone(),
-                    anchor.clone(),
-                    anchor,
-                ],
-                brace_issue_states(&parsed, None),
-            );
-        }
-        arguments.positional_nodes.remove(0);
-        arguments.positional = arguments.positional.saturating_sub(1);
-        arguments
-    } else {
-        arguments
     };
     rows_for_states_with_anchors(
         seed,
@@ -863,6 +815,7 @@ fn rows_for_states_with_anchors<const N: usize>(
             };
             let range = row_range(seed.facts.source(), anchor.clone());
             let value = make_row(
+                Incompleteness::Content,
                 relation,
                 &seed.file,
                 anchor.clone(),

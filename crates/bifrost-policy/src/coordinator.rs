@@ -83,11 +83,12 @@ use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits}
 use super::report::{
     MAX_DIFF_FIXED_FINDINGS, PolicyDependencyPackActivationMode, PolicyDiffCounts,
     PolicyDiffFixedFinding, PolicyDiffReview, PolicyDiffUnqualifiedPolicy, PolicyExecutionMetadata,
-    PolicyExecutionStage, PolicyExecutionTermination, PolicyOptionalReviews,
-    PolicyPackActivationReview, PolicyPackDecision, PolicyPackDecisionStatus,
-    PolicyPackProcedureSummaryEvidence, PolicyReportBuilder, PolicyReportBuilderError,
-    PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
-    PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange, PolicyStageTiming,
+    PolicyExecutionProgress, PolicyExecutionStage, PolicyExecutionTermination,
+    PolicyOptionalReviews, PolicyPackActivationReview, PolicyPackDecision,
+    PolicyPackDecisionStatus, PolicyPackProcedureSummaryEvidence, PolicyReportBuilder,
+    PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
+    PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
+    PolicyStageTiming,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -195,7 +196,8 @@ pub enum PolicyRunGate {
     Inconclusive,
     /// No verdict the batch may rely on: the run failed, was unsupported, was
     /// explicitly requested and could not run, or was inconclusive under
-    /// [`PolicyOnInconclusive::Unreliable`] with no policy declaration.
+    /// [`PolicyOnInconclusive::Unreliable`] or stopped by its own deadline,
+    /// either with no policy declaration.
     Unreliable,
 }
 
@@ -207,7 +209,10 @@ impl PolicyRunGate {
         } else if completion.is_reliable() {
             Self::Subset
         } else if completion.inconclusive_scope().is_some()
-            && (on_inconclusive == PolicyOnInconclusive::Pass
+            // A run its own deadline stopped never reached the analysis that
+            // decides a verdict, as SlopCop reads its rule deadline (#7557).
+            && ((on_inconclusive == PolicyOnInconclusive::Pass
+                && !completion.stopped_by_rule_deadline())
                 || matches!(
                     run.unknown_verdict(),
                     Some(UnknownVerdict::WarnUnreliable | UnknownVerdict::FailClosed)
@@ -248,17 +253,50 @@ impl TryFrom<BTreeMap<String, u64>> for PolicyCostHints {
     type Error = String;
 
     fn try_from(hints: BTreeMap<String, u64>) -> Result<Self, Self::Error> {
-        let max_policies = PolicyBatchBudget::default().max_policies();
-        if hints.len() > max_policies {
-            return Err(format!(
-                "policy_cost_hints accepts at most {max_policies} entries"
-            ));
-        }
-        if hints.contains_key("") {
-            return Err("policy_cost_hints policy ids must be non-empty".to_string());
-        }
+        validate_policy_id_map("policy_cost_hints", &hints)?;
         Ok(Self(hints))
     }
+}
+
+/// Caller-owned evaluation deadlines for single policies, in milliseconds.
+///
+/// A policy's deadline starts when its evaluation starts. When it passes, that
+/// policy ends inconclusive with `rule_deadline_exceeded` and the rest of the
+/// batch goes on; a policy without an entry runs until the batch deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(try_from = "BTreeMap<String, u64>")]
+pub struct PolicyDeadlines(BTreeMap<String, u64>);
+
+impl PolicyDeadlines {
+    fn of(&self, policy_id: &PolicyId) -> Option<Duration> {
+        self.0
+            .get(policy_id.as_str())
+            .copied()
+            .map(Duration::from_millis)
+    }
+}
+
+impl TryFrom<BTreeMap<String, u64>> for PolicyDeadlines {
+    type Error = String;
+
+    fn try_from(deadlines: BTreeMap<String, u64>) -> Result<Self, Self::Error> {
+        validate_policy_id_map("policy_deadlines_ms", &deadlines)?;
+        if deadlines.values().any(|&deadline| deadline == 0) {
+            return Err("policy_deadlines_ms deadlines must be at least 1 ms".to_string());
+        }
+        Ok(Self(deadlines))
+    }
+}
+
+fn validate_policy_id_map(name: &str, map: &BTreeMap<String, u64>) -> Result<(), String> {
+    let max_policies = PolicyBatchBudget::default().max_policies();
+    if map.len() > max_policies {
+        return Err(format!("{name} accepts at most {max_policies} entries"));
+    }
+    if map.contains_key("") {
+        return Err(format!("{name} policy ids must be non-empty"));
+    }
+    Ok(())
 }
 
 /// Complete deterministic host contract for one policy-evaluation batch.
@@ -287,6 +325,11 @@ pub struct PolicyEvaluationOptions {
     policy_timings: bool,
     /// Request-owned scheduling advice, excluded from the report and its context.
     policy_cost_hints: PolicyCostHints,
+    /// Request-owned time limits for single policies; see [`PolicyDeadlines`].
+    policy_deadlines: PolicyDeadlines,
+    /// Publish each policy's run on the request's cancellation token as soon
+    /// as it finishes; see [`PolicyEvaluationOptions::with_run_streaming`].
+    stream_runs: bool,
     /// The built-in selection this batch was resolved from, recorded in the
     /// report's evaluation context. Absent when no built-in policy was selected.
     builtin_selection: Option<BuiltInPolicySelectionRecord>,
@@ -299,6 +342,12 @@ pub struct PolicyEvaluationOptions {
 /// `policy_evaluation` stage timing is the sum over policies; this is the
 /// per-policy split of it.
 pub const EVALUATION_ELAPSED_METRIC: &str = "evaluation.elapsed_ms";
+
+/// The kind under which [`PolicyEvaluationOptions::with_run_streaming`]
+/// publishes a finished policy run. The value is
+/// `{"policy_id", "progress", "run"}`, where `progress` is `completed`,
+/// `interrupted`, `timed_out` or `pending` as in the report's execution lists.
+pub const POLICY_RUN_RESULT_KIND: &str = "io.bifrost/policy-run";
 const UNIT_PREFETCH_METRIC: &str = "units.prefetch_ms";
 const UNIT_VERIFY_METRIC: &str = "units.verify_ms";
 const UNIT_LOOKUP_REPLAY_METRIC: &str = "units.lookup_replay_ms";
@@ -328,6 +377,8 @@ impl PolicyEvaluationOptions {
             incremental: true,
             policy_timings: false,
             policy_cost_hints: PolicyCostHints(BTreeMap::new()),
+            policy_deadlines: PolicyDeadlines(BTreeMap::new()),
+            stream_runs: false,
             builtin_selection: None,
             range: PolicyRangeRequest::Workspace,
         }
@@ -393,6 +444,26 @@ impl PolicyEvaluationOptions {
         self
     }
 
+    /// Stop each listed policy at its own deadline; see [`PolicyDeadlines`].
+    pub fn with_policy_deadlines(mut self, deadlines: PolicyDeadlines) -> Self {
+        self.policy_deadlines = deadlines;
+        self
+    }
+
+    /// Publish each head policy's run, as [`POLICY_RUN_RESULT_KIND`], on the
+    /// request's cancellation token as soon as that policy finishes, so a host
+    /// can hand it to the caller before the batch ends (#7557).
+    ///
+    /// A published run is evaluated but not yet reviewed: suppressions, the
+    /// scope document, the baseline and the diff classification apply to the
+    /// whole batch once every policy has finished, so they appear only in the
+    /// final report, which stays the authoritative result. The diff base's
+    /// runs are never published.
+    pub const fn with_run_streaming(mut self, stream_runs: bool) -> Self {
+        self.stream_runs = stream_runs;
+        self
+    }
+
     pub const fn policy_timings(&self) -> bool {
         self.policy_timings
     }
@@ -444,25 +515,6 @@ impl PolicyEvaluationOptions {
     }
 }
 
-impl RetainedSize for PolicyEvaluationOptions {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.suppressions))
-            .saturating_add(retained_extra(&self.scope))
-            .saturating_add(retained_extra(&self.baseline))
-            .saturating_add(retained_extra(&self.diff_base))
-            .saturating_add(self.policy_cost_hints.0.keys().fold(0usize, |bytes, id| {
-                bytes
-                    .saturating_add(std::mem::size_of::<(String, u64)>())
-                    .saturating_add(id.capacity())
-            }))
-            .saturating_add(match &self.range {
-                PolicyRangeRequest::Files(files) => retained_extra(files),
-                PolicyRangeRequest::Workspace | PolicyRangeRequest::DiffBase => 0,
-            })
-    }
-}
-
 /// Complete canonical report plus the already precedence-resolved CLI status.
 pub struct PolicyBatchOutcome {
     report: PolicyReportDocument,
@@ -500,13 +552,6 @@ impl PolicyBatchOutcome {
     /// none to replay.
     pub const fn incremental(&self) -> Option<&PolicyIncrementalReview> {
         self.incremental.as_ref()
-    }
-
-    /// How many evaluation units this batch reused instead of recomputing.
-    pub fn reused_units(&self) -> u64 {
-        self.incremental
-            .as_ref()
-            .map_or(0, PolicyIncrementalReview::reused_units)
     }
 
     pub fn into_report(self) -> PolicyReportDocument {
@@ -578,8 +623,7 @@ impl PolicyBatchOutcome {
             current.termination(),
             current.terminal_stage(),
             current.active_policy_id().cloned(),
-            current.completed_policy_ids().to_vec(),
-            current.pending_policy_ids().to_vec(),
+            current.progress(),
         )
         .expect("preparation stages are unique and preserve validated policy progress");
         let retained_bytes = self
@@ -1055,8 +1099,7 @@ pub fn suppression_preflight_failure_outcome(
         None,
         None,
         None,
-        Vec::new(),
-        Vec::new(),
+        PolicyExecutionProgress::default(),
     )
     .map_err(|error| {
         PolicyCoordinatorError::new(format!(
@@ -1110,8 +1153,7 @@ pub fn suppression_preflight_failure_outcome(
         None,
         None,
         None,
-        Vec::new(),
-        Vec::new(),
+        PolicyExecutionProgress::default(),
     )
     .map_err(|error| {
         PolicyCoordinatorError::new(format!(
@@ -1129,42 +1171,6 @@ pub fn suppression_preflight_failure_outcome(
         complete_stage_timings,
         batch_budget,
     ))
-}
-
-pub fn workspace_snapshot_deadline_outcome(
-    options: &PolicyEvaluationOptions,
-    selected_policy_ids: Vec<PolicyId>,
-    selection_elapsed: Duration,
-    snapshot_elapsed: Duration,
-) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
-    let diagnostic = report_diagnostic(
-        PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded,
-        "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes",
-        None,
-        None,
-        Vec::new(),
-    )?;
-    deadline_before_evaluation_outcome(
-        options,
-        PolicyBatchBudget::default(),
-        options
-            .suppressions()
-            .source_states(PolicySuppressionDocumentState::NotEvaluated),
-        PolicyScopeDocumentState::NotEvaluated,
-        vec![
-            PolicyStageTiming::from_duration(
-                PolicyExecutionStage::PolicySelection,
-                selection_elapsed,
-            ),
-            PolicyStageTiming::from_duration(
-                PolicyExecutionStage::WorkspaceSnapshot,
-                snapshot_elapsed,
-            ),
-        ],
-        PolicyExecutionStage::WorkspaceSnapshot,
-        selected_policy_ids,
-        Some(diagnostic),
-    )
 }
 
 /// Snapshot deadline outcome when suppression configuration completed before
@@ -1293,8 +1299,10 @@ fn deadline_before_evaluation_outcome(
         Some(PolicyExecutionTermination::DeadlineExceeded),
         Some(terminal_stage),
         None,
-        Vec::new(),
-        pending_policy_ids,
+        PolicyExecutionProgress {
+            pending: pending_policy_ids,
+            ..PolicyExecutionProgress::default()
+        },
     )
     .map_err(|error| {
         PolicyCoordinatorError::new(format!(
@@ -1434,29 +1442,6 @@ fn evaluate_policy_inputs_with_limits(
         host_activation,
         None,
         supplied_incremental,
-        cancellation,
-    )
-}
-
-/// Evaluate mixed policy inputs against a caller-owned snapshot and a
-/// previously completed analyzer-free suppression preflight.
-pub fn evaluate_policy_inputs_with_analyzer_and_suppression_preflight(
-    root: impl AsRef<Path>,
-    policy_inputs: &[PolicyEvaluationInput],
-    workspace: &WorkspaceAnalyzer,
-    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
-    options: &PolicyEvaluationOptions,
-    suppression_preflight: PolicySuppressionPreflight,
-    cancellation: Option<&CancellationToken>,
-) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
-    evaluate_policy_inputs_with_analyzer_and_suppression_preflight_impl(
-        root,
-        policy_inputs,
-        PolicyWorkspaceSource::Supplied(workspace),
-        Some(flow_state),
-        options,
-        suppression_preflight,
-        None,
         cancellation,
     )
 }
@@ -2710,13 +2695,38 @@ struct EvaluatedPolicy {
     policy_id: PolicyId,
     run: PolicyRun,
     elapsed: std::time::Duration,
-    /// Whether the shared cancellation deadline had already expired when this
-    /// policy's evaluation returned. The batch's completed, active, and pending
-    /// classification takes the earliest policy that observed it, so the result
-    /// is the same whichever worker reached it first.
-    deadline_exceeded: bool,
+    /// Whether the shared batch deadline had already expired when this
+    /// policy's evaluation returned.
+    batch_deadline_reached: bool,
+    progress: PolicyProgress,
     /// Whether this policy's final verdict gates at the requested threshold.
     fail_closed: bool,
+}
+
+/// What became of one policy's evaluation, read from what the run observed
+/// rather than from its place in policy order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyProgress {
+    /// The evaluation ended on its own, whatever its verdict.
+    Completed,
+    /// The batch deadline stopped the evaluation while it ran.
+    Interrupted,
+    /// The policy's own deadline stopped it while the batch went on.
+    TimedOut,
+    /// The batch deadline had passed before the evaluation started, and the
+    /// evaluation stopped on it.
+    Pending,
+}
+
+impl PolicyProgress {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
+            Self::TimedOut => "timed_out",
+            Self::Pending => "pending",
+        }
+    }
 }
 
 /// Evaluate exactly one runnable policy.
@@ -2740,9 +2750,18 @@ fn evaluate_policy_once(
     per_policy_budget: PolicyBudget,
     options: &PolicyEvaluationOptions,
     workspace_has_analyzable_files: bool,
+    range: &ChangedRangeResolution,
 ) -> Result<EvaluatedPolicy, PolicyCoordinatorError> {
     let _attribution = brokk_bifrost_analysis::analyzer::ReadAttribution::for_request().install();
     let policy_id = policy.definition().metadata.id.clone();
+    let started_after_batch_deadline = policy_deadline_reached(cancellation)?;
+    // A child token: the policy's own deadline cancels this evaluation alone,
+    // while the batch's deadline and explicit cancellation still reach it.
+    let policy_cancellation = options.policy_deadlines.of(&policy_id).map(|deadline| {
+        cancellation
+            .map_or_else(CancellationToken::new, CancellationToken::child)
+            .with_timeout(deadline)
+    });
     let mut evaluation_budget = per_policy_budget;
     if scoped_files.contains_key(&policy_id)
         && let Some(incremental) = head_incremental
@@ -2759,7 +2778,7 @@ fn evaluate_policy_once(
         workspace,
         flow_state,
         root_memo: Some(root_memo),
-        cancellation,
+        cancellation: policy_cancellation.as_ref().or(cancellation),
         cvss_overlays: &[],
         organizational_risk: &[],
         // Scoped evaluations do not publish or replay whole-domain units.
@@ -2842,23 +2861,39 @@ fn evaluate_policy_once(
     if !workspace_has_analyzable_files && !policy_uses_only_file_facts(policy) {
         run.mark_inconclusive(PolicyIncompleteReason::NoAnalyzableFiles);
     }
-    let deadline_exceeded = policy_deadline_reached(cancellation)?;
-    if deadline_exceeded
-        && matches!(
-            run.completion(),
-            PolicyRunCompletion::Inconclusive { reasons, .. }
-                if reasons.contains(&PolicyIncompleteReason::Cancelled)
+    let batch_deadline_reached = policy_deadline_reached(cancellation)?;
+    let stopped = matches!(
+        run.completion(),
+        PolicyRunCompletion::Inconclusive { reasons, .. }
+            if reasons.contains(&PolicyIncompleteReason::Cancelled)
+    );
+    // A run that finished despite a deadline passing is a finished run: only
+    // one that observed the cancellation stopped on it. The batch deadline
+    // wins when both passed, since it ends the batch.
+    let (progress, deadline_reason) = if !stopped {
+        (PolicyProgress::Completed, None)
+    } else if batch_deadline_reached {
+        let progress = if started_after_batch_deadline {
+            PolicyProgress::Pending
+        } else {
+            PolicyProgress::Interrupted
+        };
+        (progress, Some(PolicyIncompleteReason::DeadlineExceeded))
+    } else if policy_deadline_reached(policy_cancellation.as_ref())? {
+        (
+            PolicyProgress::TimedOut,
+            Some(PolicyIncompleteReason::RuleDeadlineExceeded),
         )
-    {
-        run.replace_incomplete_reason(
-            PolicyIncompleteReason::Cancelled,
-            PolicyIncompleteReason::DeadlineExceeded,
-        )
-        .map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to retain deadline completion reason: {error}"
-            ))
-        })?;
+    } else {
+        (PolicyProgress::Completed, None)
+    };
+    if let Some(reason) = deadline_reason {
+        run.replace_incomplete_reason(PolicyIncompleteReason::Cancelled, reason)
+            .map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain deadline completion reason: {error}"
+                ))
+            })?;
     }
     // The policy's declared handling of a blocked verdict is applied once the
     // run's completion is final, so an unrelated cause of inconclusiveness --
@@ -2880,11 +2915,26 @@ fn evaluate_policy_once(
                 &policy.definition().metadata.severity,
                 None,
             ));
+    let run = record_unscoped_range(run, range);
+    // Serialized only when a host listens: a caller may ask to stream
+    // without supplying the progress token that delivery needs.
+    if options.stream_runs
+        && let Some(cancellation) = cancellation
+        && cancellation.delivers_results()
+    {
+        let value = serde_json::json!({
+            "policy_id": policy_id,
+            "progress": progress.label(),
+            "run": run,
+        });
+        cancellation.publish_result(POLICY_RUN_RESULT_KIND, value);
+    }
     Ok(EvaluatedPolicy {
         policy_id,
         run,
         elapsed,
-        deadline_exceeded,
+        batch_deadline_reached,
+        progress,
         fail_closed,
     })
 }
@@ -3954,6 +4004,7 @@ fn evaluate_prepared_policy_inputs(
                 per_policy_budget,
                 options,
                 workspace_has_analyzable_files,
+                &range,
             )?);
         }
         evaluations
@@ -3991,6 +4042,7 @@ fn evaluate_prepared_policy_inputs(
                         per_policy_budget,
                         options,
                         workspace_has_analyzable_files,
+                        &range,
                     ),
                 )
             });
@@ -4004,27 +4056,29 @@ fn evaluate_prepared_policy_inputs(
         evaluations
     };
     let mut fail_closed_gate = false;
-    let mut completed_policy_ids = Vec::with_capacity(evaluation_policy_ids.len());
+    let mut progress = PolicyExecutionProgress::default();
+    // The first interrupted policy in policy order, so the field does not
+    // depend on which worker observed the deadline first.
     let mut active_policy_id = None;
-    let mut pending_policy_ids = Vec::new();
-    for (policy_index, evaluated) in evaluations.into_iter().enumerate() {
+    for evaluated in evaluations {
         policy_evaluation_elapsed += evaluated.elapsed;
-        if evaluated.deadline_exceeded {
+        if evaluated.batch_deadline_reached {
             deadline_stage.get_or_insert(PolicyExecutionStage::PolicyEvaluation);
-            if active_policy_id.is_none() {
-                active_policy_id = Some(evaluated.policy_id.clone());
-                pending_policy_ids.extend_from_slice(&evaluation_policy_ids[policy_index + 1..]);
-            }
-        } else if active_policy_id.is_none() {
-            completed_policy_ids.push(evaluated.policy_id.clone());
         }
+        let ids = match evaluated.progress {
+            PolicyProgress::Completed => &mut progress.completed,
+            PolicyProgress::Interrupted => {
+                active_policy_id.get_or_insert_with(|| evaluated.policy_id.clone());
+                &mut progress.interrupted
+            }
+            PolicyProgress::TimedOut => &mut progress.timed_out,
+            PolicyProgress::Pending => &mut progress.pending,
+        };
+        ids.push(evaluated.policy_id.clone());
         if evaluated.fail_closed {
             fail_closed_gate = true;
         }
-        runs.insert(
-            evaluated.policy_id,
-            record_unscoped_range(evaluated.run, &range),
-        );
+        runs.insert(evaluated.policy_id, evaluated.run);
     }
     let evaluation_elapsed = evaluation_started.elapsed();
     brokk_bifrost_analysis::profiling::duration(
@@ -4039,6 +4093,9 @@ fn evaluate_prepared_policy_inputs(
     // that finished. A run that stopped early publishes nothing: its units
     // would be indistinguishable from complete ones on a later run, and the
     // whole reuse claim rests on being unable to confuse the two.
+    // A policy its own deadline stopped is not such a run: a unit that
+    // observed its cancellation is execution-dependent and never staged
+    // (`recompute_unit`), so the batch's other policies publish theirs (#7557).
     if let Some(store) = unit_store.as_ref()
         && deadline_stage.is_none()
     {
@@ -4491,7 +4548,9 @@ fn evaluate_prepared_policy_inputs(
         PolicyExecutionStage::ReportConstruction,
         report_started.elapsed(),
     ));
-    if let Some(terminal_stage) = deadline_stage {
+    // A policy its own deadline stopped leaves the batch running, so the report
+    // names it without a termination; its run already says why it stopped.
+    if deadline_stage.is_some() || !progress.timed_out.is_empty() {
         let stage_timings = stage_attribution.clone();
         let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
             total.saturating_add(timing.elapsed_ms())
@@ -4499,11 +4558,10 @@ fn evaluate_prepared_policy_inputs(
         let execution = PolicyExecutionMetadata::try_new(
             total_elapsed_ms,
             stage_timings,
-            Some(PolicyExecutionTermination::DeadlineExceeded),
-            Some(terminal_stage),
+            deadline_stage.map(|_| PolicyExecutionTermination::DeadlineExceeded),
+            deadline_stage,
             active_policy_id,
-            completed_policy_ids,
-            pending_policy_ids,
+            progress,
         )
         .map_err(|error| {
             PolicyCoordinatorError::new(format!(
@@ -5203,7 +5261,9 @@ fn evaluate_policy_diff_baseline(
     let mut base_options = PolicyEvaluationOptions::new(head_options.evaluation_date())
         .with_required_schema_versions(head_options.require_explicit_schema_versions())
         .with_on_inconclusive(head_options.on_inconclusive())
-        .with_policy_cost_hints(head_options.policy_cost_hints.clone());
+        .with_policy_cost_hints(head_options.policy_cost_hints.clone())
+        // A policy's own limit bounds each evaluation of it, base or head.
+        .with_policy_deadlines(head_options.policy_deadlines.clone());
     base_options.scope_override = Some(head_scope.cloned());
     // The base evaluates unit by unit for the same reason the head does: a
     // whole execution cannot attribute its reads to seed files, so unit-wise
@@ -5344,6 +5404,7 @@ fn head_evaluation_publication(
         || options.suppressions() != base_options.suppressions()
         || options.baseline() != base_options.baseline()
         || report.execution().termination().is_some()
+        || !report.execution().timed_out_policy_ids().is_empty()
         || report.diagnostics_truncated()
         || tree_diagnostics(report).any(|diagnostic| {
             matches!(
@@ -5450,7 +5511,9 @@ fn base_evaluation_publication(
 ) -> Option<PolicyEvaluationRow> {
     // Execution termination depends on time or host conditions absent from
     // the key. Retention truncation is deterministic under its keyed budget.
-    if report.execution().termination().is_some() {
+    if report.execution().termination().is_some()
+        || !report.execution().timed_out_policy_ids().is_empty()
+    {
         return None;
     }
     let runs = report
@@ -7073,8 +7136,7 @@ mod tests {
                         Some(PolicyExecutionTermination::DeadlineExceeded),
                         Some(PolicyExecutionStage::PolicyEvaluation),
                         None,
-                        Vec::new(),
-                        Vec::new(),
+                        PolicyExecutionProgress::default(),
                     )
                     .unwrap(),
                 )
@@ -7092,6 +7154,104 @@ mod tests {
                 .is_none()
             );
         }
+    }
+
+    #[test]
+    fn policy_deadline_stops_one_policy_and_the_batch_goes_on() {
+        let workspace = tempfile::tempdir().expect("workspace directory");
+        fs::write(workspace.path().join("app.ts"), "function target() {}\n")
+            .expect("source fixture");
+        let sources = ["slow", "fast"].map(|suffix| {
+            PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new(format!("policies/{suffix}.rqlp")),
+                match_policy(&format!("test.{suffix}"), suffix),
+            )
+        });
+        let slow = PolicyId::new("test.slow").unwrap();
+        let fast = PolicyId::new("test.fast").unwrap();
+        // A zero deadline has passed before the evaluation's first
+        // cancellation check, which the public map refuses as a request.
+        let deadlines = PolicyDeadlines(BTreeMap::from([(slow.as_str().to_string(), 0)]));
+
+        let outcome = evaluate_policy_inputs(
+            workspace.path(),
+            &sources,
+            &evaluation_options().with_policy_deadlines(deadlines),
+        )
+        .expect("a policy deadline still yields a report");
+
+        let run = |policy_id: &PolicyId| {
+            outcome
+                .report()
+                .runs()
+                .iter()
+                .find(|run| run.policy_id() == policy_id)
+                .expect("every policy has a run")
+        };
+        assert!(matches!(
+            run(&slow).completion(),
+            PolicyRunCompletion::Inconclusive { reasons, .. }
+                if reasons == &[PolicyIncompleteReason::RuleDeadlineExceeded]
+        ));
+        assert_eq!(run(&fast).completion(), &PolicyRunCompletion::Complete);
+        assert_eq!(run(&fast).findings().len(), 1);
+        let execution = outcome.report().execution();
+        assert_eq!(execution.termination(), None);
+        assert_eq!(
+            execution.timed_out_policy_ids(),
+            std::slice::from_ref(&slow)
+        );
+        assert_eq!(
+            execution.completed_policy_ids(),
+            std::slice::from_ref(&fast)
+        );
+        assert!(execution.interrupted_policy_ids().is_empty());
+        assert!(execution.pending_policy_ids().is_empty());
+        // The stopped policy reached no verdict, whatever the other found.
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+    }
+
+    #[test]
+    fn a_timed_out_policy_leaves_the_other_policies_units_published() {
+        let workspace = tempfile::tempdir().expect("workspace directory");
+        fs::write(workspace.path().join("app.ts"), "function target() {}\n")
+            .expect("source fixture");
+        let sources = ["slow", "fast"].map(|suffix| {
+            PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new(format!("policies/{suffix}.rqlp")),
+                match_policy(&format!("test.{suffix}"), suffix),
+            )
+        });
+        let slow = PolicyId::new("test.slow").unwrap();
+        let fast = PolicyId::new("test.fast").unwrap();
+        let deadlines = PolicyDeadlines(BTreeMap::from([(slow.as_str().to_string(), 0)]));
+
+        let timed_out = evaluate_policy_inputs(
+            workspace.path(),
+            &sources,
+            &evaluation_options().with_policy_deadlines(deadlines),
+        )
+        .expect("first run");
+        assert_eq!(
+            timed_out.report().execution().timed_out_policy_ids(),
+            std::slice::from_ref(&slow)
+        );
+        let rerun = evaluate_policy_inputs(workspace.path(), &sources, &evaluation_options())
+            .expect("second run");
+
+        let review = rerun.incremental().expect("reuse review");
+        let fast_run = review.policy(&fast).expect("fast policy review");
+        assert!(fast_run.units_reused > 0, "{fast_run:?}");
+        assert_eq!(fast_run.units_recomputed, 0, "{fast_run:?}");
+        // The stopped policy published nothing a later run could mistake
+        // for complete work, so it evaluates afresh.
+        let slow_run = review.policy(&slow).expect("slow policy review");
+        assert_eq!(slow_run.units_reused, 0, "{slow_run:?}");
+        assert!(slow_run.units_recomputed > 0, "{slow_run:?}");
+        assert_eq!(
+            rerun.report().runs()[0].completion(),
+            &PolicyRunCompletion::Complete
+        );
     }
 
     #[test]
@@ -8733,9 +8893,10 @@ pub fn run() {
         let analyzer =
             WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
                 .expect("ephemeral workspace should build");
-        // Include the registry's entry and pre-commit cancellation checks so
-        // this injection still reaches evaluation rather than registration.
-        let cancellation = CancellationToken::timeout_after_checks_for_test(11);
+        // Include the registry's entry and pre-commit cancellation checks, and
+        // the check before the policy starts, so this injection still reaches
+        // evaluation rather than registration or a policy never started.
+        let cancellation = CancellationToken::timeout_after_checks_for_test(12);
 
         let outcome = evaluate_policy_source(
             workspace.path(),
@@ -8915,6 +9076,14 @@ pub fn run() {
                 PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::DeadlineExceeded])
                     .unwrap(),
                 POLICY_EXIT_CLEAN,
+            ),
+            (
+                "rule deadline",
+                PolicyRunCompletion::inconclusive(vec![
+                    PolicyIncompleteReason::RuleDeadlineExceeded,
+                ])
+                .unwrap(),
+                POLICY_EXIT_UNRELIABLE,
             ),
             ("failed", failed(), POLICY_EXIT_UNRELIABLE),
         ] {
@@ -9468,6 +9637,47 @@ pub fn run() {
     }
 
     #[test]
+    #[hardwon("#7557: the diff base evaluated without the caller's per-policy deadlines")]
+    fn policy_deadline_bounds_the_diff_base_evaluation_too() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/slow.rqlp",
+            &match_policy("test.slow", "Slow"),
+        );
+        commit_everything(workspace.path(), "base");
+        // A zero deadline has passed before either evaluation's first
+        // cancellation check; the public map refuses it as a request.
+        let deadlines = PolicyDeadlines(BTreeMap::from([("test.slow".to_string(), 0)]));
+        let options = evaluation_options()
+            .with_diff_base("HEAD".to_string())
+            .with_policy_deadlines(deadlines);
+
+        let outcome = evaluate_policy_files(
+            workspace.path(),
+            &[PathBuf::from("policies/slow.rqlp")],
+            &options,
+        )
+        .expect("diff evaluation with a policy deadline");
+
+        let review = outcome.report().diff().expect("diff review");
+        let unqualified = review.unqualified_policies();
+        assert_eq!(unqualified.len(), 1, "{unqualified:?}");
+        assert_eq!(unqualified[0].policy_id().as_str(), "test.slow");
+        assert_eq!(unqualified[0].completion(), "inconclusive");
+        assert_eq!(
+            outcome.report().execution().timed_out_policy_ids(),
+            &[PolicyId::new("test.slow").unwrap()]
+        );
+    }
+
+    #[test]
     #[hardwon("#2586: mixed diff batches reuse only complete per-policy evidence")]
     fn mixed_diff_base_reuses_only_complete_policy_evidence() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -9961,6 +10171,45 @@ pub fn run() {
         .expect("base analyzer workspace");
         assert_eq!(base_config, AnalyzerConfig::default());
         assert_eq!(base.workspace().config(), host.config());
+    }
+
+    #[test]
+    fn diff_base_without_runnable_policies_is_unreliable_and_never_fixes_findings() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", "def create(): return 1\nvalue = create()\n")
+            .file("policies/qualified.rqlp", QUALIFIED_CALL_OUTCOME_POLICY)
+            .build();
+        init_git_workspace(project.root());
+        commit_everything(project.root(), "base");
+        let outcome = evaluate_policy_files(
+            project.root(),
+            &[PathBuf::from("policies/qualified.rqlp")],
+            &evaluation_options().with_diff_base("HEAD".to_string()),
+        )
+        .expect("canonical refused diff report");
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+        let review = outcome.report().diff().expect("diff review");
+        assert!(review.degraded());
+        assert_eq!(review.fixed_count(), 0);
+        assert_eq!(outcome.report().runs().len(), 1);
+        let run = &outcome.report().runs()[0];
+        assert_eq!(run.policy_id().as_str(), "test.qualified-call-outcome");
+        assert!(matches!(
+            run.completion(),
+            PolicyRunCompletion::NotRun { .. }
+        ));
+        assert!(run.findings().is_empty());
+        let diagnostic = outcome
+            .report()
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code() == PolicyReportDiagnosticCode::DiffBaseUnreliable)
+            .expect("unreliable baseline diagnostic");
+        assert!(
+            diagnostic.message().contains("no runnable policy"),
+            "{}",
+            diagnostic.message()
+        );
     }
 
     #[test]

@@ -765,7 +765,11 @@ func Make() *Outer { return &Outer{} }
             let store = AnalyzerStore::open_ephemeral().unwrap();
             let generation = store.current_generation("go").unwrap();
             store
-                .write_parsed_blob(oid, "go", &GoAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                    &GoAdapter,
+                    &state,
+                )
                 .unwrap();
             store
                 .conn
@@ -800,14 +804,22 @@ func Make() *Outer { return &Outer{} }
             let generation = store.current_generation("go").unwrap();
             let oid = oid_for(SOURCE.as_bytes());
             store
-                .write_parsed_blob(oid, "go", &GoAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                    &GoAdapter,
+                    &state,
+                )
                 .unwrap();
             // Distinct content identities populate the publication inventory without
             // introducing extra parser work into a query-planner regression.
             for index in 0..32 {
                 let other = oid_for(format!("planner publication {index}").as_bytes());
                 store
-                    .write_parsed_blob(other, "go", &GoAdapter, &state)
+                    .write_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(other, "go"),
+                        &GoAdapter,
+                        &state,
+                    )
                     .unwrap();
             }
             brokk_bifrost_analysis::analyzer::store::source_facts::assert_source_lookup_plan(
@@ -865,7 +877,11 @@ func Make() *Outer { return &Outer{} }
             let generation = store.current_generation("go").unwrap();
             let oid = oid_for(SOURCE.as_bytes());
             store
-                .write_parsed_blob(oid, "go", &GoAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                    &GoAdapter,
+                    &state,
+                )
                 .unwrap();
             let oid_text = oid.to_string();
             store
@@ -903,7 +919,11 @@ func Make() *Outer { return &Outer{} }
             {
                 let store = AnalyzerStore::open_persistent(&path).unwrap();
                 store
-                    .write_parsed_blob(oid, "go", &GoAdapter, &state)
+                    .write_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                        &GoAdapter,
+                        &state,
+                    )
                     .unwrap();
             }
             std::fs::remove_file(file.abs_path()).unwrap();
@@ -970,12 +990,20 @@ func Make() *Outer { return &Outer{} }
             let facts = state.source_facts.as_mut().unwrap().go.take().unwrap();
             assert!(
                 store
-                    .write_parsed_blob(oid, "go", &GoAdapter, &state)
+                    .write_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                        &GoAdapter,
+                        &state
+                    )
                     .is_err()
             );
             state.source_facts.as_mut().unwrap().go = Some(facts);
             store
-                .write_parsed_blob(oid, "go", &GoAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                    &GoAdapter,
+                    &state,
+                )
                 .unwrap();
             let read = store
                 .go_source_facts(oid, generation, &GoAdapter, &file, &|| true)
@@ -1008,7 +1036,13 @@ func Make() *Outer { return &Outer{} }
                 .unwrap();
             brokk_bifrost_analysis::analyzer::store::source_facts::assert_missing_then_republished(
                 || store.go_source_facts(oid, generation, &GoAdapter, &file, &|| true),
-                || store.write_parsed_blob(oid, "go", &GoAdapter, &state),
+                || {
+                    store.write_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                        &GoAdapter,
+                        &state,
+                    )
+                },
             );
         }
     }

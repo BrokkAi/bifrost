@@ -192,6 +192,9 @@ impl ResolutionSession {
     pub fn finish<T>(&self, value: T) -> BoundedResolution<T> {
         self.observe_cancellation();
         let state = *self.state.borrow();
+        if state.stop.is_some() {
+            crate::analyzer::carried_context::mark_execution_dependent();
+        }
         match state.stop {
             Some(ResolutionStop::Exceeded(limit)) => BoundedResolution::Exceeded {
                 limit,
@@ -350,6 +353,9 @@ impl ResolutionSession {
         {
             state.stop = Some(ResolutionStop::Cancelled);
         }
+        if state.stop.is_some() {
+            crate::analyzer::carried_context::mark_execution_dependent();
+        }
         state.stop.is_none()
     }
 
@@ -424,6 +430,7 @@ impl ResolutionSession {
     }
 
     fn stop(&self, stop: ResolutionStop) {
+        crate::analyzer::carried_context::mark_execution_dependent();
         let mut state = self.state.borrow_mut();
         if state.stop.is_none() {
             state.stop = Some(stop);
@@ -447,10 +454,13 @@ impl ResolutionSession {
             return true;
         };
         let mut state = self.state.borrow_mut();
-        if self
-            .total_work_limit
-            .is_some_and(|maximum| total_work(&state.work) >= maximum)
-        {
+        if self.total_work_limit.is_some_and(|maximum| {
+            !crate::analyzer::work_budget::LimitedCounter::from_usage(
+                total_work(&state.work),
+                maximum,
+            )
+            .allows(1)
+        }) {
             state.stop = Some(ResolutionStop::Exceeded(ReceiverBudgetLimit::TotalWork));
             drop(state);
             self.cancellation
@@ -473,7 +483,7 @@ impl ResolutionSession {
             ),
             ReceiverBudgetLimit::TotalWork => unreachable!("aggregate work is checked above"),
         };
-        if *used == maximum {
+        if !crate::analyzer::work_budget::LimitedCounter::from_usage(*used, maximum).allows(1) {
             state.stop = Some(ResolutionStop::Exceeded(limit));
             drop(state);
             self.cancellation

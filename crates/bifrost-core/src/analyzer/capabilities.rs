@@ -736,8 +736,19 @@ impl<'a> DescendantIndexScope<'a> {
     }
 }
 
-fn query_within_scope<T>(scope: &DescendantIndexScope<'_>, query: impl FnOnce() -> T) -> Option<T> {
-    (!scope.cancellation().is_cancelled()).then(query)
+/// A caller's hierarchy query was stopped. Shared by both traversal directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+fn query_within_scope<T>(
+    scope: &DescendantIndexScope<'_>,
+    query: impl FnOnce() -> T,
+) -> Result<T, Cancelled> {
+    if scope.cancellation().is_cancelled() {
+        Err(Cancelled)
+    } else {
+        Ok(query())
+    }
 }
 
 /// One member shape fixed by a platform language specification.
@@ -761,15 +772,69 @@ pub struct MemberFamilyAncestors {
     pub unread: Vec<UnreadMemberFamilyAncestor>,
 }
 
+/// Evidence that a hierarchy query could not close its search boundary.
+#[derive(Debug, Clone)]
+pub enum HierarchyOpenReason {
+    /// Existing hierarchy diagnostics, including `HierarchyTruncated` and
+    /// `AncestorExternalUnindexed`, retain their consumer-side vocabulary.
+    MemberFamily(crate::analyzer::structural::resolution::MemberFamilyReason),
+    /// The descendant index could not acquire the evidence needed to fill.
+    DescendantIndexUnavailable,
+    /// Preserve the unread name and any language-specified member inventory.
+    UnreadAncestor(UnreadMemberFamilyAncestor),
+}
+
+/// A hierarchy answer owned by one request. Never retain it in a memo or cache.
+///
+/// Only `edges` are definite. Each ambiguous group contains alternatives for
+/// one unresolved edge; none of those alternatives is a definite ancestor or
+/// descendant. Ambiguity and open reasons both prevent an exhaustive answer.
+#[derive(Debug, Default)]
+pub struct HierarchyAnswer {
+    pub edges: Vec<CodeUnit>,
+    pub ambiguous: Vec<Vec<CodeUnit>>,
+    pub open: Vec<HierarchyOpenReason>,
+}
+
+impl HierarchyAnswer {
+    /// Construct a complete answer, preserving the provider's edge order.
+    pub fn complete(edges: Vec<CodeUnit>) -> Self {
+        Self {
+            edges,
+            ambiguous: Vec::new(),
+            open: Vec::new(),
+        }
+    }
+
+    /// Union definite edges in CodeUnit order while retaining all uncertainty.
+    pub fn merge(&mut self, other: Self) {
+        self.edges.extend(other.edges);
+        self.edges.sort();
+        self.edges.dedup();
+        self.ambiguous.extend(other.ambiguous);
+        self.open.extend(other.open);
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.ambiguous.is_empty() && self.open.is_empty()
+    }
+
+    /// Lossy: drops ambiguous groups and open reasons. Only for callers whose
+    /// language answers are complete by construction.
+    pub fn definite(&self) -> &[CodeUnit] {
+        &self.edges
+    }
+}
+
 pub trait TypeHierarchyProvider: Send + Sync {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit>;
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer;
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer;
 
     /// The nominal member walk also needs the ancestors not represented by
     /// workspace declarations. Languages opt in without changing type lookup.
     fn member_family_ancestors(&self, owner: &CodeUnit) -> MemberFamilyAncestors {
         MemberFamilyAncestors {
-            resolved: self.get_direct_ancestors(owner),
+            resolved: self.get_direct_ancestors(owner).edges,
             unread: Vec::new(),
         }
     }
@@ -788,19 +853,19 @@ pub trait TypeHierarchyProvider: Send + Sync {
         code_unit.is_class()
     }
 
-    fn get_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         traverse_hierarchy(code_unit, |next| self.get_direct_ancestors(next))
     }
 
-    fn get_descendants(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        traverse_hierarchy(code_unit, |next| {
-            self.get_direct_descendants(next).into_iter().collect()
-        })
+    fn get_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+        let mut answer = traverse_hierarchy(code_unit, |next| self.get_direct_descendants(next));
+        answer.edges.sort();
+        answer
     }
 
     /// [`Self::get_direct_ancestors`] under a caller's deadline.
     ///
-    /// `None` means the resolution stopped short; it is never an empty answer,
+    /// `Err(Cancelled)` means the resolution stopped short; it is never an empty answer,
     /// which stays the honest way to say "no resolvable base types". The
     /// default checks the deadline once and delegates, which is right for a
     /// provider whose ancestor resolution is a lookup. C++ overrides it because
@@ -810,15 +875,15 @@ pub trait TypeHierarchyProvider: Send + Sync {
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<Vec<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, Cancelled> {
         query_within_scope(scope, || self.get_direct_ancestors(code_unit))
     }
 
     /// [`Self::get_direct_descendants`] under a caller's deadline and workspace
     /// slice.
     ///
-    /// `None` means the answer is not available because the build stopped
-    /// short. It is never a partial answer, and a stopped build publishes
+    /// `Incomplete` means required evidence was unavailable. `Cancelled` means
+    /// the scope stopped. Neither is a complete empty answer; a failed build publishes
     /// nothing: a truncated index memoized as complete would be served to every
     /// later caller as the truth (the rule
     /// `cancelled_cold_candidate_discovery_does_not_publish_partial_index`
@@ -836,38 +901,39 @@ pub trait TypeHierarchyProvider: Send + Sync {
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, Cancelled> {
         query_within_scope(scope, || self.get_direct_descendants(code_unit))
     }
 
     /// [`Self::get_descendants`] under a caller's deadline and workspace slice,
-    /// polling once per node of the walk. `None` carries the same meaning as in
+    /// polling once per node of the walk. Failures carry the same meaning as in
     /// [`Self::get_direct_descendants_within`].
     fn get_descendants_within(
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<Vec<CodeUnit>> {
-        traverse_hierarchy_while(code_unit, scope.cancellation(), |next| {
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        let mut answer = traverse_hierarchy_while(code_unit, scope.cancellation(), |next| {
             self.get_direct_descendants_within(next, scope)
-                .map(|descendants| descendants.into_iter().collect())
-        })
+        })?;
+        answer.edges.sort();
+        Ok(answer)
     }
 
     fn get_polymorphic_matches<T: CodeUnitIndex>(
         &self,
         target: &CodeUnit,
         analyzer: &T,
-    ) -> Vec<CodeUnit>
+    ) -> HierarchyAnswer
     where
         Self: Sized,
     {
         if !target.is_function() {
-            return Vec::new();
+            return HierarchyAnswer::complete(Vec::new());
         }
 
         let Some(parent) = analyzer.parent_of(target) else {
-            return Vec::new();
+            return HierarchyAnswer::complete(Vec::new());
         };
 
         self.get_descendants(&parent)
@@ -976,7 +1042,14 @@ where
             .all_declarations()
             .filter(|candidate| candidate.is_class() && scope.admits(candidate))
             .collect(),
-        |candidate| provider.get_direct_ancestors_within(candidate, scope),
+        |candidate| {
+            let answer = provider
+                .get_direct_ancestors_within(candidate, scope)
+                .ok()?;
+            // Legacy indexes cannot represent uncertainty. Do not publish an
+            // incomplete inverse relation as a complete cached index.
+            answer.is_complete().then_some(answer.edges)
+        },
         &scope.keep_going(),
     )
 }
@@ -1052,78 +1125,45 @@ where
 }
 
 /// [`traverse_hierarchy`] under a deadline: polls once per node popped and
-/// propagates a stopped step as `None` rather than returning the nodes it had
+/// propagates a stopped step as `Err(Cancelled)` rather than returning the nodes it had
 /// already collected. A partial subtype set read as complete would let a caller
 /// conclude that a class has no further subclasses.
 fn traverse_hierarchy_while<F>(
     root: &CodeUnit,
     cancellation: &CancellationToken,
     mut next: F,
-) -> Option<Vec<CodeUnit>>
+) -> Result<HierarchyAnswer, Cancelled>
 where
-    F: FnMut(&CodeUnit) -> Option<Vec<CodeUnit>>,
+    F: FnMut(&CodeUnit) -> Result<HierarchyAnswer, Cancelled>,
 {
-    let direct = next(root)?;
-    if direct.is_empty() {
-        return Some(Vec::new());
-    }
-
+    let mut result = HierarchyAnswer::default();
     let mut seen = BTreeSet::new();
-    let mut result = Vec::new();
-    let mut queue = VecDeque::new();
-
-    for item in direct {
-        if seen.insert(item.fq_name()) {
-            queue.push_back(item.clone());
-            result.push(item);
-        }
-    }
-
+    let mut queue = VecDeque::from([root.clone()]);
     while let Some(current) = queue.pop_front() {
-        if cancellation.is_cancelled() {
-            return None;
-        }
-        for item in next(&current)? {
+        let answer = next(&current)?;
+        result.ambiguous.extend(answer.ambiguous);
+        result.open.extend(answer.open);
+        for item in answer.edges {
             if seen.insert(item.fq_name()) {
                 queue.push_back(item.clone());
-                result.push(item);
+                result.edges.push(item);
             }
         }
+        if !queue.is_empty() && cancellation.is_cancelled() {
+            return Err(Cancelled);
+        }
     }
-
-    Some(result)
+    Ok(result)
 }
 
-fn traverse_hierarchy<F>(root: &CodeUnit, mut next: F) -> Vec<CodeUnit>
+fn traverse_hierarchy<F>(root: &CodeUnit, mut next: F) -> HierarchyAnswer
 where
-    F: FnMut(&CodeUnit) -> Vec<CodeUnit>,
+    F: FnMut(&CodeUnit) -> HierarchyAnswer,
 {
-    let direct = next(root);
-    if direct.is_empty() {
-        return Vec::new();
-    }
-
-    let mut seen = BTreeSet::new();
-    let mut result = Vec::new();
-    let mut queue = VecDeque::new();
-
-    for item in direct {
-        if seen.insert(item.fq_name()) {
-            queue.push_back(item.clone());
-            result.push(item);
-        }
-    }
-
-    while let Some(current) = queue.pop_front() {
-        for item in next(&current) {
-            if seen.insert(item.fq_name()) {
-                queue.push_back(item.clone());
-                result.push(item);
-            }
-        }
-    }
-
-    result
+    // Both variants share the traversal and completeness accounting. An owned
+    // live token makes stopping impossible for this unscoped request.
+    traverse_hierarchy_while(root, &CancellationToken::new(), |unit| Ok(next(unit)))
+        .expect("unscoped hierarchy traversal cannot stop")
 }
 
 #[cfg(test)]
@@ -1146,6 +1186,43 @@ mod hierarchy_traversal_properties {
 
     fn index_of(unit: &CodeUnit) -> usize {
         unit.fq_name()[1..].parse().expect("test node name")
+    }
+
+    #[test]
+    fn closure_preserves_uncertainty_without_traversing_alternatives() {
+        let mut visited = Vec::new();
+        let answer = traverse_hierarchy(&node(0), |unit| {
+            let id = index_of(unit);
+            visited.push(id);
+            match id {
+                0 => HierarchyAnswer {
+                    edges: vec![node(1), node(1)],
+                    ambiguous: vec![vec![node(2), node(3)]],
+                    open: Vec::new(),
+                },
+                1 => HierarchyAnswer {
+                    edges: Vec::new(),
+                    ambiguous: vec![vec![node(4), node(5)]],
+                    open: vec![HierarchyOpenReason::UnreadAncestor(
+                        UnreadMemberFamilyAncestor {
+                            name: "External".into(),
+                            inventory: None,
+                        },
+                    )],
+                },
+                _ => panic!("ambiguous alternatives must not be traversed"),
+            }
+        });
+        assert_eq!(visited, vec![0, 1]);
+        assert_eq!(answer.edges, vec![node(1)]);
+        assert_eq!(
+            answer.ambiguous,
+            vec![vec![node(2), node(3)], vec![node(4), node(5)]]
+        );
+        assert!(
+            matches!(answer.open.as_slice(), [HierarchyOpenReason::UnreadAncestor(ancestor)] if ancestor.name == "External")
+        );
+        assert!(!answer.is_complete());
     }
 
     /// Edge lists may repeat a target, hold self loops and form cycles.
@@ -1196,9 +1273,9 @@ mod hierarchy_traversal_properties {
             let result = traverse_hierarchy(&node(root), |unit| {
                 let id = index_of(unit);
                 *calls.entry(id).or_default() += 1;
-                graph[id].iter().map(|&to| node(to)).collect()
+                HierarchyAnswer::complete(graph[id].iter().map(|&to| node(to)).collect())
             });
-            let found: Vec<usize> = result.iter().map(index_of).collect();
+            let found: Vec<usize> = result.edges.iter().map(index_of).collect();
 
             let distance = reference_distances(&graph, root);
             let unique: BTreeSet<usize> = found.iter().copied().collect();
@@ -1218,9 +1295,11 @@ mod hierarchy_traversal_properties {
             // The deadline-aware variant agrees when never cancelled.
             let live = CancellationToken::new();
             let guarded = traverse_hierarchy_while(&node(root), &live, |unit| {
-                Some(graph[index_of(unit)].iter().map(|&to| node(to)).collect())
+                Ok(HierarchyAnswer::complete(graph[index_of(unit)].iter().map(|&to| node(to)).collect()))
             });
-            prop_assert_eq!(guarded, Some(result));
+            let guarded = guarded.expect("live traversal");
+            prop_assert!(guarded.is_complete());
+            prop_assert_eq!(guarded.edges, result.edges);
         }
 
         /// A failed neighbour step is propagated, not hidden behind a partial
@@ -1235,21 +1314,23 @@ mod hierarchy_traversal_properties {
             let reachable = reference_distances(&graph, root);
             let failing = traverse_hierarchy_while(&node(root), &CancellationToken::new(), |unit| {
                 let id = index_of(unit);
-                (id != fail_on).then(|| graph[id].iter().map(|&to| node(to)).collect())
+                if id == fail_on { Err(Cancelled) } else { Ok(HierarchyAnswer::complete(graph[id].iter().map(|&to| node(to)).collect())) }
             });
             // The failing node's neighbours are requested when it is the root or
             // is itself returned, so it is only skipped when neither holds.
             let requested = fail_on == root || reachable.contains_key(&fail_on);
-            prop_assert_eq!(failing.is_none(), requested);
+            prop_assert_eq!(failing.is_err(), requested);
 
             let cancelled = CancellationToken::new();
             cancelled.cancel();
             let stopped = traverse_hierarchy_while(&node(root), &cancelled, |unit| {
-                Some(graph[index_of(unit)].iter().map(|&to| node(to)).collect())
+                Ok(HierarchyAnswer::complete(graph[index_of(unit)].iter().map(|&to| node(to)).collect()))
             });
-            prop_assert_eq!(stopped.is_none(), !graph[root].is_empty());
+            prop_assert_eq!(stopped.is_err(), !graph[root].is_empty());
             if graph[root].is_empty() {
-                prop_assert_eq!(stopped, Some(Vec::new()));
+                let stopped = stopped.expect("empty traversal");
+                prop_assert!(stopped.is_complete());
+                prop_assert!(stopped.edges.is_empty());
             }
         }
     }

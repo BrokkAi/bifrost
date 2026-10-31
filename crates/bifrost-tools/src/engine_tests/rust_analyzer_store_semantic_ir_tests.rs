@@ -310,7 +310,9 @@ pub(crate) mod rust_departing_root_tests {
             };
 
             let publication = store
-                .semantic_ir_publication(oid, "rust")
+                .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "rust",
+                ))
                 .unwrap()
                 .unwrap_or_else(|| panic!("{}: no valid publication", path.display()));
             assert_eq!(publication.blob_id, blob_id);
@@ -426,11 +428,21 @@ pub(crate) mod rust_departing_root_tests {
             tx.commit().unwrap();
             blob_id
         };
-        assert_eq!(store.semantic_ir_publication(oid, "rust").unwrap(), None);
+        assert_eq!(
+            store
+                .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "rust"
+                ))
+                .unwrap(),
+            None
+        );
         store
             .ensure_semantic_ir_producer_epoch("rust", "epoch-a")
             .unwrap();
-        let publication = store.semantic_ir_publication(oid, "rust").unwrap().unwrap();
+        let publication = store
+            .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+            .unwrap()
+            .unwrap();
         assert_eq!(publication.blob_id, blob_id);
         assert_eq!(
             publication.outcome,
@@ -441,7 +453,14 @@ pub(crate) mod rust_departing_root_tests {
                 .ensure_semantic_ir_producer_epoch("rust", "epoch-b")
                 .unwrap()
         );
-        assert_eq!(store.semantic_ir_publication(oid, "rust").unwrap(), None);
+        assert_eq!(
+            store
+                .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "rust"
+                ))
+                .unwrap(),
+            None
+        );
     }
 
     /// A Rust file served through the public provider comes from its semantic IR

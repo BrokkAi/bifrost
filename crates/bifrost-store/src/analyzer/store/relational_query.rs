@@ -12,7 +12,7 @@ use super::{
     AnalyzerStore, CandidateRow, CandidateRowContainer, FqIdentityHeader, GenerationId,
     HydratedCandidateRow, RelationalUnitFq, Result, StoreError, WorkspaceSnapshots,
     candidate_row_from_row, candidate_row_from_row_at, candidate_rows_for_languages_with,
-    hydrate_candidate_rows, hydrate_mounted_candidate, require_generation_map,
+    hydrate_candidate_rows, hydrate_mounted_candidate_conn, require_generation_map,
     signature_metadata_projection_from_row,
 };
 use crate::analyzer::store::StoreLanguageAdapter;
@@ -25,7 +25,7 @@ const CANDIDATE_COLUMNS: &str =
      units.top_level_ordinal, units.in_declarations, units.in_definition_lookup,
      units.fq_anchor_kind, units.fq_anchor_pop, units.fq_package_tail_segments,
      units.fq_segment_count, units.exact_fqn_tail, units.fq_segment_bytes,
-     units.normalized_fqn_tail";
+     units.normalized_fqn_tail, keys.parse_variant AS parse_variant";
 
 const SET_QUERY_MIN_REQUESTS: usize = 64;
 
@@ -54,6 +54,7 @@ pub fn content_sql(view: &str, predicate: &str) -> String {
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
+         JOIN blobs AS keys ON keys.id = units.blob_id
          WHERE names.lang = ?1 AND names.source_kind <> 'path' AND {predicate}
          ORDER BY names.rel_path, names.blob_oid, units.unit_key"
     )
@@ -139,20 +140,22 @@ fn query_content_candidates(
     values: &[&dyn rusqlite::ToSql],
 ) -> Result<Vec<(HydratedCandidateRow, String)>> {
     let rows = candidate_rows_for_languages_with(tx, std::iter::once(lang), sql, values, |row| {
-        Ok((candidate_row_from_row(row)?, row.get::<_, String>(19)?))
+        Ok((candidate_row_from_row(row)?, row.get::<_, String>(20)?))
     })?;
     Ok(hydrate_candidate_rows(tx, rows, None)?
         .expect("uncancelled relational candidate hydration completes"))
 }
 
 fn hydrate_candidates<A: StoreLanguageAdapter>(
+    tx: &Transaction<'_>,
     adapter: &A,
     project_root: &Path,
     rows: Vec<(HydratedCandidateRow, String)>,
 ) -> Result<Vec<CodeUnit>> {
     let mut units = Vec::with_capacity(rows.len());
     for (row, rel_path) in rows {
-        units.push(hydrate_mounted_candidate(
+        units.push(hydrate_mounted_candidate_conn(
+            tx,
             adapter,
             project_root,
             row,
@@ -184,7 +187,8 @@ pub fn batched_content_sql(
           AND {join_predicate}
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
-          AND units.unit_key = names.unit_key",
+          AND units.unit_key = names.unit_key
+         JOIN blobs AS keys ON keys.id = units.blob_id",
         batched_request_rows_sql(request_values)
     )
 }
@@ -202,6 +206,7 @@ pub fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) 
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
+         JOIN blobs AS keys ON keys.id = units.blob_id
          WHERE names.lang = ?2 AND names.source_kind <> 'path'"
     )
 }
@@ -228,7 +233,8 @@ pub fn batched_definition_order_sql(view: &str) -> String {
           AND names.identifier = requests.identifier
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
-          AND units.unit_key = names.unit_key"
+          AND units.unit_key = names.unit_key
+         JOIN blobs AS keys ON keys.id = units.blob_id"
     )
 }
 
@@ -304,7 +310,7 @@ fn query_batched_content_candidates(
             let rows = statement.query_map(params![request_json, lang], |row| {
                 Ok((
                     candidate_row_from_row_at(row, 1)?,
-                    (row.get::<_, usize>(0)?, row.get::<_, String>(20)?),
+                    (row.get::<_, usize>(0)?, row.get::<_, String>(21)?),
                 ))
             })?;
             let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -339,8 +345,8 @@ fn query_batched_definition_order_candidates(
                     row.get::<_, usize>(0)?,
                     StoredDefinitionOrderCandidate {
                         candidate: candidate_row_from_row_at(row, 1)?,
-                        rel_path: row.get::<_, String>(20)?,
-                        first_start_byte: row.get::<_, Option<usize>>(21)?,
+                        rel_path: row.get::<_, String>(21)?,
+                        first_start_byte: row.get::<_, Option<usize>>(22)?,
                     },
                 ))
             })?;
@@ -451,7 +457,7 @@ fn query_batched_path_units<A: StoreLanguageAdapter>(
             let (request_index, rel_path) = row?;
             assert!(request_index < units.len());
             let file = ProjectFile::new(project_root.to_path_buf(), rel_path);
-            if let Some(unit) = adapter.hydrate_path_synthetic_module_unit(&file)? {
+            if let Some(unit) = adapter.hydrate_path_synthetic_module_unit_with_conn(tx, &file)? {
                 units[request_index].push(unit);
             }
         }
@@ -504,12 +510,13 @@ fn serialize_set_requests<T: serde::Serialize>(requests: &[T]) -> Result<String>
 }
 
 fn hydrate_batched_definition_units<A: StoreLanguageAdapter>(
+    tx: &Transaction<'_>,
     adapter: &A,
     project_root: &Path,
     rows: Vec<(HydratedCandidateRow, String)>,
     path_units: Vec<CodeUnit>,
 ) -> Result<Vec<CodeUnit>> {
-    let mut units = hydrate_candidates(adapter, project_root, rows)?;
+    let mut units = hydrate_candidates(tx, adapter, project_root, rows)?;
     units.extend(path_units);
     Ok(units)
 }
@@ -589,7 +596,8 @@ fn set_exact_definition_values<A: StoreLanguageAdapter>(
         .zip(path_candidates)
     {
         let full_name = request.name.full_name();
-        let mut units = hydrate_batched_definition_units(adapter, project_root, rows, path_units)?;
+        let mut units =
+            hydrate_batched_definition_units(tx, adapter, project_root, rows, path_units)?;
         units.retain(|unit| unit_matches_requested_name(adapter, unit, &full_name, false));
         sort_units(&mut units);
         units.dedup();
@@ -696,7 +704,7 @@ fn set_normalized_definition_values<A: StoreLanguageAdapter>(
         .zip(path_candidates)
     {
         let full_name = request.name.full_name();
-        let mut units = hydrate_candidates(adapter, project_root, rows)?;
+        let mut units = hydrate_candidates(tx, adapter, project_root, rows)?;
         units.extend(path_units);
         units.retain(|unit| unit_matches_requested_name(adapter, unit, &full_name, true));
         sort_units(&mut units);
@@ -785,7 +793,8 @@ fn set_structural_member_values<A: StoreLanguageAdapter>(
     for ((request_index, rows), path_units) in
         indices.into_iter().zip(candidates).zip(path_candidates)
     {
-        let mut units = hydrate_batched_definition_units(adapter, project_root, rows, path_units)?;
+        let mut units =
+            hydrate_batched_definition_units(tx, adapter, project_root, rows, path_units)?;
         sort_units(&mut units);
         units.dedup();
         values[request_index] = RelationalDefinitionValue::Definitions(units);
@@ -929,10 +938,10 @@ fn path_units<A: StoreLanguageAdapter>(
     let mut units = paths
         .into_iter()
         .map(|rel_path| {
-            adapter.hydrate_path_synthetic_module_unit(&ProjectFile::new(
-                project_root.to_path_buf(),
-                rel_path,
-            ))
+            adapter.hydrate_path_synthetic_module_unit_with_conn(
+                tx,
+                &ProjectFile::new(project_root.to_path_buf(), rel_path),
+            )
         })
         .collect::<Result<Vec<_>>>()?
         .into_iter()
@@ -963,7 +972,7 @@ fn query_view_candidates<A: StoreLanguageAdapter>(
     let mut units = Vec::new();
     for lang in storage_languages {
         let rows = query_content_candidates(tx, &sql, lang, &values)?;
-        units.extend(hydrate_candidates(adapter, project_root, rows)?);
+        units.extend(hydrate_candidates(tx, adapter, project_root, rows)?);
     }
     Ok(units)
 }
@@ -1477,7 +1486,7 @@ fn callable_values<A: StoreLanguageAdapter>(
         "SELECT facts.ordinal, facts.text,
                 {metadata_columns}, facts.pairing_available
          FROM live_callable_facts AS facts
-         WHERE facts.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
+         WHERE facts.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?4)
            AND facts.unit_key = ?3
          ORDER BY facts.ordinal, facts.metadata_ordinal"
     );
@@ -1497,30 +1506,43 @@ fn callable_values<A: StoreLanguageAdapter>(
             query_content_candidates(tx, &candidate_sql, lang, &[&prefix, &parent, &identifier])?;
         for (candidate, rel_path) in candidates {
             let locator = (
-                candidate.blob_oid.to_string(),
-                candidate.lang.clone(),
+                super::BlobKey {
+                    oid: candidate.blob_oid,
+                    lang: candidate.lang.clone(),
+                    variant: candidate.variant,
+                },
                 candidate.unit_key,
             );
-            let mut units = hydrate_candidates(adapter, project_root, vec![(candidate, rel_path)])?;
+            let mut units =
+                hydrate_candidates(tx, adapter, project_root, vec![(candidate, rel_path)])?;
             let declaration = units.pop().expect("a callable row has one declaration");
             if declaration.fq() != &request.name.full_name() {
                 continue;
             }
             let mut statement = tx.prepare_cached(&fact_sql)?;
-            let rows = statement.query_map(params![locator.0, locator.1, locator.2], |row| {
-                if row.get::<_, Option<bool>>(3 + super::SIGNATURE_METADATA_VALUE_COLUMNS.len())?
-                    != Some(true)
-                {
-                    return Err(super::rusqlite_error_from_store(StoreError::new(
-                        "callable signature/metadata pairing is unavailable",
-                    )));
-                }
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    callable_metadata(row, 2)?,
-                ))
-            })?;
+            let rows = statement.query_map(
+                params![
+                    locator.0.oid.to_string(),
+                    locator.0.lang,
+                    locator.1,
+                    locator.0.variant
+                ],
+                |row| {
+                    if row
+                        .get::<_, Option<bool>>(3 + super::SIGNATURE_METADATA_VALUE_COLUMNS.len())?
+                        != Some(true)
+                    {
+                        return Err(super::rusqlite_error_from_store(StoreError::new(
+                            "callable signature/metadata pairing is unavailable",
+                        )));
+                    }
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        callable_metadata(row, 2)?,
+                    ))
+                },
+            )?;
             for row in rows {
                 let (ordinal, signature, metadata) = row?;
                 facts.push(RelationalCallableFact {
@@ -1770,8 +1792,12 @@ impl AnalyzerStore {
             let full_name = name.full_name();
             let mut by_unit: HashMap<CodeUnit, Option<usize>> = HashMap::default();
             for row in rows {
-                let mut hydrated =
-                    hydrate_candidates(adapter, project_root, vec![(row.candidate, row.rel_path)])?;
+                let mut hydrated = hydrate_candidates(
+                    &tx,
+                    adapter,
+                    project_root,
+                    vec![(row.candidate, row.rel_path)],
+                )?;
                 let unit = hydrated
                     .pop()
                     .expect("one ordering candidate hydrates one declaration");

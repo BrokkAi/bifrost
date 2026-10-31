@@ -164,7 +164,11 @@ passthrough! {
         let path = fixture.root().join("rust-type-forms.db");
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let generation = store.current_generation("rust").unwrap();
         drop(state);
@@ -204,7 +208,11 @@ passthrough! {
         let oid = oid_for(TYPE_FORM_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let generation = store.current_generation("rust").unwrap();
         store.conn.execute(|conn| {
@@ -225,7 +233,11 @@ passthrough! {
         );
 
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let repaired = store
             .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
@@ -244,7 +256,11 @@ passthrough! {
         let oid = oid_for(TYPE_FORM_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         let generation = store.current_generation("rust").unwrap();
         assert_rust_source_read_cancellation_retries(

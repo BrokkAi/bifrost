@@ -7,7 +7,9 @@
 
 use crate::access_chain::{JsTsImportedMemberChainResolution, resolve_import_member_chain};
 use crate::graph::common::{enclosing_function_scope, simple_identifier_text};
-use crate::imports::{js_ts_module_identity, require_call_module_specifier};
+use crate::imports::{
+    js_ts_direct_import_export_name, js_ts_module_identity, require_call_module_specifier,
+};
 use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_imported_member_chain,
     resolve_js_ts_module_binding_candidates, resolve_js_ts_module_specifier,
@@ -16,8 +18,8 @@ use crate::providers::{JsTsSource, compute_direct_ancestors};
 use crate::source_facts::JsTsFileSourceFacts;
 use crate::syntax::parse_js_ts_tree;
 use crate::syntax::{
-    JsTsImportBinder, JsTsImportBindingResolution, js_ts_is_class_scope_kind,
-    pattern_binder_identifiers, slice, static_member_property,
+    JsTsImportBinder, JsTsImportBinding, JsTsImportBindingResolution, JsTsLexicalBindingIndex,
+    js_ts_is_class_scope_kind, pattern_binder_identifiers, slice, static_member_property,
 };
 use crate::ts_owners::{
     jsts_identifier_candidates, jsts_indexed_callable_node, ts_nodes_for_code_unit,
@@ -72,6 +74,10 @@ pub struct JsTsReceiverFactProvider<'tree, 'a> {
     imports: JsTsImportBinder,
     aliases: Arc<AliasResolver>,
     syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+    /// Declaration-kind checks live only for this file's receiver analysis.
+    imported_class_cache: RefCell<HashMap<CodeUnit, bool>>,
+    /// Export checks are scoped to this receiver analysis, not the workspace.
+    export_value_gap_cache: RefCell<HashMap<(ProjectFile, String), bool>>,
     member_target_cache:
         RefCell<HashMap<ReceiverAnalysisCacheKey, ReceiverAnalysisOutcome<CodeUnit>>>,
     jsx_props_owner_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
@@ -180,6 +186,8 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             imports,
             aliases,
             syntax_index,
+            imported_class_cache: RefCell::new(HashMap::default()),
+            export_value_gap_cache: RefCell::new(HashMap::default()),
             member_target_cache: RefCell::new(HashMap::default()),
             jsx_props_owner_cache: RefCell::new(HashMap::default()),
             jsx_component_owner_cache: RefCell::new(HashMap::default()),
@@ -993,8 +1001,72 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 reason: "unsupported_constructor_receiver",
             };
         };
-        let values = self
-            .class_units_named(name, expression)
+        let mut classes = self.class_units_named(name, constructor);
+        if classes.is_empty() {
+            // Only the import binding visible at this constructor can supply
+            // its runtime value; a shadow or competing import proves nothing.
+            let JsTsImportBindingResolution::Exact(import) =
+                self.imports.binding_at(name, constructor.start_byte())
+            else {
+                return ReceiverAnalysisOutcome::Unknown;
+            };
+            let binding = &import.binding;
+            if !matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+                || (binding.kind == ImportKind::Named && binding.imported_name.is_none())
+                || !import_binding_is_unique_value(
+                    import,
+                    self.root,
+                    self.imports
+                        .lexical_bindings()
+                        .expect("receiver provider has lexical scopes"),
+                    constructor.start_byte(),
+                )
+            {
+                return ReceiverAnalysisOutcome::Unknown;
+            }
+            // A single exported class is not proof when the module path itself
+            // has more than one possible source file.
+            let modules = resolve_js_ts_module_specifier(
+                self.file,
+                &binding.module_specifier,
+                self.language,
+                Some(&self.aliases),
+            );
+            if modules.len() != 1 {
+                return ReceiverAnalysisOutcome::Unknown;
+            }
+            let exported_name = js_ts_direct_import_export_name(binding, name);
+            classes = resolve_js_ts_module_binding_candidates(
+                self.host,
+                self.support,
+                self.language,
+                self.file,
+                &binding.module_specifier,
+                exported_name,
+                Some(&self.aliases),
+                true,
+            );
+            let [candidate] = classes.as_slice() else {
+                return ReceiverAnalysisOutcome::Unknown;
+            };
+            if !candidate.is_class() || !self.is_imported_class_declaration(candidate) {
+                return ReceiverAnalysisOutcome::Unknown;
+            }
+            let Some(index) = self.host.usage_index(None) else {
+                return ReceiverAnalysisOutcome::Unknown;
+            };
+            if index
+                .unresolved_reexport_boundary(&modules, exported_name)
+                .is_some()
+                || (self.language == Language::TypeScript
+                    && index.export_route_has_gap(&modules, exported_name, |file, name| {
+                        self.export_value_has_gap(file, name)
+                    }))
+            {
+                return ReceiverAnalysisOutcome::Unknown;
+            }
+        }
+        let values = classes
             .into_iter()
             .map(|ty| ReceiverValue::AllocationSite {
                 ty,
@@ -1003,6 +1075,169 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             })
             .collect::<Vec<_>>();
         ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
+    }
+
+    fn is_imported_class_declaration(&self, candidate: &CodeUnit) -> bool {
+        self.aliases
+            .record_authority_read(crate::tsconfig::JsTsReadAuthority::ReceiverMembers);
+        if let Some(is_class) = self.imported_class_cache.borrow().get(candidate) {
+            return *is_class;
+        }
+        // CodeUnitType::Class also represents TS interfaces, aliases, and
+        // enums. Use the indexed source and declaration ranges to distinguish
+        // an actual class without relying on its spelling or current disk.
+        let is_class = self
+            .host
+            .source_facts(candidate.source())
+            .is_some_and(|facts| {
+                self.host
+                    .indexed_source(candidate.source())
+                    .and_then(|source| parse_js_ts_tree(candidate.source(), &source, self.language))
+                    .is_some_and(|tree| {
+                        crate::graph::source::declaration_ids_for_unit(&facts, candidate)
+                            .into_iter()
+                            .filter_map(|id| {
+                                let declaration = facts.source.declaration(id);
+                                let range = facts.source.occurrence(declaration.occurrence).range;
+                                smallest_named_node_covering(
+                                    tree.root_node(),
+                                    range.start_byte,
+                                    range.end_byte,
+                                )
+                            })
+                            .filter(|node| {
+                                let definition = if node.kind() == "export_statement" {
+                                    node.child_by_field_name("declaration")
+                                        .or_else(|| node.child_by_field_name("value"))
+                                        .unwrap_or(*node)
+                                } else {
+                                    *node
+                                };
+                                matches!(
+                                    definition.kind(),
+                                    "class" | "class_declaration" | "abstract_class_declaration"
+                                )
+                            })
+                            .count()
+                            == 1
+                    })
+            });
+        self.imported_class_cache
+            .borrow_mut()
+            .insert(candidate.clone(), is_class);
+        is_class
+    }
+
+    fn export_value_has_gap(&self, file: &ProjectFile, name: &str) -> bool {
+        self.aliases
+            .record_authority_read(crate::tsconfig::JsTsReadAuthority::ReceiverMembers);
+        let key = (file.clone(), name.to_string());
+        if let Some(gap) = self.export_value_gap_cache.borrow().get(&key) {
+            return *gap;
+        }
+        let gap = (|| {
+            let facts = self.host.source_facts(file)?;
+            let named = facts
+                .facts
+                .exports
+                .iter()
+                .filter(|fact| fact.name.as_deref() == Some(name))
+                .collect::<Vec<_>>();
+            let exports = if named.is_empty() {
+                facts
+                    .facts
+                    .exports
+                    .iter()
+                    .filter(|fact| matches!(fact.kind, JsTsExportKind::Star { .. }))
+                    .collect::<Vec<_>>()
+            } else {
+                named
+            };
+            if exports.iter().all(|fact| !fact.is_esm) {
+                return Some(false);
+            }
+            let source = self.host.indexed_source(file)?;
+            let tree = parse_js_ts_tree(file, &source, self.language)?;
+            let root = tree.root_node();
+            for fact in exports {
+                if !fact.is_esm {
+                    continue;
+                }
+                let range = facts.source.occurrence(fact.occurrence).range;
+                let node = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
+                if node.kind() != "export_statement" || node_has_type_modifier(node) {
+                    return Some(true);
+                }
+                let mut cursor = node.walk();
+                if let Some(clause) = node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "export_clause")
+                {
+                    let mut cursor = clause.walk();
+                    let specifier = clause.named_children(&mut cursor).find(|specifier| {
+                        specifier.kind() == "export_specifier"
+                            && specifier
+                                .child_by_field_name("alias")
+                                .or_else(|| specifier.child_by_field_name("name"))
+                                .is_some_and(|exported| slice(exported, &source) == name)
+                    })?;
+                    if node_has_type_modifier(specifier) {
+                        return Some(true);
+                    }
+                }
+                if let JsTsExportKind::Local { local_name } = &fact.kind {
+                    let binder = JsTsImportBinder::from_source_facts(
+                        &facts.facts,
+                        &facts.imports,
+                        &facts.source,
+                    );
+                    if binder.has_binding_records(local_name) {
+                        let bindings = JsTsLexicalBindingIndex::build(root, &source);
+                        let binder = binder.with_lexical_bindings(root, bindings);
+                        let JsTsImportBindingResolution::Exact(import) =
+                            binder.binding_at(local_name, node.start_byte())
+                        else {
+                            return Some(true);
+                        };
+                        if !import_binding_is_unique_value(
+                            import,
+                            root,
+                            binder.lexical_bindings().expect("attached lexical scopes"),
+                            node.start_byte(),
+                        ) {
+                            return Some(true);
+                        }
+                    }
+                }
+                let import = match fact.kind {
+                    JsTsExportKind::ReexportNamed { import }
+                    | JsTsExportKind::ReexportModule { import }
+                    | JsTsExportKind::Star { import } => Some(import),
+                    _ => None,
+                };
+                if let Some(import) = import {
+                    let path = facts.imports.get(import.index())?.path.as_ref()?;
+                    let [specifier] = path.segments.as_slice() else {
+                        return Some(true);
+                    };
+                    if resolve_js_ts_module_specifier(
+                        file,
+                        specifier,
+                        self.language,
+                        Some(&self.aliases),
+                    )
+                    .len()
+                        != 1
+                    {
+                        return Some(true);
+                    }
+                }
+            }
+            Some(false)
+        })()
+        .unwrap_or(true);
+        self.export_value_gap_cache.borrow_mut().insert(key, gap);
+        gap
     }
 
     fn resolve_this_expression(
@@ -2069,6 +2304,47 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 }
 
+fn node_has_type_modifier(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| matches!(child.kind(), "type" | "typeof"))
+}
+
+fn import_binding_is_unique_value(
+    import: &JsTsImportBinding,
+    root: Node<'_>,
+    bindings: &JsTsLexicalBindingIndex,
+    byte: usize,
+) -> bool {
+    let ranges = bindings.binding_identifier_ranges_at(&import.local_name, byte);
+    let [range] = ranges.as_slice() else {
+        return false;
+    };
+    if range.start_byte != import.provenance.declaration_range.start_byte
+        || range.end_byte != import.provenance.declaration_range.end_byte
+    {
+        return false;
+    }
+    if !import.is_static {
+        return true;
+    }
+    // Type-only imports have no runtime value, even if they name a class.
+    let range = import.provenance.declaration_range;
+    let mut node = root.named_descendant_for_byte_range(range.start_byte, range.end_byte);
+    while let Some(current) = node {
+        if matches!(current.kind(), "import_specifier" | "import_statement") {
+            if node_has_type_modifier(current) {
+                return false;
+            }
+            if current.kind() == "import_statement" {
+                return true;
+            }
+        }
+        node = current.parent();
+    }
+    false
+}
+
 fn jsx_attribute_site(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     let attribute = if node.kind() == "jsx_attribute" {
         node
@@ -3024,6 +3300,12 @@ mod tests {
             .map(|(unit, _)| unit)
             .find(|unit| unit.identifier() == "Panel")
             .unwrap();
+        let owner = host
+            .declarations
+            .iter()
+            .map(|(unit, _)| unit)
+            .find(|unit| unit.identifier() == "Owner")
+            .unwrap();
         let mut stack = vec![tree.root_node()];
         let mut receiver = None;
         while let Some(node) = stack.pop() {
@@ -3056,6 +3338,29 @@ mod tests {
         assert!(!provider.member_target_cache.borrow().is_empty());
         assert!(!provider.jsx_props_owner_cache.borrow().is_empty());
         assert!(!provider.jsx_component_owner_cache.borrow().is_empty());
+        for _ in 0..2 {
+            seen.lock().unwrap().clear();
+            provider.is_imported_class_declaration(owner);
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .contains(&JsTsReadAuthority::ReceiverMembers)
+            );
+            seen.lock().unwrap().clear();
+            provider.export_value_has_gap(&host.file, "Owner");
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .contains(&JsTsReadAuthority::ReceiverMembers)
+            );
+        }
+        assert!(provider.imported_class_cache.borrow().contains_key(owner));
+        assert!(
+            provider
+                .export_value_gap_cache
+                .borrow()
+                .contains_key(&(host.file.clone(), "Owner".to_string()))
+        );
     }
 
     #[test]
@@ -3232,15 +3537,25 @@ mod tests {
     }
 
     impl TypeHierarchyProvider for FakeJsTsSource {
-        fn get_direct_ancestors(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
-            Vec::new()
+        fn get_direct_ancestors(
+            &self,
+            _code_unit: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+            let edges: Vec<CodeUnit> = { Vec::new() };
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
         }
 
         fn get_direct_descendants(
             &self,
             _code_unit: &CodeUnit,
-        ) -> brokk_bifrost_core::hash::HashSet<CodeUnit> {
-            brokk_bifrost_core::hash::HashSet::default()
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+            let edges: brokk_bifrost_core::hash::HashSet<CodeUnit> =
+                { brokk_bifrost_core::hash::HashSet::default() };
+            {
+                let mut edges: Vec<_> = edges.into_iter().collect();
+                edges.sort();
+                brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
+            }
         }
     }
 

@@ -1038,14 +1038,20 @@ fn live_owner_blob_id(
     result: &FindingFreeClassSetRootResult,
 ) -> Result<i64> {
     let storage_language_key = &result.key.owner_storage_language_key;
-    super::live_class_set_owner_blob_id(conn, &result.attachment.blob_oid, storage_language_key)?
-        .ok_or_else(|| {
-            StoreError::new(format!(
-                "class-set root-result owner blob {}/{} is absent",
-                result.attachment.blob_oid,
-                storage_language_key.as_str()
-            ))
-        })
+    super::live_class_set_owner_blob_id(
+        conn,
+        &super::BlobKey::unvaried(
+            git2::Oid::from_str(&result.attachment.blob_oid)?,
+            storage_language_key.as_str(),
+        ),
+    )?
+    .ok_or_else(|| {
+        StoreError::new(format!(
+            "class-set root-result owner blob {}/{} is absent",
+            result.attachment.blob_oid,
+            storage_language_key.as_str()
+        ))
+    })
 }
 
 fn validate_key_and_attachment(

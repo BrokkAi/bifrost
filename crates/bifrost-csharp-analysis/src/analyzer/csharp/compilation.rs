@@ -10,6 +10,12 @@
 //! Unsupported or ambiguous shapes are recorded gaps that leave membership
 //! unproven, never a complete absence.
 
+#[path = "compilation_symbols.rs"]
+mod symbols;
+pub(super) use symbols::{
+    capture_ancestor_configuration_paths, restore_paths_from_retained_inputs,
+};
+
 use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
 
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
@@ -52,31 +58,32 @@ const MAX_XML_NODES: usize = 64 * 1024;
 
 /// Identity of one workspace listing's MSBuild configuration inputs, present
 /// only when every input below the cap was read.
-fn read_config_digest(
-    project: &dyn Project,
-    workspace_files: &BTreeSet<ProjectFile>,
-) -> Option<StableDigest> {
-    let files = workspace_files
-        .iter()
-        .filter(|file| {
-            has_extension(file.rel_path(), "csproj")
-                || has_extension(file.rel_path(), "props")
-                || has_extension(file.rel_path(), "targets")
-        })
-        .take(MAX_CONFIG_FILES.saturating_add(1))
-        .collect::<Vec<_>>();
-    if files.len() > MAX_CONFIG_FILES {
+fn read_config_digest(project: &dyn Project) -> Option<StableDigest> {
+    let inputs = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer::workspace_configuration_inputs(
+        project, &super::adapter::CSharpAdapter, None,
+    ).ok()?;
+    if inputs.len() > MAX_CONFIG_FILES {
         return None;
     }
     let mut hasher = CanonicalHasher::new(CONFIG_IDENTITY_DOMAIN);
-    for file in files {
-        let source = brokk_bifrost_analysis::analyzer::common::read_bounded_source(
-            project,
-            file,
-            MAX_PROJECT_BYTES,
-        )?;
-        hasher.value(normalized_rel_path(file).as_bytes());
-        hasher.value(source.as_bytes());
+    for input in inputs {
+        if input.source_bytes().len() > MAX_PROJECT_BYTES {
+            return None;
+        }
+        hasher.value(input.relative_path().as_bytes());
+        let file = ProjectFile::new(project.root(), PathBuf::from(input.relative_path()));
+        if project.has_overlay(&file) {
+            // Query authority includes unsaved project changes. Persisted sets
+            // still use disk capture and reject mismatched configuration overlays.
+            let source = brokk_bifrost_analysis::analyzer::common::read_bounded_source(
+                project,
+                &file,
+                MAX_PROJECT_BYTES,
+            )?;
+            hasher.value(source.as_bytes());
+        } else {
+            hasher.value(input.source_bytes());
+        }
     }
     Some(StableDigest::from_array(hasher.finish()))
 }
@@ -109,6 +116,23 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
     let mut parsed = HashMap::<&str, Option<ParsedProject>>::default();
     let mut projects = Vec::new();
     for input in inputs {
+        // Empty retained ancestor files encode absence and cannot shadow a
+        // present parent during nearest-file selection.
+        if input.source.as_deref().is_some_and(<[u8]>::is_empty)
+            && Path::new(&input.rel_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    matches!(
+                        name,
+                        "Directory.Build.props"
+                            | "Directory.Build.targets"
+                            | "Directory.Packages.props"
+                    )
+                })
+        {
+            continue;
+        }
         if input.source.is_none() {
             facts.membership_complete = false;
             gap(
@@ -149,6 +173,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
     }
     if projects.is_empty() {
         facts.compilations.push(CSharpCompilationFact {
+            symbols: Default::default(),
             project_path: None,
             items: Vec::new(),
             references: Vec::new(),
@@ -187,6 +212,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             // Unread or undecodable (already a gap): its items and
             // references are unknown.
             facts.compilations.push(CSharpCompilationFact {
+                symbols: Default::default(),
                 project_path: Some(project_path.to_owned()),
                 items: Vec::new(),
                 references: Vec::new(),
@@ -416,6 +442,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             }
         }
         facts.compilations.push(CSharpCompilationFact {
+            symbols: Default::default(),
             project_path: Some(project_path.to_owned()),
             items,
             references,
@@ -430,6 +457,9 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 &mut facts.gaps,
             ),
         });
+    }
+    for compilation in &mut facts.compilations {
+        compilation.symbols = symbols::derive(inputs, compilation.project_path.as_deref());
     }
     facts
 }
@@ -1076,8 +1106,7 @@ impl CSharpAnalyzer {
                         return Err(());
                     }
                     let project = self.inner.project();
-                    let workspace_files = project.all_files_shared().map_err(drop)?;
-                    read_config_digest(project, &workspace_files).ok_or(())
+                    read_config_digest(project).ok_or(())
                 })
                 .ok()
                 .map(|digest| *digest)
@@ -1935,17 +1964,6 @@ fn has_extension(path: &Path, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
-fn normalized_rel_path(file: &ProjectFile) -> String {
-    file.rel_path()
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_string_lossy()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -2012,6 +2030,218 @@ mod tests {
     }
 
     /// Evaluated configuration crosses the producer/SQLite/selected-reader boundary.
+    #[test]
+    #[hardwon(
+        "#8147: ignored build inputs and SDK-qualified imports could close stale symbol sets"
+    )]
+    fn selected_compilation_symbols_match_the_compiler_golden() {
+        use std::fmt::Write;
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/compilation-symbols");
+        let mut owned = Vec::new();
+        for entry in walkdir::WalkDir::new(&fixture_root) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() {
+                let path = entry.path().strip_prefix(&fixture_root).unwrap();
+                if path.extension().is_some_and(|extension| {
+                    matches!(
+                        extension.to_str(),
+                        Some("csproj" | "props" | "targets" | "json" | "cs")
+                    )
+                }) {
+                    owned.push((
+                        portable_rel_path(path),
+                        fs::read_to_string(entry.path()).unwrap(),
+                    ));
+                }
+            }
+        }
+        let files = owned
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>();
+        let (root, delegate, _) = fixture(&files);
+        let project = Arc::new(FlakyListingProject {
+            delegate,
+            fail_listing: AtomicBool::new(false),
+            omit_build_files: true,
+        });
+        let analyzer = CSharpAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>);
+        let render = |analyzer: &CSharpAnalyzer| {
+            // Force publication before reading the selected rows.
+            analyzer.selected_compilations().unwrap().unwrap();
+            let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+            let mut statement = conn.prepare("SELECT c.compilation_id, c.project_path, c.configuration, c.target_framework, c.symbols_closed, c.open_reason, lower(hex(c.symbol_set_digest)) FROM csharp_compilations c JOIN csharp_compilation_selections s ON s.set_id = c.set_id ORDER BY c.project_path").unwrap();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut output = String::new();
+            for (id, path, configuration, framework, closed, reason, digest) in rows {
+                writeln!(output, "{path:?}: configuration={configuration} framework={framework:?} closed={closed} reason={reason:?} digest={digest}").unwrap();
+                let mut symbols = conn.prepare("SELECT symbol, source FROM csharp_compilation_symbols WHERE compilation_id = ?1 ORDER BY symbol").unwrap();
+                let symbols = symbols
+                    .query_map([id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                for (symbol, source) in &symbols {
+                    writeln!(output, "  {symbol} ({source})").unwrap();
+                }
+                if let Some(path) = path {
+                    let directory = Path::new(&path).parent().unwrap();
+                    let oracle = fixture_root.join(directory).join("compiler-symbols.txt");
+                    if oracle.exists() {
+                        let expected = fs::read_to_string(oracle)
+                            .unwrap()
+                            .lines()
+                            .map(str::to_owned)
+                            .collect::<BTreeSet<_>>();
+                        let candidates = fs::read_to_string(fixture_root.join("candidates.txt"))
+                            .unwrap()
+                            .lines()
+                            .map(str::to_owned)
+                            .collect::<BTreeSet<_>>();
+                        let actual = symbols
+                            .iter()
+                            .map(|(symbol, _)| symbol.clone())
+                            .collect::<BTreeSet<_>>();
+                        assert!(
+                            actual.is_subset(&candidates),
+                            "unprobed symbols: {actual:?}"
+                        );
+                        if closed {
+                            assert_eq!(expected, actual, "{path}");
+                        } else {
+                            assert!(actual.is_subset(&expected), "{path}: {actual:?}");
+                        }
+                    }
+                }
+            }
+            output
+        };
+        let mut output = render(&analyzer);
+        let (_, _, _, loose) = analyzed(&[("Loose.cs", "class Loose {}")]);
+        output.push_str(&render(&loose));
+        // Absence is captured even when enumeration ignores obj. A later
+        // restore changes the input digest without changing any project byte.
+        let capture = || {
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer::workspace_configuration_inputs(project.as_ref(), analyzer.inner.adapter(), None).unwrap()
+        };
+        let before = capture();
+        assert!(before.iter().any(|input| input.relative_path()
+            == "Unrestored/obj/project.assets.json"
+            && input.source_bytes().is_empty()));
+        let restored = root.path().join("Unrestored/obj");
+        fs::create_dir_all(&restored).unwrap();
+        fs::write(
+            restored.join("project.assets.json"),
+            r#"{"project":{"restore":{"originalTargetFrameworks":["net10.0"]}}}"#,
+        )
+        .unwrap();
+        for suffix in ["props", "targets"] {
+            fs::write(
+                restored.join(format!("Unrestored.csproj.nuget.g.{suffix}")),
+                "<Project/>",
+            )
+            .unwrap();
+        }
+        let after = capture();
+        let digest =
+            |inputs: &[brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput]| {
+                brokk_bifrost_analysis::analyzer::store::configuration_digest(
+                    inputs
+                        .iter()
+                        .map(|input| (input.relative_path(), input.content_oid())),
+                )
+            };
+        assert_ne!(digest(&before), digest(&after));
+        let set_digest = |analyzer: &CSharpAnalyzer| {
+            analyzer.selected_compilations().unwrap().unwrap();
+            analyzer.inner.analyzer_store().read_conn().unwrap().query_row(
+                "SELECT lower(hex(input_digest)) FROM csharp_compilation_sets ORDER BY set_id DESC LIMIT 1", [],
+                |row| row.get::<_, String>(0),
+            ).unwrap()
+        };
+        let old_digest = set_digest(&analyzer);
+        let head = analyzer.update_all();
+        assert_ne!(old_digest, set_digest(&head));
+        let conn = head.inner.analyzer_store().read_conn().unwrap();
+        let closed: bool = conn.query_row("SELECT symbols_closed FROM csharp_compilations WHERE project_path = 'Unrestored/Unrestored.csproj' ORDER BY set_id DESC LIMIT 1", [], |row| row.get(0)).unwrap();
+        assert!(closed);
+
+        writeln!(
+            output,
+            "restore appearance changes configuration digest: true"
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            before
+                .iter()
+                .any(|input| input.relative_path() == "Directory.Build.props"
+                    && input.source_bytes().is_empty())
+        );
+        let previous = set_digest(&head);
+        fs::write(root.path().join("Directory.Build.props"), "<Project><PropertyGroup><DefineConstants>ANCESTOR</DefineConstants></PropertyGroup></Project>").unwrap();
+        let ancestor = head.update_all();
+        assert_ne!(previous, set_digest(&ancestor));
+        assert!(
+            !project
+                .all_files()
+                .unwrap()
+                .iter()
+                .any(|file| file.rel_path() == Path::new("Directory.Build.props"))
+        );
+        writeln!(
+            output,
+            "ignored ancestor props appearance changes set digest: true"
+        )
+        .unwrap();
+        let previous = set_digest(&ancestor);
+        fs::write(root.path().join("Directory.Build.props"), "<Project><PropertyGroup><DefineConstants>ANCESTOR_EDIT</DefineConstants></PropertyGroup></Project>").unwrap();
+        let edited = ancestor.update_all();
+        assert_ne!(previous, set_digest(&edited));
+        let symbols = |analyzer: &CSharpAnalyzer| {
+            analyzer.inner.analyzer_store().read_conn().unwrap().prepare("SELECT symbol FROM csharp_compilation_symbols s JOIN csharp_compilations c USING(compilation_id) WHERE c.project_path = 'Console/Console.csproj' AND c.set_id = (SELECT max(set_id) FROM csharp_compilation_sets) ORDER BY symbol").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<BTreeSet<_>, _>>().unwrap()
+        };
+        assert!(symbols(&edited).contains("ANCESTOR_EDIT"));
+        writeln!(
+            output,
+            "ignored ancestor props edit changes set digest and defines ANCESTOR_EDIT: true"
+        )
+        .unwrap();
+        let previous = set_digest(&edited);
+        fs::write(root.path().join("Console/Directory.Build.props"), "<Project><PropertyGroup><DefineConstants>NEARER</DefineConstants></PropertyGroup></Project>").unwrap();
+        let nearer = edited.update_all();
+        assert_ne!(previous, set_digest(&nearer));
+        assert!(symbols(&nearer).contains("NEARER"));
+        assert!(!symbols(&nearer).contains("ANCESTOR_EDIT"));
+        writeln!(
+            output,
+            "ignored nearer props appearance changes set digest and shadows ancestor: true"
+        )
+        .unwrap();
+        let expected = fixture_root.join("expected.txt");
+        if std::env::var_os("BIFROST_BLESS").is_some() {
+            fs::write(&expected, &output).unwrap();
+        }
+        assert_eq!(fs::read_to_string(expected).unwrap(), output);
+    }
+
     #[test]
     fn compilation_metadata_round_trips_configuration_golden() {
         use std::fmt::Write;
@@ -2822,6 +3052,7 @@ mod tests {
     struct FlakyListingProject {
         delegate: TestProject,
         fail_listing: AtomicBool,
+        omit_build_files: bool,
     }
 
     impl Project for FlakyListingProject {
@@ -2837,7 +3068,26 @@ mod tests {
             if self.fail_listing.load(Ordering::SeqCst) {
                 return Err(io::Error::other("listing interrupted"));
             }
-            self.delegate.all_files()
+            self.delegate.all_files().map(|files| {
+                files
+                    .into_iter()
+                    .filter(|file| {
+                        !self.omit_build_files
+                            || !file
+                                .rel_path()
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| {
+                                    matches!(
+                                        name,
+                                        "Directory.Build.props"
+                                            | "Directory.Build.targets"
+                                            | "Directory.Packages.props"
+                                    )
+                                })
+                    })
+                    .collect()
+            })
         }
 
         fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -2867,6 +3117,7 @@ mod tests {
         let project = Arc::new(FlakyListingProject {
             delegate,
             fail_listing: AtomicBool::new(false),
+            omit_build_files: false,
         });
         let analyzer = CSharpAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>);
 

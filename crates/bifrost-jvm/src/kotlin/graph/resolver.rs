@@ -216,11 +216,12 @@ impl TargetSpec {
             // ancestor that declares it is what the target overrides. Both are
             // realm-aware, so a Java subclass overriding a Kotlin `open fun` is
             // included.
-            for relative in provider
-                .get_descendants(owner)
-                .into_iter()
-                .chain(provider.get_ancestors(owner))
-            {
+            let descendants = provider.get_descendants(owner);
+            let ancestors = provider.get_ancestors(owner);
+            if !descendants.is_complete() || !ancestors.is_complete() {
+                return None;
+            }
+            for relative in descendants.edges.into_iter().chain(ancestors.edges) {
                 if owner_declares_member(graph, &relative.fq_name(), target.identifier(), None) {
                     declaration_owner_fq_names.insert(relative.fq_name());
                 }
@@ -462,7 +463,11 @@ fn receiver_type_matches_target_uncached(
         let mut next = Vec::new();
         let mut declaring_at_this_level = Vec::new();
         for unit in &frontier {
-            for ancestor in provider.get_direct_ancestors(unit) {
+            let answer = provider.get_direct_ancestors(unit);
+            if !answer.is_complete() {
+                return ReceiverTargetMatch::Unresolved;
+            }
+            for ancestor in answer.edges {
                 let fqn = ancestor.fq_name();
                 if seen.contains(&fqn) {
                     continue;
@@ -549,11 +554,11 @@ pub fn receiver_type_fq_name(
         "super_expression" => {
             let owner = ctx.enclosing_owner_fq_names(node).into_iter().next()?;
             let unit = type_unit(ctx.graph(), &owner)?;
-            ctx.graph()
-                .hierarchy?
-                .get_direct_ancestors(&unit)
-                .first()
-                .map(CodeUnit::fq_name)
+            let answer = ctx.graph().hierarchy?.get_direct_ancestors(&unit);
+            if !answer.is_complete() {
+                return None;
+            }
+            answer.edges.first().map(CodeUnit::fq_name)
         }
         "simple_identifier" => {
             let name = node_text(node, ctx.source()).to_string();
@@ -739,7 +744,11 @@ pub fn member_unit(
     for _ in 0..MAX_MEMBER_HIERARCHY_DEPTH {
         let mut next = Vec::new();
         for unit in &frontier {
-            for ancestor in provider.get_direct_ancestors(unit) {
+            let answer = provider.get_direct_ancestors(unit);
+            if !answer.is_complete() {
+                return None;
+            }
+            for ancestor in answer.edges {
                 let fqn = ancestor.fq_name();
                 if seen.contains(&fqn) {
                     continue;
@@ -1188,7 +1197,13 @@ impl<'a> KotlinNameResolver<'a> {
         for _ in 0..MAX_INHERITED_SCOPE_DEPTH {
             let mut next = Vec::new();
             for unit in &frontier {
-                for ancestor in provider.get_direct_ancestors(unit) {
+                // S2b adds an incomplete route to inherited scope collection.
+                for ancestor in provider
+                    .get_direct_ancestors(unit)
+                    .definite()
+                    .iter()
+                    .cloned()
+                {
                     if !owners
                         .iter()
                         .any(|owner: &CodeUnit| owner.fq() == ancestor.fq())

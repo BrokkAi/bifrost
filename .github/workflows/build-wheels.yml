@@ -65,7 +65,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
-          args: --release --locked --out dist
+          args: --release --locked --out dist --compression-method deflated --compression-level 9
           rust-toolchain: '1.99.1'
 
       - name: Upload wheel artifact
@@ -123,15 +123,24 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
-          args: --release --locked --out dist
+          args: --release --locked --out dist --compression-method deflated --compression-level 9
           rust-toolchain: '1.99.1'
           working-directory: packaging/bifrost-cli
+
+      - name: Set up Python for CLI wheel compression
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Compress the CLI wheel's binary
+        shell: bash
+        run: python scripts/public/compress-cli-wheel.py packaging/bifrost-cli/wheelhouse packaging/bifrost-cli/dist/*.whl
 
       - name: Upload uv CLI wheel artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: cli-wheels-${{ matrix.target }}
-          path: packaging/bifrost-cli/dist/*.whl
+          path: packaging/bifrost-cli/wheelhouse/*.whl
           if-no-files-found: error
 
   sdist:

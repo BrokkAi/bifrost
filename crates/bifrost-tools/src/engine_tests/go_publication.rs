@@ -87,7 +87,11 @@ pub(crate) mod go_publication_tests {
             let store =
                 AnalyzerStore::open_persistent(&store_path).expect("open publication store");
             store
-                .write_parsed_blob(oid, lang, adapter, state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+                    adapter,
+                    state,
+                )
                 .expect("canonical publication succeeds");
             drop(store);
 
@@ -97,7 +101,11 @@ pub(crate) mod go_publication_tests {
                 .current_generation(lang)
                 .expect("current language generation");
             let published = reopened
-                .load_structural_facts_rows(oid, lang, generation, STRUCTURAL_FACTS_VERSION)
+                .load_structural_facts_rows(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+                    generation,
+                    STRUCTURAL_FACTS_VERSION,
+                )
                 .expect("read canonical structural rows")
                 .expect("published canonical structural rows");
             assert_eq!(
@@ -132,7 +140,11 @@ pub(crate) mod go_publication_tests {
                 .expect("typed source import publication");
             assert_eq!(typed_imports, expected_imports);
             assert_eq!(
-                read_import_infos(&conn, &oid.to_string(), lang).expect("generic import read"),
+                read_import_infos(
+                    &conn,
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang)
+                )
+                .expect("generic import read"),
                 expected_generic_imports,
                 "generic imports must remain a projection of canonical source imports"
             );
@@ -242,7 +254,11 @@ pub(crate) mod go_publication_tests {
             assert_eq!(orphan_definition_sites, 0);
 
             let hydrated = reopened
-                .hydrate_file_state(oid, lang, adapter, &fixture.file(relative_path))
+                .hydrate_file_state(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+                    adapter,
+                    &fixture.file(relative_path),
+                )
                 .expect("hydrate published file")
                 .expect("published file state");
             assert_eq!(hydrated.imports, expected_generic_imports);

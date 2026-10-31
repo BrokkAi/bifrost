@@ -4122,43 +4122,12 @@ impl<'a> VisibilityIndex<'a> {
                 "preproc_if" | "preproc_ifdef" | "preproc_elif"
             ) && conditionals.contains(&conditional.start_byte())
             {
-                let mut value = match conditional.kind() {
-                    "preproc_ifdef" => {
-                        let name = conditional.child_by_field_name("name")?;
-                        let defined =
-                            self.macro_name_defined_value(environment, node_text(name, source));
-                        match conditional.child(0)?.kind() {
-                            "#ifdef" => defined,
-                            "#ifndef" => defined.map(|defined| !defined),
-                            _ => None,
-                        }
-                    }
-                    "preproc_if" | "preproc_elif" => conditional
-                        .child_by_field_name("condition")
-                        .and_then(|condition| {
-                            self.preprocessor_integer_value(
-                                condition,
-                                source,
-                                environment,
-                                &mut Vec::new(),
-                                0,
-                            )
-                        })
-                        .map(|value| value != 0),
-                    _ => unreachable!(),
-                };
-                match preprocessor_branch_of_descendant(
+                match self.preprocessor_conditional_branch_value(
                     conditional,
                     descendant,
-                    &mut PreprocessorContextCache::default(),
+                    source,
+                    environment,
                 ) {
-                    PreprocessorBranch::Consequence => {}
-                    PreprocessorBranch::Structured(_) | PreprocessorBranch::DisplacedElse => {
-                        value = value.map(|value| !value);
-                    }
-                    PreprocessorBranch::Unreadable => value = None,
-                }
-                match value {
                     Some(true) => {}
                     Some(false) => return Some(false),
                     None => unknown = true,
@@ -4167,6 +4136,50 @@ impl<'a> VisibilityIndex<'a> {
             current = conditional.parent();
         }
         (!unknown).then_some(true)
+    }
+
+    fn preprocessor_conditional_branch_value(
+        &self,
+        conditional: Node<'_>,
+        descendant: Node<'_>,
+        source: &str,
+        environment: &MacroEnvironment,
+    ) -> Option<bool> {
+        let value = match conditional.kind() {
+            "preproc_ifdef" => {
+                let name = conditional.child_by_field_name("name")?;
+                let defined = self.macro_name_defined_value(environment, node_text(name, source));
+                match conditional.child(0)?.kind() {
+                    "#ifdef" => defined,
+                    "#ifndef" => defined.map(|defined| !defined),
+                    _ => None,
+                }
+            }
+            "preproc_if" | "preproc_elif" => conditional
+                .child_by_field_name("condition")
+                .and_then(|condition| {
+                    self.preprocessor_integer_value(
+                        condition,
+                        source,
+                        environment,
+                        &mut Vec::new(),
+                        0,
+                    )
+                })
+                .map(|value| value != 0),
+            _ => unreachable!(),
+        };
+        match preprocessor_branch_of_descendant(
+            conditional,
+            descendant,
+            &mut PreprocessorContextCache::default(),
+        ) {
+            PreprocessorBranch::Consequence => value,
+            PreprocessorBranch::Structured(_) | PreprocessorBranch::DisplacedElse => {
+                value.map(|value| !value)
+            }
+            PreprocessorBranch::Unreadable => None,
+        }
     }
 
     fn macro_name_defined_value(&self, environment: &MacroEnvironment, name: &str) -> Option<bool> {
@@ -4960,7 +4973,7 @@ impl<'a> VisibilityIndex<'a> {
     /// Candidate guard admission, without claiming that the guards hold.
     /// Structured inverse paths use this when visibility proof fails, so an
     /// unrelated guard preserves uncertainty while a contradiction is excluded.
-    pub(crate) fn declaration_guards_compatible_at_reference(
+    pub fn declaration_guards_compatible_at_reference(
         &self,
         analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
@@ -4971,12 +4984,99 @@ impl<'a> VisibilityIndex<'a> {
             return false;
         };
         let reference_guards = preprocessor_guard_environment(reference, prepared.source());
+        let requirements = declaration_guard_requirements(analyzer, self.cpp, declaration);
+        // Ordinary unguarded members and references need no translation-unit
+        // include walk. Build and dialect facts cannot contradict an empty
+        // source context or an unconditional declaration.
+        if reference_guards.as_ref().is_some_and(HashSet::is_empty)
+            && requirements.iter().any(|(_, required)| required.is_empty())
+        {
+            return true;
+        }
         let reference_guards = self.effective_reference_guards(file, reference_guards.as_ref());
-        declaration_guard_requirements(analyzer, self.cpp, declaration)
-            .iter()
-            .any(|(_, required)| {
-                guards_compatible_at_reference(required, reference_guards.as_ref())
-            })
+        requirements.iter().any(|(_, required)| {
+            guards_compatible_at_reference(required, reference_guards.as_ref())
+        })
+    }
+
+    /// A compatible declaration is only a candidate until its guards follow
+    /// from the reference's effective context. Keep this proof separate from
+    /// compatibility so an unknown header or feature guard remains uncertain.
+    pub fn declaration_guards_implied_at_reference(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        declaration: &CodeUnit,
+        reference: Node<'_>,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
+            return false;
+        };
+        let raw = preprocessor_guard_environment(reference, prepared.source());
+        let requirements = declaration_guard_requirements(analyzer, self.cpp, declaration);
+        if raw.is_some() && requirements.iter().any(|(_, required)| required.is_empty()) {
+            return true;
+        }
+        let effective = self.effective_reference_guards(file, raw.as_ref());
+        requirements.iter().any(|(byte, required)| {
+            if guard_requirements_hold_at_reference(required, effective.as_ref())
+                && (declaration.source() != file
+                    || self.preprocessor_guards_stable_between(
+                        file,
+                        (*byte).min(reference.start_byte()),
+                        (*byte).max(reference.start_byte()),
+                        required,
+                    ))
+            {
+                return true;
+            }
+            if declaration.source() != file {
+                return false;
+            }
+            // A local #define can prove a declaration's branch even when the
+            // reference lies outside it, and a later #undef cannot remove an
+            // already-declared member. Evaluate each structured condition at
+            // its own entry, before events inside its arm change the macros.
+            let root = prepared.tree().root_node();
+            let Some(node) = root.descendant_for_byte_range(
+                *byte,
+                byte.saturating_add(1).min(prepared.source().len()),
+            ) else {
+                return false;
+            };
+            let conditionals = owning_preprocessor_conditionals(root, node, prepared.source());
+            if conditionals.is_empty() {
+                return false;
+            }
+            let mut pending = conditionals.iter().copied().peekable();
+            let mut ancestor = node.parent();
+            let mut evaluated = false;
+            while let Some(conditional) = ancestor {
+                if pending.peek() == Some(&conditional.start_byte()) {
+                    pending.next();
+                    match conditional.kind() {
+                        "preproc_if" | "preproc_ifdef" | "preproc_elif" => {
+                            let environment =
+                                self.macro_environment(file, conditional.start_byte());
+                            if self.preprocessor_conditional_branch_value(
+                                conditional,
+                                node,
+                                prepared.source(),
+                                &environment,
+                            ) != Some(true)
+                            {
+                                return false;
+                            }
+                            evaluated = true;
+                        }
+                        "preproc_else" => {}
+                        _ => return false,
+                    }
+                }
+                ancestor = conditional.parent();
+            }
+            evaluated && pending.peek().is_none()
+        })
     }
 
     /// Whether a physical declaration is visible at an exact structured
@@ -7021,7 +7121,10 @@ impl<'a> VisibilityIndex<'a> {
             return LexicalTypeResolution::Ambiguous;
         };
 
-        let mut frontier = hierarchy.get_direct_ancestors(&lexical_owner);
+        let mut frontier = hierarchy
+            .get_direct_ancestors(&lexical_owner)
+            .definite()
+            .to_vec();
         let mut visited_owners = HashSet::default();
         while !frontier.is_empty() {
             let mut level_matches: Vec<(CodeUnit, Vec<CodeUnit>)> = Vec::new();
@@ -7037,7 +7140,7 @@ impl<'a> VisibilityIndex<'a> {
                     .filter(|candidate| canonical_cpp_name_matches(candidate, &qualified_name))
                     .collect::<Vec<_>>();
                 if candidates.is_empty() {
-                    for ancestor in hierarchy.get_direct_ancestors(&owner) {
+                    for ancestor in hierarchy.get_direct_ancestors(&owner).definite().to_vec() {
                         if !next_frontier
                             .iter()
                             .any(|existing: &CodeUnit| existing.fq_name() == ancestor.fq_name())
@@ -7104,7 +7207,10 @@ impl<'a> VisibilityIndex<'a> {
         injected_name: &str,
     ) -> Option<CodeUnit> {
         let hierarchy = analyzer.type_hierarchy_provider()?;
-        let mut frontier = hierarchy.get_direct_ancestors(enclosing_owner);
+        let mut frontier = hierarchy
+            .get_direct_ancestors(enclosing_owner)
+            .definite()
+            .to_vec();
         let mut propagated_counts: HashMap<CodeUnit, u8> = HashMap::default();
         while !frontier.is_empty() {
             let mut level_matches = Vec::new();
@@ -7125,7 +7231,7 @@ impl<'a> VisibilityIndex<'a> {
                 if owner.identifier() == injected_name {
                     level_matches.push(owner.clone());
                 }
-                next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
+                next_frontier.extend(hierarchy.get_direct_ancestors(&owner).definite().to_vec());
             }
             match level_matches.as_slice() {
                 [owner] => return Some(owner.clone()),
@@ -10441,7 +10547,10 @@ pub fn resolve_declaring_member_owner(
     if !matches!(direct, EnclosingMemberOwnerResolution::Missing) {
         return direct;
     }
-    let mut stack = hierarchy.get_direct_ancestors(&receiver_owner);
+    let mut stack = hierarchy
+        .get_direct_ancestors(&receiver_owner)
+        .definite()
+        .to_vec();
     let mut propagated_counts: HashMap<CodeUnit, u8> = HashMap::default();
     let mut path_matches = Vec::new();
     while let Some(raw_owner) = stack.pop() {
@@ -10468,7 +10577,7 @@ pub fn resolve_declaring_member_owner(
                 return EnclosingMemberOwnerResolution::Ambiguous;
             }
             EnclosingMemberOwnerResolution::Missing => {
-                stack.extend(hierarchy.get_direct_ancestors(&owner));
+                stack.extend(hierarchy.get_direct_ancestors(&owner).definite().to_vec());
             }
         }
     }
@@ -10583,7 +10692,7 @@ fn member_using_declaration_bases(
         return Ok(Vec::new());
     };
     let mut bases = Vec::new();
-    for raw_ancestor in hierarchy.get_ancestors(owner) {
+    for raw_ancestor in hierarchy.get_ancestors(owner).definite().to_vec() {
         let Some(ancestor) =
             visibility.canonical_visible_full_type_unit(analyzer, file, &raw_ancestor)
         else {

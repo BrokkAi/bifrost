@@ -5,7 +5,7 @@
 //! walker of their own:
 //!
 //! - the callee set of a call site is
-//!   [`crate::structural::search::semantic::SemanticQueryContext::dispatch_at_source`],
+//!   [`crate::structural::search::semantic::SemanticQueryContext::dispatch_at_source_with_cause`],
 //!   the exact answer the `dispatch_outcome` and `dispatch_target` rows
 //!   publish, so an effect row's proof is copied rather than re-derived. The
 //!   site's candidate coverage is copied too, with the one reinterpretation
@@ -25,6 +25,11 @@
 //! [`crate::analyzer::usages::effects`] and is unit-tested without a workspace.
 
 use super::*;
+use crate::analyzer::semantic_model::overlay::{
+    ModelMembersState, ModelOwnerAnswer, ModelProvider, ModelProviderSelection, ModelSymbolRef,
+    ModelTypeOwnerAnswer, SelectedModelResult,
+};
+use crate::analyzer::semantic_model::{SemanticModelSymbolKind, TypeRef, Visibility};
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_cpp_analysis::analyzer::CppCallResultUseIndex;
 use brokk_bifrost_php_analysis::analyzer::php::PhpCallResultUseIndex;
@@ -377,6 +382,7 @@ pub(super) struct CallResultContractValue {
     /// exact arm. This is internal proof input; `callee_symbol` is display
     /// text and must never be reparsed to recover it.
     modeled_target: Option<ModeledProcedureKey>,
+    selected_callable: Option<ModelSymbolRef>,
     pub(super) callee: Option<DeclarationValue>,
     pub(super) callee_symbol: Option<String>,
     pub(super) result_ordinal: Option<u32>,
@@ -673,18 +679,25 @@ type JavaLambdaResultUses = HashMap<
     Result<JavaCallResultUse, JavaCallResultUseOpen>,
 >;
 
+type DispatchAnswerWithCause = (Arc<super::dispatch::DispatchSiteAnswer>, Incompleteness);
+
+#[derive(Debug)]
+struct RustInitializerCalls {
+    ranges: Arc<HashSet<(usize, usize)>>,
+    cause: Incompleteness,
+}
+
 #[derive(Default)]
 pub(super) struct EffectTraversalCache {
     diagnostic_sources: PipelineRenderCache,
     models: CaptureScopedMemo<Option<Option<Arc<ResolvedActiveSemanticModels>>>>,
     keys: CaptureScopedMemo<HashMap<CodeUnit, Option<ModeledProcedureKey>>>,
     answers: CaptureScopedMemo<HashMap<ModeledProcedureKey, ModelAnswer>>,
-    dispatch_answers:
-        CaptureScopedMemo<HashMap<(ProjectFile, Range), Arc<super::dispatch::DispatchSiteAnswer>>>,
+    dispatch_answers: CaptureScopedMemo<HashMap<(ProjectFile, Range), DispatchAnswerWithCause>>,
     result_contract_names: CaptureScopedMemo<Option<Arc<ResultContractNameInventory>>>,
     reports: CaptureScopedMemo<HashMap<String, Arc<ProcedureEffectReport>>>,
     facts: CaptureScopedMemo<HashMap<ProjectFile, Option<Arc<FileFacts>>>>,
-    rust_static_const_initializer_calls: HashMap<ProjectFile, Arc<HashSet<(usize, usize)>>>,
+    rust_static_const_initializer_calls: HashMap<ProjectFile, RustInitializerCalls>,
     result_member_call_shapes: CaptureScopedMemo<Option<ResultMemberCallShapeWindow>>,
     result_use_indexes: CaptureScopedMemo<Option<ResultUseIndexWindow>>,
     java_result_use_indexes:
@@ -701,7 +714,7 @@ pub(super) struct EffectTraversalCache {
         CaptureScopedMemo<HashMap<(ProjectFile, Range), Arc<NativeCallTargetLookup>>>,
     modeled_call_targets: CaptureScopedMemo<Option<ModeledCallTargetWindow>>,
     conditional_wrapper_answers:
-        CaptureScopedMemo<HashMap<CodeUnit, ConditionalProcedureSummaryAnswer>>,
+        CaptureScopedMemo<HashMap<(CodeUnit, usize), ConditionalProcedureSummaryAnswer>>,
     conditional_wrapper_visiting: HashSet<CodeUnit>,
     result_contract_incomplete_diagnostics: HashSet<(ProjectFile, &'static str)>,
     /// Whether any derived row so far was not exhaustive, so the query's own
@@ -951,8 +964,16 @@ pub(super) fn result_subject_use_expansions(
         .saturating_mul(32)
         .saturating_add(graph_size.saturating_mul(128))
         .saturating_add(events.saturating_mul(events).saturating_mul(256));
-    if source.len() > limits.semantic.max_source_bytes
-        || retained_bound > limits.semantic.max_retained_bytes
+    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        source.len(),
+        limits.semantic.max_source_bytes,
+    )
+    .allows(0)
+        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            retained_bound,
+            limits.semantic.max_retained_bytes,
+        )
+        .allows(0)
         || !semantic.charge_consumer_traversal(
             file,
             source.len().saturating_add(walk_work),
@@ -2195,24 +2216,31 @@ impl EffectTraversalCache {
     /// same exact call. The projected answer owns no semantic handles, so it
     /// remains valid across this query's artifact windows while avoiding a
     /// second oracle traversal and a second retained-work charge.
-    fn dispatch_at_source(
+    fn dispatch_at_source_with_cause(
         &mut self,
         semantic: &mut SemanticQueryContext<'_>,
         file: &ProjectFile,
         range: Range,
-    ) -> Arc<super::dispatch::DispatchSiteAnswer> {
+    ) -> DispatchAnswerWithCause {
         let Self {
             dispatch_answers, ..
         } = self;
         let attribution = memo_attribution(semantic.analyzer());
         dispatch_answers.read_mut(&attribution, |dispatch_answers| {
             let key = (file.clone(), range);
-            if let Some(answer) = dispatch_answers.get(&key) {
-                return Arc::clone(answer);
+            if let Some((answer, cause)) = dispatch_answers.get(&key) {
+                if cause.execution_cause().is_some() {
+                    semantic.analyzer().mark_execution_dependent();
+                }
+                return (Arc::clone(answer), *cause);
             }
-            let answer = Arc::new(semantic.dispatch_at_source(file, range));
-            dispatch_answers.insert(key, Arc::clone(&answer));
-            answer
+            let (answer, incompleteness) = semantic.dispatch_at_source_with_cause(file, range);
+            if incompleteness.execution_cause().is_some() {
+                semantic.analyzer().mark_execution_dependent();
+            }
+            let answer = Arc::new(answer);
+            dispatch_answers.insert(key, (Arc::clone(&answer), incompleteness));
+            (answer, incompleteness)
         })
     }
 
@@ -2260,30 +2288,44 @@ impl EffectTraversalCache {
     /// local item declaration.
     fn rust_static_const_initializer_calls(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         source: &str,
     ) -> Arc<HashSet<(usize, usize)>> {
         if crate::analyzer::common::language_for_file(file) != Language::Rust {
             return Arc::new(HashSet::default());
         }
-        Arc::clone(
-            self.rust_static_const_initializer_calls
-                .entry(file.clone())
-                .or_insert_with(|| {
-                    Arc::new(rust_static_const_initializer_call_ranges(file, source))
-                }),
-        )
+        let RustInitializerCalls { ranges, cause } = self
+            .rust_static_const_initializer_calls
+            .entry(file.clone())
+            .or_insert_with(
+                || match rust_static_const_initializer_call_ranges(file, source) {
+                    Ok(ranges) => RustInitializerCalls {
+                        ranges: Arc::new(ranges),
+                        cause: Incompleteness::Content,
+                    },
+                    Err(cause) => RustInitializerCalls {
+                        ranges: Arc::new(HashSet::default()),
+                        cause: Incompleteness::Operational(cause),
+                    },
+                },
+            );
+        if cause.execution_cause().is_some() {
+            analyzer.mark_execution_dependent();
+        }
+        Arc::clone(ranges)
     }
 
     fn is_rust_static_const_initializer_call(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         source: &str,
         range: Range,
     ) -> bool {
         crate::analyzer::common::language_for_file(file) == Language::Rust
             && self
-                .rust_static_const_initializer_calls(file, source)
+                .rust_static_const_initializer_calls(analyzer, file, source)
                 .contains(&(range.start_byte, range.end_byte))
     }
 
@@ -2776,13 +2818,14 @@ impl EffectTraversalCache {
 fn rust_static_const_initializer_call_ranges(
     file: &ProjectFile,
     source: &str,
-) -> HashSet<(usize, usize)> {
-    let Some(tree) = crate::analyzer::usages::get_definition::parse_tree_for_language(
+) -> Result<HashSet<(usize, usize)>, DerivationExecutionCause> {
+    let Some(tree) = crate::analyzer::usages::get_definition::parse_tree_for_language_outcome(
         file,
         Language::Rust,
         source,
-    ) else {
-        return HashSet::default();
+    )?
+    else {
+        return Ok(HashSet::default());
     };
     let mut result = HashSet::default();
     let mut stack = vec![tree.root_node()];
@@ -2813,7 +2856,7 @@ fn rust_static_const_initializer_call_ranges(
         children.reverse();
         stack.extend(children);
     }
-    result
+    Ok(result)
 }
 
 fn application_accepts_result_contract(
@@ -2965,7 +3008,7 @@ pub(super) fn call_effect_expansions(
 ) -> Vec<PipelineExpansion> {
     let outcome = &shape.report.outcome;
     if shape.source().is_some_and(|source| {
-        cache.is_rust_static_const_initializer_call(&outcome.file, source, outcome.range)
+        cache.is_rust_static_const_initializer_call(analyzer, &outcome.file, source, outcome.range)
     }) {
         return Vec::new();
     }
@@ -3363,7 +3406,8 @@ pub(super) fn call_result_contract_expansions(
     shape: &CallShapeValue,
 ) -> Vec<PipelineExpansion> {
     let outcome = &shape.report.outcome;
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, _dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let arm_count = answer.arms.len();
     let mut modeled_arm_count = 0usize;
     let mut model_conflict = false;
@@ -3455,6 +3499,44 @@ pub(super) fn call_result_contract_expansions(
     let single_arm = (answer.arms.len() == 1).then(|| &answer.arms[0]);
     let target_id = single_arm.map(|arm| arm.target_id.clone());
     let modeled_target = single_arm.and_then(|_| keys.first().cloned()).flatten();
+    // Only the Go-gated field proof (modeled_pointer_result_field) reads the
+    // selection, so other languages skip the model reads entirely.
+    let selected_callable = modeled_target
+        .as_ref()
+        .filter(|key| key.language == "go")
+        .and_then(|key| {
+            let overlay = analyzer.semantic_model_overlay()?;
+            let descriptor = single_arm
+                .and_then(|arm| arm.unmaterialized_target.as_ref())
+                .and_then(|target| target.selected_external_descriptor.as_ref());
+            let application = super::call_binding::structured_model_application(shape);
+            let matched = super::call_binding::selected_model_callable(
+                analyzer,
+                &overlay,
+                key,
+                descriptor,
+                &application,
+            )?;
+            // Go has no overloads. Partial inventory does not erase one positive
+            // declaration, but ambiguous provenance or application shapes stay open.
+            use crate::analyzer::semantic_model::{
+                SemanticModelCallableDisposition as Disposition,
+                SemanticModelCallableIncompleteReason as Incomplete,
+            };
+            if !matches!(
+                matched.disposition,
+                Disposition::Unique | Disposition::Incomplete(Incomplete::PartialModel)
+            ) {
+                return None;
+            }
+            let [symbol] = matched.records.as_slice() else {
+                return None;
+            };
+            Some(ModelSymbolRef {
+                symbol_id: symbol.id.clone(),
+                provider: ModelProvider::from(&symbol.provenance),
+            })
+        });
     let callee = single_arm
         .and_then(|arm| arm.target_unit.as_ref())
         .and_then(|unit| {
@@ -3486,6 +3568,7 @@ pub(super) fn call_result_contract_expansions(
                 site_ast_id: outcome.site_ast_id.clone(),
                 target_id,
                 modeled_target,
+                selected_callable,
                 callee,
                 callee_symbol,
                 result_ordinal: None,
@@ -3549,6 +3632,7 @@ pub(super) fn call_result_contract_expansions(
                     site_ast_id: outcome.site_ast_id.clone(),
                     target_id: target_id.clone(),
                     modeled_target: modeled_target.clone(),
+                    selected_callable: selected_callable.clone(),
                     callee: callee.clone(),
                     callee_symbol: callee_symbol.clone(),
                     result_ordinal: Some(bound.contract.result_ordinal),
@@ -3632,13 +3716,15 @@ fn native_rust_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 EffectCoverage::Exhaustive,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
             ))];
         }
     }
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, _dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let standard_drop_wrapper = shape.source().is_some_and(|source| {
         brokk_bifrost_rust_analysis::rust_call_is_standard_drop(
             analyzer,
@@ -3759,7 +3845,14 @@ fn native_rust_call_result_obligation_expansions(
         modeled_arm_count,
         terminal: native_obligation.is_none(),
     };
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+    );
     vec![pipeline_expansion(PipelineValue::CallResultObligation(
         Box::new(row),
     ))]
@@ -4086,6 +4179,7 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return Some(expansions);
         }
@@ -4094,7 +4188,14 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
         row.coverage = row.coverage.meet(EffectCoverage::Open);
         row.reason = Some("obligation_unavailable");
     }
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, row.coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        row.coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+    );
     Some(vec![pipeline_expansion(
         PipelineValue::CallResultObligation(Box::new(row)),
     )])
@@ -4202,6 +4303,7 @@ fn native_cpp_call_result_obligation_expansions(
             diagnostics,
             &outcome.file,
             use_coverage,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
         );
         return vec![pipeline_expansion(PipelineValue::CallResultObligation(
             Box::new(row),
@@ -4228,7 +4330,11 @@ fn native_cpp_call_result_obligation_expansions(
     let full_answer = native_dispatch
         .as_ref()
         .is_none_or(|lookup| lookup.targets.is_empty() && could_be_reviewed_cpp_libc_call(shape))
-        .then(|| cache.dispatch_at_source(semantic, &outcome.file, outcome.range));
+        .then(|| {
+            cache
+                .dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range)
+                .0
+        });
     if let Some(answer) = full_answer.as_ref()
         && let Some(expansions) =
             reviewed_cpp_libc_call_result_obligation_expansions(ReviewedCppLibcCallContext {
@@ -4391,7 +4497,14 @@ fn native_cpp_call_result_obligation_expansions(
         modeled_arm_count,
         terminal: native_obligation.is_none(),
     };
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+    );
     vec![pipeline_expansion(PipelineValue::CallResultObligation(
         Box::new(row),
     ))]
@@ -4411,7 +4524,8 @@ fn native_go_call_result_obligation_expansions(
 ) -> Vec<PipelineExpansion> {
     let outcome = &shape.report.outcome;
     let classification = cache.native_result_use_for_shape(analyzer, shape);
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, _dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let dispatch_coverage = coverage_for(answer.coverage);
     let mut arm_targets = Vec::with_capacity(answer.arms.len());
     let mut arm_result_counts = Vec::with_capacity(answer.arms.len());
@@ -4640,7 +4754,14 @@ fn native_go_call_result_obligation_expansions(
             modeled_arm_count,
             terminal: native_obligation.is_none(),
         };
-        record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, coverage);
+        record_result_obligation_coverage(
+            analyzer,
+            cache,
+            diagnostics,
+            &outcome.file,
+            coverage,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+        );
         expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
             Box::new(row),
         )));
@@ -4670,7 +4791,8 @@ fn python_status_call_result_obligation_expansions(
     shape: &CallShapeValue,
 ) -> Option<Vec<PipelineExpansion>> {
     let outcome = &shape.report.outcome;
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, mut dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let status_arm_count = answer
         .arms
         .iter()
@@ -4804,6 +4926,10 @@ fn python_status_call_result_obligation_expansions(
                 row.modeled_arm_count += 1;
             }
         } else {
+            // No published snapshot means no Models read can certify absence.
+            dispatch_incompleteness = dispatch_incompleteness.combine(Incompleteness::Operational(
+                DerivationExecutionCause::Provider,
+            ));
             row.reason = Some("model_unavailable");
         }
     }
@@ -4837,6 +4963,7 @@ fn python_status_call_result_obligation_expansions(
                     diagnostics,
                     &outcome.file,
                     row.coverage,
+                    dispatch_incompleteness,
                 );
                 return Some(expansions);
             }
@@ -4848,7 +4975,14 @@ fn python_status_call_result_obligation_expansions(
     } else {
         row.coverage = row.coverage.meet(EffectCoverage::Open);
     }
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, row.coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        row.coverage,
+        dispatch_incompleteness,
+    );
     Some(vec![pipeline_expansion(
         PipelineValue::CallResultObligation(Box::new(row)),
     )])
@@ -4884,6 +5018,7 @@ fn python_call_result_obligation_expansions(
         modeled_arm_count: 0,
         terminal: true,
     };
+    let dispatch_incompleteness = Incompleteness::Content;
     let result_use = match super::python_rule_facts::python_result_use_for_call_shape(shape) {
         Ok(result_use) => result_use,
         Err(reason) => {
@@ -4901,6 +5036,7 @@ fn python_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                dispatch_incompleteness,
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -4916,6 +5052,7 @@ fn python_call_result_obligation_expansions(
             diagnostics,
             &outcome.file,
             row.coverage,
+            dispatch_incompleteness,
         );
         return vec![pipeline_expansion(PipelineValue::CallResultObligation(
             Box::new(row),
@@ -4933,7 +5070,8 @@ fn python_call_result_obligation_expansions(
         return expansions;
     }
     let exact_builtin_str_receiver = semantic.python_exact_builtin_str_receiver(shape);
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, mut dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let synthetic_target = if answer.arms.is_empty()
         && exact_builtin_str_receiver
         && answer.semantic_unsupported.is_none()
@@ -5066,6 +5204,10 @@ fn python_call_result_obligation_expansions(
             row.modeled_arm_count += 1;
         }
     } else {
+        // No published snapshot means no Models read can certify absence.
+        dispatch_incompleteness = dispatch_incompleteness.combine(Incompleteness::Operational(
+            DerivationExecutionCause::Provider,
+        ));
         row.reason = Some("model_unavailable");
     }
 
@@ -5133,6 +5275,7 @@ fn python_call_result_obligation_expansions(
                     diagnostics,
                     &outcome.file,
                     row.coverage,
+                    dispatch_incompleteness,
                 );
                 return expansions;
             }
@@ -5144,7 +5287,14 @@ fn python_call_result_obligation_expansions(
     } else {
         row.coverage = row.coverage.meet(EffectCoverage::Open);
     }
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, row.coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        row.coverage,
+        dispatch_incompleteness,
+    );
     vec![pipeline_expansion(PipelineValue::CallResultObligation(
         Box::new(row),
     ))]
@@ -5208,6 +5358,7 @@ fn csharp_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5224,6 +5375,7 @@ fn csharp_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5239,6 +5391,7 @@ fn csharp_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5255,6 +5408,7 @@ fn csharp_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5264,7 +5418,8 @@ fn csharp_call_result_obligation_expansions(
     }
 
     row.result_use = "discarded";
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, _dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let arm_targets = answer
         .arms
         .iter()
@@ -5295,6 +5450,7 @@ fn csharp_call_result_obligation_expansions(
             diagnostics,
             &outcome.file,
             row.coverage,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
         );
         return vec![pipeline_expansion(PipelineValue::CallResultObligation(
             Box::new(row),
@@ -5439,6 +5595,7 @@ fn csharp_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return expansions;
         }
@@ -5449,7 +5606,14 @@ fn csharp_call_result_obligation_expansions(
     } else {
         row.coverage = row.coverage.meet(EffectCoverage::Open);
     }
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, row.coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        row.coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+    );
     vec![pipeline_expansion(PipelineValue::CallResultObligation(
         Box::new(row),
     ))]
@@ -5568,6 +5732,7 @@ fn javascript_typescript_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5584,6 +5749,7 @@ fn javascript_typescript_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5599,6 +5765,7 @@ fn javascript_typescript_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5620,6 +5787,7 @@ fn javascript_typescript_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5643,7 +5811,8 @@ fn javascript_typescript_call_result_obligation_expansions(
         ),
         _ => unreachable!("the JS/TS result-use adapter receives only JS or TS"),
     };
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, _dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let synthetic_target = if answer.arms.is_empty()
         && exact_receiver
         && answer.semantic_unsupported.is_none()
@@ -5833,6 +6002,7 @@ fn javascript_typescript_call_result_obligation_expansions(
                     diagnostics,
                     &outcome.file,
                     row.coverage,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                 );
                 return expansions;
             }
@@ -5844,7 +6014,14 @@ fn javascript_typescript_call_result_obligation_expansions(
     } else {
         row.coverage = row.coverage.meet(EffectCoverage::Open);
     }
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, row.coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        row.coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+    );
     vec![pipeline_expansion(PipelineValue::CallResultObligation(
         Box::new(row),
     ))]
@@ -5956,6 +6133,7 @@ fn ruby_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5972,6 +6150,7 @@ fn ruby_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -5987,6 +6166,7 @@ fn ruby_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -6007,6 +6187,7 @@ fn ruby_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -6016,7 +6197,8 @@ fn ruby_call_result_obligation_expansions(
     }
 
     row.result_use = "discarded";
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, _dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let arm_targets = answer
         .arms
         .iter()
@@ -6073,6 +6255,7 @@ fn ruby_call_result_obligation_expansions(
             diagnostics,
             &outcome.file,
             row.coverage,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
         );
         return vec![pipeline_expansion(PipelineValue::CallResultObligation(
             Box::new(row),
@@ -6248,6 +6431,7 @@ fn ruby_call_result_obligation_expansions(
                     diagnostics,
                     &outcome.file,
                     row.coverage,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                 );
                 return expansions;
             }
@@ -6259,7 +6443,14 @@ fn ruby_call_result_obligation_expansions(
     } else {
         row.coverage = row.coverage.meet(EffectCoverage::Open);
     }
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, row.coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        row.coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+    );
     vec![pipeline_expansion(PipelineValue::CallResultObligation(
         Box::new(row),
     ))]
@@ -6324,6 +6515,7 @@ fn php_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -6340,6 +6532,7 @@ fn php_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -6355,6 +6548,7 @@ fn php_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -6370,6 +6564,7 @@ fn php_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return vec![pipeline_expansion(PipelineValue::CallResultObligation(
                 Box::new(row),
@@ -6379,7 +6574,8 @@ fn php_call_result_obligation_expansions(
     }
     row.result_use = "discarded";
 
-    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let (answer, _dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
     let arm_targets = answer
         .arms
         .iter()
@@ -6427,6 +6623,7 @@ fn php_call_result_obligation_expansions(
             diagnostics,
             &outcome.file,
             row.coverage,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
         );
         return vec![pipeline_expansion(PipelineValue::CallResultObligation(
             Box::new(row),
@@ -6575,6 +6772,7 @@ fn php_call_result_obligation_expansions(
                 diagnostics,
                 &outcome.file,
                 row.coverage,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
             return expansions;
         }
@@ -6585,7 +6783,14 @@ fn php_call_result_obligation_expansions(
     } else {
         row.coverage = row.coverage.meet(EffectCoverage::Open);
     }
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, row.coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        row.coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+    );
     vec![pipeline_expansion(PipelineValue::CallResultObligation(
         Box::new(row),
     ))]
@@ -6760,7 +6965,8 @@ pub(super) fn call_result_obligation_expansions(
             Err(_) => row.reason = Some("result_use_unclassified"),
             Ok(site) if matches!(site.for_port(0), CallResultUse::Discarded) => {
                 row.result_use = "discarded";
-                let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+                let (answer, _dispatch_incompleteness) =
+                    cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
                 row.arm_count = answer.arms.len();
                 row.coverage = coverage_for(answer.coverage);
                 let models = cache.models(analyzer);
@@ -6884,7 +7090,14 @@ pub(super) fn call_result_obligation_expansions(
             Ok(_) => row.reason = Some("result_use_unclassified"),
         }
     }
-    record_result_obligation_coverage(analyzer, cache, diagnostics, &outcome.file, row.coverage);
+    record_result_obligation_coverage(
+        analyzer,
+        cache,
+        diagnostics,
+        &outcome.file,
+        row.coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
+    );
     vec![pipeline_expansion(PipelineValue::CallResultObligation(
         Box::new(row),
     ))]
@@ -6943,6 +7156,7 @@ fn validate_result_contract_value_uses(
         &value.site_id,
         &value.site_ast_id,
         value.modeled_target.as_ref(),
+        value.selected_callable.as_ref(),
         contract,
         value.coverage,
         &value.success_guard_edges,
@@ -10083,6 +10297,9 @@ fn unique_state_event_read<'a>(
 
 #[derive(Clone, Copy)]
 struct IntrinsicClassificationContext<'a> {
+    cancellation: Option<&'a CancellationToken>,
+    selected_callable: Option<&'a ModelSymbolRef>,
+    selection: Option<&'a ModelProviderSelection>,
     modeled_target: Option<&'a ModeledProcedureKey>,
     result_ordinal: u32,
     semantic_model_overlay: Option<&'a SemanticModelOverlay>,
@@ -10094,6 +10311,16 @@ struct IntrinsicClassificationContext<'a> {
 /// Missing or conflicting facts stay open because declaration packs may be
 /// partial; a value-struct result also stays open because field access on it
 /// does not carry the fallback non-null precondition.
+///
+/// Only a direct public field of the pointee proves the selection. The owner
+/// may be unexported: the field's own visibility is checked below, and a
+/// pointer to an unexported struct dereferences the same way. Go forbids a
+/// field and a method with the same name on one type, so a direct field cannot be
+/// shadowed even when the pack omits other members, provided the owner's
+/// members are certified direct (`ModelMembersState::Exact`). A promoted field
+/// stays open: no pack contract certifies that shallower owners list every
+/// member, and an omitted shallower method with a pointer receiver would turn
+/// the selector into a method value that does not dereference the pointer.
 fn modeled_pointer_result_field(
     intrinsic: &IndexedIntrinsicUse,
     file: &ProjectFile,
@@ -10102,12 +10329,12 @@ fn modeled_pointer_result_field(
     if intrinsic.kind != ResultContractUseKind::Field {
         return false;
     }
-    let Some(target) = context
+    if !context
         .modeled_target
-        .filter(|target| target.language == "go")
-    else {
+        .is_some_and(|target| target.language == "go")
+    {
         return false;
-    };
+    }
     let Some(member) = intrinsic.member.as_ref().filter(|member| {
         member.language()
             == crate::analyzer::LanguageDialect::Standard(crate::analyzer::Language::Go)
@@ -10125,15 +10352,65 @@ fn modeled_pointer_result_field(
     if field.is_empty() {
         return false;
     }
-    brokk_bifrost_go_analysis::analyzer::modeled_go_callable_result_pointer_field(
+    let (Some(overlay), Some(callable), Some(selection)) = (
         context.semantic_model_overlay,
-        &target.owner,
-        &target.member,
-        target.has_receiver,
-        target.parameter_count as usize,
-        context.result_ordinal as usize,
-        field,
-    )
+        context.selected_callable,
+        context.selection,
+    ) else {
+        return false;
+    };
+    let uncancelled = CancellationToken::new();
+    let cancellation = context.cancellation.unwrap_or(&uncancelled);
+    let Ok(SelectedModelResult::Typed(TypeRef::Pointer { element: inner })) = overlay
+        .selected_callable_result(
+            callable,
+            selection,
+            context.result_ordinal as usize,
+            cancellation,
+        )
+    else {
+        return false;
+    };
+    let TypeRef::Declared {
+        arguments,
+        nullable: false,
+        ..
+    } = inner.as_ref()
+    else {
+        return false;
+    };
+    if !arguments.is_empty() {
+        return false;
+    }
+    let Ok(ModelTypeOwnerAnswer::Unique { owner, declaration }) =
+        overlay.model_type_owner("go", &inner, selection, cancellation)
+    else {
+        return false;
+    };
+    if declaration.kind != SemanticModelSymbolKind::Struct {
+        return false;
+    }
+    let Ok(Some(ModelOwnerAnswer::Declared(members))) =
+        overlay.model_member_declarations(&owner, selection, cancellation)
+    else {
+        return false;
+    };
+    if members.members_state != ModelMembersState::Exact {
+        return false;
+    }
+    let mut named = members
+        .members
+        .iter()
+        .filter(|member| member.declaration.name == field);
+    let Some(member) = named.next() else {
+        return false;
+    };
+    named.next().is_none()
+        && member.declaration.kind == SemanticModelSymbolKind::Field
+        && member.declaration.visibility == Visibility::Public
+        && !member.declaration.is_static()
+        && !member.declaration.has_receiver()
+        && !member.declaration.provenance.ambiguous
 }
 
 fn intrinsic_result_uses_for_reads(
@@ -11018,17 +11295,19 @@ fn conditional_summary_for_workspace_procedure(
     unit: &CodeUnit,
     depth: usize,
 ) -> ConditionalProcedureSummaryAnswer {
+    if depth >= MAX_CONDITIONAL_WRAPPER_DEPTH {
+        return ConditionalProcedureSummaryAnswer::Open;
+    }
+    let key = (unit.clone(), MAX_CONDITIONAL_WRAPPER_DEPTH - depth);
     if let Some(answer) = cache
         .conditional_wrapper_answers
         .read(&memo_attribution(analyzer), |answers| {
-            answers.get(unit).cloned()
+            answers.get(&key).cloned()
         })
     {
         return answer;
     }
-    if depth >= MAX_CONDITIONAL_WRAPPER_DEPTH
-        || !cache.conditional_wrapper_visiting.insert(unit.clone())
-    {
+    if !cache.conditional_wrapper_visiting.insert(unit.clone()) {
         return ConditionalProcedureSummaryAnswer::Open;
     }
     let answer = (|| {
@@ -11087,7 +11366,7 @@ fn conditional_summary_for_workspace_procedure(
     cache
         .conditional_wrapper_answers
         .read_mut(&memo_attribution(analyzer), |answers| {
-            answers.insert(unit.clone(), answer.clone())
+            answers.insert(key, answer.clone())
         });
     answer
 }
@@ -11100,7 +11379,8 @@ fn conditional_summary_for_call(
     range: Range,
     depth: usize,
 ) -> ConditionalProcedureSummaryAnswer {
-    let answer = cache.dispatch_at_source(semantic, file, range);
+    let (answer, _dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, file, range);
     if answer.arms.is_empty()
         || matches!(
             answer.outcome,
@@ -11827,6 +12107,7 @@ fn validate_result_contract_uses(
     site_id: &str,
     site_ast_id: &str,
     modeled_target: Option<&ModeledProcedureKey>,
+    selected_callable: Option<&ModelSymbolRef>,
     contract: &CompiledResultContract,
     acquisition_coverage: EffectCoverage,
     projected_success_guard_edges: &[crate::analyzer::semantic::ControlEdgeLocator],
@@ -11896,7 +12177,13 @@ fn validate_result_contract_uses(
     let exact_source = semantic_model_overlay
         .as_ref()
         .and_then(|_| model_cache.exact_source(analyzer, file));
+    let provider_selection = analyzer
+        .active_semantic_model_snapshot()
+        .map(|snapshot| snapshot.active_models().model_provider_selection());
     let intrinsic_classification = IntrinsicClassificationContext {
+        cancellation,
+        selected_callable,
+        selection: provider_selection.as_ref(),
         modeled_target,
         result_ordinal: contract.result_ordinal,
         semantic_model_overlay: semantic_model_overlay.as_deref(),
@@ -13245,7 +13532,8 @@ fn normal_return_refinement_calls(
         let Some(range) = semantic_call_range(semantics, call) else {
             continue;
         };
-        let answer = cache.dispatch_at_source(semantic, file, range);
+        let (answer, _dispatch_incompleteness) =
+            cache.dispatch_at_source_with_cause(semantic, file, range);
         if answer.arms.is_empty() {
             continue;
         }
@@ -13411,6 +13699,7 @@ fn record_result_obligation_coverage(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     file: &ProjectFile,
     coverage: EffectCoverage,
+    incompleteness: Incompleteness,
 ) {
     record_effect_coverage_incomplete(
         analyzer,
@@ -13418,6 +13707,7 @@ fn record_result_obligation_coverage(
         diagnostics,
         file,
         coverage,
+        incompleteness,
         CodeQueryDiagnosticCode::ResultObligationDerivationIncomplete,
         "reviewed result-use obligation or exact discard proof is incomplete",
     );
@@ -13471,17 +13761,20 @@ fn record_result_contract_incomplete(
         diagnostics,
         file,
         coverage,
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
         CodeQueryDiagnosticCode::ResultContractDerivationIncomplete,
         message,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_effect_coverage_incomplete(
     analyzer: &dyn IAnalyzer,
     cache: &mut EffectTraversalCache,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     file: &ProjectFile,
     coverage: EffectCoverage,
+    incompleteness: Incompleteness,
     code: CodeQueryDiagnosticCode,
     message: &'static str,
 ) {
@@ -13492,7 +13785,8 @@ fn record_effect_coverage_incomplete(
     cache.truncated |= coverage == EffectCoverage::Truncated;
     let diagnostic = super::QueryExecutionState::diagnostic(
         analyzer,
-        CodeQueryDiagnostic {
+        CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness,
             related: Vec::new(),
             source: None,
             code,
@@ -13502,7 +13796,7 @@ fn record_effect_coverage_incomplete(
             message: format!("{message} in `{}`", rel_path_string(file)),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        },
+        }),
         (coverage == EffectCoverage::Truncated).then_some(DerivationExecutionCause::Budget),
     );
     if !cache
@@ -13532,7 +13826,8 @@ fn record_coverage(
         EffectCoverage::Truncated => {
             if !cache.truncated {
                 cache.truncated = true;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EffectBudgetExhausted,
@@ -13544,7 +13839,7 @@ fn record_coverage(
                             .to_owned(),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
             }
             cache.incomplete = true;
         }
@@ -13563,8 +13858,10 @@ fn record_open_callee(
     file: &ProjectFile,
     range: Option<Range>,
     message: String,
+    incompleteness: Incompleteness,
 ) {
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         source: range.map(|range| CodeQuerySourceSpan {
             path: rel_path_string(file),
             range: render::render_source_range(analyzer, file, &range, sources),
@@ -13579,7 +13876,7 @@ fn record_open_callee(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 /// One call site's dispatch answer, reduced to what both row families need.
@@ -13678,7 +13975,8 @@ fn dispatch_arms(
     file: &ProjectFile,
     range: Range,
 ) -> DispatchedArms {
-    let answer = cache.dispatch_at_source(semantic, file, range);
+    let (answer, dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, file, range);
     let mut arms = Vec::with_capacity(answer.arms.len());
     for arm in &answer.arms {
         let callee = arm.target_unit.clone();
@@ -13798,6 +14096,7 @@ fn dispatch_arms(
                 answer.unnamed_boundaries,
                 answer.coverage_reasons
             ),
+            dispatch_incompleteness,
         );
     }
     for arm in &arms {
@@ -13823,6 +14122,7 @@ fn dispatch_arms(
                     "{reason}, callee={:?}, target={:?}",
                     arm.effect.key, arm.effect.target_id
                 ),
+                Incompleteness::Content,
             );
         }
     }
@@ -14109,7 +14409,12 @@ fn discover_effect_graph(
         if let Some(index) = index_by_unit.get(&key) {
             return Some(*index);
         }
-        if graph.procedures.len() >= bounds.max_procedures {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            graph.procedures.len(),
+            bounds.max_procedures,
+        )
+        .allows(1)
+        {
             graph.truncated = true;
             return None;
         }
@@ -14168,7 +14473,12 @@ fn discover_effect_graph(
         if let Some(index) = index_by_external.get(&external.key) {
             return Some(*index);
         }
-        if graph.procedures.len() >= bounds.max_procedures {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            graph.procedures.len(),
+            bounds.max_procedures,
+        )
+        .allows(1)
+        {
             graph.truncated = true;
             return None;
         }
@@ -14261,7 +14571,7 @@ fn discover_effect_graph(
             continue;
         };
         let static_const_initializer_calls =
-            cache.rust_static_const_initializer_calls(&file, facts.source());
+            cache.rust_static_const_initializer_calls(analyzer, &file, facts.source());
         let ranges = analyzer.ranges_of(&unit);
         // A declaration with no runnable entry has no body to enumerate: its
         // sites are declaration sites, and reading one as a body would claim an
@@ -14313,7 +14623,12 @@ fn discover_effect_graph(
         }
 
         for (_, _, call_id) in call_nodes {
-            if graph.edges.len() >= bounds.max_edges {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                graph.edges.len(),
+                bounds.max_edges,
+            )
+            .allows(1)
+            {
                 graph.truncated = true;
                 break;
             }
@@ -14510,6 +14825,27 @@ fn discover_effect_graph(
                     procedure.basis,
                     procedure.local_gaps,
                 ),
+                procedure
+                    .local_gaps
+                    .iter()
+                    .fold(Incompleteness::Content, |cause, reason| {
+                        cause.combine(match reason {
+                            EffectReason::DispatchInterrupted
+                            | EffectReason::ProcedureUnreadable => {
+                                Incompleteness::Operational(DerivationExecutionCause::Provider)
+                            }
+                            EffectReason::DispatchTruncated
+                            | EffectReason::ProcedureBudgetExhausted
+                            | EffectReason::EffectBudgetExhausted => {
+                                Incompleteness::Operational(DerivationExecutionCause::Budget)
+                            }
+                            EffectReason::DispatchUnresolved
+                            | EffectReason::DispatchUnsupported
+                            | EffectReason::CalleeUnkeyable
+                            | EffectReason::ModelConflict
+                            | EffectReason::CalleeUnmodeled => Incompleteness::Content,
+                        })
+                    }),
             );
         }
     }

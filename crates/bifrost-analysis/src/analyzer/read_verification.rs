@@ -14,7 +14,7 @@
 //!   workspace-relative path must resolve to the same blob in the same
 //!   language.
 //! * A [`ReadKey::Index`] is proved by [`ChangedFacts`], the set of index keys
-//!   every changed blob on either side contributes. The set is built by the
+//!   whose per-file published rows differ between the base and head. The set is built by the
 //!   store's own row builders, so a key it holds is spelled exactly as the
 //!   probe that reads it spells it.
 //! * A [`ReadKey::Lookup`] cannot be proved from any per-file fact, because a
@@ -102,7 +102,7 @@ pub trait WorkspaceFactIndex: Send + Sync {
         &self,
     ) -> Result<Vec<(ProjectFile, Oid)>, crate::analyzer::store::StoreError>;
 
-    /// Every `(family, key)` the facts of `file`'s `blob` contribute to the
+    /// Every `(family, key, digest)` the facts of `file`'s `blob` contribute to the
     /// name-keyed indexes a [`ReadKey::Index`] probes.
     ///
     /// `None` when this analyzer cannot enumerate them -- an incomplete file
@@ -113,9 +113,9 @@ pub trait WorkspaceFactIndex: Send + Sync {
         &self,
         file: &ProjectFile,
         blob: Oid,
-    ) -> Option<Vec<(IndexFamily, Box<[u8]>)>>;
+    ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>>;
 
-    /// Every `(family, key)` the *persisted* facts of `blob` contribute, with
+    /// Every `(family, key, digest)` the *persisted* facts of `blob` contribute, with
     /// `source` as that blob's own bytes.
     ///
     /// [`Self::blob_index_keys`] answers about a blob this analyzer has
@@ -134,7 +134,7 @@ pub trait WorkspaceFactIndex: Send + Sync {
         file: &ProjectFile,
         blob: Oid,
         source: &str,
-    ) -> Option<Vec<(IndexFamily, Box<[u8]>)>>;
+    ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>>;
 
     /// Query-local callable metrics from this language's structured AST.
     ///
@@ -163,9 +163,8 @@ pub trait WorkspaceFactIndex: Send + Sync {
 ///
 /// * the workspace-relative paths whose blob differs, was added, or was
 ///   removed, per language; and
-/// * the `(family, key)` pairs every changed blob on *either* side
-///   contributes, so a name a deleted declaration used to publish is in the
-///   set exactly as a name a new one publishes is.
+/// * the `(family, key)` pairs whose per-file published row digests differ,
+///   including keys present on only one side of a changed path.
 ///
 /// The keys are produced by the store's own row builders, so a key here is
 /// spelled the way the probe that reads it spells it. Nothing re-interprets a
@@ -226,32 +225,33 @@ impl ChangedFacts {
                 .get(&language)
                 .map(|index| blob_map(*index))
                 .unwrap_or_default();
-            for (rel_path, (file, blob)) in &base_blobs {
-                if head_blobs.get(rel_path).map(|(_, oid)| *oid) == Some(*blob) {
+            let mut paths = base_blobs
+                .keys()
+                .chain(head_blobs.keys())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths.dedup();
+            for rel_path in paths {
+                let base_blob = base_blobs.get(rel_path);
+                let head_blob = head_blobs.get(rel_path);
+                if base_blob.map(|(_, blob)| blob) == head_blob.map(|(_, blob)| blob) {
                     continue;
                 }
-                facts.record_changed_blob(
+                let entries =
+                    |side: Option<&(ProjectFile, Oid)>, index: Option<&&dyn WorkspaceFactIndex>| {
+                        side.map(|(file, blob)| {
+                            index.and_then(|index| index.blob_index_keys(file, *blob))
+                        })
+                    };
+                facts.record_index_difference(
                     language,
                     rel_path,
-                    file,
-                    *blob,
-                    base_indexes.get(&language).copied(),
+                    entries(base_blob, base_indexes.get(&language)),
+                    entries(head_blob, head_indexes.get(&language)),
                 );
             }
             for (rel_path, (_, blob)) in &head_blobs {
                 facts.head_blobs.insert((language, rel_path.clone()), *blob);
-            }
-            for (rel_path, (file, blob)) in &head_blobs {
-                if base_blobs.get(rel_path).map(|(_, oid)| *oid) == Some(*blob) {
-                    continue;
-                }
-                facts.record_changed_blob(
-                    language,
-                    rel_path,
-                    file,
-                    *blob,
-                    head_indexes.get(&language).copied(),
-                );
             }
         }
         facts
@@ -373,11 +373,18 @@ impl ChangedFacts {
                 .insert(rel_path.clone());
             let keys = base_source(*blob)
                 .and_then(|source| index.stored_blob_index_keys(&file, *blob, &source));
-            match keys {
-                Some(keys) => facts.keys.extend(keys),
-                None if head_blob.is_none() => {}
-                None => facts.unenumerated.push((language, rel_path.clone())),
-            }
+            let head_entries = head_by_language
+                .get(&language)
+                .and_then(|blobs| blobs.get(rel_path))
+                .map(|(head_file, head_blob)| index.blob_index_keys(head_file, *head_blob));
+            // An absent deleted blob never published facts in this generation;
+            // retain the existing reclamation/admission exception.
+            let base_entries = if keys.is_none() && head_blob.is_none() {
+                None
+            } else {
+                Some(keys)
+            };
+            facts.record_index_difference(language, rel_path, base_entries, head_entries);
         }
 
         for (language, blobs) in &head_by_language {
@@ -386,6 +393,9 @@ impl ChangedFacts {
                 let unchanged = base_blob_by_path.get(rel_path).copied() == Some(*blob)
                     && base_paths.is_some_and(|paths| paths.contains(rel_path));
                 if unchanged {
+                    continue;
+                }
+                if base_paths.is_some_and(|paths| paths.contains(rel_path)) {
                     continue;
                 }
                 facts.record_changed_blob(
@@ -450,7 +460,7 @@ impl ChangedFacts {
         (&self.unenumerated, &self.languages_without_index)
     }
 
-    /// Whether any changed blob contributes this exact index key.
+    /// Whether a changed file has different published entries under this key.
     pub fn contains(&self, family: IndexFamily, key: &[u8]) -> bool {
         self.keys.contains(&(family, Box::from(key)))
     }
@@ -483,6 +493,45 @@ impl ChangedFacts {
         self.paths.values().map(HashSet::len).sum()
     }
 
+    // Outer None is an absent file; inner None is a side whose facts
+    // cannot be enumerated. Only two complete sides can prove equality.
+    #[allow(clippy::type_complexity)]
+    fn record_index_difference(
+        &mut self,
+        language: Language,
+        rel_path: &str,
+        base: Option<Option<Vec<crate::analyzer::store::IndexEntryDigest>>>,
+        head: Option<Option<Vec<crate::analyzer::store::IndexEntryDigest>>>,
+    ) {
+        self.paths
+            .entry(language)
+            .or_default()
+            .insert(Box::from(rel_path));
+        if matches!(base, Some(None)) || matches!(head, Some(None)) {
+            self.unenumerated.push((language, Box::from(rel_path)));
+        }
+        let to_map = |entries: Option<Option<Vec<crate::analyzer::store::IndexEntryDigest>>>| {
+            entries
+                .flatten()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(family, key, digest)| ((family, key), digest))
+                .collect::<HashMap<_, _>>()
+        };
+        let base = to_map(base);
+        let head = to_map(head);
+        for (key, digest) in &base {
+            if head.get(key) != Some(digest) {
+                self.keys.insert(key.clone());
+            }
+        }
+        for (key, digest) in &head {
+            if base.get(key) != Some(digest) {
+                self.keys.insert(key.clone());
+            }
+        }
+    }
+
     fn record_changed_blob(
         &mut self,
         language: Language,
@@ -496,7 +545,9 @@ impl ChangedFacts {
             .or_default()
             .insert(Box::from(rel_path));
         match index.and_then(|index| index.blob_index_keys(file, blob)) {
-            Some(keys) => self.keys.extend(keys),
+            Some(keys) => self
+                .keys
+                .extend(keys.into_iter().map(|(family, key, _)| (family, key))),
             None => self.unenumerated.push((language, Box::from(rel_path))),
         }
     }
@@ -869,12 +920,17 @@ pub fn replay_lookup(
             let unit = replayed_declaration(analyzer, question)?;
             let provider = analyzer.type_hierarchy_provider()?;
             let cancellation = CancellationToken::default();
-            let descendants = provider.get_direct_descendants_within(
-                &unit,
-                &DescendantIndexScope::whole_workspace(&cancellation),
-            )?;
+            let descendants = provider
+                .get_direct_descendants_within(
+                    &unit,
+                    &DescendantIndexScope::whole_workspace(&cancellation),
+                )
+                .ok()?;
+            if !descendants.is_complete() {
+                return None;
+            }
             Some(crate::analyzer::read_ledger::declaration_set_digest(
-                &descendants,
+                &descendants.edges,
             ))
         }
         LookupKind::Importers => {
@@ -1782,7 +1838,7 @@ fn head_path_blob(
         return Ok(None);
     };
     project
-        .read_source_snapshot(&file)
+        .read_file_snapshot(&file)
         .map(|source| Some(source.oid()))
 }
 
@@ -1847,18 +1903,22 @@ mod tests {
             &self,
             _: &ProjectFile,
             blob: Oid,
-        ) -> Option<Vec<(IndexFamily, Box<[u8]>)>> {
+        ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>> {
             self.rows
                 .iter()
                 .find(|(id, _)| *id == blob)
-                .map(|(_, keys)| keys.clone())
+                .map(|(_, keys)| {
+                    keys.iter()
+                        .map(|(family, key)| (*family, key.clone(), StableDigest::sha256(key)))
+                        .collect()
+                })
         }
         fn stored_blob_index_keys(
             &self,
             file: &ProjectFile,
             blob: Oid,
             _: &str,
-        ) -> Option<Vec<(IndexFamily, Box<[u8]>)>> {
+        ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>> {
             self.blob_index_keys(file, blob)
         }
     }
@@ -1913,6 +1973,69 @@ mod tests {
             policy_source: digest,
             configuration: digest,
             epoch: digest,
+        }
+    }
+
+    #[test]
+    #[hardwon("#8180: index verification invalidated unchanged entries of changed files")]
+    fn changed_index_entries_compare_both_complete_sides() {
+        let (_root, head) = workspace_fixture("def before():\n    pass\n");
+        let entry = |name: &str, bytes: &[u8]| {
+            (
+                IndexFamily::DefinitionExact,
+                Box::<[u8]>::from(name.as_bytes()),
+                StableDigest::sha256(bytes),
+            )
+        };
+        for (base, current, expected, complete) in [
+            (
+                Some(Some(vec![entry("same", b"row")])),
+                Some(Some(vec![entry("same", b"row")])),
+                vec![],
+                true,
+            ),
+            (
+                Some(Some(vec![entry("same", b"old")])),
+                Some(Some(vec![entry("same", b"new")])),
+                vec!["same"],
+                true,
+            ),
+            (
+                Some(Some(vec![entry("removed", b"row")])),
+                Some(Some(vec![entry("added", b"row")])),
+                vec!["removed", "added"],
+                true,
+            ),
+            (
+                None,
+                Some(Some(vec![entry("added", b"row")])),
+                vec!["added"],
+                true,
+            ),
+            (
+                Some(Some(vec![entry("removed", b"row")])),
+                None,
+                vec!["removed"],
+                true,
+            ),
+            (
+                Some(None),
+                Some(Some(vec![entry("same", b"row")])),
+                vec!["same"],
+                false,
+            ),
+        ] {
+            let mut changed = ChangedFacts::between(&head, &head);
+            changed.record_index_difference(Language::Python, "app.py", base, current);
+            assert_eq!(
+                changed.keys,
+                expected
+                    .into_iter()
+                    .map(|name| (IndexFamily::DefinitionExact, Box::from(name.as_bytes())))
+                    .collect()
+            );
+            assert_eq!(changed.is_complete(), complete);
+            assert_eq!(changed.changed_path_count(), 1);
         }
     }
 

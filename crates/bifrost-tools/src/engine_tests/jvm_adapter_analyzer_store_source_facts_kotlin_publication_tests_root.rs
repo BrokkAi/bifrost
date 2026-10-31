@@ -43,19 +43,31 @@ mod jvm_extraction_tests {
         missing_links.source_declaration_metadata.clear();
         assert!(
             store
-                .write_parsed_blob(oid, "kotlin", &KotlinAdapter, &missing_links)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                    &KotlinAdapter,
+                    &missing_links
+                )
                 .is_err()
         );
         let mut missing_source = state.clone();
         missing_source.source_facts = None;
         assert!(
             store
-                .write_parsed_blob(oid, "kotlin", &KotlinAdapter, &missing_source)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                    &KotlinAdapter,
+                    &missing_source
+                )
                 .is_err()
         );
 
         store
-            .write_parsed_blob(oid, "kotlin", &KotlinAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                &KotlinAdapter,
+                &state,
+            )
             .unwrap();
         let expected_metadata_links = state.source_declaration_metadata.len() as i64;
         store.conn.execute(move |conn| {
@@ -86,11 +98,19 @@ mod jvm_extraction_tests {
         Ok::<(), brokk_bifrost_analysis::analyzer::store::StoreError>(())
     }).unwrap();
         store
-            .write_parsed_blob(oid, "kotlin", &KotlinAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                &KotlinAdapter,
+                &state,
+            )
             .unwrap();
         assert_eq!(
             store
-                .hydrate_file_state(oid, "kotlin", &KotlinAdapter, &file)
+                .hydrate_file_state(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                    &KotlinAdapter,
+                    &file
+                )
                 .unwrap()
                 .unwrap()
                 .signature_metadata,
@@ -168,19 +188,31 @@ mod jvm_extraction_tests {
         let path = fixture.root().join("canonical-kotlin.db");
         let store = AnalyzerStore::open_persistent(&path).expect("open store");
         store
-            .write_parsed_blob(oid, "kotlin", &KotlinAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                &KotlinAdapter,
+                &state,
+            )
             .expect("publish Kotlin");
         drop(store);
         let store = AnalyzerStore::open_persistent(&path).expect("reopen store");
         let generation = store.current_generation("kotlin").expect("generation");
         assert_eq!(
             store
-                .load_structural_facts_rows(oid, "kotlin", generation, STRUCTURAL_FACTS_VERSION)
+                .load_structural_facts_rows(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                    generation,
+                    STRUCTURAL_FACTS_VERSION
+                )
                 .expect("canonical structural read"),
             Some(expected)
         );
         let hydrated = store
-            .hydrate_file_state(oid, "kotlin", &KotlinAdapter, &file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                &KotlinAdapter,
+                &file,
+            )
             .expect("hydrate Kotlin")
             .expect("published Kotlin state");
         assert_eq!(hydrated.imports, state.imports);
@@ -272,11 +304,19 @@ mod jvm_extraction_tests {
         let oid = oid_for(source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().expect("open store");
         store
-            .write_parsed_blob(oid, "kotlin", &KotlinAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                &KotlinAdapter,
+                &state,
+            )
             .expect("publish Kotlin");
         let generation = store.current_generation("kotlin").expect("generation");
         let rows = store
-            .load_structural_facts_rows(oid, "kotlin", generation, STRUCTURAL_FACTS_VERSION)
+            .load_structural_facts_rows(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "kotlin"),
+                generation,
+                STRUCTURAL_FACTS_VERSION,
+            )
             .expect("canonical structural read")
             .expect("published structural rows");
         let facts = FileFacts::from_persisted_rows(source.to_owned(), rows).expect("hydrate");

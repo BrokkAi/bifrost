@@ -52,15 +52,18 @@ mod tests {
         store
             .write_parsed_blob_at_generation(
                 &crate::analyzer::store::test_blob_file(),
-                oid,
-                "go",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                 generation,
                 &GoAdapter,
                 &state,
             )
             .unwrap();
         let ordinary = store
-            .import_infos_for_key_limited(oid, "go", generation, usize::MAX)
+            .import_infos_for_key_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                generation,
+                usize::MAX,
+            )
             .unwrap();
         assert!(ordinary.complete);
         assert_eq!(ordinary.rows, state.imports);
@@ -90,7 +93,11 @@ mod tests {
         }
 
         let limited = store
-            .import_infos_for_key_limited(oid, "go", generation, usize::MAX)
+            .import_infos_for_key_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                generation,
+                usize::MAX,
+            )
             .unwrap();
         assert!(!limited.complete);
         assert!(limited.rows.is_empty());
@@ -114,8 +121,7 @@ mod tests {
         store
             .write_parsed_blob_at_generation(
                 &crate::analyzer::store::test_blob_file(),
-                oid,
-                "go",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                 generation,
                 &GoAdapter,
                 &state,
@@ -137,14 +143,22 @@ mod tests {
         }
 
         let capped = store
-            .import_infos_for_key_limited(oid, "go", generation, 1)
+            .import_infos_for_key_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                generation,
+                1,
+            )
             .unwrap();
         assert!(!capped.complete);
         assert_eq!(capped.rows.len(), 1);
         assert_eq!(capped.inspected, 1);
 
         let wider = store
-            .import_infos_for_key_limited(oid, "go", generation, 3)
+            .import_infos_for_key_limited(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                generation,
+                3,
+            )
             .unwrap();
         assert!(!wider.complete);
         assert_eq!(wider.rows.len(), 2);
@@ -162,10 +176,17 @@ mod tests {
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generations = HashMap::from_iter([("go".to_string(), GenerationId::BOOTSTRAP)]);
-        let entry = [(file.clone(), oid, "go".to_string())];
+        let entry = [(
+            file.clone(),
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+        )];
 
         store
-            .write_parsed_blob(oid, "go", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let complete = store
             .hydrate_canonical_import_facts_by_key(&entry, &generations, &adapter)
@@ -199,7 +220,11 @@ mod tests {
         );
 
         store
-            .write_parsed_blob(oid, "go", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let repaired = store
             .hydrate_canonical_import_facts_by_key(&entry, &generations, &adapter)
@@ -238,26 +263,35 @@ mod tests {
         store
             .write_parsed_blob_at_generation(
                 &ProjectFile::new(temp.path(), "client.go"),
-                oid,
-                "go",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                 prior_generation,
                 &GoAdapter,
                 state.as_ref(),
             )
             .unwrap();
-        assert!(store.contains_parsed_blob(oid, "go").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"))
+                .unwrap()
+        );
 
         let current_generation = store
             .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
             .unwrap();
 
         assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "go").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"))
+                .unwrap()
+        );
         assert_eq!(
             store
-                .missing_parsed_blob_keys(&[(oid, "go".to_string())])
+                .missing_parsed_blob_keys(&[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "go"
+                )])
                 .unwrap(),
-            vec![(oid, "go".to_string())]
+            vec![brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go")]
         );
     }
     #[test]
@@ -306,8 +340,7 @@ mod tests {
         store
             .write_parsed_blob_at_generation(
                 &crate::analyzer::store::test_blob_file(),
-                rust_oid,
-                "rust",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(rust_oid, "rust"),
                 prior_rust_generation,
                 &RustAdapter,
                 rust_state.as_ref(),
@@ -319,22 +352,39 @@ mod tests {
         store
             .write_parsed_blob_at_generation(
                 &crate::analyzer::store::test_blob_file(),
-                go_oid,
-                "go",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(go_oid, "go"),
                 go_generation,
                 &GoAdapter,
                 go_state.as_ref(),
             )
             .unwrap();
-        assert!(store.contains_parsed_blob(rust_oid, "rust").unwrap());
-        assert!(store.contains_parsed_blob(go_oid, "go").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    rust_oid, "rust"
+                ))
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    go_oid, "go"
+                ))
+                .unwrap()
+        );
 
         let current_rust_generation = store
             .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
             .unwrap();
 
         assert_ne!(current_rust_generation, prior_rust_generation);
-        assert!(!store.contains_parsed_blob(rust_oid, "rust").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    rust_oid, "rust"
+                ))
+                .unwrap()
+        );
         assert_eq!(
             store
                 .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
@@ -342,7 +392,13 @@ mod tests {
             go_generation,
             "the Rust salt bump must not move Go's epoch"
         );
-        assert!(store.contains_parsed_blob(go_oid, "go").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    go_oid, "go"
+                ))
+                .unwrap()
+        );
     }
     #[test]
     fn identical_go_blob_hydrates_with_live_import_paths() {
@@ -358,14 +414,26 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
 
         store
-            .write_parsed_blob(oid, "go", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let hydrated_a = store
-            .hydrate_file_state(oid, "go", &adapter, &file_a)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                &adapter,
+                &file_a,
+            )
             .unwrap()
             .unwrap();
         let hydrated_b = store
-            .hydrate_file_state(oid, "go", &adapter, &file_b)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                &adapter,
+                &file_b,
+            )
             .unwrap()
             .unwrap();
 
@@ -395,13 +463,17 @@ mod tests {
         let oid = oid_for(source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "go", &GoAdapter, &parse_state(&GoAdapter, &file))
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                &GoAdapter,
+                &parse_state(&GoAdapter, &file),
+            )
             .unwrap();
 
         let generation = store.current_generation("go").unwrap();
         let outcome = store
             .workspace_content_package_facts(
-                "go",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "go"),
                 generation,
                 &[oid],
                 Some(PackageAnchor::OwnModule { pop: 0 }),
@@ -429,8 +501,7 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
-                persisted_oid,
-                "go",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(persisted_oid, "go"),
                 &GoAdapter,
                 &parse_state(&GoAdapter, &file),
             )
@@ -439,7 +510,7 @@ mod tests {
         let generation = store.current_generation("go").unwrap();
         let outcome = store
             .workspace_content_package_facts(
-                "go",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "go"),
                 generation,
                 &[persisted_oid, missing_oid],
                 Some(PackageAnchor::OwnModule { pop: 0 }),

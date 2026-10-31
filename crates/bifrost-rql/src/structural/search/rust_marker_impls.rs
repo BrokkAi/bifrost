@@ -23,19 +23,36 @@ pub(super) struct RustMarkerImplValue {
 }
 
 pub(super) struct RustMarkerImplsResult {
+    incompleteness: Incompleteness,
     pub(super) rows: Vec<RustMarkerImplValue>,
     pub(super) reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct MarkerIncomplete {
+    message: String,
+    incompleteness: Incompleteness,
+}
+
+impl From<&str> for MarkerIncomplete {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+            incompleteness: Incompleteness::Operational(DerivationExecutionCause::Provider),
+        }
+    }
+}
+
 type FileRevision = (ProjectFile, Option<WorkspaceContentIdentity>);
-type SyntaxMemo = HashMap<FileRevision, Result<Option<Arc<StructuralPreparedSyntax>>, String>>;
+type SyntaxMemo =
+    HashMap<FileRevision, Result<Option<Arc<StructuralPreparedSyntax>>, MarkerIncomplete>>;
 
 // The workspace revision also covers dependencies consulted by definition lookup.
 // This memo belongs to QueryExecutionState and is dropped with that query.
 #[derive(Default)]
 pub(super) struct RustMarkerImplsCache {
     syntax: CaptureScopedMemo<SyntaxMemo>,
-    files: CaptureScopedMemo<HashMap<FileRevision, Result<MarkerImplFile, String>>>,
+    files: CaptureScopedMemo<HashMap<FileRevision, Result<MarkerImplFile, MarkerIncomplete>>>,
     methods: CaptureScopedMemo<HashMap<CodeUnit, MethodInventory>>,
 }
 
@@ -54,7 +71,7 @@ struct MarkerImplCandidate {
 }
 
 impl MarkerImplFile {
-    fn read(ctx: &mut Context<'_>, file: &ProjectFile) -> Result<Self, String> {
+    fn read(ctx: &mut Context<'_>, file: &ProjectFile) -> Result<Self, MarkerIncomplete> {
         let syntax = ctx
             .syntax(file)?
             .ok_or("Rust marker impl source syntax unavailable")?;
@@ -81,6 +98,7 @@ impl MarkerImplFile {
             if !unsafe_impl || negative {
                 continue;
             }
+            let bindings = Bindings::read(ctx, node, source)?;
             let trait_head = head(trait_node);
             let segments = path(trait_head, source);
             let Some(name) = segments.last() else {
@@ -132,12 +150,23 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
-    fn charge(&mut self) -> Result<(), String> {
+    fn charge(&mut self) -> Result<(), MarkerIncomplete> {
         if self.cancellation.is_cancelled() {
-            return Err("Rust marker impl query cancelled".into());
+            return Err(MarkerIncomplete {
+                message: "Rust marker impl query cancelled".into(),
+                incompleteness: Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+            });
         }
-        if self.budget.fact_nodes >= self.limits.max_fact_nodes {
-            return Err("Rust marker impl syntax work budget exceeded".into());
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            self.budget.fact_nodes,
+            self.limits.max_fact_nodes,
+        )
+        .allows(1)
+        {
+            return Err(MarkerIncomplete {
+                message: "Rust marker impl syntax work budget exceeded".into(),
+                incompleteness: Incompleteness::Operational(DerivationExecutionCause::Budget),
+            });
         }
         self.budget.fact_nodes += 1;
         Ok(())
@@ -146,7 +175,7 @@ impl Context<'_> {
     fn syntax(
         &mut self,
         file: &ProjectFile,
-    ) -> Result<Option<Arc<StructuralPreparedSyntax>>, String> {
+    ) -> Result<Option<Arc<StructuralPreparedSyntax>>, MarkerIncomplete> {
         let key = (file.clone(), self.revision);
         if let Some(outcome) = self.syntax_memo.get(&key) {
             return outcome.clone();
@@ -159,10 +188,18 @@ impl Context<'_> {
     fn read_syntax(
         &mut self,
         file: &ProjectFile,
-    ) -> Result<Option<StructuralPreparedSyntax>, String> {
+    ) -> Result<Option<StructuralPreparedSyntax>, MarkerIncomplete> {
         self.charge()?;
-        if self.budget.scanned_files >= self.limits.max_scanned_files {
-            return Err("Rust marker impl file budget exceeded".into());
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            self.budget.scanned_files,
+            self.limits.max_scanned_files,
+        )
+        .allows(1)
+        {
+            return Err(MarkerIncomplete {
+                message: "Rust marker impl file budget exceeded".into(),
+                incompleteness: Incompleteness::Operational(DerivationExecutionCause::Budget),
+            });
         }
         let provider = self
             .analyzer
@@ -179,10 +216,22 @@ impl Context<'_> {
                 StructuralSyntaxLimitedOutcome::Available(syntax) => syntax,
                 StructuralSyntaxLimitedOutcome::Unavailable => return Ok(None),
                 outcome => {
-                    return Err(format!(
-                        "Rust marker impl syntax unavailable for {}: {outcome:?}",
-                        file.rel_path().display()
-                    ));
+                    let cause = match outcome {
+                        StructuralSyntaxLimitedOutcome::Cancelled => {
+                            DerivationExecutionCause::Cancelled
+                        }
+                        StructuralSyntaxLimitedOutcome::Exceeded { .. } => {
+                            DerivationExecutionCause::Budget
+                        }
+                        _ => unreachable!("available and unavailable outcomes returned above"),
+                    };
+                    return Err(MarkerIncomplete {
+                        message: format!(
+                            "Rust marker impl syntax unavailable for {}: {outcome:?}",
+                            file.rel_path().display()
+                        ),
+                        incompleteness: Incompleteness::Operational(cause),
+                    });
                 }
             };
         self.budget.scanned_files += 1;
@@ -195,7 +244,7 @@ impl Context<'_> {
         file: &ProjectFile,
         source: &str,
         node: Node<'_>,
-    ) -> Result<DefinitionLookupOutcome, String> {
+    ) -> Result<DefinitionLookupOutcome, MarkerIncomplete> {
         self.charge()?;
         let mut outcomes = resolve_definition_batch_with_source_and_cancellation(
             self.analyzer,
@@ -216,7 +265,10 @@ impl Context<'_> {
             "one definition request returns one outcome"
         );
         if self.cancellation.is_cancelled() {
-            return Err("Rust marker definition lookup cancelled".into());
+            return Err(MarkerIncomplete {
+                message: "Rust marker definition lookup cancelled".into(),
+                incompleteness: Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+            });
         }
         Ok(outcomes.pop().unwrap())
     }
@@ -255,74 +307,118 @@ struct Bindings {
 }
 
 impl Bindings {
-    fn read(ctx: &mut Context<'_>, root: Node<'_>, source: &str) -> Result<Self, String> {
-        let mut result = Self::default();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
+    fn read(ctx: &mut Context<'_>, site: Node<'_>, source: &str) -> Result<Self, MarkerIncomplete> {
+        let mut containers = Vec::new();
+        let mut node = site;
+        loop {
             ctx.charge()?;
-            if matches!(
-                node.kind(),
-                "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item"
-            ) && let Some(name) = node.child_by_field_name("name")
-            {
-                *result
-                    .types
-                    .entry(text(name, source).to_owned())
-                    .or_default() += 1;
+            let module = node.kind() == "source_file"
+                || (node.kind() == "declaration_list"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "mod_item"));
+            if module || node.kind() == "block" {
+                containers.push(node);
             }
-            if node.kind() == "use_declaration" {
-                let mut imports = vec![(
-                    node.child_by_field_name("argument")
-                        .expect("use has argument"),
-                    Vec::new(),
-                )];
-                while let Some((argument, prefix)) = imports.pop() {
-                    ctx.charge()?;
-                    match argument.kind() {
-                        "scoped_use_list" => {
-                            let mut prefix = prefix;
-                            if let Some(p) = argument.child_by_field_name("path") {
-                                prefix.extend(path(p, source));
+            if module {
+                break;
+            }
+            node = node
+                .parent()
+                .ok_or("Rust marker binding scope unavailable")?;
+        }
+        let mut result = Self::default();
+        let mut seen = HashSet::default();
+        // Blocks inherit item bindings through the enclosing module, but a
+        // nested module does not inherit its parent module's bindings.
+        for root in containers {
+            let mut scoped = Self::default();
+            let mut stack = vec![root];
+            while let Some(node) = stack.pop() {
+                ctx.charge()?;
+                if matches!(
+                    node.kind(),
+                    "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item"
+                ) && let Some(name) = node.child_by_field_name("name")
+                {
+                    *scoped
+                        .types
+                        .entry(text(name, source).to_owned())
+                        .or_default() += 1;
+                }
+                if node.kind() == "use_declaration" {
+                    let mut imports = vec![(
+                        node.child_by_field_name("argument")
+                            .expect("use has argument"),
+                        Vec::new(),
+                    )];
+                    while let Some((argument, prefix)) = imports.pop() {
+                        ctx.charge()?;
+                        match argument.kind() {
+                            "scoped_use_list" => {
+                                let mut prefix = prefix;
+                                if let Some(p) = argument.child_by_field_name("path") {
+                                    prefix.extend(path(p, source));
+                                }
+                                imports.push((
+                                    argument
+                                        .child_by_field_name("list")
+                                        .expect("scoped use has list"),
+                                    prefix,
+                                ));
                             }
-                            imports.push((
-                                argument
-                                    .child_by_field_name("list")
-                                    .expect("scoped use has list"),
-                                prefix,
-                            ));
-                        }
-                        "use_list" => {
-                            for child in children(argument) {
-                                imports.push((child, prefix.clone()));
+                            "use_list" => {
+                                for child in children(argument) {
+                                    imports.push((child, prefix.clone()));
+                                }
                             }
-                        }
-                        "use_as_clause" => {
-                            let alias = text(
-                                argument.child_by_field_name("alias").expect("use alias"),
-                                source,
-                            );
-                            let mut target = prefix;
-                            target.extend(path(
-                                argument.child_by_field_name("path").expect("use path"),
-                                source,
-                            ));
-                            result
-                                .imports
-                                .entry(alias.to_owned())
-                                .or_default()
-                                .push(target);
-                        }
-                        _ => {
-                            let mut target = prefix;
-                            target.extend(path(argument, source));
-                            if let Some(name) = target.last() {
-                                result.imports.entry(name.clone()).or_default().push(target);
+                            "use_as_clause" => {
+                                let alias = text(
+                                    argument.child_by_field_name("alias").expect("use alias"),
+                                    source,
+                                );
+                                let mut target = prefix;
+                                target.extend(path(
+                                    argument.child_by_field_name("path").expect("use path"),
+                                    source,
+                                ));
+                                scoped
+                                    .imports
+                                    .entry(alias.to_owned())
+                                    .or_default()
+                                    .push(target);
+                            }
+                            _ => {
+                                let mut target = prefix;
+                                target.extend(path(argument, source));
+                                if let Some(name) = target.last() {
+                                    scoped.imports.entry(name.clone()).or_default().push(target);
+                                }
                             }
                         }
                     }
                 }
+                if node == root {
+                    stack.extend(children(node));
+                }
             }
-            stack.extend(children(node));
+
+            let names = scoped
+                .types
+                .keys()
+                .chain(scoped.imports.keys())
+                .cloned()
+                .collect::<HashSet<_>>();
+            for name in names {
+                if seen.insert(name.clone()) {
+                    if let Some(count) = scoped.types.remove(&name) {
+                        result.types.insert(name.clone(), count);
+                    }
+                    if let Some(targets) = scoped.imports.remove(&name) {
+                        result.imports.insert(name, targets);
+                    }
+                }
+            }
         }
         Ok(result)
     }
@@ -461,7 +557,7 @@ fn type_node_for_unit<'a>(
     unit: &CodeUnit,
     syntax: &'a StructuralPreparedSyntax,
     kinds: &[&str],
-) -> Result<Option<Node<'a>>, String> {
+) -> Result<Option<Node<'a>>, MarkerIncomplete> {
     let source = syntax.prepared().source();
     let ranges = ctx.analyzer.ranges_of(unit);
     let mut stack = vec![syntax.prepared().tree().root_node()];
@@ -488,10 +584,11 @@ fn marker_bounds(
     source: &str,
     bindings: &Bindings,
     bounds: &[Node<'_>],
-) -> Result<(bool, bool, bool), String> {
+) -> Result<(bool, bool, bool, Incompleteness), MarkerIncomplete> {
     let mut send = false;
     let mut sync = false;
     let mut open = false;
+    let mut incompleteness = Incompleteness::Content;
     for &bound in bounds {
         let mut worklist = Vec::new();
         let mut visited = HashSet::default();
@@ -510,11 +607,22 @@ fn marker_bounds(
             if !visited.insert(unit.clone()) {
                 continue;
             }
-            if visited.len() >= 16 {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                visited.len(),
+                16,
+            )
+            .allows(1)
+            {
+                incompleteness = incompleteness.combine(Incompleteness::Operational(
+                    DerivationExecutionCause::Budget,
+                ));
                 open = true;
                 break;
             }
             let Some(syntax) = ctx.syntax(unit.source())? else {
+                incompleteness = incompleteness.combine(Incompleteness::Operational(
+                    DerivationExecutionCause::Provider,
+                ));
                 open = true;
                 continue;
             };
@@ -523,7 +631,7 @@ fn marker_bounds(
                 continue;
             };
             let source = syntax.prepared().source();
-            let bindings = Bindings::read(ctx, syntax.prepared().tree().root_node(), source)?;
+            let bindings = Bindings::read(ctx, node, source)?;
             if let Some(bounds) = node.child_by_field_name("bounds") {
                 for bound in children(bounds) {
                     classify_bound(
@@ -541,7 +649,7 @@ fn marker_bounds(
             }
         }
     }
-    Ok((send, sync, open))
+    Ok((send, sync, open, incompleteness))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -555,7 +663,7 @@ fn classify_bound(
     sync: &mut bool,
     open: &mut bool,
     worklist: &mut Vec<CodeUnit>,
-) -> Result<(), String> {
+) -> Result<(), MarkerIncomplete> {
     ctx.charge()?;
     if bound.kind() == "lifetime" {
         *open |= text(bound, source) != "'static";
@@ -587,7 +695,7 @@ fn contains_parameter(
     node: Node<'_>,
     source: &str,
     parameter: &str,
-) -> Result<bool, String> {
+) -> Result<bool, MarkerIncomplete> {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         ctx.charge()?;
@@ -606,7 +714,7 @@ fn field_uses(
     source: &str,
     bindings: &Bindings,
     parameter: &str,
-) -> Result<(Vec<CodeQueryRustMarkerUse>, bool), String> {
+) -> Result<(Vec<CodeQueryRustMarkerUse>, bool), MarkerIncomplete> {
     let mut fields = Vec::new();
     let mut stack = vec![(declaration, String::new())];
     while let Some((node, variant)) = stack.pop() {
@@ -742,11 +850,10 @@ fn field_uses(
 struct MethodInventory {
     names: HashSet<String>,
     methods: Vec<MethodAccess>,
-    reasons: Vec<String>,
+    reasons: Vec<MarkerIncomplete>,
 }
 
 struct MethodAccess {
-    name: String,
     shared: bool,
     fields: HashSet<String>,
     calls: HashSet<String>,
@@ -791,7 +898,7 @@ fn method_access(
     function: Node<'_>,
     source: &str,
     declaration: &CodeUnit,
-) -> Result<MethodAccess, String> {
+) -> Result<MethodAccess, MarkerIncomplete> {
     let mut owner = function.parent();
     while owner.is_some_and(|n| n.kind() != "impl_item") {
         ctx.charge()?;
@@ -845,11 +952,6 @@ fn method_access(
         }
     }
     let mut access = MethodAccess {
-        name: text(
-            function.child_by_field_name("name").expect("function name"),
-            source,
-        )
-        .to_owned(),
         shared: destructured || !receivers.is_empty(),
         fields: HashSet::default(),
         calls: HashSet::default(),
@@ -944,13 +1046,16 @@ fn method_inventory(ctx: &mut Context<'_>, declaration: &CodeUnit) -> MethodInve
             if found {
                 Ok(())
             } else {
-                Err("Rust method function syntax unavailable".to_owned())
+                Err(MarkerIncomplete::from(
+                    "Rust method function syntax unavailable",
+                ))
             }
         })();
         if let Err(reason) = outcome {
-            inventory
-                .reasons
-                .push(format!("{}: {reason}", method.fq_name_str()));
+            inventory.reasons.push(MarkerIncomplete {
+                message: format!("{}: {}", method.fq_name_str(), reason.message),
+                incompleteness: reason.incompleteness,
+            });
         }
     }
     inventory
@@ -978,11 +1083,6 @@ impl MethodInventory {
                 if !self.names.contains(call) {
                     return "touches";
                 }
-                for (index, callee) in self.methods.iter().enumerate() {
-                    if callee.name == *call && callee.shared {
-                        worklist.push(index);
-                    }
-                }
             }
         }
         if self.reasons.is_empty() {
@@ -993,14 +1093,14 @@ impl MethodInventory {
     }
 }
 
-pub(super) fn rust_marker_impls(
+fn rust_marker_impls(
     analyzer: &dyn IAnalyzer,
     cache: &mut RustMarkerImplsCache,
     declaration: &CodeUnit,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
-) -> Result<RustMarkerImplsResult, String> {
+) -> Result<RustMarkerImplsResult, MarkerIncomplete> {
     let RustMarkerImplsCache {
         syntax,
         files,
@@ -1021,6 +1121,7 @@ pub(super) fn rust_marker_impls(
                 };
                 let file = declaration.source();
                 let mut result = RustMarkerImplsResult {
+                    incompleteness: Incompleteness::Content,
                     rows: Vec::new(),
                     reasons: Vec::new(),
                 };
@@ -1067,6 +1168,7 @@ pub(super) fn rust_marker_impls(
                 else {
                     return Ok(result);
                 };
+                let declaration_bindings = Bindings::read(&mut ctx, item, source)?;
                 let declaration_parameters = item
                     .child_by_field_name("type_parameters")
                     .map(children)
@@ -1082,6 +1184,7 @@ pub(super) fn rust_marker_impls(
                         .descendant_for_byte_range(candidate.span.start, candidate.span.end)
                         .expect("candidate impl belongs to retained syntax");
                     assert_eq!(node.kind(), "impl_item");
+                    let impl_bindings = Bindings::read(&mut ctx, node, source)?;
                     let marker_name = candidate.marker_name;
                     let trait_proof = candidate.trait_proof;
                     let self_type = node.child_by_field_name("type").expect("impl self type");
@@ -1148,7 +1251,7 @@ pub(super) fn rust_marker_impls(
                             file,
                             item,
                             source,
-                            bindings,
+                            &declaration_bindings,
                             mapped_name.unwrap_or(""),
                         )?;
                         let stored_uses = uses
@@ -1189,8 +1292,10 @@ pub(super) fn rust_marker_impls(
                                 }
                             }
                         }
-                        let (has_send_bound, has_sync_bound, bounds_open) =
-                            marker_bounds(&mut ctx, file, source, bindings, &bounds)?;
+                        let (has_send_bound, has_sync_bound, bounds_open, bounds_incompleteness) =
+                            marker_bounds(&mut ctx, file, source, &impl_bindings, &bounds)?;
+                        result.incompleteness =
+                            result.incompleteness.combine(bounds_incompleteness);
                         let shared_access = if marker_name == "Send" {
                             "not_applicable"
                         } else if mapping_open || uses_open || stored {
@@ -1268,7 +1373,11 @@ pub(super) fn rust_marker_impls(
                     let methods = methods
                         .entry(declaration.clone())
                         .or_insert_with(|| method_inventory(&mut ctx, declaration));
-                    result.reasons.extend(methods.reasons.iter().cloned());
+                    for reason in &methods.reasons {
+                        result.incompleteness =
+                            result.incompleteness.combine(reason.incompleteness);
+                        result.reasons.push(reason.message.clone());
+                    }
                     for value in &mut result.rows {
                         let row = &mut value.row;
                         if row.trait_kind == "sync"
@@ -1309,12 +1418,13 @@ pub(super) fn expansions(
         limits,
         cancellation.unwrap_or(&uncancelled),
     );
-    let (rows, reasons) = match outcome {
-        Ok(result) => (result.rows, result.reasons),
-        Err(reason) => (Vec::new(), vec![reason]),
+    let (rows, reasons, incompleteness) = match outcome {
+        Ok(result) => (result.rows, result.reasons, result.incompleteness),
+        Err(reason) => (Vec::new(), vec![reason.message], reason.incompleteness),
     };
     if !reasons.is_empty() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness,
             related: Vec::new(),
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1330,7 +1440,7 @@ pub(super) fn expansions(
                     .to_string_lossy()
                     .replace('\\', "/"),
             ),
-        });
+        }));
     }
     rows.into_iter()
         .map(Box::new)

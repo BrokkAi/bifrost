@@ -57,7 +57,10 @@ mod rust_departing_wave2_root_tests {
                         .admit_cached_selected_content(
                             owner,
                             &fixture.host_path,
-                            first.witness().blob_oid(),
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                first.witness().blob_oid(),
+                                (owner).lang.as_str(),
+                            ),
                             first.witness().input(),
                             &live,
                         )

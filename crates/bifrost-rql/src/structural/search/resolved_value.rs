@@ -5,7 +5,7 @@ use super::*;
 use crate::analyzer::usages::call_binding::{CallBindingCoverage, CallBindingMapping};
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, ResolvedValueIdentity, ResolvedValueIdentityKind,
-    resolve_value_identity_with_source,
+    resolve_value_identity_with_source_outcome as resolve_value_identity_with_source,
 };
 use crate::query::{CallIdentity, ResolvedCallIdentityKind, ResolvedValueFilter};
 use tree_sitter::Node;
@@ -13,7 +13,7 @@ use tree_sitter::Node;
 enum FilterOutcome {
     Match,
     Different,
-    Incomplete(String),
+    Incomplete(Incompleteness, String),
 }
 
 pub(super) fn call_binding_expansions(
@@ -31,6 +31,7 @@ pub(super) fn call_binding_expansions(
         || value.site.report.coverage != CallBindingCoverage::Exhaustive
     {
         FilterOutcome::Incomplete(
+            Incompleteness::Content,
             "call actual does not have an exact, exhaustive formal binding".to_owned(),
         )
     } else {
@@ -42,12 +43,14 @@ pub(super) fn call_binding_expansions(
                 &source,
                 row.range.start_byte,
                 row.range.end_byte,
-                false,
                 filter,
                 cancellation,
                 diagnostics,
             ),
-            None => FilterOutcome::Incomplete("source text is unavailable".to_owned()),
+            None => FilterOutcome::Incomplete(
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
+                "source text is unavailable".to_owned(),
+            ),
         }
     };
     match outcome {
@@ -55,8 +58,8 @@ pub(super) fn call_binding_expansions(
             value.clone(),
         )))],
         FilterOutcome::Different => Vec::new(),
-        FilterOutcome::Incomplete(reason) => {
-            record_incomplete(diagnostics, value.file(), reason);
+        FilterOutcome::Incomplete(incompleteness, reason) => {
+            record_incomplete(diagnostics, incompleteness, value.file(), reason);
             Vec::new()
         }
     }
@@ -94,6 +97,7 @@ pub(super) fn structural_expansions(
     ) {
         record_incomplete(
             diagnostics,
+            Incompleteness::Content,
             &seed.file,
             "structural match is not a supported exact-value node".to_owned(),
         );
@@ -107,7 +111,6 @@ pub(super) fn structural_expansions(
         source,
         fact.range.start_byte,
         fact.range.end_byte,
-        false,
         filter,
         cancellation,
         diagnostics,
@@ -117,8 +120,8 @@ pub(super) fn structural_expansions(
             Arc::clone(seed),
         ))],
         FilterOutcome::Different => Vec::new(),
-        FilterOutcome::Incomplete(reason) => {
-            record_incomplete(diagnostics, &seed.file, reason);
+        FilterOutcome::Incomplete(incompleteness, reason) => {
+            record_incomplete(diagnostics, incompleteness, &seed.file, reason);
             Vec::new()
         }
     }
@@ -136,6 +139,7 @@ pub(super) fn decorator_expansions(
     if fact.kind != crate::analyzer::structural::NormalizedKind::Decorator {
         record_incomplete(
             diagnostics,
+            Incompleteness::Content,
             &seed.file,
             "structural match is not a decorator node".to_owned(),
         );
@@ -147,6 +151,7 @@ pub(super) fn decorator_expansions(
     else {
         record_incomplete(
             diagnostics,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             &seed.file,
             "decorator syntax is unavailable".to_owned(),
         );
@@ -160,6 +165,7 @@ pub(super) fn decorator_expansions(
     ) else {
         record_incomplete(
             diagnostics,
+            Incompleteness::Content,
             &seed.file,
             "decorator node range is not unique in the syntax tree".to_owned(),
         );
@@ -174,6 +180,7 @@ pub(super) fn decorator_expansions(
         let Some(name) = decorator.child_by_field_name("name") else {
             record_incomplete(
                 diagnostics,
+                Incompleteness::Content,
                 &seed.file,
                 "C# attribute has no structured name node".to_owned(),
             );
@@ -182,6 +189,7 @@ pub(super) fn decorator_expansions(
         let Some(terminal_name) = csharp_attribute_terminal_name_node(name) else {
             record_incomplete(
                 diagnostics,
+                Incompleteness::Content,
                 &seed.file,
                 "C# attribute name has no terminal type node".to_owned(),
             );
@@ -194,19 +202,29 @@ pub(super) fn decorator_expansions(
             start_byte: Some(terminal_name.start_byte()),
             end_byte: Some(terminal_name.end_byte()),
         };
-        let Some(identity) = resolve_value_identity_with_source(
+        let identity = match resolve_value_identity_with_source(
             analyzer,
             request,
             seed.file.clone(),
             Arc::<str>::from(source),
             cancellation,
-        ) else {
-            record_incomplete(
-                diagnostics,
-                &seed.file,
-                "C# attribute resolver could not prove one exact declaration identity".to_owned(),
-            );
-            return Vec::new();
+        ) {
+            Ok(Some(identity)) => identity,
+            result => {
+                let incompleteness = match result {
+                    Ok(None) => Incompleteness::Content,
+                    Err(cause) => Incompleteness::Operational(cause),
+                    Ok(Some(_)) => unreachable!("resolved identities returned above"),
+                };
+                record_incomplete(
+                    diagnostics,
+                    incompleteness,
+                    &seed.file,
+                    "C# attribute resolver could not prove one exact declaration identity"
+                        .to_owned(),
+                );
+                return Vec::new();
+            }
         };
         return match filter_matches(&identity, &filter.resolves_to) {
             true => vec![pipeline_expansion(PipelineValue::StructuralMatch(
@@ -219,6 +237,7 @@ pub(super) fn decorator_expansions(
     if seed.language != crate::analyzer::Language::Python {
         record_incomplete(
             diagnostics,
+            Incompleteness::Content,
             &seed.file,
             "resolved decorator identity is unsupported for this language".to_owned(),
         );
@@ -228,6 +247,7 @@ pub(super) fn decorator_expansions(
     let Some(expression) = decorator.named_child(0) else {
         record_incomplete(
             diagnostics,
+            Incompleteness::Content,
             &seed.file,
             "decorator has no expression".to_owned(),
         );
@@ -240,7 +260,6 @@ pub(super) fn decorator_expansions(
         source,
         expression.start_byte(),
         expression.end_byte(),
-        true,
         filter,
         cancellation,
         diagnostics,
@@ -250,8 +269,8 @@ pub(super) fn decorator_expansions(
             Arc::clone(seed),
         ))],
         FilterOutcome::Different => Vec::new(),
-        FilterOutcome::Incomplete(reason) => {
-            record_incomplete(diagnostics, &seed.file, reason);
+        FilterOutcome::Incomplete(incompleteness, reason) => {
+            record_incomplete(diagnostics, incompleteness, &seed.file, reason);
             Vec::new()
         }
     }
@@ -265,7 +284,6 @@ fn expression_filter_outcome(
     source: &str,
     start_byte: usize,
     end_byte: usize,
-    decorator_expression: bool,
     filter: &ResolvedValueFilter,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -276,7 +294,10 @@ fn expression_filter_outcome(
         source,
     )
     .filter(|tree| !tree.root_node().has_error()) else {
-        return FilterOutcome::Incomplete("expression syntax is unavailable".to_owned());
+        return FilterOutcome::Incomplete(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            "expression syntax is unavailable".to_owned(),
+        );
     };
     let accepted_kinds = match crate::analyzer::common::language_for_file(file) {
         crate::analyzer::Language::Python => &[
@@ -309,15 +330,10 @@ fn expression_filter_outcome(
     let Some(mut expression) = exact_node(tree.root_node(), start_byte, end_byte, accepted_kinds)
     else {
         return FilterOutcome::Incomplete(
+            Incompleteness::Content,
             "selected expression range has no unique structured value node".to_owned(),
         );
     };
-    if decorator_expression && expression.kind() == "decorator" {
-        let Some(child) = expression.named_child(0) else {
-            return FilterOutcome::Incomplete("decorator has no expression".to_owned());
-        };
-        expression = child;
-    }
     while matches!(
         expression.kind(),
         "keyword_argument" | "parenthesized_expression"
@@ -328,7 +344,10 @@ fn expression_filter_outcome(
             expression.named_child(0)
         };
         let Some(child) = child else {
-            return FilterOutcome::Incomplete("value wrapper has no expression child".to_owned());
+            return FilterOutcome::Incomplete(
+                Incompleteness::Content,
+                "value wrapper has no expression child".to_owned(),
+            );
         };
         expression = child;
     }
@@ -356,10 +375,13 @@ fn expression_filter_outcome(
             | "conditional_access_expression"
             | "element_access_expression"
     ) {
-        return FilterOutcome::Incomplete(format!(
-            "{} expressions do not have a direct declaration identity",
-            expression.kind()
-        ));
+        return FilterOutcome::Incomplete(
+            Incompleteness::Content,
+            format!(
+                "{} expressions do not have a direct declaration identity",
+                expression.kind()
+            ),
+        );
     }
 
     if crate::analyzer::common::language_for_file(file) == crate::analyzer::Language::CSharp
@@ -373,6 +395,7 @@ fn expression_filter_outcome(
     let reference_expression = if expression.kind() == "call" {
         let Some(function) = expression.child_by_field_name("function") else {
             return FilterOutcome::Incomplete(
+                Incompleteness::Content,
                 "constructor call has no function expression".to_owned(),
             );
         };
@@ -406,7 +429,12 @@ fn expression_filter_outcome(
                     FilterOutcome::Different
                 };
             }
-            Err(reason) => return FilterOutcome::Incomplete(reason),
+            Err(reason) => {
+                return FilterOutcome::Incomplete(
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                    reason,
+                );
+            }
             Ok(None) => {}
         }
     }
@@ -435,16 +463,25 @@ fn expression_filter_outcome(
         start_byte: Some(focus_start_byte),
         end_byte: Some(focus_end_byte),
     };
-    let Some(identity) = resolve_value_identity_with_source(
+    let identity = match resolve_value_identity_with_source(
         analyzer,
         request,
         file.clone(),
         Arc::<str>::from(source),
         cancellation,
-    ) else {
-        return FilterOutcome::Incomplete(
-            "resolver could not prove one unshadowed exact declaration identity".to_owned(),
-        );
+    ) {
+        Ok(Some(identity)) => identity,
+        result => {
+            let incompleteness = match result {
+                Ok(None) => Incompleteness::Content,
+                Err(cause) => Incompleteness::Operational(cause),
+                Ok(Some(_)) => unreachable!("resolved identities returned above"),
+            };
+            return FilterOutcome::Incomplete(
+                incompleteness,
+                "resolver could not prove one unshadowed exact declaration identity".to_owned(),
+            );
+        }
     };
     if filter_matches(&identity, &filter.resolves_to) {
         FilterOutcome::Match
@@ -553,19 +590,22 @@ fn csharp_attribute_terminal_name_node(mut name: Node<'_>) -> Option<Node<'_>> {
 
 fn record_incomplete(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    incompleteness: Incompleteness,
     file: &ProjectFile,
     reason: String,
 ) {
     let language = crate::analyzer::common::language_for_file(file).config_label();
     let message = format!("resolved_value: {reason}");
-    if diagnostics.iter().any(|diagnostic| {
+    if let Some(diagnostic) = diagnostics.iter_mut().find(|diagnostic| {
         diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
             && diagnostic.language == language
             && diagnostic.message == message
     }) {
+        diagnostic.incompleteness = diagnostic.incompleteness.combine(incompleteness);
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -575,5 +615,5 @@ fn record_incomplete(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }

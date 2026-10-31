@@ -20,8 +20,14 @@ pipx install brokk-bifrost
 bifrost --version
 ```
 
-The PyPI package contains the compiled Rust executable; it does not run through
-Python and does not download another Bifrost binary. Published wheels support
+The PyPI package contains the compiled Rust executable, xz-compressed to stay
+under PyPI's upload limit; it does not download another Bifrost binary. The
+first `bifrost` run unpacks and verifies the executable, which takes a few
+seconds, and every run after that replaces a short Python launcher with the
+native process. The unpacked copy sits beside the package, or in your user
+cache directory when the installation is read-only. Uninstalling leaves the
+unpacked copy (a `bin-*` directory in the `brokk_bifrost_cli` package
+directory) behind. Published wheels support
 macOS on Apple Silicon and Intel, glibc Linux on x86-64 and ARM64, and x64
 Windows. Use the install script or Cargo on the other platforms listed below.
 
@@ -57,7 +63,7 @@ installation. Native packages exist for these platforms:
 
 | Operating system | CPU |
 | --- | --- |
-| macOS (one universal package) | Apple Silicon and Intel |
+| macOS | Apple Silicon and Intel |
 | Linux with glibc | x64 and ARM64 |
 | Android | ARM64 |
 | Windows | x64 and ARM64 |
@@ -141,7 +147,7 @@ missing and the terminal is interactive.
 
 | Platform | Architecture | Install script | Release target |
 | --- | --- | --- | --- |
-| macOS | Apple Silicon and Intel | Yes | `universal-apple-darwin` |
+| macOS | Apple Silicon and Intel | Yes | `universal-apple-darwin` (also published per CPU as `aarch64-apple-darwin` and `x86_64-apple-darwin`) |
 | Linux (glibc 2.28+) | x86-64 | Yes | `x86_64-unknown-linux-gnu` |
 | Linux (musl, such as Alpine) | x86-64 | No, unsupported | none published |
 | Linux (glibc 2.28+) | ARM64 | Yes | `aarch64-unknown-linux-gnu` |

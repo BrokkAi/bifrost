@@ -5012,10 +5012,11 @@ pub(super) fn validate_dependency_evidence_filter(
     if !filter.version_ranges.is_empty()
         && filter.ecosystems != ["cargo"]
         && filter.ecosystems != ["npm"]
+        && filter.ecosystems != ["nuget"]
     {
         return Err(QueryError::new(
             child_path(path, "version_ranges"),
-            "version_ranges requires exactly one supported ecosystem: cargo or npm",
+            "version_ranges requires exactly one supported ecosystem: cargo, npm or nuget",
         ));
     }
     for (index, range) in filter.version_ranges.iter().enumerate() {
@@ -5023,6 +5024,9 @@ pub(super) fn validate_dependency_evidence_filter(
             brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange::parse(range)
                 .err()
                 .map(|e| e.to_string())
+        } else if filter.ecosystems == ["nuget"] {
+            brokk_bifrost_csharp_analysis::dependency_evidence::NugetVersionRange::parse(range)
+                .err()
         } else {
             semver::VersionReq::parse(range)
                 .err()

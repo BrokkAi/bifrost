@@ -22,7 +22,11 @@ use crate::analyzer::{
     JavaAnnotationArtifact, JavaAnnotationTypeRoute, JavaAnnotationTypeStatus,
     resolve_java_annotation_type,
 };
+use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, resolve_analyzer};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
+use brokk_bifrost_csharp_analysis::{
+    CSharpAnalyzer, CSharpAttributeTypeStatus, resolve_csharp_attribute_type,
+};
 
 pub(super) const BINDING_STATUS: &[&str] = &[
     "imported",
@@ -93,6 +97,9 @@ pub(super) fn expansions_for_seed(
     });
     let identity = semantic_identity
         .or_else(|| syntax_ordinal.map(ParameterIdentity::incomplete_with_ordinal));
+    let csharp_tree = (seed.language == Language::CSharp)
+        .then(|| parse_tree_for_language(&seed.file, seed.language, seed.facts.source()))
+        .flatten();
     let decorator_targets = seed
         .facts
         .role_targets(seed.fact_match.node, Role::Decorator)
@@ -119,6 +126,8 @@ pub(super) fn expansions_for_seed(
                     name.to_owned(),
                     if seed.language == Language::Java {
                         java_annotation_binding(analyzer, seed, &decorator_range, cancellation)
+                    } else if seed.language == Language::CSharp {
+                        csharp_attribute_binding(analyzer, seed, csharp_tree.as_ref(), target.span)
                     } else {
                         decorator_binding(&environment, name, decorator_range.start_byte)
                     },
@@ -273,6 +282,92 @@ fn java_annotation_binding(
         annotation_fq_name: resolved.fq_name,
         annotation_route: resolved_route,
         annotation_artifact: resolved.artifact,
+        ..DecoratorBinding::default()
+    }
+}
+
+/// Bind a C# attribute to the class it applies. The status vocabulary is the
+/// one Java annotation rows publish; C# has no import tier, so a resolved row
+/// carries a route only when a workspace declaration decided it.
+fn csharp_attribute_binding(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    tree: Option<&tree_sitter::Tree>,
+    span: Span,
+) -> DecoratorBinding {
+    let attribute = tree
+        .and_then(|tree| {
+            tree.root_node()
+                .named_descendant_for_byte_range(span.start_byte, span.end_byte)
+        })
+        // `[Name]` spans its attribute and the attribute's name identically,
+        // and the lookup returns the deepest node, so climb to the attribute.
+        .and_then(|node| {
+            std::iter::successors(Some(node), |node| node.parent())
+                .take_while(|node| node.byte_range() == (span.start_byte..span.end_byte))
+                .find(|node| node.kind() == "attribute")
+        });
+    let unsupported = |reason: &str| DecoratorBinding {
+        status: "unsupported",
+        boundary: BoundaryStatus::ExternalUnknown.label(),
+        reason: Some(reason.to_string()),
+        annotation_status: Some(JavaAnnotationTypeStatus::Unsupported),
+        ..DecoratorBinding::default()
+    };
+    let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
+        return unsupported("the C# analyzer is unavailable");
+    };
+    let Some(attribute) = attribute else {
+        return unsupported("the decorator span does not select one C# attribute AST");
+    };
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let resolved = resolve_csharp_attribute_type(
+        analyzer,
+        csharp,
+        scope.token(),
+        &seed.file,
+        seed.facts.source(),
+        attribute,
+    );
+    let annotation_type = resolved.source_declaration.as_ref().map(|unit| {
+        let range = analyzer
+            .ranges_of(unit)
+            .into_iter()
+            .min_by_key(primary_range_key)
+            .expect("a workspace attribute class has a declaration range");
+        Box::new(render_declaration(
+            analyzer,
+            &DeclarationValue::new(unit.clone(), range),
+            CodeQueryResultDetail::Full,
+            &mut PipelineRenderCache::default(),
+        ))
+    });
+    let local = resolved.source_declaration.is_some();
+    let complete = resolved.status == CSharpAttributeTypeStatus::Resolved;
+    DecoratorBinding {
+        status: match resolved.status {
+            CSharpAttributeTypeStatus::Resolved if local => "local",
+            CSharpAttributeTypeStatus::Resolved => "imported",
+            CSharpAttributeTypeStatus::Ambiguous => "ambiguous",
+            CSharpAttributeTypeStatus::Unsupported => "unsupported",
+            CSharpAttributeTypeStatus::Incomplete => "incomplete",
+        },
+        boundary: match (complete, local) {
+            (true, true) => BoundaryStatus::WorkspaceLocal.label(),
+            (true, false) => BoundaryStatus::ExternalIndexed.label(),
+            (false, _) => BoundaryStatus::ExternalUnknown.label(),
+        },
+        complete,
+        reason: resolved.reason,
+        annotation_type,
+        annotation_status: Some(match resolved.status {
+            CSharpAttributeTypeStatus::Resolved => JavaAnnotationTypeStatus::Resolved,
+            CSharpAttributeTypeStatus::Ambiguous => JavaAnnotationTypeStatus::Ambiguous,
+            CSharpAttributeTypeStatus::Incomplete => JavaAnnotationTypeStatus::Incomplete,
+            CSharpAttributeTypeStatus::Unsupported => JavaAnnotationTypeStatus::Unsupported,
+        }),
+        annotation_fq_name: resolved.fq_name,
+        annotation_route: local.then_some(JavaAnnotationTypeRoute::SourceDeclaration),
         ..DecoratorBinding::default()
     }
 }

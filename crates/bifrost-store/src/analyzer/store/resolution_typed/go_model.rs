@@ -3,7 +3,7 @@ use super::external_owners::{TypeTermHooks, lower_type_term};
 use super::*;
 use crate::analyzer::resolution::fact_source::{
     GoInterfaceMethod, GoMemberDeclaration, GoMemberDeclarationKind, GoModelMemberDeclaration,
-    GoModelOwnerDeclarations, GoStructField,
+    GoModelOwnerDeclarations, GoStructField, ModelCallableResultDeclaration,
 };
 use crate::analyzer::resolution::{
     ExternalOwnerIdentity, ExternalOwnerLanguage, ResolutionLookupSemanticRecipe,
@@ -28,6 +28,7 @@ fn member_digest(member: &ModelSymbolRef, domain: &'static [u8]) -> CanonicalHas
 struct GoTypeTermHooks<'a, 'selection, 'store> {
     source: &'a SelectedResolutionTypedSource<'selection, 'store>,
     owner: &'a ExternalOwnerIdentity,
+    owner_kind: Kind,
     member: &'a ModelSymbolRef,
     selection: &'a ModelProviderSelection,
     purpose: &'static str,
@@ -69,6 +70,28 @@ impl TypeTermHooks for GoTypeTermHooks<'_, '_, '_> {
             && let crate::analyzer::resolution::universe::UniverseIdentityKind::Type(kind) =
                 entry.identity_kind
         {
+            if let Some(authority) = self.source.model_authority.as_deref() {
+                let names = crate::analyzer::resolution::universe::GO_UNIVERSE
+                    .iter()
+                    .filter(|entry| entry.namespace == ResolutionNamespace::Type)
+                    .map(|entry| entry.spelling)
+                    .collect::<Vec<_>>();
+                let shadows =
+                    authority
+                        .model_declared_types_named("go", &names)
+                        .map_err(|error| {
+                            StoreError::new(format!("Go model universe shadows: {error:?}"))
+                        })?;
+                if !shadows.is_empty()
+                    && brokk_bifrost_go::declarations::go_model_owner_package(
+                        &self.owner.owner_fqn,
+                        self.owner_kind == Kind::Module,
+                    )
+                    .is_none_or(|package| shadows.contains(&(package.to_owned(), name.clone())))
+                {
+                    return Ok(None);
+                }
+            }
             self.nominal_name = Some(name.clone());
             return Ok(Some((
                 SemanticId::shared_name(self.source.selection.shared_names().intern(
@@ -123,6 +146,46 @@ impl TypeTermHooks for GoTypeTermHooks<'_, '_, '_> {
     }
 }
 
+struct GoCallableResultHooks<'a, 'selection, 'store>(GoTypeTermHooks<'a, 'selection, 'store>);
+
+impl TypeTermHooks for GoCallableResultHooks<'_, '_, '_> {
+    fn allocate(&mut self) -> (SemanticId, [u8; 32]) {
+        self.0.allocate()
+    }
+    fn wrap<T>(&self, row: T) -> SelectedTypedRow<T> {
+        self.0.wrap(row)
+    }
+    fn nominal(
+        &mut self,
+        term: &TypeRef,
+        owners: &crate::hash::HashMap<String, Option<ExternalOwnerIdentity>>,
+    ) -> StoreResult<Option<(SemanticId, IntrinsicTypeKind, String)>> {
+        // #7570: rendered Named results remain open, including inside pointers.
+        // Bare predeclared names are trusted only when the active model set
+        // has no package-local declaration shadowing the universe type (#8264).
+        if !self.0.exact_nominal(term) {
+            return Ok(None);
+        }
+        if let TypeRef::Named { name, .. } = term
+            && crate::analyzer::resolution::universe::lookup(
+                Language::Go,
+                ResolutionNamespace::Type,
+                name,
+            )
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.0.nominal(term, owners)
+    }
+    fn exact_nominal(&self, term: &TypeRef) -> bool {
+        self.0.exact_nominal(term)
+    }
+    fn pointer_element<'a>(&self, term: &'a TypeRef) -> Option<&'a TypeRef> {
+        self.0.pointer_element(term)
+    }
+}
+
 impl SelectedResolutionTypedSource<'_, '_> {
     pub(super) fn read_unindexed_model_callable_result(
         &self,
@@ -131,7 +194,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         session: Option<
             &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
         >,
-    ) -> StoreResult<Option<Option<String>>> {
+    ) -> StoreResult<Option<Option<ModelCallableResultDeclaration>>> {
         use super::super::resolution_lexical::{
             SelectedLookupRecipeReadOutcome, SelectedLookupRecipeRequest,
             SelectedResolutionLexicalSource,
@@ -167,7 +230,6 @@ impl SelectedResolutionTypedSource<'_, '_> {
         let Some(recipe) = recipes[0].as_ref() else {
             return Ok(Some(None));
         };
-        let canonical = format!("{}.{}", frontier.provider_path, recipe.spelling());
         let selection = models.model_provider_selection();
         let groups = authority.model_selected_groups(
             "go",
@@ -225,15 +287,220 @@ impl SelectedResolutionTypedSource<'_, '_> {
             return Ok(Some(None));
         };
         let symbol = &member.declaration;
-        Ok(Some(
-            (symbol.kind == Kind::Function
-                && !symbol.provenance.ambiguous
-                && symbol
-                    .structured_signature
-                    .as_ref()
-                    .is_some_and(|signature| signature.returns.is_some()))
-            .then(|| format!("{canonical} from {}", symbol.provenance.pack_digest)),
-        ))
+        if symbol.kind != Kind::Function
+            || symbol.provenance.ambiguous
+            || symbol.visibility != crate::analyzer::semantic_model::Visibility::Public
+            || symbol.has_receiver()
+            || !symbol.is_static()
+        {
+            return Ok(Some(None));
+        }
+        self.lower_model_callable_result(
+            member.member.clone(),
+            selection,
+            symbol.clone(),
+            module.kind,
+            ExternalOwnerIdentity {
+                provider_id: module.provenance.pack_digest.clone().into(),
+                owner_fqn: module.qualified_name.clone().into(),
+            },
+            cancellation,
+        )
+    }
+
+    pub(super) fn read_model_member_callable_result(
+        &self,
+        member: &ModelSymbolRef,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<ModelCallableResultDeclaration>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let (Some(authority), Some(models)) = (
+            self.model_authority.as_deref(),
+            self.external_models.as_deref(),
+        ) else {
+            return Ok(Some(None));
+        };
+        let selection = models.model_provider_selection();
+        let groups = authority.model_selected_groups(
+            "go",
+            &TypeRef::Declared {
+                id: member.symbol_id.clone(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            &selection,
+            cancellation,
+        );
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let groups =
+            groups.map_err(|error| StoreError::new(format!("Go model callable: {error:?}")))?;
+        let Some(declaration) = groups.into_iter().flatten().find(|declaration| {
+            declaration.id == member.symbol_id
+                && crate::analyzer::semantic_model::overlay::ModelProvider::from(
+                    &declaration.provenance,
+                ) == member.provider
+        }) else {
+            return Ok(Some(None));
+        };
+        let Some(owner_id) = declaration.owner_id.as_ref() else {
+            return Ok(Some(None));
+        };
+        let owners = authority.model_selected_groups(
+            "go",
+            &TypeRef::Declared {
+                id: owner_id.clone(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            &selection,
+            cancellation,
+        );
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let owners =
+            owners.map_err(|error| StoreError::new(format!("Go callable owner: {error:?}")))?;
+        let Some(owner) = owners.into_iter().flatten().find(|owner| {
+            owner.id == *owner_id
+                && crate::analyzer::semantic_model::overlay::ModelProvider::from(&owner.provenance)
+                    == member.provider
+        }) else {
+            return Ok(Some(None));
+        };
+        self.lower_model_callable_result(
+            member.clone(),
+            selection,
+            declaration,
+            owner.kind,
+            ExternalOwnerIdentity {
+                provider_id: member.provider.pack_digest.clone().into(),
+                owner_fqn: owner.qualified_name.into(),
+            },
+            cancellation,
+        )
+    }
+
+    fn lower_model_callable_result(
+        &self,
+        member: ModelSymbolRef,
+        selection: ModelProviderSelection,
+        declaration: crate::analyzer::semantic_model::overlay::SemanticModelSymbol,
+        owner_kind: Kind,
+        owner: ExternalOwnerIdentity,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<ModelCallableResultDeclaration>>> {
+        use crate::analyzer::resolution::{
+            LoweredCallableParameterApplicability, LoweredCallableParameterProperty,
+            LoweredCallableResultTypeProperty,
+        };
+        let authority = self
+            .model_authority
+            .as_deref()
+            .expect("selected callable has model authority");
+        let results = authority.model_callable_results(&member, &selection, cancellation);
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let results =
+            results.map_err(|error| StoreError::new(format!("Go callable results: {error:?}")))?;
+        let definition = self
+            .context_identities
+            .model_member_semantic(&member, &self.selection.shared_names());
+        let mut lowered = None;
+        if let (Some(signature), Some(results)) =
+            (declaration.structured_signature.as_ref(), results)
+            && !declaration.provenance.ambiguous
+            && signature.type_parameters.is_empty()
+            && !signature
+                .parameters
+                .iter()
+                .enumerate()
+                .any(|(index, parameter)| {
+                    parameter.optional
+                        || (parameter.variadic && index + 1 != signature.parameters.len())
+                })
+        {
+            let mut memo = self.external_signatures.borrow_mut();
+            let mut parameters = Vec::new();
+            let mut applicability = Vec::new();
+            let mut result_types = Vec::new();
+            for (position, parameter) in signature.parameters.iter().enumerate() {
+                let mut hooks = GoTypeTermHooks {
+                    source: self,
+                    owner: &owner,
+                    owner_kind,
+                    member: &member,
+                    selection: &selection,
+                    purpose: "callable-parameter",
+                    position,
+                    next_slot: 0,
+                    nominal_name: None,
+                    cancellation,
+                };
+                let (slot, _) = hooks.allocate();
+                let ordinal = u32::try_from(position).expect("model parameter ordinal fits u32");
+                parameters.push(LoweredCallableParameterProperty::new(
+                    ordinal,
+                    slot,
+                    slot,
+                    parameter.variadic,
+                ));
+                applicability.push(LoweredCallableParameterApplicability::new(
+                    ordinal, 0, None, false, true,
+                ));
+            }
+            for (position, term) in results.iter().enumerate() {
+                let mut hooks = GoCallableResultHooks(GoTypeTermHooks {
+                    source: self,
+                    owner: &owner,
+                    owner_kind,
+                    member: &member,
+                    selection: &selection,
+                    purpose: "callable-result",
+                    position,
+                    next_slot: 0,
+                    nominal_name: None,
+                    cancellation,
+                });
+                let Some(slot) = lower_type_term(
+                    &mut memo,
+                    term.as_ref().unwrap_or(&TypeRef::Unknown),
+                    &mut hooks,
+                    &self.context_identities,
+                    cancellation,
+                )?
+                else {
+                    return Ok(None);
+                };
+                result_types.push(LoweredCallableResultTypeProperty::new(
+                    u32::try_from(position).expect("model result ordinal fits u32"),
+                    slot,
+                ));
+            }
+            let signature = LoweredCallableSignatureProperty::new(
+                definition,
+                0,
+                parameters,
+                ResolutionCompletion::Complete,
+            )
+            .with_result_types(result_types)
+            .with_applicability_shape(
+                vec![0].into_boxed_slice(),
+                applicability.into_boxed_slice(),
+                None,
+            );
+            lowered = Some(signature);
+        }
+        Ok(Some(Some(ModelCallableResultDeclaration {
+            member,
+            selection,
+            declaration,
+            signature: lowered,
+        })))
     }
 
     pub(super) fn read_go_model_owner_declarations(
@@ -351,6 +618,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     let mut hooks = GoTypeTermHooks {
                         source,
                         owner: identity,
+                        owner_kind: declarations.declaration.kind,
                         member: &member.member,
                         selection: &selection,
                         purpose: "field",
@@ -385,6 +653,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             let mut hooks = GoTypeTermHooks {
                 source,
                 owner: identity,
+                owner_kind: declarations.declaration.kind,
                 member: &owner,
                 selection: &selection,
                 purpose: "embedded",

@@ -38,7 +38,7 @@ pub(in crate::analyzer) fn jvm_root_import_origin(
 /// JVM import order is origin rank before lexical depth.
 pub(super) struct JvmBindingPrecedence {
     pub(super) rank: u32,
-    depth: u32,
+    pub(super) depth: u32,
 }
 
 pub(super) type JvmImportBinding = super::imports::ImportBinding<JvmBindingPrecedence>;
@@ -186,6 +186,8 @@ struct JvmSourceDemand {
     qualified_completion: Option<ResolutionCompletion>,
     caller_scoped_source: Option<JvmCallerScopedSource>,
     caller_gap_reasons: Vec<ResolutionIncompleteReason>,
+    pending_query_obligations:
+        Vec<crate::analyzer::resolution::query_obligations::PendingQueryObligation>,
     caller_discharged_provider_reasons: BTreeSet<SemanticId>,
     caller_positive_binding_providers: BTreeMap<SemanticId, BTreeSet<SemanticId>>,
     import_qualifiers: Option<(SelectedRootPathHalf, Box<[SemanticId]>)>,
@@ -524,6 +526,7 @@ impl JvmDemandState<'_, '_, '_> {
                                 qualified_completion: None,
                                 caller_scoped_source,
                                 caller_gap_reasons: Vec::new(),
+                                pending_query_obligations: Vec::new(),
                                 caller_discharged_provider_reasons: BTreeSet::new(),
                                 caller_positive_binding_providers: BTreeMap::new(),
                                 import_qualifiers: None,
@@ -621,6 +624,7 @@ impl JvmDemandState<'_, '_, '_> {
             qualified_completion: qualified.then_some(source.completion),
             caller_scoped_source,
             caller_gap_reasons: Vec::new(),
+            pending_query_obligations: Vec::new(),
             caller_discharged_provider_reasons: BTreeSet::new(),
             caller_positive_binding_providers: BTreeMap::new(),
             import_qualifiers,
@@ -699,6 +703,18 @@ impl JvmDemandState<'_, '_, '_> {
         }
         references.sort_unstable();
         references.dedup();
+        for reference in &references {
+            rank = rank
+                .into_iter()
+                .chain(
+                    self.operation
+                        .jvm_on_demand_type_ranks
+                        .borrow()
+                        .get(reference)
+                        .copied(),
+                )
+                .min();
+        }
         for binding in &import_bindings {
             let selected_reference = references.contains(&binding.reference)
                 || matches!(source.caller_scoped_source, Some(JvmCallerScopedSource::Import { token, .. }) if token == binding.token);
@@ -1396,15 +1412,31 @@ impl JvmDemandState<'_, '_, '_> {
                         && gap.lookup.namespace() == ResolutionNamespace::Callable
                         && root_lookup.spelling() == gap.lookup.spelling())
             })
-            .filter_map(|gap| match gap.boundary_status {
-                Some(status) => Some(ResolutionIncompleteReason::OpenBoundary {
-                    semantic: gap.reason,
-                    status,
-                }),
-                None if !implicit_root_reference => {
-                    Some(ResolutionIncompleteReason::UnsupportedSemantic(gap.reason))
+            .filter_map(|gap| {
+                if gap.kind == "jvm-default-import-package-open" {
+                    let pending =
+                        crate::analyzer::resolution::query_obligations::PendingQueryObligation {
+                            reason: gap.reason,
+                            obligation: crate::analyzer::resolution::QueryObligation::new(
+                                gap.kind,
+                                gap.owner.clone().expect("default import package owner"),
+                                "unacquired",
+                            ),
+                        };
+                    if !source.pending_query_obligations.contains(&pending) {
+                        source.pending_query_obligations.push(pending);
+                    }
                 }
-                None => None,
+                match gap.boundary_status {
+                    Some(status) => Some(ResolutionIncompleteReason::OpenBoundary {
+                        semantic: gap.reason,
+                        status,
+                    }),
+                    None if !implicit_root_reference => {
+                        Some(ResolutionIncompleteReason::UnsupportedSemantic(gap.reason))
+                    }
+                    None => None,
+                }
             })
             .collect();
         Ok(Some(reasons))
@@ -1543,6 +1575,7 @@ impl JvmDemandState<'_, '_, '_> {
 
     fn caller_gap_witness(source: &JvmSourceDemand) -> ClosureWitness {
         ClosureWitness {
+            pending_query_obligations: source.pending_query_obligations.clone(),
             discharged_provider_reasons: source.caller_discharged_provider_reasons.clone(),
             positive_binding_providers: source.caller_positive_binding_providers.clone(),
         }
@@ -2178,6 +2211,27 @@ pub struct JvmForwardOperationContext<'a> {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_jvm_forward_operation_for_test<T>(
+        &self,
+        context: JvmForwardOperationContext<'_>,
+        run: impl FnOnce(&mut crate::analyzer::resolution::FactResolutionOperation<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_jvm_forward_operation(
+            context.storage_language,
+            context.blueprint,
+            context.lexical,
+            context.typed,
+            context.caller_path,
+            Some(context.import_gaps),
+            context.cancellation,
+            context.session,
+            None,
+            run,
+        )
+    }
+
     #[doc(hidden)]
     pub fn stage_jvm_reference_batches(
         &self,
@@ -2442,6 +2496,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                     ContextId(index)
                 });
                 let frame = RootFrame {
+                    query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
                     endpoint: endpoint.clone(),
                     sources: Box::new([]),
                     halves,
@@ -3239,12 +3294,17 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
         let mut exact = discharges.clone().unwrap_or_default();
         exact.discharged_provider_reasons = facts.witness.discharged_provider_reasons.clone();
         exact.positive_binding_providers = facts.witness.positive_binding_providers.clone();
+        let query_scope = crate::analyzer::resolution::ClosedQueryScope {
+            query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
+            pending_query_obligations: facts.witness.pending_query_obligations.clone(),
+        };
         let mut policy = super::demand_closure::ClosurePolicy::new(
             ResolutionCompletion::Complete,
             BaseEligibility::Retain,
             exact,
             Box::new([]),
         );
+        policy = policy.with_query_scope(query_scope);
         if discharges.is_some() {
             policy.preserve_discharge_record();
         }

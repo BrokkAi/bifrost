@@ -53,7 +53,11 @@ function make(?PackageAlias $value): Child { return new Child(); }
         {
             let store = AnalyzerStore::open_persistent(&path).unwrap();
             store
-                .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                    &PhpAdapter,
+                    &state,
+                )
                 .unwrap();
             store
             .conn
@@ -141,7 +145,11 @@ function make(?PackageAlias $value): Child { return new Child(); }
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("php").unwrap();
         store
-            .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                &PhpAdapter,
+                &state,
+            )
             .unwrap();
         store
         .conn
@@ -186,7 +194,11 @@ function make(?PackageAlias $value): Child { return new Child(); }
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("php").unwrap();
         store
-            .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                &PhpAdapter,
+                &state,
+            )
             .unwrap();
         store
         .conn
@@ -217,10 +229,18 @@ function make(?PackageAlias $value): Child { return new Child(); }
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("php").unwrap();
         store
-            .write_parsed_blob(empty_oid, "php", &PhpAdapter, &empty_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(empty_oid, "php"),
+                &PhpAdapter,
+                &empty_state,
+            )
             .unwrap();
         store
-            .write_parsed_blob(populated_oid, "php", &PhpAdapter, &populated_state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(populated_oid, "php"),
+                &PhpAdapter,
+                &populated_state,
+            )
             .unwrap();
         assert!(
             store
@@ -277,12 +297,20 @@ function make(?PackageAlias $value): Child { return new Child(); }
         let generation = store.current_generation("php").unwrap();
         let oid = oid_for(SOURCE.as_bytes());
         store
-            .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                &PhpAdapter,
+                &state,
+            )
             .unwrap();
         for index in 0..32 {
             let other = oid_for(format!("planner PHP publication {index}").as_bytes());
             store
-                .write_parsed_blob(other, "php", &PhpAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(other, "php"),
+                    &PhpAdapter,
+                    &state,
+                )
                 .unwrap();
         }
         brokk_bifrost_analysis::analyzer::store::source_facts::assert_source_lookup_plan(
@@ -328,12 +356,20 @@ function make(?PackageAlias $value): Child { return new Child(); }
         let facts = state.source_facts.as_mut().unwrap().php.take().unwrap();
         assert!(
             store
-                .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                    &PhpAdapter,
+                    &state
+                )
                 .is_err()
         );
         state.source_facts.as_mut().unwrap().php = Some(facts);
         store
-            .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                &PhpAdapter,
+                &state,
+            )
             .unwrap();
         assert!(
             store
@@ -359,7 +395,11 @@ function make(?PackageAlias $value): Child { return new Child(); }
                 .is_err()
         );
         store
-            .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                &PhpAdapter,
+                &state,
+            )
             .unwrap();
         assert!(
             store
@@ -380,7 +420,11 @@ function make(?PackageAlias $value): Child { return new Child(); }
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("php").unwrap();
         store
-            .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                &PhpAdapter,
+                &state,
+            )
             .unwrap();
         brokk_bifrost_analysis::analyzer::store::source_facts::assert_reader_rejects_tampering(
             || {
@@ -413,7 +457,11 @@ function make(?PackageAlias $value): Child { return new Child(); }
         let generation = store.current_generation("php").unwrap();
         let oid = oid_for(SOURCE.as_bytes());
         store
-            .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                &PhpAdapter,
+                &state,
+            )
             .unwrap();
         let read = store
             .php_source_facts(oid, generation, &PhpAdapter, &file, &|| true)
@@ -469,7 +517,11 @@ use ;
         // overwrote the generic list with a second interpretation that skipped
         // the phantom clause and the nested `use`.
         store
-            .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+                &PhpAdapter,
+                &state,
+            )
             .unwrap();
     }
 }

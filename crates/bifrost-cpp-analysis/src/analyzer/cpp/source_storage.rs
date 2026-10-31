@@ -47,7 +47,7 @@ pub const CPP_SOURCE_HEADER_SQL: &str = "SELECT blob.id, marker.logical_rows, ma
      JOIN source_fact_manifests AS source ON source.blob_id = blob.id
      JOIN blob_meta AS meta ON meta.blob_id = blob.id
      JOIN source_fact_readiness AS ready ON ready.blob_id = blob.id
-     WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.generation = ?3
+     WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.parse_variant = x'' AND blob.generation = ?3
        AND marker.facts_version = ?4 AND source.facts_version = ?5
        AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
 
@@ -680,7 +680,7 @@ impl CppSourceStorage for AnalyzerStore {
                 )));
             }
             let Some(units) =
-                read_source_unit_map(tx, &oid.to_string(), lang, adapter, file, keep_going)?
+                read_source_unit_map(tx,&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang), adapter, file, keep_going)?
             else {
                 return Ok(None);
             };
@@ -926,7 +926,11 @@ pub trait CanonicalCppSourceFacts {
         file: &ProjectFile,
         lang: &str,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile, String),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>>;
@@ -938,7 +942,11 @@ impl<A: LanguageAdapter> CanonicalCppSourceFacts for TreeSitterAnalyzer<A> {
         file: &ProjectFile,
         lang: &str,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile, String),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>> {
@@ -951,7 +959,11 @@ impl<A: LanguageAdapter> CanonicalCppSourceFacts for TreeSitterAnalyzer<A> {
             return None;
         }
         let key = Self::transient_cache_key(oid, file);
-        let cache_key = (generation, oid, file.clone(), lang.to_owned());
+        let cache_key = (
+            generation,
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang),
+            file.clone(),
+        );
         let is_primary_language = lang == self.adapter.storage_language_key_for_file(file);
         let retained_primary = self.retained_file_state(file, &key);
         // Ordinary store hydration deliberately omits canonical source families.
@@ -1032,7 +1044,9 @@ impl<A: LanguageAdapter> CanonicalCppSourceFacts for TreeSitterAnalyzer<A> {
                 }
             } else if !self.store_query_or_record(
                 |sink| sink.push(self.file_read_key(file, oid)),
-                self.store_context.store.contains_blob(oid, lang),
+                self.store_context
+                    .store
+                    .contains_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang)),
                 format!("checking C/C++ source projection ownership for {file:?} ({oid}, {lang})"),
             )? {
                 // An optional dialect with no blob registration was never produced.

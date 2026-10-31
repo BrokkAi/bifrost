@@ -1,4 +1,5 @@
 use crate::analyzer::python::*;
+use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use brokk_bifrost_semantic::analyzer::semantic::type_flow::ClassIdentity;
 
@@ -70,8 +71,6 @@ use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
 
 use brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index;
 
-use brokk_bifrost_core::analyzer::capabilities::descendants_from_variant_index;
-
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_core::hash::HashMap;
@@ -114,7 +113,12 @@ struct HierarchyBudget<'a> {
 
 impl HierarchyBudget<'_> {
     fn charge(&mut self, visits: usize, work: usize) -> Result<(), PythonHierarchyReason> {
-        if self.visits.saturating_add(visits) > MAX_PYTHON_HIERARCHY_VISITS {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            self.visits,
+            MAX_PYTHON_HIERARCHY_VISITS,
+        )
+        .allows(visits)
+        {
             return Err(PythonHierarchyReason::VisitLimit);
         }
         if !self.session.scope_steps(work.max(visits)) {
@@ -668,7 +672,12 @@ impl PythonClassHierarchyProvider for PythonAnalyzer {
             };
             let declarations = self.direct_children_in_source_order(mro_owner);
             visits = visits.saturating_add(declarations.len());
-            if visits > MAX_PYTHON_MEMBER_VISITS {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                visits,
+                MAX_PYTHON_MEMBER_VISITS,
+            )
+            .allows(0)
+            {
                 return stopped(
                     PythonOverrideOutcome::Incomplete,
                     Some(PythonHierarchyReason::VisitLimit),
@@ -966,7 +975,12 @@ impl PythonAnalyzer {
             };
             let declarations = self.direct_children_in_source_order(owner);
             visits = visits.saturating_add(declarations.len());
-            if visits > MAX_PYTHON_MEMBER_VISITS {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                visits,
+                MAX_PYTHON_MEMBER_VISITS,
+            )
+            .allows(0)
+            {
                 answer.outcome = PythonHierarchyOutcome::Incomplete;
                 answer.reason = Some(PythonHierarchyReason::VisitLimit);
                 break;
@@ -1057,7 +1071,7 @@ pub(crate) fn spend_c3(work: &mut usize, amount: usize) -> Result<(), C3Failure>
 }
 
 impl TypeHierarchyProvider for PythonAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         let ancestors = super::read_memo(
@@ -1076,39 +1090,36 @@ impl TypeHierarchyProvider for PythonAnalyzer {
             },
             super::weight_code_unit_vec,
         );
-        (*ancestors).clone()
+        HierarchyAnswer::complete((*ancestors).clone())
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let uncancelled = CancellationToken::default();
         self.get_direct_descendants_within(
             code_unit,
             &DescendantIndexScope::whole_workspace(&uncancelled),
         )
-        // The compatibility API has no failure channel. The guarded builder
-        // records operational failures in the query context and refuses to
-        // cache them, even when this particular traversal has no stop token.
-        .unwrap_or_default()
+        .expect("a whole-workspace descendant query cannot be cancelled")
     }
     fn get_direct_descendants_within(
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         self.direct_descendant_index.read(
             &super::memo_attribution(self),
             |(memo, _)| {
-                descendants_from_variant_index(memo, scope, code_unit, || {
-                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
-                        self,
-                        || build_direct_descendant_index(self, self, scope),
-                    )
-                    .ok()
-                    .flatten()
-                })
+                brokk_bifrost_analysis::analyzer::common::complete_descendant_query(
+                    self,
+                    scope,
+                    code_unit,
+                    memo,
+                    || build_direct_descendant_index(self, self, scope),
+                    |_| {},
+                )
             },
             |answer| {
-                if answer.is_some() {
+                if answer.as_ref().is_ok_and(|answer| answer.is_complete()) {
                     self.descendants_authority_digest()
                         .map_or(super::AuthorityInputs::Unnamed, super::whole_fact)
                 } else {

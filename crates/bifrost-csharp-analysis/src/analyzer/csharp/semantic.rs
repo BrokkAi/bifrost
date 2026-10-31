@@ -150,7 +150,10 @@ fn compound_division_can_throw(context: CSharpCompoundContext) -> bool {
 // Initializer, event-accessor, arity and parser changes reach the lowerer (v23).
 // Compound assignments and built-in binary result types reach it (v24, #7344, #7345).
 // Operator aborts and gaps follow operand evaluation (v27, #8019).
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v27";
+// Location assignments convert before accessor checks and stores (v29, #8259).
+// #8269: defer simple-write access checks until the store after the right operand.
+// #8338: infer exact local array and numeric literal conversion identities.
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v31";
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -427,6 +430,28 @@ fn binary_numeric_type(
 }
 
 impl CSharpPredefinedType {
+    const fn keyword(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::SByte => "sbyte",
+            Self::Byte => "byte",
+            Self::Short => "short",
+            Self::UShort => "ushort",
+            Self::Int => "int",
+            Self::UInt => "uint",
+            Self::Long => "long",
+            Self::ULong => "ulong",
+            Self::NInt => "nint",
+            Self::NUInt => "nuint",
+            Self::Char => "char",
+            Self::Float => "float",
+            Self::Double => "double",
+            Self::Decimal => "decimal",
+            Self::Object => "object",
+            Self::String => "string",
+        }
+    }
+
     fn from_keyword(keyword: &str) -> Option<Self> {
         Some(match keyword {
             "bool" => Self::Bool,
@@ -564,6 +589,12 @@ impl CSharpPredefinedType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CSharpTypeIdentity {
     Predefined(CSharpPredefinedType),
+    /// Elements are interned structurally in this file's type index. Keeping
+    /// explicit IDs makes nested arrays stack-safe and preserves Copy identity.
+    Array {
+        element: usize,
+        rank: usize,
+    },
     /// One type declared in this file. `start_byte` is the identity: one file
     /// holds at most one declaration at a byte, and `kind` is a property of
     /// that same declaration rather than a second identity.
@@ -578,6 +609,7 @@ impl CSharpTypeIdentity {
     /// naming a shared object.
     const fn is_value_type(self) -> bool {
         match self {
+            Self::Array { .. } => false,
             Self::Predefined(predefined) => predefined.is_value_type(),
             Self::Declared { kind, .. } => !matches!(kind, CSharpDeclaredTypeKind::Reference),
         }
@@ -596,7 +628,8 @@ impl CSharpTypeIdentity {
                 kind: CSharpDeclaredTypeKind::Enum,
                 ..
             } => Some(TransferKind::Copy),
-            Self::Predefined(_)
+            Self::Array { .. }
+            | Self::Predefined(_)
             | Self::Declared {
                 kind: CSharpDeclaredTypeKind::Reference,
                 ..
@@ -692,6 +725,9 @@ struct CSharpStaticCallable {
 /// same-named declaration (#2847).
 #[derive(Debug, Default)]
 struct CSharpTypeIndex {
+    /// Query-local canonical element identities, discarded after lowering this
+    /// file. Equal nested array shapes receive equal element IDs.
+    array_elements: std::cell::RefCell<CSharpArrayElements>,
     declarations: TypeDeclarations,
     /// Names bound by a `using X = ...;` alias anywhere in this file.
     aliases: HashSet<Box<str>>,
@@ -707,6 +743,12 @@ struct CSharpTypeIndex {
     /// could divert.
     kinds: HashMap<usize, CSharpDeclaredTypeKind>,
     callables: HashMap<(usize, Box<str>), Option<CSharpStaticCallable>>,
+}
+
+#[derive(Debug, Default)]
+struct CSharpArrayElements {
+    ids: HashMap<CSharpTypeIdentity, usize>,
+    identities: Vec<CSharpTypeIdentity>,
 }
 
 /// One instance member whose storage a value-type copy duplicates.
@@ -742,17 +784,39 @@ struct CSharpTypeMembers {
 impl CSharpTypeIndex {
     /// The exact type a type node names at its own position.
     fn resolve(&self, node: Node<'_>, source: &str) -> Option<CSharpTypeIdentity> {
-        match node.kind() {
-            "predefined_type" => nonempty_node_text(source, node)
+        let mut current = node;
+        let mut wrappers = Vec::new();
+        loop {
+            match current.kind() {
+                "array_type" => {
+                    let rank = current.child_by_field_name("rank")?;
+                    let mut cursor = rank.walk();
+                    let dimensions = rank
+                        .children(&mut cursor)
+                        .filter(|child| child.kind() == ",")
+                        .count()
+                        + 1;
+                    wrappers.push(Some(dimensions));
+                    current = current.child_by_field_name("type")?;
+                }
+                "nullable_type" => {
+                    wrappers.push(None);
+                    current = current.child_by_field_name("type")?;
+                }
+                _ => break,
+            }
+        }
+        let mut identity = match current.kind() {
+            "predefined_type" => nonempty_node_text(source, current)
                 .and_then(CSharpPredefinedType::from_keyword)
                 .map(CSharpTypeIdentity::Predefined),
             "identifier" => {
-                let name = nonempty_node_text(source, node)?;
-                if self.aliases.contains(name) || type_parameter_binds(node, name, source) {
+                let name = nonempty_node_text(source, current)?;
+                if self.aliases.contains(name) || type_parameter_binds(current, name, source) {
                     return None;
                 }
                 let declaration = self.declarations.get(name)?.as_ref()?;
-                declaration_is_visible_from(declaration, node, source).then_some(
+                declaration_is_visible_from(declaration, current, source).then_some(
                     CSharpTypeIdentity::Declared {
                         start_byte: declaration.start_byte,
                         kind: declaration.kind,
@@ -760,7 +824,59 @@ impl CSharpTypeIndex {
                 )
             }
             _ => None,
+        }?;
+        while let Some(wrapper) = wrappers.pop() {
+            match wrapper {
+                Some(rank) => {
+                    // Adjacent rank specifiers run outside-in in C# source
+                    // order (17.2.1), opposite the grammar's nested type nodes.
+                    // Nullable annotations separate these groups.
+                    let mut ranks = vec![rank];
+                    while let Some(Some(rank)) = wrappers.last().copied() {
+                        wrappers.pop();
+                        ranks.push(rank);
+                    }
+                    for rank in ranks.into_iter().rev() {
+                        let mut elements = self.array_elements.borrow_mut();
+                        let CSharpArrayElements { ids, identities } = &mut *elements;
+                        let key = identity;
+                        let element = *ids.entry(key).or_insert_with(|| {
+                            let next = identities.len();
+                            identities.push(key);
+                            next
+                        });
+                        debug_assert_eq!(identities[element], key, "array element intern hit");
+                        identity = CSharpTypeIdentity::Array { element, rank };
+                    }
+                }
+                // Nullable reference annotations do not change identity. A
+                // nullable value type needs its own representation, not T.
+                None if identity.is_value_type() => return None,
+                None => {}
+            }
         }
+        Some(identity)
+    }
+
+    /// A lossless spelling for inferred predefined types and their arrays.
+    /// External names and declared types retain their structured identity only.
+    fn inferred_spelling(&self, mut identity: CSharpTypeIdentity) -> Option<Box<str>> {
+        let mut ranks = Vec::new();
+        let elements = self.array_elements.borrow();
+        while let CSharpTypeIdentity::Array { element, rank } = identity {
+            ranks.push(rank);
+            identity = elements.identities[element];
+        }
+        let CSharpTypeIdentity::Predefined(primitive) = identity else {
+            return None;
+        };
+        let mut spelling = primitive.keyword().to_owned();
+        for rank in ranks {
+            spelling.push('[');
+            spelling.extend(std::iter::repeat_n(',', rank - 1));
+            spelling.push(']');
+        }
+        Some(spelling.into_boxed_str())
     }
 
     /// The exact type one declaration in this file is, addressed by the
@@ -790,6 +906,7 @@ impl CSharpTypeIndex {
         while let Some(identity) = pending.pop() {
             match identity {
                 CSharpTypeIdentity::Predefined(CSharpPredefinedType::Object) => {}
+                CSharpTypeIdentity::Array { .. } => {}
                 CSharpTypeIdentity::Predefined(_) => return false,
                 CSharpTypeIdentity::Declared { start_byte, .. } => {
                     if !visited.insert(start_byte) {
@@ -1346,6 +1463,7 @@ fn enumerate_procedures<'tree>(
     // are ordinary type nodes: they resolve only now that every declaration in
     // the file is recorded.
     let mut type_index = CSharpTypeIndex {
+        array_elements: Default::default(),
         declarations: type_declarations,
         aliases: type_aliases,
         base_types: HashMap::default(),
@@ -2495,6 +2613,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|binding| binding.value)
     }
 
+    fn assignment_binding(
+        &self,
+        name: &str,
+        start_byte: usize,
+    ) -> Option<(ValueId, ValueFlowKind)> {
+        match self.local_at(name, start_byte) {
+            Some(local) => Some((local, ValueFlowKind::Local)),
+            None if !self.by_reference_parameters.contains(name) => {
+                Some((*self.parameters.get(name)?, ValueFlowKind::Parameter))
+            }
+            None => None,
+        }
+    }
+
     fn binding_type_at(&self, name: &str, byte: usize) -> Option<&str> {
         self.local_binding_at(name, byte)
             .and_then(|binding| binding.type_identity.as_deref())
@@ -2511,11 +2643,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let Some(resolved) = self.expression_type_identity(pending.initializer) else {
                 continue;
             };
+            let spelling = self.type_index.inferred_spelling(resolved);
             if let Some(binding) = self.locals.get_mut(&pending.name).and_then(|bindings| {
                 bindings
                     .iter_mut()
                     .find(|binding| binding.declaration_start == pending.declaration_start)
             }) {
+                binding.type_identity = spelling;
                 binding.resolved_type = Some(resolved);
             }
         }
@@ -2598,26 +2732,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     }
                     _ => {
                         let identity = (|| match current.kind() {
-                            "integer_literal" => {
-                                let value = node_text(self.prepared.source(), current)?
-                                    .parse::<u64>()
-                                    .ok()?;
-                                Some(CSharpTypeIdentity::Predefined(
-                                    if value <= i32::MAX as u64 {
-                                        CSharpPredefinedType::Int
-                                    } else if value <= u32::MAX as u64 {
-                                        CSharpPredefinedType::UInt
-                                    } else if value <= i64::MAX as u64 {
-                                        CSharpPredefinedType::Long
-                                    } else {
-                                        CSharpPredefinedType::ULong
-                                    },
-                                ))
+                            "integer_literal" | "real_literal" => {
+                                csharp_numeric_literal_type(self.prepared.source(), current)
+                                    .map(CSharpTypeIdentity::Predefined)
                             }
                             "boolean_literal" => {
                                 Some(CSharpTypeIdentity::Predefined(CSharpPredefinedType::Bool))
                             }
-                            "cast_expression" | "object_creation_expression" => {
+                            "cast_expression"
+                            | "object_creation_expression"
+                            | "array_creation_expression" => {
                                 self.type_node_identity(current.child_by_field_name("type")?)
                             }
                             "identifier" => {
@@ -2860,6 +2984,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         target: ValueId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<ProgramPointId, CSharpLoweringError> {
+        self.emit_operator_call(
+            builder,
+            point,
+            node,
+            scope,
+            resolution,
+            vec![SemanticCallArgument::direct(
+                source,
+                ArgumentDomain::Positional,
+            )]
+            .into_boxed_slice(),
+            target,
+            "C# implicit conversion callee is unknown",
+            "C# implicit conversion call target is unknown",
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_operator_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        node: Node<'tree>,
+        scope: ScopeFrameId,
+        resolution: CallableTargetResolution,
+        arguments: Box<[SemanticCallArgument]>,
+        target: ValueId,
+        callee_detail: &str,
+        call_detail: &str,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, CSharpLoweringError> {
         let normal = self.session.add_node_point(builder, node, Vec::new())?;
         let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
         let callee = self
@@ -2890,11 +3046,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver: None,
                 member_selection: None,
-                arguments: vec![SemanticCallArgument::direct(
-                    source,
-                    ArgumentDomain::Positional,
-                )]
-                .into_boxed_slice(),
+                arguments,
                 normal_results: Box::new([]),
                 result: Some(target),
                 thrown: Some(thrown),
@@ -2912,8 +3064,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             callee,
             call_site,
             &resolution,
-            "C# implicit conversion callee is unknown",
-            "C# implicit conversion call target is unknown",
+            callee_detail,
+            call_detail,
         )?;
         self.session
             .add_target_edge(builder, point, EdgeTarget::normal(normal))?;
@@ -3429,9 +3581,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// regardless of their kind. Operator overloading is impossible when every
     /// operand is of a predefined type, so that is the proof required here.
     ///
-    /// An increment or decrement is built in exactly when its write is
-    /// lowered (see [`Self::integral_update_target`]); any other update also
-    /// writes its operand, and that write is not represented yet.
+    /// An increment or decrement is built in when its exact target type
+    /// proves a predefined operator (see [`Self::predefined_update_target`]).
     fn operation_is_builtin(&self, node: Node<'tree>) -> bool {
         // Only an operator expression asks this question. Without the kind
         // check every node with predefined-typed children answered "built-in",
@@ -3443,7 +3594,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return false;
         }
         if is_update_expression(node) {
-            return self.integral_update_target(node).is_some();
+            return self.predefined_update_target(node).is_some();
         }
         if self.is_string_concatenation(node) {
             return true;
@@ -3455,38 +3606,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .all(|operand| self.expression_is_predefined(*operand))
     }
 
-    /// The binding `x++` or `x--` writes, when `x` names a local or by-value
-    /// parameter of a predefined integral type, so the operator is the
-    /// built-in one: the operand, the binding and its flow kind. Floating and
-    /// `decimal` operands, enums, members, `ref` locals and formals, and user
-    /// types keep the unlowered-assignment gap. `nint`/`nuint` qualify: the
-    /// write is exact even though their platform width keeps the consumer's
-    /// value unknown.
-    fn integral_update_target(
+    /// The binding a built-in numeric or enum update writes. Exact resolved
+    /// types distinguish these from overloadable user types. Members can be
+    /// properties, and by-reference targets retain their existing gaps.
+    fn predefined_update_target(
         &self,
         node: Node<'tree>,
-    ) -> Option<(Node<'tree>, ValueId, ValueFlowKind)> {
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::Byte;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::Char;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::Int;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::Long;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::NInt;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::NUInt;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::SByte;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::Short;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::UInt;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::ULong;
-
-        use crate::analyzer::csharp::semantic::CSharpPredefinedType::UShort;
+    ) -> Option<(Node<'tree>, ValueId, ValueFlowKind, CSharpTypeIdentity)> {
         if !is_update_expression(node) {
             return None;
         }
@@ -3495,34 +3621,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return None;
         }
         let name = node_text(self.prepared.source(), operand)?;
-        let (target, kind) = match self.local_at(name, operand.start_byte()) {
-            Some(local) => (local, ValueFlowKind::Local),
-            None if !self.by_reference_parameters.contains(name) => {
-                (*self.parameters.get(name)?, ValueFlowKind::Parameter)
-            }
-            None => return None,
-        };
+        let (target, kind) = self.assignment_binding(name, operand.start_byte())?;
         // A `ref` local resolves no type: its declaration names a `ref_type`,
         // which the type index does not read, so it stays a gap.
-        matches!(
-            self.binding_resolved_type(name, operand.start_byte())?,
-            CSharpTypeIdentity::Predefined(
-                SByte | Byte | Short | UShort | Int | UInt | Long | ULong | NInt | NUInt | Char
-            )
-        )
-        .then_some((operand, target, kind))
+        let operand_type = self.binding_resolved_type(name, operand.start_byte())?;
+        let builtin = match operand_type {
+            CSharpTypeIdentity::Predefined(ty) => {
+                ty.is_value_type() && ty != CSharpPredefinedType::Bool
+            }
+            CSharpTypeIdentity::Declared {
+                kind: CSharpDeclaredTypeKind::Enum,
+                ..
+            } => true,
+            _ => false,
+        };
+        builtin.then_some((operand, target, kind, operand_type))
     }
 
-    /// Lower `x++` or `x--` on an integral binding (see
-    /// [`Self::integral_update_target`]): read `x`, write the value one step
-    /// away back to it, and yield the old value for a postfix operator or the
-    /// new one for a prefix operator. The step is a structured integer offset,
-    /// so a scalar consumer follows a loop counter across it and reports an
-    /// overflowing step as unknown, which is what an unchecked context's wrap
-    /// deserves. A checked context throws instead, before the store: the
-    /// operation point owns the exceptional edge and only its normal successor
-    /// writes the binding.
-    fn integral_update(
+    /// Read the old binding, apply the built-in update, then write and yield
+    /// the old (postfix) or new (prefix) value. Integral and enum updates carry
+    /// an integer offset; floating and decimal results derive from the operand
+    /// without claiming an integer value. Decimal always may overflow, while
+    /// integral/enum overflow follows the existing checked-context rule and
+    /// floating updates never throw. Only normal completion writes the binding.
+    fn predefined_update(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
@@ -3531,9 +3653,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        let (operand, target, kind) = self
-            .integral_update_target(node)
-            .expect("an integral update has a lowered target");
+        let (operand, target, kind, operand_type) = self
+            .predefined_update_target(node)
+            .expect("a predefined update has a lowered target");
         let decrement = unary_operator(node).is_some_and(|operator| operator.kind() == "--");
         let operation = self.session.add_node_point(builder, node, Vec::new())?;
         let terminal = self.session.add_node_point(builder, node, Vec::new())?;
@@ -3544,8 +3666,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             builder,
             terminal,
             SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::IntegerOffset {
-                    offset: SignedIntegerMagnitude::new(decrement, 1),
+                kind: if matches!(
+                    operand_type,
+                    CSharpTypeIdentity::Predefined(
+                        CSharpPredefinedType::Float
+                            | CSharpPredefinedType::Double
+                            | CSharpPredefinedType::Decimal
+                    )
+                ) {
+                    ValueFlowKind::LanguageDefined
+                } else {
+                    ValueFlowKind::IntegerOffset {
+                        offset: SignedIntegerMagnitude::new(decrement, 1),
+                    }
                 },
                 source: old,
                 target: computed,
@@ -3567,7 +3700,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 value: yielded,
             },
         )?;
-        self.implicit_abort_route(builder, node, operation, scope, stack)?;
+        if compound_arithmetic_can_throw(CSharpCompoundContext {
+            operand: Some(operand_type),
+            overflow_checks: arithmetic_overflow_checks_apply(node),
+        }) {
+            self.implicit_abort_route(builder, node, operation, scope, stack)?;
+        }
         self.session
             .add_target_edge(builder, operation, EdgeTarget::normal(terminal))?;
         self.session.add_target_edge(builder, terminal, next)?;
@@ -3576,6 +3714,126 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             entry,
             &[operand],
             EdgeTarget::normal(operation),
+            scope,
+            stack,
+        )
+    }
+
+    fn unknown_update(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        let left = if node.kind() == "assignment_expression" {
+            required_field(node, "left")?
+        } else {
+            first_runtime_named_child(node).expect("update has an operand")
+        };
+        let read = self.session.add_node_point(builder, left, Vec::new())?;
+        let operation = self.session.add_node_point(builder, node, Vec::new())?;
+        let old = self.expression_value(builder, left, SemanticValueKind::Temporary)?;
+        // Compound target accesses publish their own load. Read explicitly
+        // only when access lowering suppresses the load for a unary update,
+        // after the receiver and index have been evaluated.
+        let location = self.memory_access_target(builder, read, left)?;
+        if let Some(load) = location.filter(|_| access_is_write_target(left)) {
+            self.append_effect(
+                builder,
+                read,
+                SemanticEffect::MemoryLoad {
+                    kind: load.kind,
+                    location: load.location,
+                    result: old,
+                },
+            )?;
+            self.add_memory_identity_gap(builder, read, load)?;
+        }
+        let computed = self
+            .session
+            .add_node_value(builder, node, SemanticValueKind::Temporary)?;
+        let mut arguments = vec![SemanticCallArgument::direct(
+            old,
+            ArgumentDomain::Positional,
+        )];
+        if let Some(right) = node.child_by_field_name("right") {
+            let value = self.expression_value(
+                builder,
+                right,
+                expression_value_kind(self.prepared.source(), right),
+            )?;
+            arguments.push(SemanticCallArgument::direct(
+                value,
+                ArgumentDomain::Positional,
+            ));
+        }
+        let normal = self.emit_operator_call(
+            builder,
+            operation,
+            node,
+            scope,
+            CallableTargetResolution::Unknown,
+            arguments.into_boxed_slice(),
+            computed,
+            "C# update operator callee is unknown",
+            "C# update operator call target is unknown",
+            stack,
+        )?;
+        let binding = if left.kind() == "identifier" {
+            let name =
+                nonempty_node_text(self.prepared.source(), left).expect("identifier has a name");
+            self.assignment_binding(name, left.start_byte())
+        } else {
+            None
+        };
+        if let Some((target, kind)) = binding {
+            self.emit_assignment_flow(builder, normal, kind, computed, target)?;
+        } else if let Some(store) = location {
+            self.emit_memory_store(builder, normal, store, computed)?;
+        } else {
+            self.session.record_gap(
+                builder,
+                normal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "compound or increment/decrement assignment flow is not yet lowered",
+            )?;
+        }
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        self.append_effect(
+            builder,
+            normal,
+            SemanticEffect::Assignment {
+                target: result,
+                value: if node.kind() == "postfix_unary_expression" {
+                    old
+                } else {
+                    computed
+                },
+            },
+        )?;
+        self.session.add_target_edge(builder, normal, next)?;
+        let operands = node
+            .child_by_field_name("right")
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.schedule_expressions(
+            builder,
+            read,
+            &operands,
+            EdgeTarget::normal(operation),
+            scope,
+            stack,
+        )?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[left],
+            EdgeTarget::normal(read),
             scope,
             stack,
         )
@@ -4242,18 +4500,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let binding = if left.kind() == "identifier" {
             let name = node_text(self.prepared.source(), left)
                 .ok_or_else(|| missing_field(node, "target name"))?;
-            self.local_at(name, left.start_byte())
-                .map(|value| (value, ValueFlowKind::Local))
-                .or_else(|| {
-                    (!self.by_reference_parameters.contains(name))
-                        .then(|| {
-                            self.parameters
-                                .get(name)
-                                .copied()
-                                .map(|value| (value, ValueFlowKind::Parameter))
-                        })
-                        .flatten()
-                })
+            self.assignment_binding(name, left.start_byte())
         } else {
             None
         };
@@ -4378,7 +4625,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .as_deref()
                     .is_some_and(|declared| self.identity_is_preserved(Some(declared), right))
             } else {
-                self.identity_is_preserved(self.binding_type_at(name, left.start_byte()), right)
+                match (destination, self.expression_type_identity(right)) {
+                    (Some(target), Some(source)) => target == source,
+                    (Some(CSharpTypeIdentity::Array { .. }), None) => false,
+                    _ => self.identity_is_preserved(
+                        self.binding_type_at(name, left.start_byte()),
+                        right,
+                    ),
+                }
             };
             if let Some(target) = target {
                 let alias = if local.is_some() {
@@ -4468,6 +4722,44 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
             vec![right]
+        } else if !self.identity_is_preserved(self.assignment_target_type(left).as_deref(), right)
+            && let Some(store) = self.memory_access_target(builder, terminal, left)?
+        {
+            // The receiver and indexes, then the right operand, precede the
+            // conversion. Accessor checks and the store follow its normal
+            // continuation (ECMA-334 12.21.2, #8259).
+            let converted =
+                self.session
+                    .add_node_value(builder, node, SemanticValueKind::Temporary)?;
+            continuation = self.emit_conversion_call(
+                builder,
+                terminal,
+                node,
+                scope,
+                CallableTargetResolution::Unknown,
+                value,
+                converted,
+                stack,
+            )?;
+            self.session.record_gap(
+                builder,
+                continuation,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "assignment target accessors and overloaded assignment conversions require type refinement",
+            )?;
+            self.implicit_abort_route(builder, node, continuation, scope, stack)?;
+            self.emit_memory_store(builder, continuation, store, converted)?;
+            self.append_effect(
+                builder,
+                continuation,
+                SemanticEffect::Assignment {
+                    target: result,
+                    value: converted,
+                },
+            )?;
+            runtime_expression_children(node)
         } else {
             // The value of an assignment expression is the value assigned,
             // and a write through a location asks the same conversion
@@ -4877,7 +5169,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             match this.binding_resolved_type(name, operand.start_byte())? {
                 CSharpTypeIdentity::Predefined(predefined) => Some(predefined),
-                CSharpTypeIdentity::Declared { .. } => None,
+                CSharpTypeIdentity::Declared { .. } | CSharpTypeIdentity::Array { .. } => None,
             }
         };
         if lexical_type(self, node) == Some(Bool) {
@@ -5395,7 +5687,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        self.implicit_abort_route(builder, node, terminal, scope, stack)?;
+        // Simple writes check the location at the assignment's store point.
+        // Updates still read the location before evaluating the right operand.
+        if !access_is_write_target(node) || node.parent().is_some_and(is_update_expression) {
+            self.implicit_abort_route(builder, node, terminal, scope, stack)?;
+        }
         // The lowered route answers where an abort goes, not what a
         // property getter, an indexer, or a type initializer the
         // access can enter does. That is an invocation question, so it
@@ -5823,9 +6119,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
             "prefix_unary_expression" | "postfix_unary_expression"
-                if self.integral_update_target(node).is_some() =>
+                if self.predefined_update_target(node).is_some() =>
             {
-                self.integral_update(builder, node, entry, next, scope, stack)
+                self.predefined_update(builder, node, entry, next, scope, stack)
             }
             // An operator over predefined operands runs the language's own
             // operator, so its result derives from its operands and the flow
@@ -5868,6 +6164,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                     stack,
                 )
+            }
+            "assignment_expression" if !is_simple_assignment(node) => {
+                self.unknown_update(builder, node, entry, next, scope, stack)
+            }
+            "prefix_unary_expression" | "postfix_unary_expression"
+                if is_update_expression(node) =>
+            {
+                self.unknown_update(builder, node, entry, next, scope, stack)
             }
             "assignment_expression"
             | "binary_expression"
@@ -7888,6 +8192,38 @@ fn unary_operator(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// Decode only a numeric literal node selected by the grammar (C# 6.4.5.3).
+fn csharp_numeric_literal_type(source: &str, node: Node<'_>) -> Option<CSharpPredefinedType> {
+    use CSharpPredefinedType::*;
+    let text = node_text(source, node)?;
+    if node.kind() == "real_literal" {
+        return Some(match text.as_bytes().last()?.to_ascii_lowercase() {
+            b'f' => Float,
+            b'm' => Decimal,
+            _ => Double,
+        });
+    }
+    let normalized = text.replace('_', "").to_ascii_lowercase();
+    let digits = normalized.trim_end_matches(['u', 'l']);
+    let suffix = &normalized[digits.len()..];
+    let value = if let Some(hex) = digits.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()?
+    } else if let Some(binary) = digits.strip_prefix("0b") {
+        u64::from_str_radix(binary, 2).ok()?
+    } else {
+        csharp_integer_literal_value(source, node)
+            .and_then(|value| u64::try_from(value).ok())
+            .or_else(|| digits.parse::<u64>().ok())?
+    };
+    match suffix {
+        "" if value <= i32::MAX as u64 => Some(Int),
+        "" | "u" if value <= u32::MAX as u64 => Some(UInt),
+        "" | "l" if value <= i64::MAX as u64 => Some(Long),
+        "" | "u" | "l" | "ul" | "lu" => Some(ULong),
+        _ => None,
+    }
+}
+
 fn csharp_integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
     brokk_bifrost_analysis::analyzer::common::integer_literal_value(source, node)
 }
@@ -8290,7 +8626,7 @@ fn is_simple_assignment(node: Node<'_>) -> bool {
 }
 
 fn is_update_expression(node: Node<'_>) -> bool {
-    unary_operator(node).is_some_and(|operator| matches!(operator.kind(), "++" | "--"))
+    brokk_bifrost_analysis::analyzer::assignment_facts::csharp_is_update_expression(node)
 }
 
 /// The named target of a C# `goto label;`. `goto case` and `goto default`
@@ -8941,20 +9277,15 @@ mod tests {
                 "{expression}"
             );
         }
-        // A floating operand and a `ref` formal keep the assignment gap at
-        // the update operation, after its operand evaluation.
+        // A `ref` formal keeps the assignment gap after operand evaluation.
+        // A floating binding has a built-in update and a certain write (#8098).
         let gapped = run
             .gaps
             .iter()
             .filter(|gap| gap.capability == SemanticCapability::Assignments)
             .map(|gap| mapping_text(run, source, gap.source))
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            gapped,
-            ["d++", "r++"].into_iter().collect(),
-            "{:?}",
-            run.gaps
-        );
+        assert_eq!(gapped, ["r++"].into_iter().collect(), "{:?}", run.gaps);
     }
 
     /// A conditional access nested inside another shares its entry point:

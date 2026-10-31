@@ -32,7 +32,9 @@ use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
-use brokk_bifrost_core::analyzer::tree_walk::{named_children_iter, node_range};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    named_children_iter, node_range, unwrap_parenthesized_expression,
+};
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -228,6 +230,7 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("local_function_statement", NormalizedKind::Function),
     ("lambda_expression", NormalizedKind::Lambda),
     ("anonymous_method_expression", NormalizedKind::Lambda),
+    ("parameter", NormalizedKind::Parameter),
     ("class_declaration", NormalizedKind::Class),
     ("interface_declaration", NormalizedKind::Class),
     ("struct_declaration", NormalizedKind::Class),
@@ -299,7 +302,9 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
             "object_creation_expression" => current = current.child_by_field_name("type")?,
             "member_access_expression" => current = current.child_by_field_name("name")?,
             "conditional_access_expression" => current = conditional_member_binding(current)?,
-            "member_binding_expression" => current = current.child_by_field_name("name")?,
+            "member_binding_expression" | "attribute" => {
+                current = current.child_by_field_name("name")?;
+            }
             "argument" | "attribute_argument" => {
                 current = first_argument_value(current).map(expression_target_node)?;
             }
@@ -855,12 +860,14 @@ impl StructuralSpec for CSharpStructuralSpec {
         csharp_string_literal_value(node, source)
     }
 
-    fn conditional_regions(
+    fn preprocess(
         &self,
-        _root: Node<'_>,
         source: &str,
-    ) -> brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions {
-        crate::preprocessor::scan_preprocessor(source).conditional_regions(source)
+    ) -> Option<std::sync::Arc<dyn brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor>>
+    {
+        Some(std::sync::Arc::new(crate::preprocessor::scan_preprocessor(
+            source,
+        )))
     }
 
     fn parser_included_ranges(&self, source: &str) -> Option<Vec<tree_sitter::Range>> {
@@ -910,6 +917,9 @@ impl StructuralSpec for CSharpStructuralSpec {
         _source: &str,
         _context: &CallSiteContext,
     ) -> NormalizedKind {
+        if node.kind() == "variable_declarator" && variable_declarator_value(node).is_none() {
+            return NormalizedKind::Declaration;
+        }
         if kind == NormalizedKind::UnaryExpression && is_signed_numeric_prefix(node) {
             return NormalizedKind::NumericLiteral;
         }
@@ -948,9 +958,7 @@ impl StructuralSpec for CSharpStructuralSpec {
             return false;
         }
 
-        kind != NormalizedKind::Assignment
-            || node.kind() != "variable_declarator"
-            || variable_declarator_value(node).is_some()
+        true
     }
 
     /// C# spells object creation as its own grammar node, so a constructor
@@ -1033,7 +1041,7 @@ impl StructuralSpec for CSharpStructuralSpec {
                     attach_role_with_derived_name(
                         sink,
                         Role::Operand,
-                        operand,
+                        expression_target_node(operand),
                         expression_name_node,
                     );
                 }
@@ -1083,16 +1091,18 @@ impl StructuralSpec for CSharpStructuralSpec {
                     );
                 } else if let Some(test) = named_children_iter(node).find(|child| !child.is_extra())
                 {
-                    sink.role(Role::Test, test);
+                    sink.role(Role::Test, expression_target_node(test));
                 }
             }
             NormalizedKind::Case => {
                 let (tests, body) = case_parts(node).expect("admitted case label");
                 for test in tests {
-                    sink.role(Role::Test, test);
+                    sink.role(Role::Test, expression_target_node(test));
                 }
                 for statement in body {
-                    sink.role(Role::Body, statement);
+                    // A switch-expression arm's body is an expression, so its
+                    // parentheses are stripped like any other expression role.
+                    sink.role(Role::Body, expression_target_node(statement));
                 }
             }
             NormalizedKind::Label => {
@@ -1106,7 +1116,12 @@ impl StructuralSpec for CSharpStructuralSpec {
             }
             NormalizedKind::Return | NormalizedKind::Throw => {
                 if let Some(value) = named_children_iter(node).find(|child| !child.is_extra()) {
-                    attach_role_with_derived_name(sink, Role::Value, value, expression_name_node);
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Value,
+                        expression_target_node(value),
+                        expression_name_node,
+                    );
                 }
             }
             NormalizedKind::StringLiteral if node.kind() == "interpolated_string_expression" => {
@@ -1122,7 +1137,7 @@ impl StructuralSpec for CSharpStructuralSpec {
                                     | "interpolation_format_clause"
                             )
                     }) {
-                        sink.role(Role::Part, expression);
+                        sink.role(Role::Part, expression_target_node(expression));
                     }
                 }
             }
@@ -1146,7 +1161,12 @@ impl StructuralSpec for CSharpStructuralSpec {
                     .named_children(&mut cursor)
                     .filter(|child| !child.is_extra());
                 if let Some(value) = children.next() {
-                    sink.role(Role::Value, value);
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Value,
+                        expression_target_node(value),
+                        expression_name_node,
+                    );
                 }
                 if let Some(body) = children.next() {
                     sink.role(Role::Body, body);
@@ -1192,7 +1212,7 @@ impl StructuralSpec for CSharpStructuralSpec {
                         attach_role_with_derived_name(
                             sink,
                             Role::Receiver,
-                            receiver,
+                            expression_target_node(receiver),
                             expression_name_node,
                         );
                     }
@@ -1203,7 +1223,7 @@ impl StructuralSpec for CSharpStructuralSpec {
                         attach_role_with_derived_name(
                             sink,
                             Role::Receiver,
-                            receiver,
+                            expression_target_node(receiver),
                             expression_name_node,
                         );
                     }
@@ -1218,7 +1238,7 @@ impl StructuralSpec for CSharpStructuralSpec {
                         attach_role_with_derived_name(
                             sink,
                             Role::Object,
-                            object,
+                            expression_target_node(object),
                             expression_name_node,
                         );
                     }
@@ -1246,7 +1266,12 @@ impl StructuralSpec for CSharpStructuralSpec {
                     node.child_by_field_name("expression")
                 };
                 if let Some(object) = object {
-                    attach_role_with_derived_name(sink, Role::Object, object, expression_name_node);
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Object,
+                        expression_target_node(object),
+                        expression_name_node,
+                    );
                 }
             }
             NormalizedKind::Function
@@ -1262,6 +1287,15 @@ impl StructuralSpec for CSharpStructuralSpec {
                 // `expression_name_node` returns unchanged.
                 if let Some(name) = node.child_by_field_name("name") {
                     sink.set_name(expression_name_node(name).unwrap_or(name));
+                }
+                attach_decorators(sink, node);
+            }
+            // A parameter's attributes sit in its own attribute lists, which
+            // is how `[FromQuery]` and other binding attributes reach the
+            // shared decorator relation.
+            NormalizedKind::Parameter => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    sink.set_name(name);
                 }
                 attach_decorators(sink, node);
             }
@@ -1331,6 +1365,52 @@ impl brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSynta
         )
     }
 
+    fn is_indentation_loop(&self, node: Node<'_>) -> bool {
+        matches!(
+            node.kind(),
+            "for_statement" | "foreach_statement" | "while_statement"
+        )
+    }
+
+    fn is_transparent_body_owner(&self, node: Node<'_>) -> bool {
+        matches!(
+            node.kind(),
+            "lock_statement" | "using_statement" | "fixed_statement"
+        )
+    }
+
+    fn reaches_following_statement(&self, node: Node<'_>, source: &str) -> bool {
+        match node.kind() {
+            "return_statement" | "throw_statement" | "break_statement" | "continue_statement"
+            | "goto_statement" | "lock_statement" | "using_statement" | "try_statement"
+            | "checked_statement" | "unsafe_statement" | "fixed_statement"
+            | "labeled_statement" => false,
+            "yield_statement" => !node
+                .children(&mut node.walk())
+                .any(|child| child.kind() == "break"),
+            "for_statement" | "while_statement" | "do_statement" => {
+                match node.child_by_field_name("condition") {
+                    None => false,
+                    Some(condition) => {
+                        let condition = unwrap_parenthesized_expression(condition);
+                        !(condition.kind() == "boolean_literal"
+                            && condition.utf8_text(source.as_bytes()).ok() == Some("true"))
+                    }
+                }
+            }
+            "switch_statement" => !named_children_iter(node)
+                .filter(|child| child.kind() == "switch_body")
+                .flat_map(named_children_iter)
+                .filter(|child| child.kind() == "switch_section")
+                .any(|section| {
+                    section
+                        .children(&mut section.walk())
+                        .any(|child| child.kind() == "default")
+                }),
+            _ => true,
+        }
+    }
+
     fn roles<'tree>(&self, node: Node<'tree>, role: Role) -> Vec<Node<'tree>> {
         let target = match role {
             Role::Test if matches!(node.kind(), "switch_section" | "switch_expression_arm") => {
@@ -1347,6 +1427,11 @@ impl brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSynta
             Role::Test => node.child_by_field_name("condition"),
             Role::Consequence => node.child_by_field_name("consequence"),
             Role::Alternative => node.child_by_field_name("alternative"),
+            Role::Body if matches!(node.kind(), "lock_statement" | "fixed_statement") => {
+                named_children_iter(node)
+                    .filter(|child| !child.is_extra())
+                    .last()
+            }
             Role::Body => node.child_by_field_name("body"),
             Role::Left => node.child_by_field_name("left"),
             Role::Right => node.child_by_field_name("right"),

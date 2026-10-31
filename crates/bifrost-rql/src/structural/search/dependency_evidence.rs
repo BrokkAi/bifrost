@@ -30,6 +30,27 @@ fn axis(values: &[String], value: Option<&str>) -> bool {
 enum VersionRange {
     Cargo(semver::VersionReq),
     Npm(brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange),
+    Nuget(brokk_bifrost_csharp_analysis::dependency_evidence::NugetVersionRange),
+}
+
+/// Parse one validated range with its ecosystem's own version semantics.
+fn version_range(ecosystem: &str, requirement: &str) -> VersionRange {
+    match ecosystem {
+        "npm" => VersionRange::Npm(
+            brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange::parse(requirement)
+                .expect("validated npm range"),
+        ),
+        "nuget" => VersionRange::Nuget(
+            brokk_bifrost_csharp_analysis::dependency_evidence::NugetVersionRange::parse(
+                requirement,
+            )
+            .expect("validated NuGet range"),
+        ),
+        "cargo" => VersionRange::Cargo(
+            semver::VersionReq::parse(requirement).expect("validated Cargo range"),
+        ),
+        _ => unreachable!("version range ecosystems are validated"),
+    }
 }
 /// Reuse the seed's strict ecosystem-specific version interpretation for a
 /// mitigation on this exact row. Unsupported evidence stays unknown.
@@ -39,18 +60,7 @@ pub(super) fn mitigation_version_predicate(
 ) -> impl Fn(&DependencyEvidence) -> Option<bool> {
     let ranges = requirements
         .iter()
-        .map(|requirement| match ecosystem {
-            "npm" => VersionRange::Npm(
-                brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange::parse(
-                    requirement,
-                )
-                .expect("validated mitigation range"),
-            ),
-            "cargo" => VersionRange::Cargo(
-                semver::VersionReq::parse(requirement).expect("validated mitigation range"),
-            ),
-            _ => unreachable!("mitigation ecosystems are validated"),
-        })
+        .map(|requirement| version_range(ecosystem, requirement))
         .collect::<Vec<_>>();
     let filter = DependencyEvidenceFilter {
         ecosystems: vec![ecosystem.to_owned()],
@@ -97,6 +107,13 @@ fn matches(
                 };
                 value
             }
+            VersionRange::Nuget(range) => {
+                let value = brokk_bifrost_csharp_analysis::dependency_evidence::nuget_dependency_version_matches(row, range)?;
+                let Some(value) = value else {
+                    return Ok(None);
+                };
+                value
+            }
             VersionRange::Cargo(range) => {
                 let Some(raw) = row.exact_version.as_deref() else {
                     return Ok(None);
@@ -130,20 +147,7 @@ pub(super) fn execute_dependency_evidence_seed(
         .filter
         .version_ranges
         .iter()
-        .map(|range| {
-            if seed.filter.ecosystems == ["npm"] {
-                VersionRange::Npm(
-                    brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange::parse(
-                        range,
-                    )
-                    .expect("validated npm requirement"),
-                )
-            } else {
-                VersionRange::Cargo(
-                    semver::VersionReq::parse(range).expect("validated Cargo requirement"),
-                )
-            }
-        })
+        .map(|range| version_range(&seed.filter.ecosystems[0], range))
         .collect::<Vec<_>>();
     let evidence = match state.analyzer.dependency_file_evidence() {
         Ok(evidence) => evidence,
@@ -158,7 +162,10 @@ pub(super) fn execute_dependency_evidence_seed(
             state.analyzer.mark_execution_dependent();
             diagnostics.push(super::QueryExecutionState::diagnostic(
                 state.analyzer,
-                CodeQueryDiagnostic {
+                CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                    ),
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -168,7 +175,7 @@ pub(super) fn execute_dependency_evidence_seed(
                     message: format!("static dependency publication is unavailable: {error}"),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                },
+                }),
                 Some(DerivationExecutionCause::Provider),
             ));
             return PlanExecution {
@@ -181,7 +188,8 @@ pub(super) fn execute_dependency_evidence_seed(
     };
     let mut incomplete = !evidence.complete();
     for gap in &evidence.gaps {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -191,14 +199,14 @@ pub(super) fn execute_dependency_evidence_seed(
             message: format!(
                 "dependency evidence {:?} at {}:{}..{}: {}",
                 gap.kind,
-                gap.build_file.display(),
+                crate::path_utils::workspace_relative_slash_path(&gap.build_file),
                 gap.byte_range.start,
                 gap.byte_range.end,
                 gap.message
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     let locations = match state.analyzer.dependency_file_locations() {
         Ok(locations) => locations.into_iter().collect::<HashMap<_, _>>(),
@@ -206,7 +214,10 @@ pub(super) fn execute_dependency_evidence_seed(
             incomplete = true;
             diagnostics.push(super::QueryExecutionState::diagnostic(
                 state.analyzer,
-                CodeQueryDiagnostic {
+                CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                    ),
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -216,7 +227,7 @@ pub(super) fn execute_dependency_evidence_seed(
                     message: format!("dependency source presentation proof unavailable: {error}"),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                },
+                }),
                 Some(DerivationExecutionCause::Provider),
             ));
             HashMap::default()
@@ -242,7 +253,8 @@ pub(super) fn execute_dependency_evidence_seed(
             Ok(Some(false)) => continue,
             unknown => {
                 truncated = true;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -252,21 +264,22 @@ pub(super) fn execute_dependency_evidence_seed(
                     message: format!(
                         "dependency version predicate unresolved for {} at {}: {}",
                         row.id(),
-                        row.build_file.display(),
+                        crate::path_utils::workspace_relative_slash_path(&row.build_file),
                         unknown
                             .err()
                             .unwrap_or_else(|| "no complete exact version evidence".into())
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
                 continue;
             }
         }
         if !locations.contains_key(&row.id()) && !missing_location_reported {
             missing_location_reported = true;
             truncated = true;
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -276,7 +289,7 @@ pub(super) fn execute_dependency_evidence_seed(
                 message: "selected dependency rows lack retained source presentation proof".into(),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
         if rows.len() >= cap {
             truncated = true;

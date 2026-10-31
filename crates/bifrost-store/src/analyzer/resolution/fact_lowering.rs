@@ -3818,7 +3818,18 @@ impl<'facts> FactIndex<'facts> {
                     reference.reference, reference.root_scope
                 )
             });
-            assert_import_scope(*root_scope, "root reference");
+            // A bare lexical root's walk starts at its attachment scope, so only
+            // it may attach below the package. Import routes and qualified roots
+            // keep their package-level attachment. Fall-through roots that must
+            // lose to every lexical binding belong at the outermost scope of
+            // their module; language hooks may select their own lookup start.
+            if matches!(
+                root_scope.kind,
+                ResolutionScopeKind::CompilationUnit | ResolutionScopeKind::Package
+            ) || !facts.is_bare_lexical_root(&reference)
+            {
+                assert_import_scope(*root_scope, "root reference");
+            }
             let site = sites.get(&reference.reference).unwrap_or_else(|| {
                 panic!("root reference names unknown site {}", reference.reference)
             });
@@ -8748,6 +8759,10 @@ let _neutral_rules = crate::analyzer::store::language_support::neutral_fixture::
         "#5909: typed binder validation treated alias binding sites as declarations"
     )]
     fn alias_reference_preserves_the_targets_declared_type_through_full_lowering() {
+        let _neutral_rules =
+            crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+                Language::Java,
+            ]);
         use crate::analyzer::resolution::test_support::{slot, transfer};
         use brokk_bifrost_core::analyzer::resolution_facts::{
             BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole,

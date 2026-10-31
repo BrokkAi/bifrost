@@ -42,7 +42,7 @@ pub const PHP_SOURCE_HEADER_SQL: &str = "SELECT blob.id, marker.logical_rows, ma
      JOIN source_fact_manifests AS source ON source.blob_id = blob.id
      JOIN blob_meta AS meta ON meta.blob_id = blob.id
      JOIN source_fact_readiness AS ready ON ready.blob_id = blob.id
-     WHERE blob.blob_oid = ?1 AND blob.lang = 'php' AND blob.generation = ?2
+     WHERE blob.blob_oid = ?1 AND blob.lang = 'php' AND blob.parse_variant = x'' AND blob.generation = ?2
        AND marker.facts_version = ?3 AND source.facts_version = ?4
        AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
 
@@ -457,9 +457,7 @@ impl PhpSourceStorage for AnalyzerStore {
                 )));
             }
             let Some(units) = read_source_unit_map(
-                tx,
-                &oid.to_string(),
-                "php",
+                tx,&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
                 adapter,
                 file,
                 keep_going,
@@ -506,7 +504,11 @@ pub trait CanonicalPhpSourceFacts {
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>,
         >,
         keep_going: &dyn Fn() -> bool,
@@ -518,7 +520,11 @@ impl<A: LanguageAdapter> CanonicalPhpSourceFacts for TreeSitterAnalyzer<A> {
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>,
         >,
         keep_going: &dyn Fn() -> bool,
@@ -543,7 +549,11 @@ impl<A: LanguageAdapter> CanonicalPhpSourceFacts for TreeSitterAnalyzer<A> {
             });
             return keep_going().then_some(facts);
         }
-        let cache_key = (generation, oid, file.clone());
+        let cache_key = (
+            generation,
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
+            file.clone(),
+        );
         if let Some(facts) = cache.get(&cache_key) {
             return keep_going().then_some(facts);
         }

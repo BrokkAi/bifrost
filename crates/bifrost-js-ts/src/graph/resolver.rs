@@ -149,6 +149,7 @@ impl JsTsUsageIndex {
         self.visit_reexport_leaves::<()>(
             module_files,
             exported_name,
+            |_, _| None,
             |file, _, entry| {
                 match entry {
                     ExportEntry::Local { local_name } => {
@@ -182,6 +183,7 @@ impl JsTsUsageIndex {
         self.visit_reexport_leaves(
             module_files,
             exported_name,
+            |_, _| None,
             |file, _, entry| match entry {
                 ExportEntry::ReexportedNamed {
                     module_specifier, ..
@@ -198,10 +200,29 @@ impl JsTsUsageIndex {
         )
     }
 
+    /// Check every node in the existing re-export traversal for evidence that
+    /// prevents a value binding from being proven.
+    pub fn export_route_has_gap(
+        &self,
+        module_files: &[ProjectFile],
+        exported_name: &str,
+        mut has_gap: impl FnMut(&ProjectFile, &str) -> bool,
+    ) -> bool {
+        self.visit_reexport_leaves(
+            module_files,
+            exported_name,
+            |file, name| has_gap(file, name).then_some(()),
+            |_, _, _| None,
+            |_, _, _| None,
+        )
+        .is_some()
+    }
+
     fn visit_reexport_leaves<T>(
         &self,
         module_files: &[ProjectFile],
         exported_name: &str,
+        mut visit_step: impl FnMut(&ProjectFile, &str) -> Option<T>,
         mut visit_entry: impl FnMut(&ProjectFile, &str, &ExportEntry) -> Option<T>,
         mut visit_external_star: impl FnMut(&ProjectFile, &str, &str) -> Option<T>,
     ) -> Option<T> {
@@ -215,6 +236,9 @@ impl JsTsUsageIndex {
         while let Some((file, name)) = frontier.pop_front() {
             if !visited.insert((file.clone(), name.clone())) {
                 continue;
+            }
+            if let Some(result) = visit_step(&file, &name) {
+                return Some(result);
             }
 
             if let Some(targets) = self

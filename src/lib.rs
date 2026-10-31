@@ -154,7 +154,7 @@ pub fn open_pack_engine_profile() -> serde_json::Value {
             "semantic_model_read": analyzer::semantic_model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
             "semantic_model_write": [analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION],
             "semantic_spec": [],
-            "release_index": [semantic_packs::release_bundle::RELEASE_BUNDLE_SCHEMA_VERSION],
+            "release_index": semantic_packs::release_bundle::READABLE_RELEASE_BUNDLE_SCHEMA_VERSIONS,
             "runtime": [],
         },
         "capabilities": capabilities,

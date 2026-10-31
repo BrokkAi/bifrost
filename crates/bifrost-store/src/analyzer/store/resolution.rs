@@ -792,14 +792,19 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // publishes each anonymous allocation's synthetic body identity, so
         // warm bundles from v46 lack those facts for casts and qualified
         // assignments.
+        // v55 reverts #8261's v54 record and annotation parents (#8361); the
+        // epoch moves forward so no v54 bundle replays without those rows.
         Language::Java => {
-            "resolution-bundle-java-v53-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v55-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
+        // v71: v70 (#7509) and v70 (#7391) landed together.
+        // v70 (#7509): persist SpreadArgument type frontiers (role ordinal 8).
+        // v70 (#7391): publish type assertion results.
         // v69 (#7509): publish embedding and interface method candidate names.
         // v68 (#7509): an initialized type-switch clause binder no longer
         // carries an InferredType gap row.
         Language::Go => {
-            "resolution-bundle-go-v69-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
+            "resolution-bundle-go-v71-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
         }
         Language::Cpp => "resolution-bundle-cpp-v26-opaque-guard-implication-6902-2026-10",
         Language::JavaScript => {
@@ -840,15 +845,22 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // instead of publishing an unproduced identity slot (#5685).
         // A qualified parent's type-constructor path is looked up in the scope enclosing
         // its template, not the template's own member scope (#5104).
+        // v84 publishes asInstanceOf target types into expression values (#7577).
+        // v85: the v84 asInstanceOf bump (#7577) and the v84 incomplete
+        // function-type bump (#8200) landed together.
+        // v87 reverts #8261's v86 implicit AnyRef parents (#8361); the epoch
+        // moves forward so no v86 bundle replays the unbound AnyRef slots.
         Language::Scala => {
-            "resolution-bundle-scala-v83-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-2026-10"
+            "resolution-bundle-scala-v87-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10"
         }
-        Language::CSharp => "resolution-bundle-csharp-v28-scope-choice-7314-c1-0b-2026-10",
+        Language::CSharp => {
+            "resolution-bundle-csharp-v30-preprocessor-decisions-8147-m4a-bare-lexical-roots-7314-c1-4b2p-2026-10"
+        }
         Language::Ruby => {
             "resolution-bundle-ruby-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         Language::Kotlin => {
-            "resolution-bundle-kotlin-v62-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
+            "resolution-bundle-kotlin-v63-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
         }
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }

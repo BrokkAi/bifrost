@@ -20,6 +20,7 @@ pub(super) fn push_seed_provider_omission(
         analyzer,
         incomplete_diagnostic(
             CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            brokk_bifrost_rql::Incompleteness::Content,
             language.config_label(),
             format!(
                 "structural seed omitted {} because its provider returned no {unavailable}",

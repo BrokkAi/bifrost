@@ -5177,6 +5177,17 @@ fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> S
     let callable_is_static = !parameters_node.is_some_and(rust_parameters_have_self);
     let with_modifiers = |metadata: SignatureMetadata| {
         metadata
+            .with_overload_discriminator(
+                enclosing_rust_impl_item(node)
+                    .and_then(|implementation| implementation.child_by_field_name("trait"))
+                    .map(|trait_path| {
+                        brokk_bifrost_core::analyzer::tree_walk::overload_discriminator(
+                            brokk_bifrost_core::analyzer::tree_walk::canonical_type_tokens(
+                                trait_path, source,
+                            ),
+                        )
+                    }),
+            )
             .with_dispatch_extensibility(dispatch)
             .with_callable_modifiers(callable_is_static, false, DeclaredVisibility::Unknown)
     };

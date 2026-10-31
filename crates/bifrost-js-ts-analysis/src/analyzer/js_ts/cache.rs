@@ -50,7 +50,7 @@ pub(crate) struct JsTsMemoCaches {
     pub(crate) source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
-            git2::Oid,
+            brokk_bifrost_core::gitblob::BlobKey,
             ProjectFile,
         ),
         Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>,

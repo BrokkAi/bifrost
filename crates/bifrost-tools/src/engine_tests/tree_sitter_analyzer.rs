@@ -2040,8 +2040,20 @@ mod tests {
         let seed_analyzer = TreeSitterAnalyzer::new(seed_project, CppAdapter);
         let store = Arc::clone(&seed_analyzer.store_context.store);
         let shared_oid = Oid::hash_object(ObjectType::Blob, SHARED_SOURCE.as_bytes()).unwrap();
-        assert!(store.contains_parsed_blob(shared_oid, "cpp").unwrap());
-        assert!(store.contains_parsed_blob(shared_oid, "cpp:c").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    shared_oid, "cpp"
+                ))
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    shared_oid, "cpp:c"
+                ))
+                .unwrap()
+        );
 
         std::fs::remove_file(seed.abs_path()).expect("remove independent C owner");
         for name in ["GoodA", "GoodB"] {
@@ -2105,8 +2117,7 @@ mod tests {
         drop(events);
 
         let request = [CompleteAnalysisBlobRequest::new(
-            shared_oid,
-            "cpp",
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(shared_oid, "cpp"),
             ["cpp:c".to_owned()],
         )];
         let dirty_key = dirty_key.clone();
@@ -2127,8 +2138,20 @@ mod tests {
         assert!(retried.additional_projections.is_empty());
         assert_eq!(store.parsed_blob_transaction_starts_for_test(), starts + 1);
         assert!(analyzer.state.dirty_snapshot().is_empty());
-        assert!(store.contains_parsed_blob(shared_oid, "cpp").unwrap());
-        assert!(store.contains_parsed_blob(shared_oid, "cpp:c").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    shared_oid, "cpp"
+                ))
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    shared_oid, "cpp:c"
+                ))
+                .unwrap()
+        );
         assert!(
             store
                 .missing_published_complete_analysis_blob_keys_at_generations(
@@ -2264,7 +2287,9 @@ mod tests {
                 analyzer
                     .store_context
                     .store
-                    .contains_parsed_blob(oid, "java")
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "java"
+                    ))
                     .unwrap()
             );
         }
@@ -2274,7 +2299,9 @@ mod tests {
             !analyzer
                 .store_context
                 .store
-                .contains_parsed_blob(bad_oid, "java")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    bad_oid, "java"
+                ))
                 .unwrap()
         );
     }
@@ -2741,7 +2768,11 @@ mod tests {
             );
             let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
             assert!(
-                !store.contains_parsed_blob(oid, "java").unwrap(),
+                !store
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid, "java"
+                    ))
+                    .unwrap(),
                 "a timeout marker must not be published as a complete blob"
             );
         }
@@ -2758,7 +2789,14 @@ mod tests {
                 .any(|declaration| declaration.short_name() == "Healthy")
         );
         let healthy_oid = Oid::hash_object(ObjectType::Blob, healthy_source.as_bytes()).unwrap();
-        assert!(store.contains_parsed_blob(healthy_oid, "java").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    healthy_oid,
+                    "java"
+                ))
+                .unwrap()
+        );
 
         let retry_oid = Oid::hash_object(ObjectType::Blob, retry_source.as_bytes()).unwrap();
         let retry_generation = analyzer.store_context.generations["java"];
@@ -2766,8 +2804,7 @@ mod tests {
             .fetch_file_state(&retry)
             .expect("partial retry state");
         let preparation_error = AnalyzerStore::prepare_parsed_blob(
-            retry_oid,
-            "java",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(retry_oid, "java"),
             retry_generation,
             &JavaAdapter,
             Arc::clone(&partial_retry_state),
@@ -2781,15 +2818,20 @@ mod tests {
         let direct_error = store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                retry_oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(retry_oid, "java"),
                 retry_generation,
                 &JavaAdapter,
                 partial_retry_state.as_ref(),
             )
             .expect_err("the direct write path must enforce the same completeness invariant");
         assert!(direct_error.to_string().contains("timed-out file analysis"));
-        assert!(!store.contains_parsed_blob(retry_oid, "java").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    retry_oid, "java"
+                ))
+                .unwrap()
+        );
 
         let retried = analyzer.update(&BTreeSet::from([retry.clone()]));
         let retried_state = retried.fetch_file_state(&retry).expect("retried state");
@@ -2800,7 +2842,13 @@ mod tests {
                 .iter()
                 .any(|declaration| declaration.short_name() == "Retry")
         );
-        assert!(store.contains_parsed_blob(retry_oid, "java").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    retry_oid, "java"
+                ))
+                .unwrap()
+        );
 
         drop(retried);
         drop(analyzer);
@@ -2866,7 +2914,9 @@ mod tests {
         let reopen_oid = Oid::hash_object(ObjectType::Blob, reopen_source.as_bytes()).unwrap();
         assert!(
             reopened_store
-                .contains_parsed_blob(reopen_oid, "java")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    reopen_oid, "java"
+                ))
                 .unwrap()
         );
     }
@@ -2980,8 +3030,7 @@ mod tests {
             .state,
         );
         let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "python",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
             GenerationId::BOOTSTRAP,
             &adapter,
             Arc::clone(&parsed),
@@ -3004,11 +3053,16 @@ mod tests {
         assert_eq!(stats.transactions, 1);
         assert_eq!(stats.peak_batch_rows, expected_rows);
         assert_eq!(stats.peak_batch_payload_bytes, expected_bytes);
-        assert!(store.contains_parsed_blob(oid, "python").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "python"
+                ))
+                .unwrap()
+        );
         let hydrated = store
             .hydrate_file_state_with_source(
-                oid,
-                "python",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
                 GenerationId::BOOTSTRAP,
                 &adapter,
                 &file,
@@ -3661,8 +3715,7 @@ mod tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "python",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
                 generation,
                 &*adapter,
                 &parsed,
@@ -3928,7 +3981,13 @@ mod tests {
             "import os\nclass Dirty:\n    pass\n",
         );
 
-        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "python"
+                ))
+                .unwrap()
+        );
         let states = analyzer.bulk_file_states([file.clone()], BulkFileStateSource::Omit);
         assert!(states.get(&file).is_some_and(|state| {
             state
@@ -4427,7 +4486,7 @@ mod tests {
             analyzer
                 .store_context
                 .store
-                .contains_parsed_blob(oid, "cpp")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"))
                 .unwrap(),
             "interval-cache fixture must have a complete persisted C++ blob"
         );
@@ -5023,7 +5082,9 @@ mod tests {
         updated
             .store_context
             .store
-            .mark_parsed_blob_incomplete_for_test(oid, "rust");
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "rust",
+            ));
         project.reset_reads();
         updated.reset_full_hydration_count_for_test();
 
@@ -5206,7 +5267,9 @@ mod tests {
         analyzer
             .store_context
             .store
-            .mark_parsed_blob_incomplete_for_test(oid, "cpp");
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "cpp",
+            ));
         let cache = moka::sync::Cache::new(1);
         analyzer.reset_full_hydration_count_for_test();
         {
@@ -5232,7 +5295,11 @@ mod tests {
         analyzer
             .store_context
             .store
-            .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"),
+                &CppAdapter,
+                &state,
+            )
             .unwrap();
         {
             let scope =
@@ -5293,7 +5360,7 @@ mod tests {
             !analyzer
                 .store_context
                 .store
-                .contains_parsed_blob(oid, "cpp")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"))
                 .unwrap()
         );
 
@@ -5321,7 +5388,7 @@ mod tests {
             retried
                 .store_context
                 .store
-                .contains_parsed_blob(oid, "cpp")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "cpp"))
                 .unwrap()
         );
         let scope = AnalyzerQueryScope::new(&retried);
@@ -5358,7 +5425,10 @@ mod tests {
         analyzer
             .store_context
             .store
-            .mark_parsed_blob_incomplete_for_test(oid, adapter.storage_language_key_for_file(file));
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid,
+                adapter.storage_language_key_for_file(file),
+            ));
         analyzer.reset_full_hydration_count_for_test();
         retained
     }
@@ -5419,7 +5489,9 @@ mod tests {
         analyzer
             .store_context
             .store
-            .mark_parsed_blob_incomplete_for_test(oid, "php");
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "php",
+            ));
         analyzer.source_snapshot_file_states = Arc::new(HashMap::default());
         analyzer.transient_file_states.lock().unwrap().clear();
         analyzer.query_file_state_snapshot.store(None);
@@ -5460,7 +5532,7 @@ mod tests {
         cache.insert(
             (
                 analyzer.language_generation("php").unwrap(),
-                oid,
+                brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "php"),
                 file.clone(),
             ),
             Arc::clone(&facts),
@@ -5502,7 +5574,7 @@ mod tests {
             !analyzer
                 .store_context
                 .store
-                .contains_parsed_blob(oid, "ruby")
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "ruby"))
                 .unwrap()
         );
     }
@@ -7491,6 +7563,7 @@ mod tests {
                 analyzer
                     .structural_snapshot_key(&file, &decoded)
                     .unwrap()
+                    .blob
                     .oid,
                 oid
             );
@@ -7504,7 +7577,7 @@ mod tests {
                 analyzer
                     .store_context
                     .store
-                    .contains_blob(oid, "java")
+                    .contains_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
                     .expect("published blob")
             );
         }
@@ -7567,7 +7640,9 @@ mod tests {
             Oid::hash_object(ObjectType::Blob, old_source.as_bytes()).expect("old source OID");
         let generation = analyzer.store_context.generations["rust"];
         let initial = store
-            .rust_usage_facts(old_oid, "rust")
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                old_oid, "rust",
+            ))
             .expect("initial Rust usage facts");
         assert!(
             initial
@@ -7581,7 +7656,9 @@ mod tests {
         analyzer.persist_live_blobs(std::slice::from_ref(&file));
 
         let after_changed_parse = store
-            .rust_usage_facts(old_oid, "rust")
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                old_oid, "rust",
+            ))
             .expect("old Rust usage facts remain readable");
         assert_eq!(
             after_changed_parse, initial,
@@ -7599,7 +7676,11 @@ mod tests {
         analyzer.persist_live_blobs(std::slice::from_ref(&file));
         assert!(
             store
-                .blobs_with_rust_facts("rust", generation, &[old_oid])
+                .blobs_with_rust_facts(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+                    generation,
+                    &[old_oid]
+                )
                 .expect("probe missing old publication")
                 .is_empty(),
             "a changed parse must not manufacture a missing old publication"
@@ -7636,7 +7717,11 @@ mod tests {
         store.delete_rust_facts_for_test("rust");
         assert!(
             store
-                .blobs_with_rust_facts("rust", generation, &[oid])
+                .blobs_with_rust_facts(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &[oid]
+                )
                 .expect("probe removed publication")
                 .is_empty()
         );
@@ -7645,7 +7730,11 @@ mod tests {
 
         assert!(
             store
-                .blobs_with_rust_facts("rust", generation, &[oid])
+                .blobs_with_rust_facts(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &[oid]
+                )
                 .expect("probe restored publication")
                 .contains(&oid)
         );
@@ -7727,7 +7816,9 @@ mod tests {
         assert_eq!(warm.get_definitions("dup_b.shared.Shared").len(), 1);
 
         let shared_oid = Oid::hash_object(ObjectType::Blob, shared_source.as_bytes()).unwrap();
-        store.mark_parsed_blob_incomplete_for_test(shared_oid, "python");
+        store.mark_parsed_blob_incomplete_for_test(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(shared_oid, "python"),
+        );
         store.reset_parsed_blob_point_contains_queries_for_test();
         let parse_count = Arc::new(AtomicUsize::new(0));
         let progress_count = Arc::clone(&parse_count);

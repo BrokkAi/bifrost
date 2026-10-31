@@ -257,11 +257,9 @@ fn kotlin_boolean_literal(source: &str, node: Node<'_>) -> Option<bool> {
     if node.kind() != "boolean_literal" {
         return None;
     }
-    match node.utf8_text(source.as_bytes()).ok()? {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::boolean_literal_value(
+        node.utf8_text(source.as_bytes()).ok()?,
+    )
 }
 
 fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {

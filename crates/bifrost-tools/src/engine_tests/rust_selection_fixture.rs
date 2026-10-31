@@ -32,8 +32,10 @@ pub fn with_store(
                         let state = parsed_fixture_state(&JavaAdapter, "src/Model.java", source);
                         store.write_parsed_blob_at_generation(
                             &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                            Oid::from_str(oid).unwrap(),
-                            storage_language,
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                Oid::from_str(oid).unwrap(),
+                                storage_language,
+                            ),
                             generation,
                             &JavaAdapter,
                             &state,
@@ -43,8 +45,10 @@ pub fn with_store(
                         let state = parsed_fixture_state(&RustAdapter, "src/Model.rs", source);
                         store.write_parsed_blob_at_generation(
                             &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                            Oid::from_str(oid).unwrap(),
-                            storage_language,
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                Oid::from_str(oid).unwrap(),
+                                storage_language,
+                            ),
                             generation,
                             &RustAdapter,
                             &state,
@@ -115,8 +119,10 @@ pub(super) fn write_rust_fixture_blob(
     store
         .write_parsed_blob_at_generation(
             &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-            Oid::from_str(oid).unwrap(),
-            storage_language,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                Oid::from_str(oid).unwrap(),
+                storage_language,
+            ),
             generation,
             &RustAdapter,
             &state,

@@ -2,6 +2,7 @@
 
 use crate::analyzer::QueryScope;
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValuePermit};
+use brokk_bifrost_core::gitblob::BlobKey;
 
 use crate::analyzer::semantic::partial_flow::ProcedurePartialFlows;
 use crate::analyzer::semantic::{
@@ -67,10 +68,10 @@ pub fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
         }
         Err(PreparedSourceFailure::Exceeded(_)) => return Ok(None),
         Err(PreparedSourceFailure::Refused(reason)) => {
-            return Err(SemanticProviderError::SourceAdmissionRefused {
-                file: file.clone(),
+            return Err(SemanticProviderError::source_admission_refused(
+                file.clone(),
                 reason,
-            });
+            ));
         }
     };
     let overlay_revision = match snapshot.origin() {
@@ -83,11 +84,20 @@ pub fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
     // dispatch oracle resolves, and re-hashing a file it has already hashed is
     // the residual #2295 named.
     let digests = analyzer.semantic_source_digests();
-    let content = match digests.get(source_identity) {
+    let content = match digests.get(BlobKey::unvaried(
+        source_identity,
+        analyzer.adapter().storage_language_key_for_file(file),
+    )) {
         Some(content) => content,
         None => {
             let content = ContentIdentity::hash_bytes(source.as_bytes());
-            digests.record(source_identity, content);
+            digests.record(
+                BlobKey::unvaried(
+                    source_identity,
+                    analyzer.adapter().storage_language_key_for_file(file),
+                ),
+                content,
+            );
             content
         }
     };
@@ -200,7 +210,10 @@ pub(crate) fn materialize_with_lowerer_inner<A: LanguageAdapter>(
             file.rel_path().display(),
         );
         let content = publication.content;
-        analyzer.semantic_source_digests().record(oid, content);
+        analyzer.semantic_source_digests().record(
+            BlobKey::unvaried(oid, analyzer.adapter().storage_language_key_for_file(file)),
+            content,
+        );
         let key = semantic_artifact_key_from_content(
             file,
             LanguageDialect::for_path(analyzer.adapter().language(), file.rel_path()),
@@ -263,10 +276,10 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     ) {
         PreparedSyntaxLimitedOutcome::Available(oid, prepared) => (oid, prepared),
         PreparedSyntaxLimitedOutcome::Refused(reason) => {
-            return Err(SemanticProviderError::SourceAdmissionRefused {
-                file: file.clone(),
+            return Err(SemanticProviderError::source_admission_refused(
+                file.clone(),
                 reason,
-            });
+            ));
         }
         PreparedSyntaxLimitedOutcome::Cancelled => {
             return Ok(SemanticOutcome::Cancelled {
@@ -323,9 +336,13 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     // Reuse the prepared snapshot's digest. Recording it against the blob
     // identity also lets the next touch skip source preparation entirely.
     let content = ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
-    analyzer
-        .semantic_source_digests()
-        .record(source_identity, content);
+    analyzer.semantic_source_digests().record(
+        BlobKey::unvaried(
+            source_identity,
+            analyzer.adapter().storage_language_key_for_file(file),
+        ),
+        content,
+    );
     let key = semantic_artifact_key_for_prepared(file, &prepared, content, identity)?;
     let (acquisition, cache_wait) = cache.acquire(&key, request.cancellation);
     if cache_wait.wait_ns > 0 {
@@ -410,7 +427,13 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
             || {
                 analyzer
                     .adapter()
-                    .parse_file(file, prepared.source(), prepared.tree())
+                    .parse_file_preprocessed(
+                        file,
+                        prepared.source(),
+                        prepared.tree(),
+                        prepared.preprocessor().map(|p| p.as_ref()),
+                    )
+                    .0
             },
         )
     } else {
@@ -505,7 +528,10 @@ pub(crate) fn served_from_unchanged_source<A: LanguageAdapter>(
     let Some(source_identity) = analyzer.reusable_live_oid(file) else {
         return Ok(None);
     };
-    let Some(content) = analyzer.semantic_source_digests().get(source_identity) else {
+    let Some(content) = analyzer.semantic_source_digests().get(BlobKey::unvaried(
+        source_identity,
+        analyzer.adapter().storage_language_key_for_file(file),
+    )) else {
         return Ok(None);
     };
     let key = semantic_artifact_key_from_content(
@@ -528,7 +554,7 @@ pub(crate) fn complete_semantic_ir_publication<A: LanguageAdapter>(
     let storage_language = analyzer.adapter().storage_language_key_for_file(file);
     let publication = analyzer
         .analyzer_store()
-        .semantic_ir_publication(oid, storage_language)
+        .semantic_ir_publication(&BlobKey::unvaried(oid, storage_language))
         .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
     Ok(publication.filter(|publication| {
         matches!(publication.outcome, SemanticIrPublicationOutcome::Complete)

@@ -1563,7 +1563,7 @@ pub fn summarize_procedure_effects(
                                 changed |= existing.merge(candidate);
                             }
                             None => {
-                                if effects[node].len() >= budget.max_effects_per_procedure {
+                                if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(effects[node].len(), budget.max_effects_per_procedure).allows(1) {
                                     effect_budget_exhausted[node] = true;
                                     continue;
                                 }

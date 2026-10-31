@@ -76,8 +76,7 @@ mod jvm_extraction_tests {
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     generation,
                     &JavaAdapter,
                     &state,
@@ -87,14 +86,20 @@ mod jvm_extraction_tests {
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         let generation = store.current_generation("java").unwrap();
         let hydrated = store
-            .hydrate_file_state_with_source(oid, "java", generation, &JavaAdapter, &file, SOURCE)
+            .hydrate_file_state_with_source(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                generation,
+                &JavaAdapter,
+                &file,
+                SOURCE,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(hydrated.signature_metadata, state.signature_metadata);
         let bulk = store
             .hydrate_file_states(
                 &[(file.clone(), oid)],
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "java"),
                 &JavaAdapter,
                 &HashMap::from_iter([(file.clone(), SOURCE.to_owned())]),
             )
@@ -103,14 +108,17 @@ mod jvm_extraction_tests {
         for (unit, expected) in &state.signature_metadata {
             assert_eq!(
                 store
-                    .signature_metadata_for_unit(oid, "java", generation, unit)
+                    .signature_metadata_for_unit(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                        generation,
+                        unit
+                    )
                     .unwrap(),
                 *expected
             );
             let bounded = store
                 .signature_metadata_for_unit_limited(
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     generation,
                     unit,
                     expected.len() + 1,
@@ -161,8 +169,10 @@ mod jvm_extraction_tests {
             let generation = store.current_generation("java").unwrap();
             let result = store.write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid_for(b"missing-constructor-shape"),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid_for(b"missing-constructor-shape"),
+                    "java",
+                ),
                 generation,
                 &JavaAdapter,
                 &missing,
@@ -197,8 +207,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -206,7 +215,11 @@ mod jvm_extraction_tests {
             .unwrap();
         assert!(
             store
-                .signature_metadata_for_unit(oid, "java", generation, target)
+                .signature_metadata_for_unit(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    generation,
+                    target
+                )
                 .is_ok()
         );
         store
@@ -253,19 +266,27 @@ mod jvm_extraction_tests {
             .unwrap();
         assert!(
             store
-                .signature_metadata_for_unit(oid, "java", generation, target)
+                .signature_metadata_for_unit(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    generation,
+                    target
+                )
                 .is_err()
         );
         assert!(
             store
-                .signature_metadata_for_unit_limited(oid, "java", generation, target, 10)
+                .signature_metadata_for_unit_limited(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    generation,
+                    target,
+                    10
+                )
                 .is_err()
         );
         assert!(
             store
                 .hydrate_file_state_with_source(
-                    oid,
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                     generation,
                     &JavaAdapter,
                     &file,
@@ -277,7 +298,7 @@ mod jvm_extraction_tests {
             store
                 .hydrate_file_states(
                     &[(file.clone(), oid)],
-                    "java",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "java"),
                     &JavaAdapter,
                     &HashMap::from_iter([(file, "class Plain {}".to_owned())]),
                 )

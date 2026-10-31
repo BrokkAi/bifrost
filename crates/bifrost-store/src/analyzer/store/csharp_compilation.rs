@@ -26,7 +26,11 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// Increment when the rules derived from the same inputs change. Older sets
 /// stop satisfying the validity rule and the next publication replaces them.
-pub const DERIVATION_VERSION: i64 = 2;
+// v4 retains ancestor absence and rejects unmodeled SDK imports.
+// v3 includes symbol derivation and the SDK 10.0.403 implicit-symbol table v1.
+pub const DERIVATION_VERSION: i64 = 4;
+/// Rotate this table identity and DERIVATION_VERSION together when SDK rules change.
+pub const IMPLICIT_SYMBOL_TABLE_VERSION: &[u8] = b"sdk-10.0.403-v1";
 /// The storage language whose revisions publish compilation membership.
 pub const STORAGE_LANGUAGE: &str = "csharp";
 const MAX_CONFIGURATION_FILES: usize = 16 * 1024;
@@ -69,6 +73,48 @@ pub struct CSharpCompilationFact {
     /// default, so readers may walk its edges transitively.
     pub transitive_flow: bool,
     pub metadata: CSharpCompilationMetadata,
+    pub symbols: CSharpSymbolEnvironment,
+}
+
+/// One selected compilation environment. Open environments deliberately list no symbols.
+#[derive(Debug)]
+pub struct CSharpSymbolEnvironment {
+    pub configuration: String,
+    pub target_framework: Option<String>,
+    pub open_reason: Option<String>,
+    pub symbols: Vec<(String, String)>,
+}
+
+impl Default for CSharpSymbolEnvironment {
+    fn default() -> Self {
+        Self {
+            configuration: "Debug".into(),
+            target_framework: None,
+            open_reason: Some("loose_files".into()),
+            symbols: Vec::new(),
+        }
+    }
+}
+
+impl CSharpSymbolEnvironment {
+    pub fn digest(&self) -> [u8; 32] {
+        debug_assert!(self.open_reason.is_none() || self.symbols.is_empty());
+        let mut hash =
+            CanonicalHasher::new(b"csharp-symbol-environment:derivation-v1:sdk-10.0.403-v1");
+        hash.field("configuration", self.configuration.as_bytes());
+        hash.field(
+            "framework",
+            self.target_framework.as_deref().unwrap_or("").as_bytes(),
+        );
+        hash.field(
+            "open_reason",
+            self.open_reason.as_deref().unwrap_or("").as_bytes(),
+        );
+        for (symbol, source) in &self.symbols {
+            hash.field(source, symbol.as_bytes());
+        }
+        hash.finish()
+    }
 }
 
 /// Configuration facts read whole for one compilation, never retained as a workspace index.
@@ -243,6 +289,7 @@ pub(super) fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> R
     }
 
     let mut hasher = CanonicalHasher::new(b"bifrost-csharp-compilation-inputs:v1");
+    hasher.field("implicit_symbol_table", IMPLICIT_SYMBOL_TABLE_VERSION);
     {
         let mut identities = tx.prepare_cached(CONFIGURATION_IDENTITIES_SQL)?;
         let mut rows = identities.query(snapshot_params(snapshot))?;
@@ -396,6 +443,7 @@ fn insert_set(
             &[u8::from(compilation.references_complete)],
         );
         output.field("transitive_flow", &[u8::from(compilation.transitive_flow)]);
+        output.field("symbols", &compilation.symbols.digest());
         let metadata = &compilation.metadata;
         output.field(
             "assembly_name",
@@ -466,8 +514,9 @@ fn insert_set(
             "INSERT INTO csharp_compilations(
                set_id, project_path, references_complete, transitive_flow,
                assembly_name, global_usings_complete, internals_visible_to_complete,
-               global_usings, internals_visible_to
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9))",
+               global_usings, internals_visible_to, configuration, target_framework,
+               symbols_closed, open_reason, symbol_set_digest
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9), ?10, ?11, ?12, ?13, ?14)",
         )?;
         let mut items = tx.prepare_cached(
             "INSERT INTO csharp_compilation_items(
@@ -486,9 +535,20 @@ fn insert_set(
                 serde_json::to_string(&compilation.metadata.global_usings)
                     .expect("usings serialize"),
                 serde_json::to_string(&compilation.metadata.internals_visible_to)
-                    .expect("friends serialize")
+                    .expect("friends serialize"),
+                compilation.symbols.configuration,
+                compilation.symbols.target_framework,
+                compilation.symbols.open_reason.is_none(),
+                compilation.symbols.open_reason,
+                compilation.symbols.digest().as_slice()
             ])?;
             let compilation_id = tx.last_insert_rowid();
+            for (symbol, source) in &compilation.symbols.symbols {
+                tx.execute(
+                    "INSERT INTO csharp_compilation_symbols(compilation_id, symbol, source) VALUES(?1, ?2, ?3)",
+                    params![compilation_id, symbol, source],
+                )?;
+            }
             if let Some(path) = compilation.project_path.as_deref() {
                 assert!(
                     ids.insert(path, compilation_id).is_none(),
@@ -645,6 +705,7 @@ impl SelectedCSharpCompilations<'_> {
 }
 
 impl<'a> CSharpCompilationView<'a> {
+    // Its readers, C#'s demand installer and unit reader, are trial code.
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn selected(
         conn: &'a Connection,
@@ -1200,6 +1261,7 @@ mod tests {
         };
         let facts = |missing: &str| CSharpCompilationFacts {
             compilations: vec![CSharpCompilationFact {
+                symbols: Default::default(),
                 project_path: Some("App/App.csproj".to_owned()),
                 items: Vec::new(),
                 references: Vec::new(),

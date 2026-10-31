@@ -175,6 +175,12 @@ pub mod shared_support {
             registry.file = file;
             registry.visit_file(&syntax);
         }
+        registry
+            .schemas
+            .push(crate::analyzer::store::REQUESTED_PARSED_BLOBS_DDL.to_owned());
+        registry
+            .schemas
+            .push(crate::analyzer::store::REQUESTED_ANALYSIS_PROJECTIONS_DDL.to_owned());
         // Reverse nomination arms in resolution_operation read this request
         // TEMP table; its DDL lives in reverse_candidates.rs, outside the scan.
         registry.schemas.push(
@@ -206,6 +212,26 @@ pub mod shared_support {
         };
         use crate::analyzer::store::{go_unit_summaries, rust_unit_summaries, selected_definition};
         for (name, sql) in [
+            (
+                "MISSING_PUBLISHED_COMPLETE_ANALYSIS_SQL",
+                crate::analyzer::store::MISSING_PUBLISHED_COMPLETE_ANALYSIS_SQL,
+            ),
+            (
+                "REQUIRED_EXISTING_ANALYSIS_PROJECTIONS_SQL",
+                crate::analyzer::store::REQUIRED_EXISTING_ANALYSIS_PROJECTIONS_SQL,
+            ),
+            (
+                "csharp_demand::NAMESPACE_ROUTE",
+                super::super::csharp_demand::NAMESPACE_ROUTE,
+            ),
+            (
+                "csharp_demand::HAS_USING_DIRECTIVES",
+                super::super::csharp_demand::HAS_USING_DIRECTIVES,
+            ),
+            (
+                "csharp_demand::TYPE_WITH_EXPLICIT_BASES",
+                super::super::csharp_demand::TYPE_WITH_EXPLICIT_BASES,
+            ),
             (
                 "csharp_namespaces::ORDINARY_CANDIDATES",
                 super::super::csharp_namespaces::ORDINARY_CANDIDATES,

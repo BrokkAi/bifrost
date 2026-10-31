@@ -186,21 +186,9 @@ impl CrossDomainValue {
         match self {
             Self::DependencyConfiguration(value) => terminal_source_file(&value.code)
                 .expect("dependency rows name their retained source file"),
-            Self::Correlated { code, .. } | Self::CodeWitness(code) => match code.as_ref() {
-                PipelineValue::File(file) => file,
-                PipelineValue::ReceiverAnalysis(value)
-                | PipelineValue::MemberTargetAnalysis(value) => &value.report.site.file,
-                other => {
-                    terminal_source_file(other).expect("every other code row names its source file")
-                }
-            },
-            Self::ConfigurationCode { code, .. } => match code.as_ref() {
-                PipelineValue::File(file) => file,
-                PipelineValue::ReceiverAnalysis(value)
-                | PipelineValue::MemberTargetAnalysis(value) => &value.report.site.file,
-                other => terminal_source_file(other)
-                    .expect("configuration-code rows name their source file"),
-            },
+            Self::Correlated { code, .. }
+            | Self::CodeWitness(code)
+            | Self::ConfigurationCode { code, .. } => code_row_file(code),
             Self::ConfigurationCodeAbsent { configuration, .. } => configuration.file(),
             Self::ConfigurationWitness(configuration) => configuration.file(),
         }
@@ -267,7 +255,10 @@ pub(super) fn cross_domain_diagnostic(
     impact: CodeQueryDiagnosticImpact,
     message: String,
 ) -> CodeQueryDiagnostic {
-    CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+            brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+        ),
         related: Vec::new(),
         source: None,
         code,
@@ -277,7 +268,7 @@ pub(super) fn cross_domain_diagnostic(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    }
+    })
 }
 
 /// The location of a code row in diagnostics: path and exact byte span.

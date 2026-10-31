@@ -245,7 +245,11 @@ mod csharp_extraction_tests {
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
-            .write_parsed_blob(oid, "csharp", &adapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "csharp"),
+                &adapter,
+                &state,
+            )
             .unwrap();
         let workspace_file = WorkspaceFileRow {
             rel_path: brokk_bifrost_core::path_utils::rel_path_string(&file),
@@ -300,4 +304,117 @@ mod csharp_extraction_tests {
         assert_eq!(normalized_tail, "Demo.Outer.Nested");
         assert_eq!(segment_count, nested.fq().len() as i64);
     }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8155: incomplete C# descendant cache fills panicked during member-family inversion"
+)]
+fn csharp_incomplete_descendant_fill_leaves_member_family_open() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
+    use brokk_bifrost_analysis::analyzer::usages::member_family::csharp_member_family;
+    use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, IAnalyzer, capture_query_reads};
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+    use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+    use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyOutcome;
+    use brokk_bifrost_csharp_analysis::CSharpAnalyzer;
+    use std::collections::BTreeMap;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Base.cs",
+            "public class Base { public virtual void Run() {} }",
+        )
+        .file(
+            "Child.cs",
+            "public class Child : Base { public override void Run() {} }",
+        )
+        .build();
+    let analyzer = MultiAnalyzer::new(BTreeMap::from([(
+        Language::CSharp,
+        AnalyzerDelegate::new(CSharpAnalyzer::new(project.project_dyn())),
+    )]));
+    let member = analyzer
+        .declarations(&project.file("Base.cs"))
+        .into_iter()
+        .find(|unit| unit.is_function() && unit.identifier() == "Run")
+        .unwrap();
+    let owner = analyzer.parent_of(&member).unwrap();
+    let gap = QueryReadIncomplete::SemanticEvidenceGap("refused hierarchy input".into());
+    let (_, reads) = capture_query_reads(&analyzer, || {
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        analyzer.record_query_incomplete(gap.clone());
+        let answer = csharp_member_family(&analyzer, &analyzer, &member, None);
+        assert_eq!(
+            answer.descendants.outcome,
+            MemberFamilyOutcome::Incomplete,
+            "{answer:?}"
+        );
+        assert_eq!(scope.captured_read_incompleteness(), vec![gap]);
+    });
+    assert_eq!(reads.execution_dependences(), 0, "{reads:?}");
+    assert!(reads.unattributed_reads() > 0, "{reads:?}");
+    let descendants = analyzer.get_direct_descendants(&owner);
+    assert!(
+        descendants.is_complete()
+            && descendants
+                .edges
+                .iter()
+                .any(|unit| unit.identifier() == "Child"),
+        "{descendants:?}"
+    );
+}
+
+#[test]
+fn csharp_membership_descendants_preserve_refused_fill() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete};
+    use brokk_bifrost_core::analyzer::capabilities::{
+        DescendantIndexScope, HierarchyOpenReason, TypeHierarchyProvider,
+    };
+    use brokk_bifrost_core::analyzer::{CodeUnitIndex, Language};
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource;
+    use brokk_bifrost_csharp_analysis::CSharpAnalyzer;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Base.cs", "public partial class Base {}")
+        .file(
+            "Part.cs",
+            "public partial class Base {} public class Child : Base {}",
+        )
+        .build();
+    let analyzer = CSharpAnalyzer::new(project.project_dyn());
+    let owner = analyzer
+        .declarations(&project.file("Base.cs"))
+        .into_iter()
+        .find(|unit| unit.identifier() == "Base")
+        .unwrap();
+    let view = MembershipScopedSource::new(&analyzer, &project.file("Base.cs"));
+    let _query = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+    analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+        "refused physical part".into(),
+    ));
+    let answer = view.get_direct_descendants(&owner);
+    assert!(!answer.is_complete(), "{answer:?}");
+    assert!(
+        answer
+            .open
+            .iter()
+            .any(|reason| matches!(reason, HierarchyOpenReason::DescendantIndexUnavailable)),
+        "{answer:?}"
+    );
+    let token = CancellationToken::default();
+    let scoped = view
+        .get_direct_descendants_within(&owner, &DescendantIndexScope::whole_workspace(&token))
+        .unwrap();
+    assert!(!scoped.is_complete(), "{scoped:?}");
+    assert!(
+        scoped
+            .open
+            .iter()
+            .any(|reason| matches!(reason, HierarchyOpenReason::DescendantIndexUnavailable)),
+        "{scoped:?}"
+    );
 }

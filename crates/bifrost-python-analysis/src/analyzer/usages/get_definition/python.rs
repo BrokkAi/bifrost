@@ -31,16 +31,21 @@ use crate::analyzer::PythonAnalyzer;
 
 use crate::analyzer::python::external_authority::*;
 
+use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+
 pub(crate) fn definition_value_identity(
     analyzer: &dyn IAnalyzer,
     request: &DefinitionLookupRequest,
     file: &ProjectFile,
     source: &str,
     cancellation: Option<&CancellationToken>,
-) -> Option<ResolvedValueIdentity> {
-    python_external_value_identity_at_range(analyzer, request, file, source, cancellation).or_else(
-        || python_attribute_value_identity_at_range(analyzer, request, file, source, cancellation),
-    )
+) -> Result<Option<ResolvedValueIdentity>, DerivationExecutionCause> {
+    match python_external_value_identity_at_range(analyzer, request, file, source, cancellation)? {
+        Some(identity) => Ok(Some(identity)),
+        None => {
+            python_attribute_value_identity_at_range(analyzer, request, file, source, cancellation)
+        }
+    }
 }
 
 fn python_attribute_value_identity_at_range(
@@ -49,13 +54,20 @@ fn python_attribute_value_identity_at_range(
     file: &ProjectFile,
     source: &str,
     cancellation: Option<&CancellationToken>,
-) -> Option<ResolvedValueIdentity> {
-    let (start_byte, end_byte) = (request.start_byte?, request.end_byte?);
-    let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
-    let (terminal_start_byte, terminal_end_byte) =
+) -> Result<Option<ResolvedValueIdentity>, DerivationExecutionCause> {
+    let (Some(start_byte), Some(end_byte)) = (request.start_byte, request.end_byte) else {
+        return Ok(None);
+    };
+    let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
+        return Ok(None);
+    };
+    let Some((terminal_start_byte, terminal_end_byte)) =
         crate::analyzer::python::python_attribute_value_terminal_range(
             python, file, source, start_byte, end_byte,
-        )?;
+        )
+    else {
+        return Ok(None);
+    };
     let terminal_request = DefinitionLookupRequest {
         file: file.clone(),
         line: None,
@@ -80,9 +92,18 @@ fn python_attribute_value_identity_at_range(
         )
     }
     .into_iter()
-    .next()?;
+    .next()
+    .expect("one identity request produces one outcome");
+    match outcome.status {
+        DefinitionLookupStatus::Cancelled => return Err(DerivationExecutionCause::Cancelled),
+        DefinitionLookupStatus::ExceededBudget(_) => return Err(DerivationExecutionCause::Budget),
+        DefinitionLookupStatus::Unavailable | DefinitionLookupStatus::Incomplete => {
+            return Err(DerivationExecutionCause::Provider);
+        }
+        _ => {}
+    }
     if outcome.status != DefinitionLookupStatus::Resolved {
-        return None;
+        return Ok(None);
     }
     let mut definitions = outcome.definitions;
     definitions.sort_by_key(|definition| definition.declaration_id());
@@ -90,7 +111,7 @@ fn python_attribute_value_identity_at_range(
     let mut modeled = outcome.modeled_definitions;
     modeled.sort_by(|left, right| left.id.cmp(&right.id));
     modeled.dedup_by(|left, right| left.id == right.id);
-    match (definitions.as_slice(), modeled.as_slice()) {
+    Ok(match (definitions.as_slice(), modeled.as_slice()) {
         ([definition], []) => Some(ResolvedValueIdentity {
             kind: ResolvedValueIdentityKind::WorkspaceDeclaration,
             identity: definition.declaration_id().to_string(),
@@ -104,7 +125,7 @@ fn python_attribute_value_identity_at_range(
             })
         }
         _ => None,
-    }
+    })
 }
 
 fn python_external_value_identity_at_range(
@@ -113,10 +134,14 @@ fn python_external_value_identity_at_range(
     file: &ProjectFile,
     source: &str,
     cancellation: Option<&CancellationToken>,
-) -> Option<ResolvedValueIdentity> {
-    let (start_byte, end_byte) = (request.start_byte?, request.end_byte?);
+) -> Result<Option<ResolvedValueIdentity>, DerivationExecutionCause> {
+    let (Some(start_byte), Some(end_byte)) = (request.start_byte, request.end_byte) else {
+        return Ok(None);
+    };
     let scope = AnalyzerQueryScope::new(analyzer);
-    let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
+    let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
+        return Ok(None);
+    };
     let resolution = python_external_imported_symbol_at_range_bounded(
         python,
         scope.token(),
@@ -131,32 +156,34 @@ fn python_external_value_identity_at_range(
             value: Some((module, member)),
             ..
         } => (module, member),
-        BoundedResolution::Complete { value: None, .. }
-        | BoundedResolution::Exceeded { .. }
-        | BoundedResolution::Cancelled { .. } => return None,
+        BoundedResolution::Complete { value: None, .. } => return Ok(None),
+        BoundedResolution::Exceeded { .. } => return Err(DerivationExecutionCause::Budget),
+        BoundedResolution::Cancelled { .. } => return Err(DerivationExecutionCause::Cancelled),
     };
     let external = format!("{module}.{member}");
-    let overlay = analyzer.semantic_model_overlay()?;
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return Ok(None);
+    };
     let matched = overlay.symbols_named(&external);
     if matched.disposition
         != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
     {
-        return None;
+        return Ok(None);
     }
     let [symbol] = matched.records.as_slice() else {
-        return None;
+        return Ok(None);
     };
     if symbol.qualified_name != external
         || symbol.language != Language::Python.config_label()
         || !exact_semantic_model_value_identity(symbol)
     {
-        return None;
+        return Ok(None);
     }
-    Some(ResolvedValueIdentity {
+    Ok(Some(ResolvedValueIdentity {
         kind: ResolvedValueIdentityKind::ActiveSemanticModel,
         identity: symbol.id.clone(),
         aliases: symbol.aliases.clone(),
-    })
+    }))
 }
 
 pub(crate) fn definition_tree(
@@ -5773,7 +5800,7 @@ fn python_member_outcome(
         } else {
             PythonAncestorRoutes::default()
         };
-        for ancestor in provider.get_ancestors(&receiver_type) {
+        for ancestor in provider.get_ancestors(&receiver_type).definite().to_vec() {
             let found = support.members_for_owner(&ancestor, member);
             attribution.record_inherited(&receiver_type, &ancestor, &found, &routes);
             candidates.extend(found);
@@ -5859,7 +5886,7 @@ impl PythonAncestorRoutes {
         let mut routes = Self::default();
         let mut seen: HashSet<String> = HashSet::default();
         seen.insert(receiver.fq_name());
-        let mut level = provider.get_direct_ancestors(receiver);
+        let mut level = provider.get_direct_ancestors(receiver).definite().to_vec();
         for ancestor in &level {
             routes
                 .parents
@@ -5884,7 +5911,7 @@ impl PythonAncestorRoutes {
                     break 'walk;
                 }
                 routes.depths.insert(ancestor.clone(), depth);
-                let expanded = provider.get_direct_ancestors(&ancestor);
+                let expanded = provider.get_direct_ancestors(&ancestor).definite().to_vec();
                 for next in &expanded {
                     routes
                         .parents
@@ -6170,6 +6197,24 @@ fn python_import_binding_outcome(
         Some(attribute) => format!("{local}.{attribute}"),
         None => local.to_string(),
     };
+    // Module paths are semantic binder values. Probe every package prefix so
+    // adding a package or module invalidates this previously external boundary.
+    let mut prefix = import_target;
+    loop {
+        let normalized = brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::ForwardQueryProvider::normalize_rendered_name(py, prefix);
+        for spelling in [prefix, normalized.as_str()] {
+            analyzer.record_read(
+                brokk_bifrost_analysis::analyzer::read_ledger::ReadKey::index(
+                    brokk_bifrost_analysis::analyzer::read_ledger::IndexFamily::PathSymbol,
+                    spelling,
+                ),
+            );
+        }
+        let Some((parent, _)) = prefix.rsplit_once('.') else {
+            break;
+        };
+        prefix = parent;
+    }
     let workspace_internal = python_import_binding_is_workspace_internal(
         py,
         token,
@@ -6978,6 +7023,46 @@ mod bounded_tests {
 
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn unindexed_import_identity_is_a_bounded_content_answer() {
+        let source = "from unavailable.package import ImmutableDict\nvalue = ImmutableDict\n";
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Python)
+            .file("a.py", source)
+            .build();
+        let workspace = project
+            .workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let start = source.rfind("ImmutableDict").unwrap();
+        let (answer, reads) =
+            brokk_bifrost_analysis::analyzer::capture_query_reads(analyzer, || {
+                resolve_value_identity_with_source_outcome(
+                    analyzer,
+                    DefinitionLookupRequest {
+                        file: project.file("a.py"),
+                        line: None,
+                        column: None,
+                        start_byte: Some(start),
+                        end_byte: Some(start + "ImmutableDict".len()),
+                    },
+                    project.file("a.py"),
+                    Arc::from(source),
+                    None,
+                )
+            });
+        assert!(matches!(answer, Ok(None)), "{answer:?}");
+        assert!(reads.is_bounded(), "{reads:?}");
+        for module in ["unavailable.package", "unavailable"] {
+            assert!(
+                reads.keys().contains(&ReadKey::index(
+                    brokk_bifrost_analysis::analyzer::read_ledger::IndexFamily::PathSymbol,
+                    module,
+                )),
+                "missing {module}: {:?}",
+                reads.keys()
+            );
+        }
+    }
 
     #[test]
     #[hardwon(

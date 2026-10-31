@@ -70,7 +70,8 @@ fn provenance_expansions_with_model_key(
         return Vec::new();
     }
     let Some(workspace) = workspace else {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -80,11 +81,12 @@ fn provenance_expansions_with_model_key(
             message: "C/C++ provenance requires a semantic workspace".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
         return Vec::new();
     };
     let Some(semantic) = semantic.as_mut() else {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -94,7 +96,7 @@ fn provenance_expansions_with_model_key(
             message: "C/C++ provenance requires procedure semantics".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
         return Vec::new();
     };
     let rules = if filter.rules.is_empty() {
@@ -110,7 +112,8 @@ fn provenance_expansions_with_model_key(
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 diagnostics.push(super::QueryExecutionState::diagnostic(
                     workspace.analyzer(),
-                    CodeQueryDiagnostic {
+                    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -120,7 +123,7 @@ fn provenance_expansions_with_model_key(
                         message: "C/C++ provenance selection was cancelled".to_string(),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    },
+                    }),
                     Some(DerivationExecutionCause::Cancelled),
                 ));
                 return Vec::new();
@@ -173,7 +176,8 @@ fn report_incomplete(
 ) {
     diagnostics.push(super::QueryExecutionState::diagnostic(
         analyzer,
-        CodeQueryDiagnostic {
+        CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -188,7 +192,7 @@ fn report_incomplete(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        },
+        }),
         CodeQueryDiagnosticCode::from_execution_reason(
             CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             reason.unwrap_or(derivation_reason::UNKNOWN),

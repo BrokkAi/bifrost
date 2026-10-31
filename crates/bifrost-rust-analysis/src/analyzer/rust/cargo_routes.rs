@@ -73,7 +73,9 @@ mod tests {
             .expect("live file identity");
         analyzer
             .analyzer_store()
-            .mark_parsed_blob_incomplete_for_test(oid, "rust");
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "rust",
+            ));
         {
             let scope = AnalyzerQueryScope::new(&analyzer);
             assert!(matches!(

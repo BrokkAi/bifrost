@@ -183,8 +183,7 @@ mod rust_departing_wave2_root_tests {
                         store
                             .admit_cached_selected_content(
                                 owner,
-                                &fixture.host_path,
-                                witness.blob_oid(),
+                                &fixture.host_path,&brokk_bifrost_core::gitblob::BlobKey::unvaried(witness.blob_oid(), (owner).lang.as_str()),
                                 witness.input(),
                                 &CancellationToken::default(),
                             )
@@ -279,8 +278,7 @@ mod rust_departing_wave2_root_tests {
                     store
                         .admit_cached_selected_content(
                             owner,
-                            &fixture.host_path,
-                            witness.blob_oid(),
+                            &fixture.host_path,&brokk_bifrost_core::gitblob::BlobKey::unvaried(witness.blob_oid(), (owner).lang.as_str()),
                             witness.input(),
                             &CancellationToken::default(),
                         )
@@ -317,9 +315,7 @@ mod rust_departing_wave2_root_tests {
                         .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
                         .unwrap();
                     persisted_blob_mutation_cost_fallback_statement(
-                        &mut statement,
-                        &capsule_oid,
-                        &capsule_lang,
+                        &mut statement,&brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::from_str(&capsule_oid).unwrap(), &capsule_lang),
                     )
                     .unwrap()
                 });
@@ -339,7 +335,7 @@ mod rust_departing_wave2_root_tests {
                 loop {
                     let candidate: Option<(String, String, usize)> = store.conn.execute(|conn| {
                         conn.query_row(stale_generation_blob_costs_sql(), [], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                            Ok((row.get(0)?, row.get(1)?, row.get(3)?))
                         })
                         .optional()
                         .unwrap()

@@ -542,6 +542,24 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: bash scripts/public/stage-unix-release-archive.sh "target/${{ matrix.target }}/release/${BIN_NAME}" "${{ matrix.target }}" "$RELEASE_TAG"
+      # npm refused the universal tarball as too large (#8288), so the npm
+      # packages carry one slice each. The universal archive stays a GitHub
+      # asset because the plugin launchers and the policy-scan action select it.
+      - name: Stage macOS per-architecture archives
+        if: matrix.target == 'universal-apple-darwin'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          for slice in x86_64-apple-darwin:x86_64 aarch64-apple-darwin:arm64; do
+            target="${slice%%:*}"
+            archs="$(lipo -archs "target/${target}/release/${BIN_NAME}")"
+            if [[ "$archs" != "${slice#*:}" ]]; then
+              echo "::error::${target} binary has architectures '${archs}', expected '${slice#*:}'"
+              exit 1
+            fi
+            bash scripts/public/stage-unix-release-archive.sh "target/${target}/release/${BIN_NAME}" "$target" "$RELEASE_TAG"
+          done
       - name: Stage Windows archive
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -618,6 +636,9 @@ jobs:
         with:
           shared-key: release-readiness-python-${{ matrix.target }}
           cache-workspace-crates: false
+      # Deflate level 9 keeps the native wheels further under PyPI's 100 MiB
+      # per-file limit (#8288): on the v0.14.3 binaries it saved 3.2 MB on the
+      # CLI wheel and 2.8 MB on searchtools for a few seconds of build time.
       - name: Build Python wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
@@ -625,7 +646,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
-          args: --release --locked --out dist
+          args: --release --locked --out dist --compression-method deflated --compression-level 9
           rust-toolchain: '1.99.1'
       - name: Set up Python for staged wheel smoke
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -708,7 +729,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
-          args: --release --locked --out dist
+          args: --release --locked --out dist --compression-method deflated --compression-level 9
           rust-toolchain: '1.99.1'
           working-directory: packaging/bifrost-cli
       - name: Set up Python for staged CLI wheel smoke
@@ -721,11 +742,16 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
+      # The raw binary deflates to about 95 MB against PyPI's 100 MiB per-file
+      # limit; the wheel ships it xz-compressed behind a launcher (#8288).
+      - name: Compress the CLI wheel's binary
+        shell: bash
+        run: python scripts/public/compress-cli-wheel.py packaging/bifrost-cli/wheelhouse packaging/bifrost-cli/dist/*.whl
       - name: Install and exercise exact CLI wheel
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-        run: python scripts/public/verify-python-wheel.py --wheel-directory packaging/bifrost-cli/dist --kind cli --version "$RELEASE_VERSION"
+        run: python scripts/public/verify-python-wheel.py --wheel-directory packaging/bifrost-cli/wheelhouse --kind cli --version "$RELEASE_VERSION"
       # Under Rosetta an arm64 executable would also run, so the smoke alone
       # does not prove that the packaged macOS binary has the wheel's
       # architecture. pip's platform tag check covers the tag, this the file.
@@ -736,13 +762,12 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.macho_arch }}
         run: |
           unpacked="$(mktemp -d)"
-          wheels=(packaging/bifrost-cli/dist/*.whl)
+          wheels=(packaging/bifrost-cli/wheelhouse/*.whl)
           test "${#wheels[@]}" -eq 1
-          unzip -q "${wheels[0]}" -d "$unpacked"
-          binaries=("$unpacked"/*.data/scripts/bifrost)
-          test "${#binaries[@]}" -eq 1
-          test -f "${binaries[0]}"
-          archs="$(lipo -archs "${binaries[0]}")"
+          unzip -q "${wheels[0]}" brokk_bifrost_cli/bifrost.xz -d "$unpacked"
+          python -I -c 'import lzma, shutil, sys; shutil.copyfileobj(lzma.open(sys.argv[1]), open(sys.argv[2], "wb"))' \
+            "$unpacked/brokk_bifrost_cli/bifrost.xz" "$unpacked/bifrost"
+          archs="$(lipo -archs "$unpacked/bifrost")"
           if [ "$archs" != "$EXPECTED_ARCH" ]; then
             echo "::error::packaged bifrost has architectures '$archs', expected '$EXPECTED_ARCH'"
             exit 1
@@ -751,7 +776,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: cli-wheels-${{ matrix.target }}
-          path: packaging/bifrost-cli/dist/*.whl
+          path: packaging/bifrost-cli/wheelhouse/*.whl
           if-no-files-found: error
           retention-days: 14
 

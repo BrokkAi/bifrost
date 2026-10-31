@@ -304,7 +304,7 @@ pub struct PythonAnalyzer {
     source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
-            git2::Oid,
+            brokk_bifrost_core::gitblob::BlobKey,
             ProjectFile,
         ),
         Arc<brokk_bifrost_python::source_facts::PythonFileSourceFacts>,
@@ -2547,8 +2547,10 @@ impl LanguageSupport for PythonSupport {
         file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         source: &str,
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
-    ) -> Option<brokk_bifrost_analysis::analyzer::usages::get_definition::ResolvedValueIdentity>
-    {
+    ) -> Result<
+        Option<brokk_bifrost_analysis::analyzer::usages::get_definition::ResolvedValueIdentity>,
+        brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause,
+    > {
         crate::analyzer::usages::get_definition::python::definition_value_identity(
             analyzer,
             request,

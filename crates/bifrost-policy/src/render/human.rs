@@ -3867,7 +3867,7 @@ fn write_summary<W: Write>(
         .iter()
         .filter(|review| review.result_omitted())
         .count();
-    write_summary_count(output, scope_result_omitted_count, "scope result omitted")?;
+    write_summary_count(output, scope_result_omitted_count, "omitted scope result")?;
     write_summary_count(output, orphaned_count, "orphaned suppression record")?;
     write_summary_count(
         output,
@@ -3881,7 +3881,7 @@ fn write_summary<W: Write>(
         "policy-hash-drifted suppression review",
     )?;
     write_summary_count(output, unproven_count, "unproven suppression review")?;
-    write_summary_count(output, result_omitted_count, "suppression result omitted")?;
+    write_summary_count(output, result_omitted_count, "omitted suppression result")?;
     if let Some(review) = report.baseline() {
         write!(
             output,
@@ -3904,7 +3904,7 @@ fn write_summary<W: Write>(
         write_summary_count(
             output,
             usize::try_from(review.result_omitted_count()).unwrap_or(usize::MAX),
-            "baseline result omitted",
+            "omitted baseline result",
         )?;
     }
     if let Some(review) = report.diff() {
@@ -4078,8 +4078,15 @@ fn write_count<W: Write>(
     suffix: &str,
 ) -> Result<(), PolicyRenderError> {
     if count > 0 {
-        write!(output, "; {count} {label}{suffix}{}", plural_suffix(count))
-            .map_err(map_io_error)?;
+        let (label, plural) = if count != 1
+            && suffix.is_empty()
+            && let Some(label) = label.strip_suffix(" entry")
+        {
+            (label, " entries")
+        } else {
+            (label, plural_suffix(count))
+        };
+        write!(output, "; {count} {label}{suffix}{plural}").map_err(map_io_error)?;
     }
     Ok(())
 }

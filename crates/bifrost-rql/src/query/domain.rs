@@ -29,15 +29,17 @@ pub enum ConfigurationFormat {
     Json,
     Xml,
     Properties,
+    Hocon,
 }
 
 impl ConfigurationFormat {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Yaml,
         Self::Toml,
         Self::Json,
         Self::Xml,
         Self::Properties,
+        Self::Hocon,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -51,6 +53,7 @@ impl ConfigurationFormat {
             Self::Json => CoreConfigurationFormat::Json,
             Self::Xml => CoreConfigurationFormat::Xml,
             Self::Properties => CoreConfigurationFormat::Properties,
+            Self::Hocon => CoreConfigurationFormat::Hocon,
         }
     }
 
@@ -62,6 +65,7 @@ impl ConfigurationFormat {
             Self::Json => &[],
             Self::Xml => &["config"],
             Self::Properties => &["props", "property"],
+            Self::Hocon => &["conf"],
         }
     }
 
@@ -85,6 +89,7 @@ impl From<CoreConfigurationFormat> for ConfigurationFormat {
             CoreConfigurationFormat::Json => Self::Json,
             CoreConfigurationFormat::Xml => Self::Xml,
             CoreConfigurationFormat::Properties => Self::Properties,
+            CoreConfigurationFormat::Hocon => Self::Hocon,
         }
     }
 }

@@ -240,6 +240,7 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 // #7673: Python module members follow the target module's re-exports under the trial.
 // #7735: binding targets selecting their authored declaration are declaration sites.
 // #5658: proven import declarations classify alias targets and synthetic import reads.
+// #6234: bare Kotlin values bind receiver members before top-level properties.
 // #7509 M3a: Go type answers at declaration names come from the declaration value slot.
 // #3494: closed Ruby member selections discharge their dispatch gaps.
 // #7509 M3a part 2: Go failure-handler binding proofs come from native evidence.
@@ -265,7 +266,48 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 // so units previously unbounded by its refused fills now publish.
 // #7509 G1b-1: Go owners behind incomplete imports lose the legacy G1b completion reason.
 // #8097: assignment-relation flow gaps scope their withheld rows to the procedure's file.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5113-returned-refinement-census-v4-5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry-5721-python-local-import-bases-5738-intrinsic-root-evidence-5745-python-runtime-class-binding-5751-python-class-object-aliases-5812-iteration-value-origins-5113-reference-inventory-ownership-5920-performed-source-lane-5964-comparison-chain-demand-proof-7186-compact-constructor-bindings-7289-field-initializer-reads-7150-go-call-result-counts-7219-rust-concrete-receiver-closed-7183-unproven-family-dispatch-7179-incomplete-family-edges-and-coverage-2445-root-allotment-4365-javadoc-tag-anchors-7379-dereference-store-operations-7344-7345-csharp-compound-writes-5658-single-writer-identity-5658-structural-module-mutations-7373-csharp-contextual-keyword-binders-5658-python-attribute-space-owners-5658-python-argument-independent-calls-7371-nonlocal-branch-distinction-7372-initializer-body-relations-7179-java-unread-ancestors-4365-shared-statement-facts-7107-content-diagnostic-units-7220-php-terminal-case-fold-rust-deref-receiver-steps-7226-7464-csharp-incoming-overload-partition-7368-7369-csharp-equals-argument-identity-7150-open-member-calls-7340-live-region-overwrite-veto-7520-go-interface-dispatch-references-5658-python-global-writer-identity-5658-python-native-member-targets-7548-configuration-skips-bifrost-dir-analysis-quicksilver-round12-boolean-contexts-binder-spans-7202-classified-summary-identity-7547-java-string-literal-values-analysis-quicksilver-round12-fact-analyzers-7471-go-short-var-redeclaration-7386-conditional-compilation-regions-7341-7342-go-remainder-comma-ok-7617-go-direct-type-shapes-7343-go-static-type-failure-branches-7393-unproven-nonempty-failure-branches-7470-go-visible-binding-shapes-7616-go-modeled-package-result-unknown-analysis-quicksilver-round12-config-lookup-7518-go-undecided-receiver-candidates-7578-branch-conditioned-sanitizers-7618-java-creation-receiver-site-7560-csharp-row-backed-models-7348-7349-7369-java-compound-static-patterns-4379-m3b-csharp-statement-facts-7642-witness-budget-incomplete-5658-python-unplaced-file-references-7516-go-constructor-shadow-7673-python-qualified-module-members-7619-java-implicit-external-inherited-calls-7620-java-wildcard-sibling-applicability-7578-java-observed-value-type-7578-guard-writer-reachability-7735-binder-declaration-sites-5658-python-import-occurrence-kinds-7781-synthetic-members-completeness-7509-go-declaration-value-types-7755-refused-alternative-before-budget-3494-ruby-member-closure-7789-indexed-import-destinations-7817-external-supertype-kind-7849-java-external-owner-observed-type-7509-go-native-binding-proofs-2445-m4a-workspace-facts-qs13-flow-go-no-return-method-expressions-7350-nonbinding-rhs-distinct-qs13-flow-summary-payload-accounting-qs13-flow-typestate-byte-accounting-7918-go-field-selector-addressability-7536-initialization-retained-gaps-7915-flow-slot-identity-7508-csharp-conditional-branch-conversions-7803-external-field-value-types-2445-m4b-property-gaps-qs13-flow-store-error-kind-context-qs13-flow-taint-composition-quality-7779-exact-selection-owner-inventory-qs13-flow-call-transfer-canonical-order-7972-go-cross-file-global-self-assignment-7509-go-model-authority-7755-dead-value-liveness-7868-closure-open-relations-7876-query-incompleteness-scope-7509-go-relative-source-imports-qs13-flow-value-flow-survivors-7351-go-error-method-set-proof-7886-nested-budget-stop-propagation-qs13-flow-field-slot-source-kinds-8036-go-native-external-callee-identity-qs13-rql-pending-cleanup-nested-scope-qs13-rql-python-loop-exit-and-docstring-blocks-7968-go-satisfaction-membership-8108-java-inventory-stable-replay-qs13-rql-configuration-property-ancestor-7509-g1b-incomplete-import-owner-8097-assignment-flow-gap-scope";
+// #3800: Python module-global reads are static loads, and fields on static loads are property subjects.
+// #7362: query obligations ride beside binding certainty and reach unit diagnostics.
+// #7505: member-family and candidate member ids carry canonical overload discriminators; family-derived finding ids rotate once.
+// #7187: JVM lexical type formals and static-context barriers change binding queries.
+// #4379 M6: C# cs/static-array follows CodeQL's definition test.
+// #8146: boolean patterns evaluate role targets that have no normalized kind.
+// #4379: C# nested-if and misleading-indentation query-local statement facts.
+// #2445: typed diagnostic causes admit content-only partial evaluation units.
+// #8148: authority inputs key binary file bytes without source decoding.
+// #6664: failed descendant reads are incomplete, not cancelled or empty.
+// #4379: C# rethrows publish throw anchors and unwrap parenthesized operands.
+// #8153: overloads of one owner do not prove a call target.
+// #8000: on-demand JVM imports bind provider-indexed external types.
+// Quicksilver round 13: RQL conditional-wrapper answers key on remaining depth, and ambiguous modeled
+// Rust owners propagate, so both fixed points no longer depend on visit order.
+// #7509 G1b-2: modeled Go callable results are typed natively, without the legacy reason.
+// #7391: Go type assertion results change receiver binding and usage answers.
+// #7153: C++ guarded field definition answers change policy inputs.
+// #6945: curated Python star children change module and call bindings.
+// #8154: recursive empty-arm answers depend on uncertain statements and omissions.
+// #7424: old Java enum-switch units can claim a clean negative without reading the enum file.
+// #7577: Scala cast expression types change call applicability and bindings.
+// #8242: taint endpoint supersedes edges reduce same-point, same-phase, same-carrier
+// endpoints before events are minted.
+// Quicksilver round 13: same-project configuration joins match file-valued code rows, and a selected-property
+// budget, cancellation or provider cut marks its unit instead of being admitted as content.
+// #7240: imported constructor receiver proofs change usage and reverse answers.
+// Quicksilver round 13: only the global CException is the MFC root, C++ bases resolve through the shared
+// resolver, printf literals keep their width and floating kind, XML attributes compare as a set, and Rust
+// marker bindings follow block and module scope.
+// #8262: missing model hierarchy endpoints withhold authoritative absence.
+// #8264: predeclared Go modeled result types change receiver, value and binding answers.
+// #7509 G1b-3 B: Go result-contract field classification for promoted fields stays open.
+// #8147 M4a applies preprocessor decisions to C# syntax and resolution facts.
+// #8290: a repeated read through one forward operation keeps the closed root's closure discharges, so warm answers change.
+// #2445: stable Python result-obligation, return-profile and hierarchy gaps are content, not provider stops.
+// #7314 C1-4b: the C# native demand trial answers definitions and names external misses.
+// Quicksilver round 13: Python rule facts recognize __ne__ delegation, receiver stores, explicit super
+// classes, loop kinds and main guards correctly; builtin format, copy.deepcopy, mutable-default
+// emptiness, qualified bases and range aliases follow Python semantics; a receiver-read gap is a reason.
+// #7509 G1b-3 B follow-up: Go pointer-field proofs no longer require a public pointee owner.
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5113-returned-refinement-census-v4-5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry-5721-python-local-import-bases-5738-intrinsic-root-evidence-5745-python-runtime-class-binding-5751-python-class-object-aliases-5812-iteration-value-origins-5113-reference-inventory-ownership-5920-performed-source-lane-5964-comparison-chain-demand-proof-7186-compact-constructor-bindings-7289-field-initializer-reads-7150-go-call-result-counts-7219-rust-concrete-receiver-closed-7183-unproven-family-dispatch-7179-incomplete-family-edges-and-coverage-2445-root-allotment-4365-javadoc-tag-anchors-7379-dereference-store-operations-7344-7345-csharp-compound-writes-5658-single-writer-identity-5658-structural-module-mutations-7373-csharp-contextual-keyword-binders-5658-python-attribute-space-owners-5658-python-argument-independent-calls-7371-nonlocal-branch-distinction-7372-initializer-body-relations-7179-java-unread-ancestors-4365-shared-statement-facts-7107-content-diagnostic-units-7220-php-terminal-case-fold-rust-deref-receiver-steps-7226-7464-csharp-incoming-overload-partition-7368-7369-csharp-equals-argument-identity-7150-open-member-calls-7340-live-region-overwrite-veto-7520-go-interface-dispatch-references-5658-python-global-writer-identity-5658-python-native-member-targets-7548-configuration-skips-bifrost-dir-analysis-quicksilver-round12-boolean-contexts-binder-spans-7202-classified-summary-identity-7547-java-string-literal-values-analysis-quicksilver-round12-fact-analyzers-7471-go-short-var-redeclaration-7386-conditional-compilation-regions-7341-7342-go-remainder-comma-ok-7617-go-direct-type-shapes-7343-go-static-type-failure-branches-7393-unproven-nonempty-failure-branches-7470-go-visible-binding-shapes-7616-go-modeled-package-result-unknown-analysis-quicksilver-round12-config-lookup-7518-go-undecided-receiver-candidates-7578-branch-conditioned-sanitizers-7618-java-creation-receiver-site-7560-csharp-row-backed-models-7348-7349-7369-java-compound-static-patterns-4379-m3b-csharp-statement-facts-7642-witness-budget-incomplete-5658-python-unplaced-file-references-7516-go-constructor-shadow-7673-python-qualified-module-members-7619-java-implicit-external-inherited-calls-7620-java-wildcard-sibling-applicability-7578-java-observed-value-type-7578-guard-writer-reachability-7735-binder-declaration-sites-5658-python-import-occurrence-kinds-7781-synthetic-members-completeness-7509-go-declaration-value-types-7755-refused-alternative-before-budget-3494-ruby-member-closure-7789-indexed-import-destinations-7817-external-supertype-kind-7849-java-external-owner-observed-type-7509-go-native-binding-proofs-2445-m4a-workspace-facts-qs13-flow-go-no-return-method-expressions-7350-nonbinding-rhs-distinct-qs13-flow-summary-payload-accounting-qs13-flow-typestate-byte-accounting-7918-go-field-selector-addressability-7536-initialization-retained-gaps-7915-flow-slot-identity-7508-csharp-conditional-branch-conversions-7803-external-field-value-types-2445-m4b-property-gaps-qs13-flow-store-error-kind-context-qs13-flow-taint-composition-quality-7779-exact-selection-owner-inventory-qs13-flow-call-transfer-canonical-order-7972-go-cross-file-global-self-assignment-7509-go-model-authority-7755-dead-value-liveness-7868-closure-open-relations-7876-query-incompleteness-scope-7509-go-relative-source-imports-qs13-flow-value-flow-survivors-7351-go-error-method-set-proof-7886-nested-budget-stop-propagation-qs13-flow-field-slot-source-kinds-8036-go-native-external-callee-identity-qs13-rql-pending-cleanup-nested-scope-qs13-rql-python-loop-exit-and-docstring-blocks-7968-go-satisfaction-membership-8108-java-inventory-stable-replay-qs13-rql-configuration-property-ancestor-7509-g1b-incomplete-import-owner-8097-assignment-flow-gap-scope-3800-static-rooted-property-bases-7362-query-obligation-ledger-7505-member-ids-carry-signature-7187-jvm-type-parameter-bindings-4379-m6-csharp-static-array-definitions-8146-boolean-patterns-unkinded-targets-4379-m6-csharp-nested-if-misleading-indentation-2445-content-partial-diagnostics-8148-binary-authority-inputs-6664-incomplete-descendant-queries-4379-m6-csharp-rethrow-throw-sites-8153-ambiguous-binding-no-proven-target-8000-jvm-on-demand-external-candidates-qs13-rql-order-independent-fixed-points-7509-g1b-callable-result-slots-7391-go-type-assertion-receivers-7153-cpp-field-guard-definitions-6945-curated-star-child-binding-8154-recursive-empty-arm-statements-7424-java-enum-switch-proof-7577-scala-cast-expression-types-8242-taint-endpoint-dominance-qs13-rql-file-joins-and-selected-property-admission-7240-imported-constructor-receivers-6234-kotlin-implicit-receiver-values-qs13-rql-source-and-language-survivors-8262-model-hierarchy-missing-endpoint-8264-go-predeclared-result-types-7509-g1b3-pointer-result-field-8147-m4a-csharp-preprocessor-decisions-8290-warm-closure-discharges-2445-content-cause-precision-7314-c1-4b-csharp-native-demand-qs13-rql-python-search-survivors-7509-b-unexported-pointee-owner";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {
@@ -1017,15 +1059,6 @@ impl InMemoryPolicyUnitStore {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// How many units this store holds.
-    pub fn len(&self) -> usize {
-        self.units.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.units.is_empty()
-    }
 }
 
 impl PolicyUnitStore for InMemoryPolicyUnitStore {
@@ -1737,6 +1770,20 @@ impl<'a> PolicyIncrementalContext<'a> {
             .copied()
     }
 
+    /// Read this attempt's provisional product without publishing it.
+    pub(crate) fn staged_unit(
+        &self,
+        policy_id: &PolicyId,
+        key: &PolicyUnitKey,
+    ) -> Option<PolicyUnit> {
+        self.staged
+            .lock()
+            .expect("policy incremental staged units mutex poisoned")
+            .get(policy_id)
+            .and_then(|units| units.get(key))
+            .cloned()
+    }
+
     /// Keep one recomputed unit provisional until its policy succeeds.
     pub(crate) fn stage_unit(&self, policy_id: PolicyId, unit: PolicyUnit) {
         let mut staged = self
@@ -2102,20 +2149,6 @@ impl PolicyIncrementalReview {
         }
     }
 
-    /// How many units the base evaluation in this run reused.
-    pub fn reused_base_units(&self) -> u64 {
-        self.policies
-            .iter()
-            .fold(0, |total, run| total.saturating_add(run.base_units_reused))
-    }
-
-    /// How many units the base evaluation in this run recomputed.
-    pub fn recomputed_base_units(&self) -> u64 {
-        self.policies.iter().fold(0, |total, run| {
-            total.saturating_add(run.base_units_recomputed)
-        })
-    }
-
     pub fn policies(&self) -> &[PolicyIncrementalRun] {
         &self.policies
     }
@@ -2156,6 +2189,10 @@ mod tests {
         );
         let policy = registry.policies().next().unwrap();
         for component in [
+            "-7577-scala-cast-expression-types",
+            "-7187-jvm-type-parameter-bindings",
+            "-2445-content-cause-precision",
+            "-2445-content-partial-diagnostics",
             "-7886-nested-budget-stop-propagation",
             "-5511-python-modeled-runtime-ancestry",
             "-5721-python-local-import-bases",
@@ -2251,6 +2288,36 @@ mod tests {
             "-qs13-rql-configuration-property-ancestor",
             "-7509-g1b-incomplete-import-owner",
             "-8097-assignment-flow-gap-scope",
+            "-3800-static-rooted-property-bases",
+            "-7362-query-obligation-ledger",
+            "-7505-member-ids-carry-signature",
+            "-4379-m6-csharp-static-array-definitions",
+            "-8146-boolean-patterns-unkinded-targets",
+            "-4379-m6-csharp-nested-if-misleading-indentation",
+            "-8148-binary-authority-inputs",
+            "-6664-incomplete-descendant-queries",
+            "-4379-m6-csharp-rethrow-throw-sites",
+            "-8153-ambiguous-binding-no-proven-target",
+            "-8000-jvm-on-demand-external-candidates",
+            "-qs13-rql-order-independent-fixed-points",
+            "-7509-g1b-callable-result-slots",
+            "-7153-cpp-field-guard-definitions",
+            "-6945-curated-star-child-binding",
+            "-8154-recursive-empty-arm-statements",
+            "-7424-java-enum-switch-proof",
+            "-8242-taint-endpoint-dominance",
+            "-qs13-rql-file-joins-and-selected-property-admission",
+            "-7240-imported-constructor-receivers",
+            "-6234-kotlin-implicit-receiver-values",
+            "-qs13-rql-source-and-language-survivors",
+            "-8262-model-hierarchy-missing-endpoint",
+            "-8264-go-predeclared-result-types",
+            "-7509-g1b3-pointer-result-field",
+            "-8147-m4a-csharp-preprocessor-decisions",
+            "-8290-warm-closure-discharges",
+            "-7314-c1-4b-csharp-native-demand",
+            "-qs13-rql-python-search-survivors",
+            "-7509-b-unexported-pointee-owner",
         ] {
             assert_eq!(POLICY_SUBSTRATE_EPOCH.matches(component).count(), 1);
             let old_substrate = POLICY_SUBSTRATE_EPOCH.replacen(component, "", 1);

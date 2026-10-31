@@ -18,8 +18,6 @@ pub mod callable_values;
 pub mod catalog;
 #[doc(hidden)]
 pub mod compiler;
-#[doc(hidden)]
-pub mod conversion;
 pub mod csmi;
 #[doc(hidden)]
 pub mod deferred_runtime;

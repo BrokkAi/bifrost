@@ -107,6 +107,8 @@ pub fn build_ruby_semantic_facts(ruby: &dyn RubySource) -> RubySemanticFacts {
     {
         let direct = ruby
             .get_direct_ancestors(&unit)
+            .definite()
+            .to_vec()
             .into_iter()
             .map(|ancestor| ancestor.fq_name())
             .collect();

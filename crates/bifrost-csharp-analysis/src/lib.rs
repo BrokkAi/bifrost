@@ -22,6 +22,7 @@ pub mod analyzer {
     }
 }
 
+pub use analyzer::csharp::dependency_evidence;
 pub use analyzer::csharp::external::{
     CSharpAssemblyPackProducer, CSharpDependencyPackAdapter, CSharpExternalDeclarationIndex,
     CSharpExternalDeclarationSource, CSharpExternalMember, CSharpExternalMemberKind,
@@ -29,8 +30,9 @@ pub use analyzer::csharp::external::{
     resolve_csharp_semantic_pack_dependencies,
 };
 pub use analyzer::csharp::{
-    CSharpAdapter, CSharpAnalyzer, CSharpCatchFacts, CSharpCatchTypeRelation, CSharpSupport,
-    csharp_catch_facts,
+    CSharpAdapter, CSharpAnalyzer, CSharpAttributeTypeResolution, CSharpAttributeTypeStatus,
+    CSharpCatchFacts, CSharpCatchTypeRelation, CSharpSupport, csharp_catch_facts,
+    resolve_csharp_attribute_type,
 };
 pub use analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
 #[cfg(test)]

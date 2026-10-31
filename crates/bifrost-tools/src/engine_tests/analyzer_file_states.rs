@@ -544,7 +544,9 @@ fn retryable_parse_complete_state_reparses_retained_source_and_publishes() {
         analyzer
             .store_context
             .store
-            .contains_parsed_blob(key.oid, "java")
+            .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                key.oid, "java"
+            ))
             .expect("check retried publication")
     );
 }

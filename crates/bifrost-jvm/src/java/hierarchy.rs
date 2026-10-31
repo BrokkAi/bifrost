@@ -165,7 +165,11 @@ pub fn java_nearest_declaring_ancestors(
     mut declares: impl FnMut(&CodeUnit) -> Result<bool, JavaHierarchyFactError>,
 ) -> Result<Option<Vec<CodeUnit>>, JavaHierarchyFactError> {
     let mut seen = HashSet::from_iter([owner.clone()]);
-    let mut level = provider.get_direct_ancestors(owner);
+    let answer = provider.get_direct_ancestors(owner);
+    if !answer.is_complete() {
+        return Err(JavaHierarchyFactError::MetadataUnavailable);
+    }
+    let mut level = answer.edges;
     while !level.is_empty() {
         let mut declaring_owners = Vec::new();
         let mut next_level = Vec::new();
@@ -176,7 +180,11 @@ pub fn java_nearest_declaring_ancestors(
             if declares(&ancestor)? {
                 declaring_owners.push(ancestor.clone());
             }
-            next_level.extend(provider.get_direct_ancestors(&ancestor));
+            let answer = provider.get_direct_ancestors(&ancestor);
+            if !answer.is_complete() {
+                return Err(JavaHierarchyFactError::MetadataUnavailable);
+            }
+            next_level.extend(answer.edges);
         }
         if !declaring_owners.is_empty() {
             return java_preferred_declaring_owners(source, &declaring_owners).map(Some);

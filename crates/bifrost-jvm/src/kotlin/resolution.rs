@@ -84,7 +84,21 @@ impl KotlinJvmAnnotationProofs {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             if node.kind() == "import_header" {
-                let path = kotlin_import_header_segments(node)
+                if crate::recovered_name(node, source) {
+                    continue;
+                }
+                let segments = kotlin_import_header_segments(node);
+                let alias = first_named_child_of_kind(node, "import_alias")
+                    .and_then(|alias| first_named_child_of_kind(alias, "type_identifier"));
+                if segments
+                    .iter()
+                    .copied()
+                    .chain(alias)
+                    .any(|name| crate::recovered_name(name, source))
+                {
+                    continue;
+                }
+                let path = segments
                     .into_iter()
                     .map(|segment| kotlin_identifier_text(segment, source).to_owned())
                     .collect::<Vec<_>>();
@@ -114,6 +128,9 @@ impl KotlinJvmAnnotationProofs {
                 "class_declaration" | "object_declaration" | "companion_object" | "type_alias"
             ) && let Some(name) = first_named_child_of_kind(node, "type_identifier")
             {
+                if crate::recovered_name(name, source) {
+                    continue;
+                }
                 let name = kotlin_identifier_text(name, source).to_owned();
                 proofs.declared_types.insert(name.clone());
                 if node.kind() == "class_declaration" && kotlin_has_modifier(node, "value") {
@@ -126,9 +143,19 @@ impl KotlinJvmAnnotationProofs {
     }
 
     fn annotation_denotes(&self, annotation: Node<'_>, expected: &[&str], source: &str) -> bool {
+        if crate::recovered_name(annotation, source) {
+            return false;
+        }
         let expected_path = expected.join(".");
         for user_type in annotation_user_types(annotation) {
-            let segments = kotlin_user_type_segments(user_type)
+            let names = kotlin_user_type_segments(user_type);
+            if names
+                .iter()
+                .any(|name| crate::recovered_name(*name, source))
+            {
+                continue;
+            }
+            let segments = names
                 .into_iter()
                 .map(|segment| kotlin_identifier_text(segment, source))
                 .collect::<Vec<_>>();
@@ -312,6 +339,24 @@ impl<'source, 'collector, 'declarations>
             },
         )];
         while let Some((node, mut context)) = stack.pop() {
+            // Consumers read immediate names before the walk reaches those names.
+            // Reject recovered name carriers at that boundary, preserving siblings.
+            if node.is_error()
+                || node.is_missing()
+                || named_children(node).iter().any(|child| {
+                    matches!(
+                        child.kind(),
+                        "simple_identifier" | "type_identifier" | "navigation_suffix"
+                    ) && crate::recovered_name(*child, self.source)
+                })
+            {
+                let site = self.add_site(node, ResolutionSiteKind::UnsupportedRoute, context.scope);
+                self.facts.gaps.push(ResolutionGapFact::new(
+                    site,
+                    ResolutionGapKind::MalformedSyntax,
+                ));
+                continue;
+            }
             if node.kind() == "delegation_specifier"
                 && node
                     .parent()
@@ -782,6 +827,7 @@ impl<'source, 'collector, 'declarations>
             placement_gap_site: placement,
         });
         if let Some(header) = first_named_child_of_kind(root, "package_header")
+            && !header.has_error()
             && let Some(path) = first_named_child_of_kind(header, "identifier")
         {
             for (ordinal, segment) in named_children(path)
@@ -819,6 +865,14 @@ impl<'source, 'collector, 'declarations>
     }
 
     fn record_import(&mut self, node: Node<'_>, scope: ResolutionScopeId) {
+        if node.is_missing() || node.has_error() {
+            let site = self.add_site(node, ResolutionSiteKind::ImportDeclaration, scope);
+            self.facts.gaps.push(ResolutionGapFact::new(
+                site,
+                ResolutionGapKind::MalformedSyntax,
+            ));
+            return;
+        }
         let Some(import) = super::imports::kotlin_import_info_from_node(node, self.source) else {
             return;
         };
@@ -1119,6 +1173,13 @@ impl<'source, 'collector, 'declarations>
                     .iter()
                     .filter_map(|parameter| {
                         let name = first_named_child_of_kind(*parameter, "simple_identifier")?;
+                        if crate::recovered_name(name, self.source) {
+                            self.facts.gaps.push(ResolutionGapFact::new(
+                                owner,
+                                ResolutionGapKind::MalformedSyntax,
+                            ));
+                            return None;
+                        }
                         Some(SyntheticParameter {
                             name: kotlin_identifier_text(name, self.source),
                             source: Some(*parameter),
@@ -2008,6 +2069,20 @@ impl<'source, 'collector, 'declarations>
         if segments.is_empty() {
             return None;
         }
+        if segments.iter().any(|segment| {
+            segment.is_missing()
+                || segment.has_error()
+                || kotlin_identifier_text(*segment, self.source).is_empty()
+        }) {
+            let site = self.add_site(node, ResolutionSiteKind::TypeReference, context.scope);
+            let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+            self.facts.gaps.push(ResolutionGapFact::new(
+                site,
+                ResolutionGapKind::MalformedSyntax,
+            ));
+            self.type_slots_by_node.insert(node.id(), slot);
+            return Some(slot);
+        }
         let arguments = segments
             .last()
             .and_then(|segment| segment.next_named_sibling())
@@ -2153,8 +2228,14 @@ impl<'source, 'collector, 'declarations>
                 let site = self.add_site(node, ResolutionSiteKind::TypeReference, scope);
                 let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
                 self.type_slots_by_node.insert(node.id(), slot);
-                let arity = u32::try_from(kotlin_function_type_arity(node))
-                    .expect("Kotlin function type arity fits u32");
+                let Some(arity) = kotlin_function_type_arity(node) else {
+                    self.facts.gaps.push(ResolutionGapFact::new(
+                        site,
+                        ResolutionGapKind::UnsupportedTypeSyntax,
+                    ));
+                    break slot;
+                };
+                let arity = u32::try_from(arity).expect("Kotlin function type arity fits u32");
                 self.pending_applied_types.push((slot, node, scope, owner));
                 let function_name = self.intern_name(&format!("kotlin.Function{arity}"));
                 self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
@@ -2194,7 +2275,10 @@ impl<'source, 'collector, 'declarations>
     fn finish_applied_type_arguments(&mut self) {
         while let Some((owner, function, scope, declaration)) = self.pending_applied_types.pop() {
             let types = if function.kind() == "function_type" {
-                let (mut types, result) = kotlin_function_type_parts(function);
+                let Some((mut types, result)) = kotlin_function_type_parts(function) else {
+                    // Only recognized function shapes are queued by ensure_type_slot.
+                    unreachable!("queued Kotlin function type has recognized parts");
+                };
                 types.push(result);
                 types
             } else {
@@ -3992,6 +4076,13 @@ impl<'source, 'collector, 'declarations>
             } else {
                 callee
             };
+            if crate::recovered_name(callee_name, self.source) {
+                self.facts.gaps.push(ResolutionGapFact::new(
+                    call_site,
+                    ResolutionGapKind::MalformedSyntax,
+                ));
+                continue;
+            }
             let callee_site = self
                 .sites_by_node
                 .get(&callee_name.id())
@@ -4131,6 +4222,13 @@ impl<'source, 'collector, 'declarations>
                         .first()
                         .copied()
                         .filter(|first| kotlin_named_argument_label(argument, *first));
+                    if label_node.is_some_and(|label| crate::recovered_name(label, self.source)) {
+                        self.facts.gaps.push(ResolutionGapFact::new(
+                            call_site,
+                            ResolutionGapKind::MalformedSyntax,
+                        ));
+                        continue;
+                    }
                     let value_node = children
                         .last()
                         .copied()
@@ -4201,6 +4299,13 @@ impl<'source, 'collector, 'declarations>
         // bounds, without changing the canonical AST node-to-site mapping.
         for (name_node, target, scope) in std::mem::take(&mut self.pending_constructor_aliases) {
             let alias = self.add_site(name_node, ResolutionSiteKind::AliasBinding, scope);
+            if crate::recovered_name(name_node, self.source) {
+                self.facts.gaps.push(ResolutionGapFact::new(
+                    alias,
+                    ResolutionGapKind::MalformedSyntax,
+                ));
+                continue;
+            }
             let name = self.intern_name(kotlin_identifier_text(name_node, self.source));
             self.facts.identifiers.push(PositionedIdentifierFact {
                 site: alias,
@@ -4670,7 +4775,10 @@ fn annotation_has_simple_name(annotation: Node<'_>, expected: &str, source: &str
         .any(|user_type| {
             kotlin_user_type_segments(user_type)
                 .last()
-                .is_some_and(|segment| kotlin_identifier_text(*segment, source) == expected)
+                .is_some_and(|segment| {
+                    !crate::recovered_name(*segment, source)
+                        && kotlin_identifier_text(*segment, source) == expected
+                })
         })
 }
 
@@ -4726,38 +4834,40 @@ fn callable_parameter_nodes(callable: Node<'_>) -> Vec<Node<'_>> {
         .unwrap_or_default()
 }
 
-fn kotlin_function_type_parts(node: Node<'_>) -> (Vec<Node<'_>>, Node<'_>) {
+fn kotlin_function_type_parts(node: Node<'_>) -> Option<(Vec<Node<'_>>, Node<'_>)> {
     assert_eq!(node.kind(), "function_type");
     let is_type = |node: &Node<'_>| {
-        KOTLIN_TYPE_NODE_KINDS.contains(&node.kind()) || node.kind() == "user_type"
+        // `dynamic` is an anonymous grammar token, including in function results.
+        KOTLIN_TYPE_NODE_KINDS.contains(&node.kind()) || node.kind() == "dynamic"
     };
     let mut inputs = node
         .child_by_field_name("receiver")
         .into_iter()
         .collect::<Vec<_>>();
     if let Some(parameters) = first_named_child_of_kind(node, "function_type_parameters") {
-        inputs.extend(
-            named_children(parameters)
-                .into_iter()
-                .filter_map(|parameter| {
-                    if parameter.kind() == "parameter" {
-                        named_children(parameter).into_iter().find(&is_type)
-                    } else {
-                        is_type(&parameter).then_some(parameter)
-                    }
-                }),
-        );
+        let mut cursor = parameters.walk();
+        inputs.extend(parameters.children(&mut cursor).filter_map(|parameter| {
+            if parameter.kind() == "parameter" {
+                let mut cursor = parameter.walk();
+                parameter.children(&mut cursor).find(&is_type)
+            } else {
+                is_type(&parameter).then_some(parameter)
+            }
+        }));
     }
-    let result = named_children(node)
-        .into_iter()
-        .rev()
-        .find(is_type)
-        .expect("a function type has a result");
-    (inputs, result)
+    // The grammar has no result field. Select a type after the arrow so a
+    // recovered receiver or parameter cannot masquerade as the result.
+    let mut cursor = node.walk();
+    let result = node
+        .children(&mut cursor)
+        .skip_while(|child| child.kind() != "->")
+        .skip(1)
+        .find(|child| is_type(child) && !child.has_error() && !child.is_missing())?;
+    Some((inputs, result))
 }
 
-fn kotlin_function_type_arity(node: Node<'_>) -> usize {
-    kotlin_function_type_parts(node).0.len()
+fn kotlin_function_type_arity(node: Node<'_>) -> Option<usize> {
+    kotlin_function_type_parts(node).map(|(inputs, _)| inputs.len())
 }
 
 fn kotlin_lambda_parameter_count(lambda: Node<'_>, source: &str) -> Option<usize> {

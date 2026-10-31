@@ -9,7 +9,6 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
 
 use brokk_bifrost_core::hash::HashMap;
-use git2::Oid;
 use std::sync::Arc;
 
 pub(crate) trait ScalaSourceFacts {
@@ -17,7 +16,11 @@ pub(crate) trait ScalaSourceFacts {
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>>;
@@ -28,12 +31,21 @@ impl ScalaSourceFacts for TreeSitterAnalyzer<ScalaAdapter> {
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
+            (
+                GenerationId,
+                brokk_bifrost_core::gitblob::BlobKey,
+                ProjectFile,
+            ),
             Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>,
         >,
     ) -> Option<Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>> {
         let reader = self.canonical_source_read(file, "scala")?;
-        let cache_key = reader.cache_key();
+        let (generation, oid, cache_file) = reader.cache_key();
+        let cache_key = (
+            generation,
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "scala"),
+            cache_file,
+        );
         reader.record_read_key();
         if let Some(facts) = cache.get(&cache_key) {
             return Some(facts);

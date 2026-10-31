@@ -1138,8 +1138,7 @@ mod jvm_extraction_tests {
                 &JavaAdapter,
             );
             let prepared = AnalyzerStore::prepare_parsed_blob(
-                persisted_oid(),
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(persisted_oid(), "java"),
                 generation,
                 &JavaAdapter,
                 state,
@@ -1205,8 +1204,7 @@ mod jvm_extraction_tests {
             let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                 .expect("hash actual Java fixture content");
             let prepared = AnalyzerStore::prepare_parsed_blob(
-                oid,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                 self.generation,
                 &JavaAdapter,
                 state,
@@ -1252,9 +1250,15 @@ mod jvm_extraction_tests {
                 .admit_cached_selected_content(
                     &self.snapshots["java"],
                     path,
-                    persisted_oid(),
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        persisted_oid(),
+                        self.snapshots["java"].lang.as_str(),
+                    ),
                     &ResolutionContentInput::Parsed {
-                        content_oid: persisted_oid(),
+                        key: brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                            persisted_oid(),
+                            "java",
+                        ),
                         semantic_language: Language::Java,
                     },
                     &CancellationToken::default(),

@@ -98,7 +98,8 @@ impl MaterializationTraversalCache {
                 if !self.reported_axes.insert((language, *axis)) {
                     continue;
                 }
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code,
@@ -112,13 +113,14 @@ impl MaterializationTraversalCache {
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
                 continue;
             }
             if !self.reported.insert((file.clone(), code)) {
                 continue;
             }
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                 related: Vec::new(),
                 source: None,
                 code,
@@ -137,7 +139,7 @@ impl MaterializationTraversalCache {
                 ),
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
     }
 }

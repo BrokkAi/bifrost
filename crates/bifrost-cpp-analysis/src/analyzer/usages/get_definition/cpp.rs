@@ -885,7 +885,14 @@ pub fn resolve_cpp<'a>(
             }
             let candidates = cpp_visible_value_candidates(ctx, token, type_node, text);
             if !candidates.is_empty() {
-                return candidates_outcome(candidates);
+                return cpp_guarded_field_candidates_outcome(
+                    ctx.analyzer,
+                    token,
+                    ctx.visibility,
+                    ctx.file,
+                    type_node,
+                    candidates,
+                );
             }
         }
         return outcome;
@@ -1137,7 +1144,14 @@ pub fn resolve_cpp<'a>(
             }
             let candidates = cpp_visible_value_candidates(ctx, token, identifier, text);
             if !candidates.is_empty() {
-                return candidates_outcome(candidates);
+                return cpp_guarded_field_candidates_outcome(
+                    ctx.analyzer,
+                    token,
+                    ctx.visibility,
+                    ctx.file,
+                    identifier,
+                    candidates,
+                );
             }
             // A function used as a value (`pthread_create(..., worker, ...)`,
             // an initializer, or an assignment RHS) is an Identifier, not a
@@ -3605,7 +3619,9 @@ fn resolve_cpp_type(
             &text,
         );
         if !candidates.is_empty() {
-            return candidates_outcome(candidates);
+            return cpp_guarded_field_candidates_outcome(
+                analyzer, token, visibility, file, node, candidates,
+            );
         }
     }
     // A template-id used as the scope of a qualified access denotes the
@@ -5480,7 +5496,10 @@ fn cpp_focused_type_enclosing_class_tiers(
         };
         let mut seen = HashSet::default();
         seen.insert(lexical_owner.clone());
-        let mut frontier = hierarchy.get_direct_ancestors(&lexical_owner);
+        let mut frontier = hierarchy
+            .get_direct_ancestors(&lexical_owner)
+            .definite()
+            .to_vec();
         loop {
             frontier.retain(|base| seen.insert(base.clone()));
             sort_units(&mut frontier);
@@ -5490,7 +5509,7 @@ fn cpp_focused_type_enclosing_class_tiers(
             }
             let next = frontier
                 .iter()
-                .flat_map(|base| hierarchy.get_direct_ancestors(base))
+                .flat_map(|base| hierarchy.get_direct_ancestors(base).definite().to_vec())
                 .collect();
             tiers.push(frontier);
             frontier = next;
@@ -7117,7 +7136,14 @@ fn resolve_cpp_construction_type(
                     }
                 };
             }
-            return candidates_outcome(member_candidates);
+            return cpp_guarded_field_candidates_outcome(
+                ctx.analyzer,
+                token,
+                ctx.visibility,
+                ctx.file,
+                type_node,
+                member_candidates,
+            );
         }
         if let Some(unit) = resolve_in_enclosing_scopes(
             ctx.analyzer,
@@ -7355,9 +7381,48 @@ fn resolve_cpp_field(
         if arity.is_some() {
             cpp_callable_candidates_outcome(candidates)
         } else {
-            candidates_outcome(candidates)
+            cpp_guarded_field_candidates_outcome(
+                ctx.analyzer,
+                token,
+                ctx.visibility,
+                ctx.file,
+                name_node,
+                candidates,
+            )
         }
     }
+}
+
+/// A compatible conditional member is useful navigation evidence, but it is
+/// not a proven definition until the reference context implies its guards.
+fn cpp_guarded_field_candidates_outcome(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    reference: Node<'_>,
+    candidates: Vec<CodeUnit>,
+) -> DefinitionLookupOutcome {
+    let dispatch = CppDispatch::new(analyzer, token);
+    let graph = dispatch.source();
+    let uncertain = candidates.iter().any(|candidate| {
+        candidate.is_field()
+            && candidate.source() == file
+            && type_owner_of(&graph, candidate).is_some()
+            && !visibility
+                .declaration_guards_implied_at_reference(&graph, file, candidate, reference)
+    });
+    let mut outcome = candidates_outcome(candidates);
+    if uncertain {
+        outcome.status = DefinitionLookupStatus::Incomplete;
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "missing_compile_context".to_string(),
+            message: "the field's preprocessor guards are not established at this reference"
+                .to_string(),
+        });
+    }
+    outcome
 }
 
 /// Whether the receiver expression is structurally guaranteed to be an
@@ -8452,7 +8517,7 @@ fn cpp_member_using_declaration_bases(
     let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
         return Vec::new();
     };
-    let ancestors = hierarchy.get_ancestors(owner);
+    let ancestors = hierarchy.get_ancestors(owner).definite().to_vec();
     if ancestors.is_empty() {
         return Vec::new();
     }
@@ -9002,7 +9067,7 @@ fn cpp_type_assignable_to(
 fn cpp_direct_base_types(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<CodeUnit> {
     analyzer
         .type_hierarchy_provider()
-        .map(|hierarchy| hierarchy.get_direct_ancestors(unit))
+        .map(|hierarchy| hierarchy.get_direct_ancestors(unit).definite().to_vec())
         .unwrap_or_default()
 }
 
@@ -9705,9 +9770,16 @@ fn cpp_visible_value_candidates(
         ctx.root,
         node.start_byte(),
     ) {
+        let dispatch = CppDispatch::new(ctx.analyzer, token);
+        let graph = dispatch.source();
         let members = cpp_member_candidates(ctx, token, vec![owner], text, None, None)
             .into_iter()
-            .filter(CodeUnit::is_field)
+            .filter(|candidate| {
+                candidate.is_field()
+                    && ctx.visibility.declaration_guards_compatible_at_reference(
+                        &graph, ctx.file, candidate, node,
+                    )
+            })
             .collect::<Vec<_>>();
         if !members.is_empty() {
             return members;
@@ -9774,6 +9846,12 @@ fn cpp_enclosing_class_member_candidates(
             .into_iter()
             .filter(|candidate| {
                 !cpp_type_alias_declaration_contains_node(analyzer, candidate, node)
+                    && visibility.declaration_guards_compatible_at_reference(
+                        &dispatch.source(),
+                        file,
+                        candidate,
+                        node,
+                    )
                     && visibility.external_type_candidate_visible_in_context(
                         &dispatch.source(),
                         file,

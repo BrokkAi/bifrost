@@ -262,32 +262,29 @@ fn resolve_supertype_relation(
     external: &CSharpExternalDeclarations<'_>,
     visited: &mut HashSet<String>,
 ) -> CSharpCatchTypeRelation {
-    if let Some(fqn) = resolve_type_fq_name(csharp, token, unit.source(), reference) {
-        if fqn == SYSTEM_EXCEPTION {
-            return CSharpCatchTypeRelation::SystemException;
+    match classify_source_reference(csharp, token, unit.source(), reference) {
+        SourceReferenceClassification::SystemException => CSharpCatchTypeRelation::SystemException,
+        SourceReferenceClassification::SourceClasses(definitions) => definitions
+            .iter()
+            .map(|candidate| {
+                source_type_relation_from_unit(csharp, token, candidate, external, visited)
+            })
+            .fold(
+                CSharpCatchTypeRelation::NotSystemException,
+                combine_relation,
+            ),
+        SourceReferenceClassification::ResolvedWithoutClass => {
+            CSharpCatchTypeRelation::NotSystemException
         }
-        let definitions = csharp
-            .get_definitions(&fqn)
-            .into_iter()
-            .filter(|candidate| candidate.is_class())
-            .collect::<Vec<_>>();
-        if !definitions.is_empty() {
-            return definitions
-                .iter()
-                .map(|candidate| {
-                    source_type_relation_from_unit(csharp, token, candidate, external, visited)
-                })
-                .fold(
-                    CSharpCatchTypeRelation::NotSystemException,
-                    combine_relation,
-                );
-        }
-        return CSharpCatchTypeRelation::NotSystemException;
+        SourceReferenceClassification::Unresolved => resolve_external_reference_relation(
+            csharp,
+            token,
+            unit.source(),
+            reference,
+            external,
+            visited,
+        ),
     }
-    if system_exception_from_structured_reference(csharp, token, unit.source(), reference) {
-        return CSharpCatchTypeRelation::SystemException;
-    }
-    resolve_external_reference_relation(csharp, token, unit.source(), reference, external, visited)
 }
 
 fn external_type_relation(
@@ -327,37 +324,65 @@ fn resolve_external_reference_relation(
     external: &CSharpExternalDeclarations<'_>,
     visited: &mut HashSet<String>,
 ) -> CSharpCatchTypeRelation {
+    match classify_source_reference(csharp, token, file, reference) {
+        SourceReferenceClassification::SystemException => CSharpCatchTypeRelation::SystemException,
+        SourceReferenceClassification::SourceClasses(definitions) => {
+            source_type_relation(csharp, token, &definitions, external)
+        }
+        SourceReferenceClassification::ResolvedWithoutClass => {
+            CSharpCatchTypeRelation::NotSystemException
+        }
+        SourceReferenceClassification::Unresolved => {
+            let lookup = external.resolve_type_in_file(
+                reference,
+                &csharp.namespace_of_file(file),
+                &csharp.using_namespaces_of(token, file),
+                &csharp.using_aliases_of(token, file),
+            );
+            match lookup {
+                CSharpExternalTypeLookup::Unique(candidate) => {
+                    external_type_relation(csharp, token, file, external, &candidate, visited)
+                }
+                CSharpExternalTypeLookup::Absent | CSharpExternalTypeLookup::Ambiguous => {
+                    CSharpCatchTypeRelation::Unknown
+                }
+            }
+        }
+    }
+}
+
+enum SourceReferenceClassification {
+    SystemException,
+    SourceClasses(Vec<CodeUnit>),
+    ResolvedWithoutClass,
+    Unresolved,
+}
+
+fn classify_source_reference(
+    csharp: &CSharpAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    reference: &str,
+) -> SourceReferenceClassification {
     if let Some(fqn) = resolve_type_fq_name(csharp, token, file, reference) {
         if fqn == SYSTEM_EXCEPTION {
-            return CSharpCatchTypeRelation::SystemException;
+            return SourceReferenceClassification::SystemException;
         }
-        let definitions = csharp
+        let classes = csharp
             .get_definitions(&fqn)
             .into_iter()
-            .filter(|candidate| candidate.is_class())
+            .filter(CodeUnit::is_class)
             .collect::<Vec<_>>();
-        if !definitions.is_empty() {
-            return source_type_relation(csharp, token, &definitions, external);
-        }
-        return CSharpCatchTypeRelation::NotSystemException;
+        return if classes.is_empty() {
+            SourceReferenceClassification::ResolvedWithoutClass
+        } else {
+            SourceReferenceClassification::SourceClasses(classes)
+        };
     }
     if system_exception_from_structured_reference(csharp, token, file, reference) {
-        return CSharpCatchTypeRelation::SystemException;
+        return SourceReferenceClassification::SystemException;
     }
-    let lookup = external.resolve_type_in_file(
-        reference,
-        &csharp.namespace_of_file(file),
-        &csharp.using_namespaces_of(token, file),
-        &csharp.using_aliases_of(token, file),
-    );
-    match lookup {
-        CSharpExternalTypeLookup::Unique(candidate) => {
-            external_type_relation(csharp, token, file, external, &candidate, visited)
-        }
-        CSharpExternalTypeLookup::Absent | CSharpExternalTypeLookup::Ambiguous => {
-            CSharpCatchTypeRelation::Unknown
-        }
-    }
+    SourceReferenceClassification::Unresolved
 }
 
 fn combine_relation(
@@ -415,9 +440,7 @@ fn exact_catch_node<'tree>(syntax: &'tree PreparedSyntaxTree, catch: Range) -> O
 }
 
 fn named_child_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind(node, kind)
 }
 
 fn has_named_child_kind(node: Node<'_>, kind: &str) -> bool {

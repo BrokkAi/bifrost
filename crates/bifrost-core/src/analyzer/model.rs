@@ -989,6 +989,11 @@ impl CallableOverrideModifier {
     }
 }
 
+/// Whether a callable signature row must carry structural overload identity.
+pub fn requires_overload_discriminator(language: &str, unit: &CodeUnit) -> bool {
+    unit.is_callable() && matches!(language, "java" | "kotlin" | "scala" | "csharp" | "cpp")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SignatureMetadata {
     label: String,
@@ -1129,6 +1134,8 @@ pub struct SignatureMetadata {
     /// tell overriding from hiding (#1721).
     #[serde(default)]
     callable_override_modifier: Option<CallableOverrideModifier>,
+    #[serde(default)]
+    overload_discriminator: Option<[u8; 32]>,
     /// Whether this class-like declaration has the Java `static` modifier.
     ///
     /// Java uses this fact to determine whether an unqualified reference in a
@@ -2511,6 +2518,16 @@ pub fn first_callable_parameter_types(
 }
 
 impl SignatureMetadata {
+    /// Declaration-time digest of canonical overload type tokens.
+    pub fn overload_discriminator(&self) -> Option<&[u8; 32]> {
+        self.overload_discriminator.as_ref()
+    }
+
+    pub fn with_overload_discriminator(mut self, digest: Option<[u8; 32]>) -> Self {
+        self.overload_discriminator = digest;
+        self
+    }
+
     pub fn new(label: impl Into<String>, parameters: Vec<ParameterMetadata>) -> Self {
         Self {
             label: label.into(),
@@ -2542,6 +2559,7 @@ impl SignatureMetadata {
             callable_parameter_types: None,
             callable_is_native: false,
             callable_override_modifier: None,
+            overload_discriminator: None,
             class_like_is_interface: false,
             class_like_kind: None,
             class_like_is_static: false,

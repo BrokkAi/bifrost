@@ -147,10 +147,11 @@ use brokk_bifrost_core::analyzer::project::Project;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_jvm::java::declarations::{
-    class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
-    java_modifier_keywords, node_text, parse_tree,
+    class_like_body_children_rev, determine_package_name, explicit_java_source_visibility,
+    is_class_like_declaration_kind, node_text, parse_tree,
 };
 use jclassfile::attributes::Attribute;
 use jclassfile::constant_pool::ConstantPool;
@@ -5414,15 +5415,11 @@ fn source_visibility(
     node: tree_sitter::Node<'_>,
     default_visibility: JvmVisibility,
 ) -> JvmVisibility {
-    let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
-    if modifiers.contains(&"public") {
-        JvmVisibility::Public
-    } else if modifiers.contains(&"protected") {
-        JvmVisibility::Protected
-    } else if modifiers.contains(&"private") {
-        JvmVisibility::Private
-    } else {
-        default_visibility
+    match explicit_java_source_visibility(node) {
+        Some(DeclaredVisibility::Public) => JvmVisibility::Public,
+        Some(DeclaredVisibility::Protected) => JvmVisibility::Protected,
+        Some(DeclaredVisibility::Private) => JvmVisibility::Private,
+        _ => default_visibility,
     }
 }
 

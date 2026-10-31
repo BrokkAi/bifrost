@@ -188,6 +188,7 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_admissions(
   derivation_digest BLOB,
   checkpoint_digest BLOB,
   host_module_scope INTEGER,
+  parse_variant BLOB NOT NULL DEFAULT x'' CHECK(length(parse_variant) IN (0,32)),
   CHECK((input_kind=0 AND semantic_language IS NOT NULL
          AND host_content_oid IS NULL AND invocation IS NULL
          AND definition_content_oid IS NULL AND selected_declaration IS NULL
@@ -198,7 +199,7 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_admissions(
          AND definition_content_oid IS NOT NULL AND selected_declaration IS NOT NULL
          AND matched_arm_index IS NOT NULL AND derivation_digest IS NOT NULL AND length(derivation_digest)=32
          AND checkpoint_digest IS NOT NULL AND length(checkpoint_digest)=32 AND host_module_scope IS NOT NULL)),
-  UNIQUE(workspace_id,storage_language,generation,revision,blob_oid)
+  UNIQUE(workspace_id,storage_language,generation,revision,blob_oid,parse_variant)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS temp.selected_resolution_admissions_invocation
  ON selected_resolution_admissions(workspace_id,storage_language,generation,revision,host_content_oid,invocation)
@@ -438,7 +439,7 @@ impl<'selection, 'store> SelectedResolutionStage<'selection, 'store> {
     }
 }
 
-const WITNESS_COLUMNS: &str = "workspace_id,storage_language,generation,revision,blob_id,blob_oid,manifest_digest,producer_epoch,logical_rows,payload_bytes,input_kind,semantic_language,host_content_oid,invocation,definition_content_oid,selected_declaration,matched_arm_index,derivation_digest,checkpoint_digest,host_module_scope";
+const WITNESS_COLUMNS: &str = "workspace_id,storage_language,generation,revision,blob_id,blob_oid,manifest_digest,producer_epoch,logical_rows,payload_bytes,input_kind,semantic_language,host_content_oid,invocation,definition_content_oid,selected_declaration,matched_arm_index,derivation_digest,checkpoint_digest,host_module_scope,parse_variant";
 
 fn witness_cells(witness: &ResolutionContentWitness) -> Vec<Value> {
     let owner = witness.owner();
@@ -460,10 +461,10 @@ fn witness_cells(witness: &ResolutionContentWitness) -> Vec<Value> {
     ];
     match witness.input() {
         ResolutionContentInput::Parsed {
-            content_oid,
+            key,
             semantic_language,
         } => {
-            assert_eq!(*content_oid, witness.blob_oid());
+            assert_eq!(key, &witness.key);
             cells.extend([
                 Value::Integer(0),
                 Value::Text(semantic_language.config_label().to_owned()),
@@ -492,6 +493,7 @@ fn witness_cells(witness: &ResolutionContentWitness) -> Vec<Value> {
             ]);
         }
     }
+    cells.push(Value::Blob(witness.key.variant.as_bytes().to_vec()));
     cells
 }
 
@@ -503,12 +505,12 @@ fn insert_admission(
 ) -> Result<Option<i64>> {
     let cells = witness_cells(witness);
     let sql = format!(
-        "SELECT admission_id,{WITNESS_COLUMNS} FROM temp.selected_resolution_admissions WHERE workspace_id=?1 AND storage_language=?2 AND generation=?3 AND revision=?4 AND blob_oid=?5"
+        "SELECT admission_id,{WITNESS_COLUMNS} FROM temp.selected_resolution_admissions WHERE workspace_id=?1 AND storage_language=?2 AND generation=?3 AND revision=?4 AND blob_oid=?5 AND parse_variant=?6"
     );
     let prior = connection
         .prepare_cached(&sql)?
         .query_row(
-            params![cells[0], cells[1], cells[2], cells[3], cells[5]],
+            params![cells[0], cells[1], cells[2], cells[3], cells[5], cells[20]],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -674,6 +676,7 @@ WHERE COALESCE(epoch.generation,0) IS NOT admission.generation
  OR producer.producer_epoch IS NOT admission.producer_epoch
  OR revision.revision IS NULL OR root.blob_id IS NULL
  OR blob.blob_oid IS NOT admission.blob_oid OR blob.lang IS NOT admission.storage_language
+ OR blob.parse_variant IS NOT admission.parse_variant
  OR blob.generation IS NOT admission.generation OR manifest.publication_state IS NOT 'complete'
  OR manifest.producer_epoch IS NOT admission.producer_epoch
  OR manifest.interior_digest IS NOT admission.manifest_digest

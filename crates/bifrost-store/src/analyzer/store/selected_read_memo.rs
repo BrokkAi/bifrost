@@ -9,17 +9,46 @@ use crate::hash::HashMap;
 
 pub(crate) struct ExactReadMemo<K: Eq + Hash, V> {
     entries: HashMap<K, V>,
+    #[cfg(any(test, feature = "test-support"))]
+    bounded_fills: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    refused_admissions: usize,
 }
 
 impl<K: Eq + Hash, V> Default for ExactReadMemo<K, V> {
     fn default() -> Self {
         Self {
             entries: HashMap::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            bounded_fills: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            refused_admissions: 0,
         }
     }
 }
 
 impl<K: Eq + Hash, V> ExactReadMemo<K, V> {
+    pub(crate) fn insert_bounded(&mut self, key: K, value: V) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.bounded_fills += 1;
+        }
+        if self.entries.len() >= 8192 {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                self.refused_admissions += 1;
+            }
+            return false;
+        }
+        self.entries.insert(key, value);
+        true
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn bounded_counts(&self) -> (usize, usize) {
+        (self.bounded_fills, self.refused_admissions)
+    }
+
     pub(crate) fn get(&self, key: &K) -> Option<&V> {
         self.entries.get(key)
     }
@@ -62,5 +91,22 @@ impl<K: Eq + Hash, V> RequestReadCache<K, V> {
             return None;
         }
         self.entries.insert(key, value)
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::ExactReadMemo;
+
+    #[test]
+    fn bounded_admission_preserves_old_rows_and_counts_refusals() {
+        let mut memo = ExactReadMemo::default();
+        for key in 0..8192 {
+            assert!(memo.insert_bounded(key, key));
+        }
+        assert!(!memo.insert_bounded(8192, 8192));
+        assert_eq!(memo.get(&0), Some(&0));
+        assert_eq!(memo.get(&8192), None);
+        assert_eq!(memo.bounded_counts(), (8193, 1));
     }
 }

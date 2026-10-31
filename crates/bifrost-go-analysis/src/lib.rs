@@ -34,9 +34,7 @@ pub mod analyzer {
     pub use go::native_rename::{GoNativeRenameProvider, go_native_rename};
     #[cfg(any(test, feature = "test-support"))]
     pub use go::native_usages::GoNativeUsageStrategy;
-    pub use go::package_identity::{
-        modeled_go_callable_result_nominal_type, modeled_go_callable_result_pointer_field,
-    };
+    pub use go::package_identity::modeled_go_callable_result_nominal_type;
     #[cfg(any(test, feature = "test-support"))]
     pub use go::persist_live_go_sources_for_test;
     #[cfg(any(test, feature = "test-support"))]

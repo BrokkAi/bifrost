@@ -345,7 +345,7 @@ impl RustSourceStorage for AnalyzerStore {
                          ON item.blob_id = keys.blob_id
                        JOIN source_rust_module_manifests AS module
                          ON module.blob_id = keys.blob_id
-                      WHERE keys.blob_oid = ?1 AND keys.lang = 'rust'
+                      WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.parse_variant = x''
                         AND keys.generation = ?2
                         AND manifest.publication_state = 'complete'
                         AND manifest.facts_version = ?3
@@ -1598,7 +1598,7 @@ impl RustSourceStorage for AnalyzerStore {
             drop(statement);
 
             let Some(units) =
-                read_source_unit_map(tx, &oid_text, "rust", adapter, file, keep_going)?
+                read_source_unit_map(tx,&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"), adapter, file, keep_going)?
             else {
                 return Ok(None);
             };

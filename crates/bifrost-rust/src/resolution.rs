@@ -1690,6 +1690,13 @@ impl<'source> RustResolutionBuilder<'source> {
             return;
         }
         let root_scope = self.nearest_root_scope();
+        let scope = &self.facts.scopes[root_scope.index()];
+        assert!(
+            scope.kind == ResolutionScopeKind::CompilationUnit
+                || (scope.kind == ResolutionScopeKind::Package
+                    && scope.inheritance == ResolutionScopeInheritance::Root),
+            "prelude fall-through must attach at its module root: {scope:?}"
+        );
         self.prelude_fall_throughs
             .push(ResolutionRootReferenceFact {
                 reference: site,

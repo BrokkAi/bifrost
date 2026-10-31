@@ -410,15 +410,24 @@ impl<'a> CSharpDefinitionProvider<'a> {
         self.observe_cancellation().then_some(target)
     }
 
-    fn global_using_namespaces_at(&self) -> Option<Vec<String>> {
-        let mut namespaces = match self.session {
-            Some(session) => session.query_limited_rows(|limit| {
-                self.csharp
-                    .global_using_namespaces_limited(limit, || session.observe_cancellation())
-            }),
-            None => CSharpSource::sorted_global_using_namespaces(self.csharp),
-        };
+    fn session_global_using_namespaces(&self, session: &ResolutionSession) -> Vec<String> {
+        let mut namespaces = session.query_limited_rows(|limit| {
+            self.csharp
+                .global_using_namespaces_limited(limit, || session.observe_cancellation())
+        });
         namespaces.sort();
+        namespaces
+    }
+
+    fn global_using_namespaces_at(&self) -> Option<Vec<String>> {
+        let namespaces = match self.session {
+            Some(session) => self.session_global_using_namespaces(session),
+            None => {
+                let mut namespaces = CSharpSource::sorted_global_using_namespaces(self.csharp);
+                namespaces.sort();
+                namespaces
+            }
+        };
         self.observe_cancellation().then_some(namespaces)
     }
 
@@ -558,18 +567,15 @@ impl<'a> CSharpDefinitionProvider<'a> {
     }
 
     fn global_using_namespaces(&self, token: QueryToken<'_>) -> Vec<String> {
-        let mut namespaces = match self.session {
-            Some(session) => session.query_limited_rows(|limit| {
-                self.csharp
-                    .global_using_namespaces_limited(limit, || session.observe_cancellation())
-            }),
-            None => self
-                .csharp
-                .global_using_namespaces(token)
-                .iter()
-                .cloned()
-                .collect(),
-        };
+        if let Some(session) = self.session {
+            return self.session_global_using_namespaces(session);
+        }
+        let mut namespaces: Vec<_> = self
+            .csharp
+            .global_using_namespaces(token)
+            .iter()
+            .cloned()
+            .collect();
         namespaces.sort();
         namespaces
     }
@@ -2585,12 +2591,13 @@ fn csharp_dynamic_binding_is_visible(
     false
 }
 
-fn csharp_seed_dynamic_active_path(
+fn csharp_seed_active_path<'tree, T: Clone + Eq + std::hash::Hash>(
     definitions: &CSharpDefinitionProvider<'_>,
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<()>,
+    bindings: &mut LocalInferenceEngine<T>,
+    mut seed_binding: impl FnMut(Node<'tree>, &mut LocalInferenceEngine<T>),
 ) {
     csharp_visit_bounded_active_path(definitions, root, cutoff_start, |node| {
         if node.kind() == "local_function_statement"
@@ -2611,11 +2618,30 @@ fn csharp_seed_dynamic_active_path(
         if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
             && node.end_byte() <= cutoff_start
         {
-            csharp_seed_dynamic_binding(definitions, source, node, bindings);
+            seed_binding(node, bindings);
         }
 
         true
     });
+}
+
+fn csharp_seed_dynamic_active_path(
+    definitions: &CSharpDefinitionProvider<'_>,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<()>,
+) {
+    csharp_seed_active_path(
+        definitions,
+        source,
+        root,
+        cutoff_start,
+        bindings,
+        |node, bindings| {
+            csharp_seed_dynamic_binding(definitions, source, node, bindings);
+        },
+    );
 }
 
 fn csharp_seed_dynamic_binding(
@@ -2679,30 +2705,16 @@ fn csharp_seed_type_active_path(
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
-    csharp_visit_bounded_active_path(definitions, root, cutoff_start, |node| {
-        if node.kind() == "local_function_statement"
-            && let Some(name) = node.child_by_field_name("name")
-            && name.start_byte() < cutoff_start
-        {
-            bindings.declare_shadow(csharp_node_text(name, source));
-        }
-
-        let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
-        if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
-            return false;
-        }
-        if enters_scope {
-            bindings.enter_scope();
-        }
-
-        if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
-            && node.end_byte() <= cutoff_start
-        {
+    csharp_seed_active_path(
+        definitions,
+        source,
+        root,
+        cutoff_start,
+        bindings,
+        |node, bindings| {
             csharp_seed_type_binding(node, token, csharp, definitions, file, source, bindings);
-        }
-
-        true
-    });
+        },
+    );
 }
 
 fn csharp_visit_bounded_active_path<'tree>(
@@ -2793,22 +2805,19 @@ fn csharp_seed_type_binding(
                     continue;
                 };
                 if inferred {
-                    let candidates = csharp_object_created_type(child)
-                        .map(|type_node| {
-                            csharp_type_candidates_at(
-                                csharp,
-                                token,
-                                definitions,
-                                file,
-                                source,
-                                type_node,
-                            )
-                        })
-                        .unwrap_or_default();
-                    if candidates.is_empty() {
-                        bindings.declare_shadow(csharp_node_text(name, source));
+                    if let Some(type_node) = csharp_object_created_type(child) {
+                        csharp_seed_symbol_for_type(
+                            name,
+                            token,
+                            type_node,
+                            csharp,
+                            definitions,
+                            file,
+                            source,
+                            bindings,
+                        );
                     } else {
-                        bindings.seed_symbol_many(csharp_node_text(name, source), candidates);
+                        bindings.declare_shadow(csharp_node_text(name, source));
                     }
                     continue;
                 }
@@ -2867,10 +2876,7 @@ fn csharp_type_candidates_at(
     ) {
         return vec![unit];
     }
-    let mut candidates =
-        definitions.visible_type_candidates_at(file, &reference, source, type_node);
-    graph_support::sort_dedup_type_candidates(&mut candidates);
-    candidates
+    csharp_logical_visible_type_candidates(definitions, file, source, type_node, &reference)
 }
 
 /// What the written type of one callable parameter names.
@@ -8064,13 +8070,17 @@ class Runner {
         );
     }
 
-    fn review_chained_receiver_case(outside: &str, extra: Option<(&str, &str)>) {
-        let source = "class Use { void Run(Twin t) { t.Make().Hum(); } }";
-        let twin = format!("{outside}/Twin.cs");
+    fn chained_receiver_files<'a>(
+        outside_path: &'a str,
+        visible_part: &'a str,
+        outside_part: &'a str,
+        source: &'a str,
+        extra: Option<(&'a str, &'a str)>,
+    ) -> Vec<(&'a str, &'a str)> {
         let mut files = vec![
             ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
-            ("App/Twin.cs", "public partial class Twin {}"),
-            (twin.as_str(), "public partial class Twin : Base {}"),
+            ("App/Twin.cs", visible_part),
+            (outside_path, outside_part),
             (
                 "App/Base.cs",
                 "public class Base { public Target Make() { return null; } }",
@@ -8082,6 +8092,19 @@ class Runner {
             ("App/Use.cs", source),
         ];
         files.extend(extra);
+        files
+    }
+
+    fn review_chained_receiver_case(outside: &str, extra: Option<(&str, &str)>) {
+        let source = "class Use { void Run(Twin t) { t.Make().Hum(); } }";
+        let twin = format!("{outside}/Twin.cs");
+        let files = chained_receiver_files(
+            twin.as_str(),
+            "public partial class Twin {}",
+            "public partial class Twin : Base {}",
+            source,
+            extra,
+        );
         let (outcome, _, _) = membership_outcome(
             &files,
             "App/Use.cs",
@@ -8131,21 +8154,13 @@ class Runner {
         ] {
             let source = "class Use { void Run(Twin t) { t.Make().Hum(); } }";
             let twin = format!("{outside}/Twin.cs");
-            let mut files = vec![
-                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
-                ("App/Twin.cs", "public partial class Twin : Base {}"),
-                (twin.as_str(), "public partial class Twin {}"),
-                (
-                    "App/Base.cs",
-                    "public class Base { public Target Make() { return null; } }",
-                ),
-                (
-                    "App/Target.cs",
-                    "public class Target { public void Hum() {} }",
-                ),
-                ("App/Use.cs", source),
-            ];
-            files.extend(extra);
+            let files = chained_receiver_files(
+                twin.as_str(),
+                "public partial class Twin : Base {}",
+                "public partial class Twin {}",
+                source,
+                extra,
+            );
             let (outcome, proven, unproven) = membership_outcome(
                 &files,
                 "App/Use.cs",
@@ -8209,11 +8224,15 @@ class Runner {
             let ancestors = view.get_direct_ancestors(&twin);
             let descendants = view.get_direct_descendants(&base);
             assert_eq!(
-                ancestors.iter().any(|unit| unit.fq_name() == "Base"),
+                ancestors
+                    .definite()
+                    .iter()
+                    .any(|unit| unit.fq_name() == "Base"),
                 expected_doubt,
                 "{outside}: {ancestors:?}"
             );
             let descendant_types = descendants
+                .definite()
                 .iter()
                 .map(CodeUnit::fq_name)
                 .collect::<std::collections::BTreeSet<_>>();
@@ -8557,7 +8576,7 @@ class Runner {
                 let before = view.doubt();
                 let direct = view.get_direct_ancestors(&twin);
                 assert_eq!(
-                    direct.iter().any(|u| u.fq_name() == "Middle"),
+                    direct.definite().iter().any(|u| u.fq_name() == "Middle"),
                     outside == "Loose"
                 );
                 assert_eq!(view.doubt() > before, outside == "Loose");
@@ -8565,26 +8584,32 @@ class Runner {
                 let scoped = view
                     .get_direct_ancestors_within(&twin, &scope)
                     .expect("scope");
-                assert_eq!(direct, scoped);
+                assert_eq!(direct.definite(), scoped.definite());
                 assert_eq!(view.doubt() > before, outside == "Loose");
                 let before = view.doubt();
                 let ancestors = view.get_ancestors(&child);
                 assert_eq!(
-                    ancestors.iter().any(|u| u.fq_name() == "Base"),
+                    ancestors.definite().iter().any(|u| u.fq_name() == "Base"),
                     outside == "Loose"
                 );
                 assert_eq!(view.doubt() > before, outside == "Loose");
                 let before = view.doubt();
                 let descendants = view.get_descendants(&base);
                 assert_eq!(
-                    descendants.iter().any(|u| u.fq_name() == "Child"),
+                    descendants
+                        .definite()
+                        .iter()
+                        .any(|u| u.fq_name() == "Child"),
                     outside == "Loose"
                 );
                 assert_eq!(view.doubt() > before, outside == "Loose");
                 let before = view.doubt();
                 let scoped_descendants = view.get_descendants_within(&base, &scope).expect("scope");
                 assert_eq!(
-                    scoped_descendants.iter().any(|u| u.fq_name() == "Child"),
+                    scoped_descendants
+                        .definite()
+                        .iter()
+                        .any(|u| u.fq_name() == "Child"),
                     outside == "Loose"
                 );
                 assert_eq!(view.doubt() > before, outside == "Loose");

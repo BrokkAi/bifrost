@@ -1,4 +1,5 @@
 use crate::analyzer::rust::RustAnalyzer;
+use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
@@ -166,12 +167,12 @@ impl ImportAnalysisProvider for ExportWalkSource {
 impl TypeAliasProvider for ExportWalkSource {}
 
 impl TypeHierarchyProvider for ExportWalkSource {
-    fn get_direct_ancestors(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        Vec::new()
+    fn get_direct_ancestors(&self, _code_unit: &CodeUnit) -> HierarchyAnswer {
+        HierarchyAnswer::complete(Vec::new())
     }
 
-    fn get_direct_descendants(&self, _code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        HashSet::default()
+    fn get_direct_descendants(&self, _code_unit: &CodeUnit) -> HierarchyAnswer {
+        HierarchyAnswer::complete(Vec::new())
     }
 }
 

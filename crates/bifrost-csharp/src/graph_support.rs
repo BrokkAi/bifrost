@@ -1551,6 +1551,11 @@ impl CSharpLookupContext {
     pub fn namespace(&self) -> &str {
         &self.scopes[0].namespace
     }
+
+    /// The enclosing namespaces, from the innermost through the global scope.
+    pub fn namespaces(&self) -> impl Iterator<Item = &str> {
+        self.scopes.iter().map(|scope| scope.namespace.as_str())
+    }
 }
 
 fn collect_context_usings(

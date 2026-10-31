@@ -226,16 +226,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         name: &str,
         byte: usize,
     ) -> Option<ValueId> {
-        self.locals
-            .get(name)?
-            .iter()
-            .filter(|binding| {
-                binding.visible_from <= byte
-                    && binding.scope_start <= byte
-                    && byte < binding.scope_end
-            })
-            .min_by_key(|binding| binding.scope_end - binding.scope_start)
-            .map(|binding| binding.value)
+        brokk_bifrost_analysis::analyzer::common::visible_local_binding(
+            self.locals.get(name)?,
+            byte,
+            |binding| (binding.visible_from, binding.scope_start, binding.scope_end),
+            |_, (_, scope_start, scope_end)| scope_end - scope_start,
+        )
+        .map(|binding| binding.value)
     }
 
     pub(in crate::analyzer::kotlin::semantic) fn local_declaration_value(
@@ -243,11 +240,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         name: &str,
         declaration_start: usize,
     ) -> Option<ValueId> {
-        self.locals
-            .get(name)?
-            .iter()
-            .find(|binding| binding.declaration_start == declaration_start)
-            .map(|binding| binding.value)
+        brokk_bifrost_analysis::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)?
+                .iter()
+                .map(|binding| (binding.declaration_start, binding.value)),
+            declaration_start,
+        )
     }
 
     pub(in crate::analyzer::kotlin::semantic) fn emit_procedure_inputs(
@@ -527,14 +526,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<SemanticLocator, KotlinLoweringError> {
         let procedure = self.session.locator();
         let anchor = source_anchor(node, 0).map_err(KotlinLoweringError::Invalid)?;
-        Ok(SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        ))
+        Ok(procedure.memory_location_at(anchor))
     }
 
     pub(in crate::analyzer::kotlin::semantic) fn add_field_identity_gap(

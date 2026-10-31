@@ -834,6 +834,7 @@ impl GoRules<'_, '_, '_, '_> {
             )
         } else {
             RootFrame {
+                query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
                 endpoint: endpoint.clone(),
                 sources: Box::new([RootSource::Context(
                     context.expect("a remote context has a certified role"),

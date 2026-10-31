@@ -271,20 +271,6 @@ impl<'a> GoOverlayPackages<'a> {
         self.overlay?.symbols_named(qualified_name).unique()
     }
 
-    /// Unknown or ambiguous owners establish no receiver-kind evidence.
-    pub(crate) fn receiver_type_kind(&self, owner_fqn: &str) -> Option<SemanticModelSymbolKind> {
-        let owner = self.unique_symbol(owner_fqn)?;
-        (owner.language == "go"
-            && owner.owner_id.is_none()
-            && owner.visibility == Visibility::Public
-            && !owner.provenance.ambiguous
-            && matches!(
-                owner.kind,
-                SemanticModelSymbolKind::Struct | SemanticModelSymbolKind::Interface
-            ))
-        .then_some(owner.kind)
-    }
-
     /// The sole active Go member with this exact direct owner and name.
     ///
     /// Validate uniqueness before interpreting kind, visibility, receiver, or
@@ -828,35 +814,4 @@ pub(crate) fn go_field_value_copy_from_source(field: &GoStructFieldIdentity) -> 
             MemoryValueCopy::Unknown
         }
     }
-}
-
-/// Whether positive declaration facts prove that one exact modeled Go call
-/// result is a pointer to a struct that owns the selected public field.
-///
-/// The call identity and result ordinal are structured inputs from dispatch;
-/// the field name must come from a grammar-backed member locator. This helper
-/// deliberately does not interpret a callee string, treat a value-struct field
-/// as nil-requiring, or use a partial pack's missing members as negative
-/// evidence.
-pub fn modeled_go_callable_result_pointer_field(
-    overlay: Option<&SemanticModelOverlay>,
-    owner_fqn: &str,
-    callable: &str,
-    has_receiver: bool,
-    parameter_count: usize,
-    result_ordinal: usize,
-    field: &str,
-) -> bool {
-    let packages = GoOverlayPackages::new(overlay);
-    packages
-        .callable_result_nominal_type(
-            owner_fqn,
-            callable,
-            has_receiver,
-            parameter_count,
-            result_ordinal,
-        )
-        .filter(|result| result.pointer)
-        .and_then(|result| packages.concrete_receiver_field(&result.qualified_name, field))
-        .is_some()
 }

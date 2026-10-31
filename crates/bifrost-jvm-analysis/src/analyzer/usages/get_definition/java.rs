@@ -431,7 +431,8 @@ impl<'a> JavaResolutionSession<'a> {
         if !self.observe_cancellation() {
             return Vec::new();
         }
-        self.track_rows(ancestors)
+        // S2b: Receiver row tracking has no incomplete hierarchy channel.
+        self.track_rows(ancestors.definite().to_vec())
     }
 
     fn charge(&self, limit: ReceiverBudgetLimit) -> bool {
@@ -962,7 +963,7 @@ fn is_java_declaration_or_import_name(node: Node<'_>) -> bool {
         )
 }
 
-fn resolve_java_type_reference(
+pub(crate) fn resolve_java_type_reference(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
@@ -2514,7 +2515,7 @@ fn java_unresolved_receiver_outcome(
                 member,
                 owner.form,
                 parameter_count,
-                java.and_then(|java| java_selected_jdk_artifact(analyzer, java, file)),
+                java.and_then(|java| java.selected_jdk_artifact_for_file(analyzer, file)),
                 owner.jdk_artifact_sha256.as_deref(),
             );
             if owner.non_overridable.is_some() {
@@ -2567,18 +2568,6 @@ fn java_external_call_evidence(
     }
 }
 
-fn java_selected_jdk_artifact(
-    analyzer: &dyn IAnalyzer,
-    java: &JavaAnalyzer,
-    file: &ProjectFile,
-) -> Option<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence> {
-    let home = java.selected_jdk_home_for_file(file).ok()?;
-    analyzer
-        .active_semantic_model_snapshot()?
-        .jdk_artifact_for_home(home)
-        .cloned()
-}
-
 fn java_resolve_type_with_selected_jdk(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -2586,7 +2575,7 @@ fn java_resolve_type_with_selected_jdk(
     file: &ProjectFile,
     name: &str,
 ) -> Option<JavaTypeResolution> {
-    let selected = java_selected_jdk_artifact(analyzer, java, file);
+    let selected = java.selected_jdk_artifact_for_file(analyzer, file);
     java.resolve_type_name_with_selected_jdk(
         token,
         analyzer.semantic_model_overlay(),
@@ -2605,7 +2594,7 @@ fn java_resolve_member_with_selected_jdk(
     file: &ProjectFile,
     name: &str,
 ) -> Option<crate::analyzer::jvm::external::JvmExternalMember> {
-    let selected = java_selected_jdk_artifact(analyzer, java, file);
+    let selected = java.selected_jdk_artifact_for_file(analyzer, file);
     java.resolve_member_name_with_selected_jdk(
         token,
         analyzer.semantic_model_overlay(),
@@ -6667,7 +6656,7 @@ fn java_static_import_candidates(
                     member,
                     JavaExternalReceiverForm::TypeQualifier,
                     parameter_count,
-                    java_selected_jdk_artifact(analyzer, java, file),
+                    java.selected_jdk_artifact_for_file(analyzer, file),
                     callee_jdk_artifact.as_deref(),
                 )
             })

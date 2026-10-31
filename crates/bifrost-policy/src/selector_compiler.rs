@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range as ByteRange;
 use std::sync::Arc;
@@ -3013,7 +3013,11 @@ impl<'a> SelectorUnits<'a> {
         self.widen.get_or_insert(reason);
     }
 
-    fn into_outcome(self) -> SelectorUnitOutcome {
+    fn into_outcome(mut self) -> SelectorUnitOutcome {
+        // Consumers may share a selector, but the recorded dependency set
+        // names each unit once. Preserve first-consumer order.
+        let mut seen = HashSet::with_capacity(self.keys.len());
+        self.keys.retain(|key| seen.insert(key.clone()));
         SelectorUnitOutcome {
             all_published: self.all_published,
             keys: if self.all_published {

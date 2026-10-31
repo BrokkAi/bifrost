@@ -2,39 +2,13 @@ use crate::analyzer::semantic_model::artifact::ArtifactEncoding;
 
 use crate::analyzer::semantic_model::artifact::ArtifactError;
 
-use crate::analyzer::semantic_model::artifact::CompiledClassDecoratorIdentity;
-
-use crate::analyzer::semantic_model::artifact::CompiledClassDecoratorKeyword;
-
-use crate::analyzer::semantic_model::artifact::CompiledConditionalIndirectWrite;
-
-use crate::analyzer::semantic_model::artifact::CompiledConditionalResultRefinement;
-
-use crate::analyzer::semantic_model::artifact::CompiledIndirectWriteTarget;
-
-use crate::analyzer::semantic_model::artifact::CompiledNormalReturnRefinement;
-
-use crate::analyzer::semantic_model::artifact::CompiledNormalReturnTypeRefinement;
-
-use crate::analyzer::semantic_model::artifact::CompiledOperationPrecondition;
-
 use crate::analyzer::semantic_model::artifact::CompiledPackManifest;
 
 use crate::analyzer::semantic_model::artifact::CompiledPayload;
 
-use crate::analyzer::semantic_model::artifact::CompiledPredicateProofEffect;
-
 use crate::analyzer::semantic_model::artifact::CompiledProcedureSummary;
 
 use crate::analyzer::semantic_model::artifact::CompiledProcedureTarget;
-
-use crate::analyzer::semantic_model::artifact::CompiledResultContract;
-
-use crate::analyzer::semantic_model::artifact::CompiledResultMemberContract;
-
-use crate::analyzer::semantic_model::artifact::CompiledResultUseObligation;
-
-use crate::analyzer::semantic_model::artifact::CompiledReturnedCallable;
 
 use crate::analyzer::semantic_model::artifact::CompiledSemanticModelPack;
 
@@ -43,14 +17,6 @@ use crate::analyzer::semantic_model::artifact::CompiledShard;
 use crate::analyzer::semantic_model::artifact::CompiledShardArtifact;
 
 use crate::analyzer::semantic_model::artifact::CompiledShardDescriptor;
-
-use crate::analyzer::semantic_model::artifact::CompiledSummaryExitKind;
-
-use crate::analyzer::semantic_model::artifact::CompiledSummaryLocation;
-
-use crate::analyzer::semantic_model::artifact::CompiledSummaryLocationKind;
-
-use crate::analyzer::semantic_model::artifact::CompiledSummaryTransfer;
 
 use crate::analyzer::semantic_model::artifact::DecodeLimits;
 
@@ -71,20 +37,6 @@ use crate::analyzer::semantic_model::artifact::routing_keys;
 use crate::analyzer::semantic_model::artifact::semantic_digest;
 
 use crate::analyzer::semantic_model::artifact::shard_inventory;
-
-use crate::analyzer::semantic_model::conversion::compile_concurrency_effect;
-
-use crate::analyzer::semantic_model::conversion::compile_declared_effect;
-
-use crate::analyzer::semantic_model::conversion::compile_result_predicate;
-
-use crate::analyzer::semantic_model::conversion::compile_summary_effect;
-
-use crate::analyzer::semantic_model::conversion::compile_summary_input;
-
-use crate::analyzer::semantic_model::conversion::compile_summary_output;
-
-use crate::analyzer::semantic_model::conversion::compile_summary_value_transfer;
 
 use crate::analyzer::semantic_model::model::*;
 
@@ -696,172 +648,21 @@ fn compile_procedure_summary(
         covers_overrides: summary.covers_overrides,
         normal_continuation_absent: summary.normal_continuation_absent,
         normal_result_count: summary.normal_result_count,
-        locations: summary
-            .locations
-            .iter()
-            .map(|location| CompiledSummaryLocation {
-                id: location.id.clone(),
-                location_kind: match location.location_kind {
-                    AuthoredSummaryLocationKind::Capture => CompiledSummaryLocationKind::Capture,
-                    AuthoredSummaryLocationKind::Heap => CompiledSummaryLocationKind::Heap,
-                },
-            })
-            .collect(),
-        transfers: summary
-            .transfers
-            .iter()
-            .map(|transfer| CompiledSummaryTransfer {
-                input: compile_summary_input(&transfer.input),
-                exit_kind: match transfer.exit_kind {
-                    AuthoredSummaryExitKind::Normal => CompiledSummaryExitKind::Normal,
-                    AuthoredSummaryExitKind::Exceptional => CompiledSummaryExitKind::Exceptional,
-                },
-                output: compile_summary_output(&transfer.output),
-                value_transfer: transfer
-                    .value_transfer
-                    .as_ref()
-                    .map(compile_summary_value_transfer),
-            })
-            .collect(),
+        locations: summary.locations.clone(),
+        transfers: summary.transfers.clone(),
         transfer_partitions: summary.transfer_partitions.clone(),
-        effects: summary.effects.iter().map(compile_summary_effect).collect(),
-        concurrency_effects: summary
-            .concurrency_effects
-            .iter()
-            .map(compile_concurrency_effect)
-            .collect(),
-        returned_callables: summary
-            .returned_callables
-            .iter()
-            .map(|callable| CompiledReturnedCallable {
-                result_ordinal: callable.result_ordinal,
-                at_most_once: callable.at_most_once,
-                concurrency_effects: callable
-                    .concurrency_effects
-                    .iter()
-                    .map(compile_concurrency_effect)
-                    .collect(),
-            })
-            .collect(),
-        declared_effects: summary
-            .declared_effects
-            .iter()
-            .map(compile_declared_effect)
-            .collect(),
-        preconditions: summary.preconditions.as_ref().map(|preconditions| {
-            preconditions
-                .iter()
-                .map(|precondition| CompiledOperationPrecondition {
-                    input: compile_summary_input(&precondition.input),
-                    predicate: compile_result_predicate(precondition.predicate),
-                })
-                .collect()
-        }),
-        result_contracts: summary
-            .result_contracts
-            .iter()
-            .map(|contract| CompiledResultContract {
-                result_ordinal: contract.result_ordinal,
-                condition_result_ordinal: contract.condition_result_ordinal,
-                predicate: contract.predicate.map(compile_result_predicate),
-                result_success_predicate: contract
-                    .result_success_predicate
-                    .map(compile_result_predicate),
-                member_contracts: contract
-                    .member_contracts
-                    .iter()
-                    .map(|member| CompiledResultMemberContract {
-                        member: member.member.clone(),
-                        parameter_count: member.parameter_count,
-                        completeness: member.completeness,
-                        preconditions: member.preconditions.as_ref().map(|preconditions| {
-                            preconditions
-                                .iter()
-                                .map(|precondition| CompiledOperationPrecondition {
-                                    input: compile_summary_input(&precondition.input),
-                                    predicate: compile_result_predicate(precondition.predicate),
-                                })
-                                .collect()
-                        }),
-                        declared_effects: member
-                            .declared_effects
-                            .iter()
-                            .map(compile_declared_effect)
-                            .collect(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        result_use_obligations: summary
-            .result_use_obligations
-            .iter()
-            .map(|obligation| CompiledResultUseObligation {
-                result_ordinal: obligation.result_ordinal,
-                kind: obligation.kind,
-                failure_predicate: obligation.failure_predicate.map(compile_result_predicate),
-            })
-            .collect(),
-        conditional_result_refinements: summary
-            .conditional_result_refinements
-            .iter()
-            .map(|refinement| CompiledConditionalResultRefinement {
-                result_ordinal: refinement.result_ordinal,
-                outcome: refinement.outcome,
-                parameter_ordinal: refinement.parameter_ordinal,
-                predicate: compile_result_predicate(refinement.predicate),
-                proof_effect: match refinement.proof_effect {
-                    AuthoredPredicateProofEffect::Establishes => {
-                        CompiledPredicateProofEffect::Establishes
-                    }
-                    AuthoredPredicateProofEffect::DoesNotEstablish => {
-                        CompiledPredicateProofEffect::DoesNotEstablish
-                    }
-                },
-            })
-            .collect(),
-        conditional_indirect_writes: summary
-            .conditional_indirect_writes
-            .iter()
-            .map(|write| CompiledConditionalIndirectWrite {
-                result_ordinal: write.result_ordinal,
-                outcome: write.outcome,
-                parameter_ordinal: write.parameter_ordinal,
-                target: match write.target {
-                    AuthoredIndirectWriteTarget::Pointee => CompiledIndirectWriteTarget::Pointee,
-                },
-            })
-            .collect(),
-        normal_return_refinements: summary
-            .normal_return_refinements
-            .iter()
-            .map(|refinement| CompiledNormalReturnRefinement {
-                parameter_ordinal: refinement.parameter_ordinal,
-                predicate: compile_result_predicate(refinement.predicate),
-            })
-            .collect(),
-        normal_return_type_refinements: summary
-            .normal_return_type_refinements
-            .iter()
-            .map(|refinement| CompiledNormalReturnTypeRefinement {
-                parameter_ordinal: refinement.parameter_ordinal,
-                class_parameter_ordinal: refinement.class_parameter_ordinal,
-                required_receiver_members: refinement.required_receiver_members.clone(),
-            })
-            .collect(),
-        class_decorator_identity: summary.class_decorator_identity.as_ref().map(|identity| {
-            CompiledClassDecoratorIdentity {
-                direct: identity.direct,
-                factory_keywords: identity.factory_keywords.as_ref().map(|keywords| {
-                    keywords
-                        .iter()
-                        .map(|keyword| CompiledClassDecoratorKeyword {
-                            name: keyword.name.clone(),
-                            allowed_values: keyword.allowed_values.clone(),
-                        })
-                        .collect()
-                }),
-            }
-        }),
+        effects: summary.effects.clone(),
+        concurrency_effects: summary.concurrency_effects.clone(),
+        returned_callables: summary.returned_callables.clone(),
+        declared_effects: summary.declared_effects.clone(),
+        preconditions: summary.preconditions.clone(),
+        result_contracts: summary.result_contracts.clone(),
+        result_use_obligations: summary.result_use_obligations.clone(),
+        conditional_result_refinements: summary.conditional_result_refinements.clone(),
+        conditional_indirect_writes: summary.conditional_indirect_writes.clone(),
+        normal_return_refinements: summary.normal_return_refinements.clone(),
+        normal_return_type_refinements: summary.normal_return_type_refinements.clone(),
+        class_decorator_identity: summary.class_decorator_identity.clone(),
     })
 }
 

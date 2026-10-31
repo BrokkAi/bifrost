@@ -223,6 +223,11 @@ pub trait CallApplicabilityAdapter: Sync {
         None
     }
 
+    /// Whether non-invoking value names also search the ordered receiver chain.
+    fn implicit_receiver_value_lookup(&self) -> bool {
+        false
+    }
+
     fn implicit_receiver_scope_kind(
         &self,
         _kind: ResolutionScopeKind,
@@ -313,6 +318,16 @@ pub trait CallApplicabilityAdapter: Sync {
 
     fn type_in_call_position(&self) -> TypeInCallPosition {
         TypeInCallPosition::Nothing
+    }
+
+    /// Whether a sole call argument needs declared result cardinality evidence.
+    fn has_multivalued_call_arguments(&self) -> bool {
+        false
+    }
+
+    /// Whether the declared result count is supported as one modeled argument.
+    fn accepts_modeled_argument_results(&self, _count: Option<usize>) -> bool {
+        true
     }
 
     fn map_arguments(

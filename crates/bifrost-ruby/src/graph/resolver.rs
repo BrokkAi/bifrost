@@ -1087,10 +1087,17 @@ mod tests {
         }
     }
     impl TypeHierarchyProvider for Fixture {
-        fn get_direct_ancestors(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-            crate::hierarchy::ruby_direct_ancestors(self, unit)
+        fn get_direct_ancestors(
+            &self,
+            unit: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+            let edges = crate::hierarchy::ruby_direct_ancestors(self, unit);
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
         }
-        fn get_direct_descendants(&self, _: &CodeUnit) -> HashSet<CodeUnit> {
+        fn get_direct_descendants(
+            &self,
+            _: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
             unimplemented!()
         }
     }

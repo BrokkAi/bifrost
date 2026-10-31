@@ -2428,8 +2428,11 @@ pub fn get_symbol_ancestors(
                         rejected_kind.get_or_insert(code_unit_kind_name(code_unit.kind()));
                         continue;
                     }
+                    // S2b: SymbolAncestors has no hierarchy incompleteness channel.
                     let mut ancestor_names = provider
                         .get_ancestors(&code_unit)
+                        .definite()
+                        .to_vec()
                         .into_iter()
                         .map(|ancestor| display_symbol_for_target(analyzer, &ancestor))
                         .collect::<Vec<_>>();

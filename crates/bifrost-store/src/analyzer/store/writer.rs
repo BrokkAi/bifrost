@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use rusqlite::Connection;
 
 use super::{
-    GenerationId, PersistBatchTargets, PreparedParsedBlob, PreparedPersistenceWriter,
+    BlobKey, GenerationId, PersistBatchTargets, PreparedParsedBlob, PreparedPersistenceWriter,
     PreparedWriteCounters, StoreError, reader_source_path,
 };
 
@@ -593,8 +593,8 @@ impl PersistentWriter {
 
 struct RepairBatch {
     groups: Vec<RepairGroup>,
-    by_key: HashMap<(git2::Oid, String, GenerationId), usize>,
-    generations_by_blob: HashMap<(git2::Oid, String), GenerationId>,
+    by_key: HashMap<(BlobKey, GenerationId), usize>,
+    generations_by_blob: HashMap<BlobKey, GenerationId>,
     accepted_requests: usize,
     fragments: usize,
     rows: usize,
@@ -609,7 +609,7 @@ impl RepairBatch {
         let rows = first.prepared.mutation_logical_rows();
         let bytes = first.prepared.mutation_payload_bytes();
         let key = repair_key(&first.prepared);
-        let blob_key = (key.0, key.1.clone());
+        let blob_key = key.0.clone();
         let mut by_key = HashMap::new();
         by_key.insert(key.clone(), 0);
         let mut generations_by_blob = HashMap::new();
@@ -617,14 +617,14 @@ impl RepairBatch {
         first
             .prepared
             .append_fragment_generations(&mut fragment_generations);
-        for (oid, storage_language, generation) in fragment_generations {
-            let previous = generations_by_blob.insert((oid, storage_language), generation);
+        for (blob_key, generation) in fragment_generations {
+            let previous = generations_by_blob.insert(blob_key, generation);
             assert!(
                 previous.is_none_or(|previous| previous == generation),
                 "one prepared envelope must use one generation per physical blob key"
             );
         }
-        debug_assert_eq!(generations_by_blob.get(&blob_key), Some(&key.2));
+        debug_assert_eq!(generations_by_blob.get(&blob_key), Some(&key.1));
         Self {
             groups: vec![RepairGroup {
                 prepared: first.prepared,
@@ -651,10 +651,10 @@ impl RepairBatch {
         request
             .prepared
             .append_fragment_generations(&mut fragment_generations);
-        for (oid, storage_language, generation) in &fragment_generations {
+        for (blob_key, generation) in &fragment_generations {
             if self
                 .generations_by_blob
-                .get(&(*oid, storage_language.clone()))
+                .get(blob_key)
                 .is_some_and(|current| current != generation)
             {
                 return Err(request);
@@ -672,8 +672,8 @@ impl RepairBatch {
                 .compatible_persistence_envelope_addition_cost(&request.prepared)
             else {
                 group.conflict = Some(StoreError::new(format!(
-                    "conflicting prepared repair envelopes for {}/{}",
-                    key.0, key.1
+                    "conflicting prepared repair envelopes for {:?}",
+                    key
                 )));
                 group.replies.push(request.reply);
                 self.accepted_requests = self.accepted_requests.saturating_add(1);
@@ -698,9 +698,9 @@ impl RepairBatch {
             self.fragments = self.fragments.saturating_add(added_fragments);
             self.rows = self.rows.saturating_add(added_rows);
             self.bytes = self.bytes.saturating_add(added_bytes);
-            for (oid, storage_language, generation) in fragment_generations {
+            for (blob_key, generation) in fragment_generations {
                 self.generations_by_blob
-                    .entry((oid, storage_language))
+                    .entry(blob_key)
                     .or_insert(generation);
             }
             group.replies.push(reply);
@@ -720,9 +720,8 @@ impl RepairBatch {
 
         let group = self.groups.len();
         self.by_key.insert(key.clone(), group);
-        for (oid, storage_language, generation) in fragment_generations {
-            self.generations_by_blob
-                .insert((oid, storage_language), generation);
+        for (blob_key, generation) in fragment_generations {
+            self.generations_by_blob.insert(blob_key, generation);
         }
         self.groups.push(RepairGroup {
             prepared: request.prepared,
@@ -797,12 +796,8 @@ fn persist_one_repair(
         .map_or(Ok(()), Err)
 }
 
-fn repair_key(prepared: &PreparedParsedBlob) -> (git2::Oid, String, GenerationId) {
-    (
-        prepared.oid(),
-        prepared.lang().to_string(),
-        prepared.generation,
-    )
+fn repair_key(prepared: &PreparedParsedBlob) -> (BlobKey, GenerationId) {
+    (prepared.key.clone(), prepared.generation)
 }
 
 impl Drop for PersistentWriter {

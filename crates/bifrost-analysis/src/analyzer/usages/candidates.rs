@@ -97,17 +97,26 @@ fn find_import_graph_candidates(
     {
         // The index build behind this call is the one that used to run past
         // the request's whole budget without ever looking at it (#1748). A
-        // `None` means it stopped: everything discovered so far is real, and
+        // A failure means it stopped or required evidence was unavailable: everything discovered so far is real, and
         // the finder reports the incompleteness through the completion it
         // already has, so return rather than inventing a second channel.
         let descendants = match scope {
             Some(scope) => match provider.get_descendants_within(&parent, scope) {
-                Some(descendants) => descendants,
-                None => return candidates,
+                Ok(answer) => answer,
+                Err(_) => {
+                    analyzer
+                        .record_query_incomplete(crate::analyzer::QueryReadIncomplete::Cancelled);
+                    analyzer.record_unattributed_read();
+                    return candidates;
+                }
             },
             None => provider.get_descendants(&parent),
         };
-        for descendant in descendants {
+        if !descendants.is_complete() {
+            crate::analyzer::record_descendant_query_failure(analyzer);
+            return candidates;
+        }
+        for descendant in descendants.edges {
             if is_cancelled(cancellation) {
                 return candidates;
             }
@@ -587,6 +596,7 @@ fn find_text_candidates(
     analyzer: &dyn IAnalyzer,
     cancellation: Option<&CancellationToken>,
 ) -> HashSet<ProjectFile> {
+    let carried_context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     let identifier = source_identifier_for_target(target);
     let companion_identifier = scala_companion_syntax_candidate_identifier(target);
     if identifier.trim().is_empty() && companion_identifier.is_none() {
@@ -618,24 +628,26 @@ fn find_text_candidates(
     let matches: Mutex<HashSet<ProjectFile>> = Mutex::new(HashSet::default());
 
     files.par_iter().for_each(|file| {
-        if is_cancelled(cancellation) {
-            return;
-        }
-        if file.is_binary().unwrap_or(true) {
-            return;
-        }
-        let Ok(content) = file.read_to_string() else {
-            return;
-        };
-        if is_cancelled(cancellation) {
-            return;
-        }
-        if (content.contains(identifier)
-            || companion_identifier.is_some_and(|owner| content.contains(owner)))
-            && let Ok(mut sink) = matches.lock()
-        {
-            sink.insert(file.clone());
-        }
+        carried_context.run(|| {
+            if is_cancelled(cancellation) {
+                return;
+            }
+            if file.is_binary().unwrap_or(true) {
+                return;
+            }
+            let Ok(content) = file.read_to_string() else {
+                return;
+            };
+            if is_cancelled(cancellation) {
+                return;
+            }
+            if (content.contains(identifier)
+                || companion_identifier.is_some_and(|owner| content.contains(owner)))
+                && let Ok(mut sink) = matches.lock()
+            {
+                sink.insert(file.clone());
+            }
+        })
     });
 
     matches.into_inner().expect("candidate match set poisoned")

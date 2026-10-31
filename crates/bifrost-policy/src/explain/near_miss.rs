@@ -108,7 +108,7 @@ use crate::evaluator::PolicyEvaluationContext;
 use crate::finding::PolicyIncompleteReason;
 use crate::identity::PolicySemanticHash;
 use crate::resolved::LoadedPolicy;
-use crate::retained::{RetainedSize, retained_extra};
+use crate::retained::retained_extra;
 
 use super::model::{
     ExplainError, ExplanationBudgetLimit, ExplanationGeneration, ExplanationLimits,
@@ -155,15 +155,6 @@ pub enum NearMissEnumeration {
         /// so the candidate set is the whole of what the scope contains.
         exhaustive: bool,
     },
-}
-
-impl RetainedSize for NearMissEnumeration {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(match self {
-            Self::Supplied { .. } => 0,
-            Self::PolicySeed { scope, .. } => scope.capacity(),
-        })
-    }
 }
 
 /// One ranked subject.
@@ -230,12 +221,6 @@ impl NearMissEntry {
                     .saturating_mul(size_of::<PolicyIncompleteReason>()),
             )
             .saturating_add(self.actual.capacity())
-    }
-}
-
-impl RetainedSize for NearMissEntry {
-    fn retained_size(&self) -> usize {
-        self.own_bytes()
     }
 }
 
@@ -400,18 +385,6 @@ impl PolicyNearMissRanking {
     /// equal rankings render byte-identically.
     pub fn to_json(&self) -> String {
         super::serialize_json(self, "the near-miss model is serializable")
-    }
-}
-
-impl RetainedSize for PolicyNearMissRanking {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.policy_id))
-            .saturating_add(retained_extra(&self.enumeration))
-            .saturating_add(self.conjuncts.iter().fold(0usize, |total, label| {
-                total.saturating_add(label.capacity())
-            }))
-            .saturating_add(retained_extra(&self.entries))
     }
 }
 

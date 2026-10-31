@@ -57,9 +57,12 @@ impl SelectionFixture {
             .admit_cached_selected_content(
                 &self.snapshots[&self.storage_language],
                 "src/cached.java",
-                oid,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, &self.storage_language),
                 &ResolutionContentInput::Parsed {
-                    content_oid: oid,
+                    key: brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid,
+                        &self.storage_language,
+                    ),
                     semantic_language: self.semantic_language,
                 },
                 &CancellationToken::default(),

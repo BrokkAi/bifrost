@@ -1508,7 +1508,14 @@ impl LanguageSupport for KotlinSupport {
             != Language::Kotlin
             && let Some((kotlin, realm)) = Self::kotlin_realm(workspace)
         {
-            return kotlin.direct_descendants_in_realm(token, unit, Some(&realm), scope);
+            let answer = kotlin
+                .direct_descendants_in_realm(token, unit, Some(&realm), scope)
+                .ok()?;
+            if !answer.is_complete() {
+                brokk_bifrost_analysis::analyzer::record_descendant_query_failure(kotlin);
+                return None;
+            }
+            return Some(answer.edges.into_iter().collect());
         }
         Some(HashSet::default())
     }

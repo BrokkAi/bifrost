@@ -388,7 +388,8 @@ impl EdgeTraversalCache {
                     if !self.reported_axes.insert((language, *axis)) {
                         continue;
                     }
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::EdgeAxisUnsupported,
@@ -402,7 +403,7 @@ impl EdgeTraversalCache {
                         ),
                     exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                 }
                 EdgeIncompleteReason::NoStructuralAdapter
                 | EdgeIncompleteReason::UsageListingTruncated
@@ -438,7 +439,8 @@ impl EdgeTraversalCache {
                     if !self.reported.insert((subject.to_string(), code)) {
                         continue;
                     }
-                    diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+                    diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                         related: Vec::new(),
                         source: None,
                         code,
@@ -451,7 +453,7 @@ impl EdgeTraversalCache {
                         ),
                     exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    }, cause));
+                    }), cause));
                 }
             }
         }
@@ -479,7 +481,8 @@ impl EdgeTraversalCache {
             }
         }
         if !newly_reported_global.is_empty() {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                 related: Vec::new(),
                 source: None,
                 exhausted_roots: Vec::new(),
@@ -491,7 +494,7 @@ impl EdgeTraversalCache {
                     "selected Java inverse index generation {generation} is incomplete ({newly_reported_global:?}); it does not cover every requested reference-edge axis"
                 ),
                 withheld_rows_path: None,
-            });
+            }));
         }
         if !subject_local.is_empty() {
             let code = CodeQueryDiagnosticCode::EdgeDerivationIncomplete;
@@ -499,7 +502,8 @@ impl EdgeTraversalCache {
                 .reported_selected_local
                 .insert((declaration.clone(), code))
             {
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                 related: Vec::new(),
                 source: None,
                 exhausted_roots: Vec::new(),
@@ -511,7 +515,7 @@ impl EdgeTraversalCache {
                         "{subject} has an incomplete selected Java inverse-index derivation ({subject_local:?}); it does not cover every requested reference-edge axis"
                     ),
                     withheld_rows_path: None,
-                });
+                }));
             }
         }
     }

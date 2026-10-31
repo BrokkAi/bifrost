@@ -1272,7 +1272,7 @@ pub fn resolve_outgoing_call_candidate(
     status: DefinitionLookupStatus,
     definitions: Vec<CodeUnit>,
 ) -> OutgoingCallCandidate {
-    let (proof, ambiguous) = match status {
+    let (mut proof, mut ambiguous) = match status {
         DefinitionLookupStatus::Resolved => (Some(UsageProof::Proven), false),
         DefinitionLookupStatus::Ambiguous => (Some(UsageProof::Unproven), true),
         _ => {
@@ -1299,6 +1299,21 @@ pub fn resolve_outgoing_call_candidate(
         // A resolved/ambiguous outcome promises at least one candidate site.
         // An empty definition set therefore omits one lower-bound candidate.
         omitted = 1;
+    }
+    // Several dispatch targets in different owners can all be proven. Several
+    // signatures of the same owner/name still require overload selection, even
+    // when the resolver reports that member family as Resolved (#8153).
+    let mut signatures = HashMap::default();
+    for callee in &callees {
+        if let Some(signature) = callee.signature()
+            && signatures
+                .insert(callee.fq(), signature)
+                .is_some_and(|previous| previous != signature)
+        {
+            proof = Some(UsageProof::Unproven);
+            ambiguous = true;
+            break;
+        }
     }
     let fully_retained = omitted == 0 && !callees.is_empty();
     OutgoingCallCandidate {
@@ -1433,11 +1448,13 @@ fn refine_incoming_call_targets(
     }
     let mut retained = Vec::with_capacity(sites.len());
     let mut unproven_sites = Vec::new();
+    let mut ambiguous_sites = Vec::new();
     let mut truncated = false;
     for mut site in sites {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
+        let mut complete_ambiguity = false;
         let matches_target =
             match cache.resolved_call_target(analyzer, &site.file, site.callee_range, cancellation)
             {
@@ -1452,6 +1469,8 @@ fn refine_incoming_call_targets(
                         outcome.outcome.status,
                         outcome.outcome.definitions,
                     );
+                    complete_ambiguity =
+                        certain && resolution.ambiguous && resolution.fully_retained;
                     (certain
                         && resolution.proof == Some(UsageProof::Proven)
                         && resolution.omitted == 0)
@@ -1464,13 +1483,32 @@ fn refine_incoming_call_targets(
             Some(true) => {}
             None => {
                 site.proof = UsageProof::Unproven;
-                unproven_sites.push((
+                let sites = if complete_ambiguity {
+                    &mut ambiguous_sites
+                } else {
+                    &mut unproven_sites
+                };
+                sites.push((
                     crate::path_utils::rel_path_string(&site.file),
                     site.callee_range,
                 ));
             }
         }
         retained.push(site);
+    }
+    if !ambiguous_sites.is_empty() {
+        // The callers are known even when overload selection is uncertain.
+        // Reverse-caller consumers must be able to retain all these edges.
+        diagnostics.push(CallRelationDiagnostic::new(
+            CallRelationDiagnosticCode::TargetsAmbiguous,
+            format!(
+                "incoming call target identity was ambiguous for {} {:?} in {} at {ambiguous_sites:?}; all candidates are unproven",
+                target.fq_name(),
+                target.signature(),
+                crate::path_utils::rel_path_string(target.source())
+            ),
+            target.fq_name().to_string(),
+        ));
     }
     if !unproven_sites.is_empty() {
         diagnostics.push(CallRelationDiagnostic::analysis_failed(

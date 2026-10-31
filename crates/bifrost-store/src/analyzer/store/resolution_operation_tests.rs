@@ -402,6 +402,7 @@ mod native_demand_installer_tests {
         static BUILDS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
         static RUNS: Cell<usize> = const { Cell::new(0) };
         static CANCEL: Cell<bool> = const { Cell::new(false) };
+        static UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
     }
     struct FakeInstaller;
     impl StoreLanguageSupport for FakeInstaller {
@@ -420,6 +421,8 @@ mod native_demand_installer_tests {
             BUILDS.with(|builds| builds.borrow_mut().push(caller.to_path_buf()));
             Ok(if CANCEL.get() {
                 NativeDemandPreparationOutcome::Cancelled
+            } else if UNAVAILABLE.get() {
+                NativeDemandPreparationOutcome::Unavailable
             } else {
                 NativeDemandPreparationOutcome::Ready(Arc::new(()))
             })
@@ -589,5 +592,119 @@ mod native_demand_installer_tests {
                 .map(PathBuf::from)
             )
         });
+        UNAVAILABLE.set(true);
+        let context = operation
+            .empty_contexts(&ResolutionCompletion::Complete)
+            .unwrap();
+        let outcome = operation
+            .resolve_reference_with_projection(
+                NativeReferenceQuery {
+                    context,
+                    locator: &locator,
+                    cancellation: &cancellation,
+                    context_metrics: &mut SelectedResolutionContextMetrics,
+                    session: &session,
+                    artifacts: None,
+                    go_demand: None,
+                    selected_import_gap: None,
+                    go_receiver_overlay: None,
+                    query_result_slot: None,
+                    point_metrics: None,
+                },
+                |_, _, _, _| -> Result<()> { panic!("unavailable preparation must not resolve") },
+            )
+            .unwrap();
+        assert!(matches!(outcome,
+            SelectedResolutionOperationOutcome::Unavailable(
+                SelectedResolutionUnavailable::NativeDemandUnavailable { storage_language, persisted_relative_path }
+            ) if storage_language == "go" && persisted_relative_path == "fixture.go"
+        ));
+        assert_eq!(
+            RUNS.get(),
+            2,
+            "unavailable preparation must not run the installer"
+        );
+        UNAVAILABLE.set(false);
+        // Source references ordinarily have local identities. Exercise the generic
+        // arm's missing-ordinal contract with an operation-local staged reference.
+        let reference = SemanticId::for_test("reference without an ordinal");
+        assert!(reference.ordinal().is_none());
+        let key = crate::analyzer::store::resolution_stage::codec::encode_semantic(reference);
+        operation
+            .ready
+            .inventory
+            .with_owned_temp_write(|connection| {
+                connection.execute(
+                    "UPDATE temp.selected_resolution_stage_semantics SET semantic_key=?1",
+                    [key],
+                )?;
+                connection.execute(
+                    "UPDATE temp.selected_resolution_stage_nodes SET kind_semantic_key=?1",
+                    [key],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let builds_before = BUILDS.with(|builds| builds.borrow().clone());
+        for has_installer in [true, false] {
+            let _plain_rules =
+                (!has_installer).then(|| neutral_fixture::neutral_rules_fixture(&[Language::Go]));
+            let context = operation
+                .empty_contexts(&ResolutionCompletion::Complete)
+                .unwrap();
+            let outcome = operation
+                .resolve_reference_with_projection(
+                    NativeReferenceQuery {
+                        context,
+                        locator: &locator,
+                        cancellation: &cancellation,
+                        context_metrics: &mut SelectedResolutionContextMetrics,
+                        session: &session,
+                        artifacts: None,
+                        go_demand: None,
+                        selected_import_gap: None,
+                        go_receiver_overlay: None,
+                        query_result_slot: None,
+                        point_metrics: None,
+                    },
+                    |_, _, _, _| {
+                        callbacks.set(callbacks.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            if has_installer {
+                assert!(matches!(outcome,
+                    SelectedResolutionOperationOutcome::Unavailable(
+                        SelectedResolutionUnavailable::NativeDemandUnavailable { storage_language, persisted_relative_path }
+                    ) if storage_language == "go" && persisted_relative_path == "fixture.go"
+                ));
+                assert_eq!(
+                    callbacks.get(),
+                    2,
+                    "ordinal-free installer references must refuse before projection"
+                );
+            } else {
+                assert!(matches!(
+                    outcome,
+                    SelectedResolutionOperationOutcome::Native(
+                        SelectedResolutionLocated::Found(())
+                    )
+                ));
+                assert_eq!(
+                    callbacks.get(),
+                    3,
+                    "without an installer the plain projection must run"
+                );
+            }
+            assert_eq!(RUNS.get(), 2);
+            BUILDS.with(|builds| {
+                assert_eq!(
+                    *builds.borrow(),
+                    builds_before,
+                    "ordinal-free references must not prepare an installer"
+                )
+            });
+        }
     }
 }

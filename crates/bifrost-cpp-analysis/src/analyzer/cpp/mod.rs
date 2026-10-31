@@ -220,9 +220,8 @@ pub struct CppAnalyzer {
     canonical_source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
-            git2::Oid,
+            brokk_bifrost_core::gitblob::BlobKey,
             ProjectFile,
-            String,
         ),
         Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
     >,

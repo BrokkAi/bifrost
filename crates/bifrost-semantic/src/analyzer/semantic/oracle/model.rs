@@ -385,7 +385,11 @@ pub struct OracleCallContext {
 impl OracleCallContext {
     pub fn bounded(mut calls: Vec<CallSiteHandle>, limits: OracleLimits) -> Self {
         let retained = limits.call_context_depth();
-        let truncated = calls.len() > retained;
+        let truncated = !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            calls.len(),
+            retained,
+        )
+        .allows(0);
         if truncated {
             calls.drain(..calls.len() - retained);
         }
@@ -413,8 +417,18 @@ impl OracleCallContext {
         let mut calls = self.calls.to_vec();
         calls.push(call);
         let retained = limits.call_context_depth();
-        let truncated = self.truncated || calls.len() > retained;
-        if calls.len() > retained {
+        let truncated = self.truncated
+            || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                calls.len(),
+                retained,
+            )
+            .allows(0);
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            calls.len(),
+            retained,
+        )
+        .allows(0)
+        {
             calls.drain(..calls.len() - retained);
         }
         Self {
@@ -423,7 +437,10 @@ impl OracleCallContext {
         }
     }
 
-    pub const fn was_truncated(&self) -> bool {
+    pub fn was_truncated(&self) -> bool {
+        if self.truncated {
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+        }
         self.truncated
     }
 }

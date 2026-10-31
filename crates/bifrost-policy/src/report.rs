@@ -1509,15 +1509,41 @@ impl PolicyStageTiming {
     }
 }
 
+/// Where each policy of a batch stood when the batch ended.
+///
+/// The lists are disjoint and say what happened to each policy, not where it
+/// sat in policy order: a parallel batch can finish a later policy before an
+/// earlier one, and a policy dispatched after the batch deadline can still
+/// finish when its work was already cached (#7557).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyExecutionProgress {
+    /// Policies whose evaluation ended on its own, whatever its verdict.
+    pub completed: Vec<PolicyId>,
+    /// Policies the batch deadline stopped while they were running.
+    pub interrupted: Vec<PolicyId>,
+    /// Policies their own deadline stopped while the batch went on.
+    pub timed_out: Vec<PolicyId>,
+    /// Policies that had not started when the batch deadline passed.
+    pub pending: Vec<PolicyId>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PolicyExecutionMetadata {
     total_elapsed_ms: u64,
     stage_timings: Vec<PolicyStageTiming>,
     termination: Option<PolicyExecutionTermination>,
     terminal_stage: Option<PolicyExecutionStage>,
+    /// The first interrupted policy in policy order, kept for readers of the
+    /// single-policy field that predates `interrupted_policy_ids`.
     active_policy_id: Option<PolicyId>,
     completed_policy_ids: Vec<PolicyId>,
     pending_policy_ids: Vec<PolicyId>,
+    // Omitted when empty, so a report that ran to completion stays
+    // byte-identical to one written before these lists existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    interrupted_policy_ids: Vec<PolicyId>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    timed_out_policy_ids: Vec<PolicyId>,
 }
 
 impl PolicyExecutionMetadata {
@@ -1527,22 +1553,28 @@ impl PolicyExecutionMetadata {
                 MAX_POLICY_EXECUTION_STAGES.saturating_mul(size_of::<PolicyStageTiming>()),
             )
             .saturating_add(
+                // The active policy is also one of the interrupted ones.
                 policy_count
                     .min(MAX_POLICY_EXECUTION_PROGRESS_IDS)
+                    .saturating_add(1)
                     .saturating_mul(size_of::<PolicyId>().saturating_add(200)),
             )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         total_elapsed_ms: u64,
         mut stage_timings: Vec<PolicyStageTiming>,
         termination: Option<PolicyExecutionTermination>,
         terminal_stage: Option<PolicyExecutionStage>,
         active_policy_id: Option<PolicyId>,
-        mut completed_policy_ids: Vec<PolicyId>,
-        mut pending_policy_ids: Vec<PolicyId>,
+        progress: PolicyExecutionProgress,
     ) -> Result<Self, PolicyExecutionMetadataError> {
+        let PolicyExecutionProgress {
+            completed: mut completed_policy_ids,
+            interrupted: mut interrupted_policy_ids,
+            timed_out: mut timed_out_policy_ids,
+            pending: mut pending_policy_ids,
+        } = progress;
         if stage_timings.len() > MAX_POLICY_EXECUTION_STAGES {
             return Err(PolicyExecutionMetadataError::TooManyStageTimings {
                 max: MAX_POLICY_EXECUTION_STAGES,
@@ -1558,41 +1590,51 @@ impl PolicyExecutionMetadata {
         if termination.is_some() != terminal_stage.is_some() {
             return Err(PolicyExecutionMetadataError::InconsistentTermination);
         }
-        if termination.is_none() && (active_policy_id.is_some() || !pending_policy_ids.is_empty()) {
+        if termination.is_none()
+            && (!interrupted_policy_ids.is_empty() || !pending_policy_ids.is_empty())
+        {
             return Err(PolicyExecutionMetadataError::IncompleteProgressWithoutTermination);
         }
-
-        completed_policy_ids.sort();
-        pending_policy_ids.sort();
-        if completed_policy_ids
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
-            || pending_policy_ids.windows(2).any(|pair| pair[0] == pair[1])
+        if active_policy_id
+            .as_ref()
+            .is_some_and(|policy_id| !interrupted_policy_ids.contains(policy_id))
+            || (active_policy_id.is_none() && !interrupted_policy_ids.is_empty())
         {
-            return Err(PolicyExecutionMetadataError::DuplicatePolicyProgress);
+            return Err(PolicyExecutionMetadataError::ActivePolicyNotInterrupted);
         }
-        let progress_count = completed_policy_ids
-            .len()
-            .saturating_add(pending_policy_ids.len())
-            .saturating_add(usize::from(active_policy_id.is_some()));
-        if progress_count > MAX_POLICY_EXECUTION_PROGRESS_IDS {
+
+        let mut all = Vec::with_capacity(
+            completed_policy_ids.len()
+                + interrupted_policy_ids.len()
+                + timed_out_policy_ids.len()
+                + pending_policy_ids.len(),
+        );
+        for ids in [
+            &mut completed_policy_ids,
+            &mut interrupted_policy_ids,
+            &mut timed_out_policy_ids,
+            &mut pending_policy_ids,
+        ] {
+            ids.sort();
+            if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(PolicyExecutionMetadataError::DuplicatePolicyProgress);
+            }
+            all.extend(ids.iter());
+        }
+        if all.len() > MAX_POLICY_EXECUTION_PROGRESS_IDS {
             return Err(PolicyExecutionMetadataError::TooManyPolicyProgressIds {
                 max: MAX_POLICY_EXECUTION_PROGRESS_IDS,
             });
         }
-        if completed_policy_ids
-            .iter()
-            .any(|policy_id| pending_policy_ids.binary_search(policy_id).is_ok())
-            || active_policy_id.as_ref().is_some_and(|policy_id| {
-                completed_policy_ids.binary_search(policy_id).is_ok()
-                    || pending_policy_ids.binary_search(policy_id).is_ok()
-            })
-        {
+        all.sort();
+        if all.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(PolicyExecutionMetadataError::OverlappingPolicyProgress);
         }
 
         super::finding::tighten_vec(&mut stage_timings);
         super::finding::tighten_vec(&mut completed_policy_ids);
+        super::finding::tighten_vec(&mut interrupted_policy_ids);
+        super::finding::tighten_vec(&mut timed_out_policy_ids);
         super::finding::tighten_vec(&mut pending_policy_ids);
         Ok(Self {
             total_elapsed_ms,
@@ -1602,6 +1644,8 @@ impl PolicyExecutionMetadata {
             active_policy_id,
             completed_policy_ids,
             pending_policy_ids,
+            interrupted_policy_ids,
+            timed_out_policy_ids,
         })
     }
 
@@ -1632,6 +1676,24 @@ impl PolicyExecutionMetadata {
     pub fn pending_policy_ids(&self) -> &[PolicyId] {
         &self.pending_policy_ids
     }
+
+    pub fn interrupted_policy_ids(&self) -> &[PolicyId] {
+        &self.interrupted_policy_ids
+    }
+
+    pub fn timed_out_policy_ids(&self) -> &[PolicyId] {
+        &self.timed_out_policy_ids
+    }
+
+    /// Every list of policy progress, for a caller that rebuilds the metadata.
+    pub fn progress(&self) -> PolicyExecutionProgress {
+        PolicyExecutionProgress {
+            completed: self.completed_policy_ids.clone(),
+            interrupted: self.interrupted_policy_ids.clone(),
+            timed_out: self.timed_out_policy_ids.clone(),
+            pending: self.pending_policy_ids.clone(),
+        }
+    }
 }
 
 impl RetainedSize for PolicyExecutionMetadata {
@@ -1641,6 +1703,8 @@ impl RetainedSize for PolicyExecutionMetadata {
             .saturating_add(retained_extra(&self.stage_timings))
             .saturating_add(retained_extra(&self.completed_policy_ids))
             .saturating_add(retained_extra(&self.pending_policy_ids))
+            .saturating_add(retained_extra(&self.interrupted_policy_ids))
+            .saturating_add(retained_extra(&self.timed_out_policy_ids))
     }
 }
 
@@ -1650,6 +1714,7 @@ pub enum PolicyExecutionMetadataError {
     DuplicateStageTiming,
     InconsistentTermination,
     IncompleteProgressWithoutTermination,
+    ActivePolicyNotInterrupted,
     DuplicatePolicyProgress,
     TooManyPolicyProgressIds { max: usize },
     OverlappingPolicyProgress,
@@ -1670,8 +1735,12 @@ impl fmt::Display for PolicyExecutionMetadataError {
             Self::InconsistentTermination => formatter.write_str(
                 "policy execution termination and terminal stage must be present together",
             ),
-            Self::IncompleteProgressWithoutTermination => formatter
-                .write_str("active or pending policy progress requires an execution termination"),
+            Self::IncompleteProgressWithoutTermination => formatter.write_str(
+                "interrupted or pending policy progress requires an execution termination",
+            ),
+            Self::ActivePolicyNotInterrupted => formatter.write_str(
+                "the active policy must be interrupted, and interrupted policies need an active one",
+            ),
             Self::DuplicatePolicyProgress => {
                 formatter.write_str("policy execution progress IDs must be unique")
             }
@@ -1680,7 +1749,7 @@ impl fmt::Display for PolicyExecutionMetadataError {
                 "policy execution accepts at most {max} progress policy IDs"
             ),
             Self::OverlappingPolicyProgress => formatter.write_str(
-                "policy execution completed, active, and pending policy IDs must not overlap",
+                "policy execution completed, interrupted, timed-out, and pending policy IDs must not overlap",
             ),
         }
     }
@@ -4307,8 +4376,10 @@ mod tests {
             Some(PolicyExecutionTermination::DeadlineExceeded),
             Some(PolicyExecutionStage::WorkspaceSnapshot),
             None,
-            Vec::new(),
-            vec![second.clone(), first.clone()],
+            PolicyExecutionProgress {
+                pending: vec![second.clone(), first.clone()],
+                ..PolicyExecutionProgress::default()
+            },
         )
         .unwrap();
         let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 0).unwrap();
@@ -4865,8 +4936,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Vec::new(),
-                Vec::new(),
+                PolicyExecutionProgress::default(),
             ),
             Err(PolicyExecutionMetadataError::DuplicateStageTiming)
         );
@@ -4877,20 +4947,55 @@ mod tests {
                 Some(PolicyExecutionTermination::DeadlineExceeded),
                 Some(PolicyExecutionStage::PolicyEvaluation),
                 Some(policy_id.clone()),
-                vec![policy_id],
-                Vec::new(),
+                PolicyExecutionProgress {
+                    completed: vec![policy_id.clone()],
+                    interrupted: vec![policy_id.clone()],
+                    ..PolicyExecutionProgress::default()
+                },
             ),
             Err(PolicyExecutionMetadataError::OverlappingPolicyProgress)
+        );
+        assert_eq!(
+            PolicyExecutionMetadata::try_new(
+                1,
+                Vec::new(),
+                Some(PolicyExecutionTermination::DeadlineExceeded),
+                Some(PolicyExecutionStage::PolicyEvaluation),
+                Some(policy_id.clone()),
+                PolicyExecutionProgress {
+                    timed_out: vec![policy_id.clone()],
+                    ..PolicyExecutionProgress::default()
+                },
+            ),
+            Err(PolicyExecutionMetadataError::ActivePolicyNotInterrupted)
+        );
+        // A policy its own deadline stopped is not a termination of the batch.
+        assert_eq!(
+            PolicyExecutionMetadata::try_new(
+                1,
+                Vec::new(),
+                None,
+                None,
+                None,
+                PolicyExecutionProgress {
+                    interrupted: vec![policy_id],
+                    ..PolicyExecutionProgress::default()
+                },
+            ),
+            Err(PolicyExecutionMetadataError::IncompleteProgressWithoutTermination)
         );
     }
 
     #[test]
     fn execution_metadata_reservation_covers_maximum_policy_progress() {
-        let pending = (0..MAX_POLICY_EXECUTION_PROGRESS_IDS)
+        let interrupted = (0..MAX_POLICY_EXECUTION_PROGRESS_IDS)
             .map(|index| {
                 PolicyId::new(format!("test.policy{index:03}.{}", "x".repeat(180))).unwrap()
             })
             .collect::<Vec<_>>();
+        // The active policy repeats one interrupted policy, so the
+        // reservation holds one id more than the progress lists do.
+        let active = interrupted[0].clone();
         let execution = PolicyExecutionMetadata::try_new(
             6,
             vec![
@@ -4903,9 +5008,11 @@ mod tests {
             ],
             Some(PolicyExecutionTermination::DeadlineExceeded),
             Some(PolicyExecutionStage::PolicyEvaluation),
-            None,
-            Vec::new(),
-            pending,
+            Some(active),
+            PolicyExecutionProgress {
+                interrupted,
+                ..PolicyExecutionProgress::default()
+            },
         )
         .unwrap();
 

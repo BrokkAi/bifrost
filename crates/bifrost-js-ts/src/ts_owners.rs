@@ -2144,15 +2144,25 @@ export function caller(items: string[]): Wrapped<string> | string {
     }
 
     impl TypeHierarchyProvider for FakeJsTsSource {
-        fn get_direct_ancestors(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
-            Vec::new()
+        fn get_direct_ancestors(
+            &self,
+            _code_unit: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+            let edges: Vec<CodeUnit> = { Vec::new() };
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
         }
 
         fn get_direct_descendants(
             &self,
             _code_unit: &CodeUnit,
-        ) -> brokk_bifrost_core::hash::HashSet<CodeUnit> {
-            brokk_bifrost_core::hash::HashSet::default()
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+            let edges: brokk_bifrost_core::hash::HashSet<CodeUnit> =
+                { brokk_bifrost_core::hash::HashSet::default() };
+            {
+                let mut edges: Vec<_> = edges.into_iter().collect();
+                edges.sort();
+                brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(edges)
+            }
         }
     }
 

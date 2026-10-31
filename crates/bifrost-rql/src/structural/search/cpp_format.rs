@@ -522,7 +522,8 @@ fn report_format_incomplete(
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -532,7 +533,7 @@ fn report_format_incomplete(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 fn retain_format_argument(
@@ -573,7 +574,7 @@ fn argument_kind(
         match node.kind {
             NormalizedKind::StringLiteral => return FormatValueKind::String,
             NormalizedKind::NumericLiteral => {
-                let long = analyzer
+                let literal = analyzer
                     .cpp_expression_source_facts(value.file())
                     .and_then(|source_facts| {
                         source_facts.expressions.iter().find(|fact| {
@@ -586,15 +587,26 @@ fn argument_kind(
                                     == argument.range
                         })
                         .and_then(|fact| fact.literal_text.as_deref())
-                        .map(|literal| {
-                            literal
-                                .chars()
-                                .rev()
-                                .take_while(|character| character.is_ascii_alphabetic())
-                                .any(|character| character == 'l' || character == 'L')
-                        })
-                    })
-                    .unwrap_or(false);
+                        .map(str::to_owned)
+                    });
+                let Some(literal) = literal else {
+                    return FormatValueKind::Unknown;
+                };
+                let hexadecimal = literal.starts_with("0x") || literal.starts_with("0X");
+                if literal.contains('.')
+                    || if hexadecimal {
+                        literal.contains(['p', 'P'])
+                    } else {
+                        literal.contains(['e', 'E'])
+                    }
+                {
+                    return FormatValueKind::Floating;
+                }
+                let long = literal
+                    .chars()
+                    .rev()
+                    .take_while(|character| character.is_ascii_alphabetic())
+                    .any(|character| character == 'l' || character == 'L');
                 return FormatValueKind::Integer { long };
             }
             NormalizedKind::NullLiteral => {
@@ -681,7 +693,10 @@ fn conversion_accepts(conversion: char, length: FormatLength, kind: FormatValueK
         'n' => matches!(kind, FormatValueKind::Pointer { .. }),
         'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'c' => match kind {
             FormatValueKind::Integer { long } => {
-                matches!(length, FormatLength::L | FormatLength::Ll) == long
+                matches!(
+                    length,
+                    FormatLength::L | FormatLength::Ll | FormatLength::I64
+                ) == long
                     || matches!(length, FormatLength::H | FormatLength::Hh)
             }
             _ => false,

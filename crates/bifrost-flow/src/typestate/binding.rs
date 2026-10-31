@@ -93,7 +93,7 @@ impl TypestateContextKey {
         &self.calls
     }
 
-    pub const fn was_truncated(&self) -> bool {
+    pub fn was_truncated(&self) -> bool {
         self.truncated
     }
 }
@@ -340,7 +340,7 @@ impl TypestateBindingContext {
         &self.key
     }
 
-    pub const fn was_truncated(&self) -> bool {
+    pub fn was_truncated(&self) -> bool {
         self.runtime.was_truncated()
     }
 }

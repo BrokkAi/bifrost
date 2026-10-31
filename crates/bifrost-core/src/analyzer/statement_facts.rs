@@ -12,6 +12,8 @@ pub enum StatementFactKind {
     EmptyBlock,
     LongSwitch,
     MissingCaseInSwitch,
+    NestedIfStatements,
+    MisleadingIndentation,
     NestedLoopsWithSameVariable,
     UseOfGoto,
 }
@@ -24,6 +26,8 @@ impl StatementFactKind {
         Self::EmptyBlock,
         Self::LongSwitch,
         Self::MissingCaseInSwitch,
+        Self::NestedIfStatements,
+        Self::MisleadingIndentation,
         Self::NestedLoopsWithSameVariable,
         Self::UseOfGoto,
     ];
@@ -36,6 +40,8 @@ impl StatementFactKind {
             Self::EmptyBlock => "empty-block",
             Self::LongSwitch => "long-switch",
             Self::MissingCaseInSwitch => "missing-case-in-switch",
+            Self::NestedIfStatements => "nested-if-statements",
+            Self::MisleadingIndentation => "misleading-indentation",
             Self::NestedLoopsWithSameVariable => "nested-loops-with-same-variable",
             Self::UseOfGoto => "use-of-goto",
         }
@@ -49,6 +55,8 @@ impl StatementFactKind {
             Self::EmptyBlock => "cpp_empty_block",
             Self::LongSwitch => "cpp_long_switch",
             Self::MissingCaseInSwitch => "cpp_missing_case_in_switch",
+            Self::NestedIfStatements => "cpp_nested_if_statements",
+            Self::MisleadingIndentation => "cpp_misleading_indentation",
             Self::NestedLoopsWithSameVariable => "cpp_nested_loops_with_same_variable",
             Self::UseOfGoto => "cpp_use_of_goto",
         }
@@ -86,6 +94,8 @@ pub struct SwitchFact {
     pub default_present: bool,
     pub long_case: bool,
     pub missing_enum_case: bool,
+    /// The analyzer could not establish the enum exhaustiveness relation.
+    pub enum_proof_undecided: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

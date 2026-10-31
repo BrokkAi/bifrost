@@ -983,7 +983,16 @@ fn loop_body_unconditionally_redefines(
 fn in_main_guard(node: Node<'_>, source: &str) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "function_definition" | "class_definition" | "lambda"
+        ) {
+            return false;
+        }
         if parent.kind() == "if_statement"
+            && parent
+                .child_by_field_name("consequence")
+                .is_some_and(|body| body.id() == current.id())
             && let Some(condition) = parent.child_by_field_name("condition")
             && condition.kind() == "comparison_operator"
         {
@@ -1101,10 +1110,8 @@ fn function_class<'tree>(function: Node<'tree>) -> Option<Node<'tree>> {
 fn class_base_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "identifier" => super::python_rule_facts::node_text(source, node).map(str::to_owned),
-        "attribute" => node
-            .child_by_field_name("attribute")
-            .and_then(|attribute| super::python_rule_facts::node_text(source, attribute))
-            .map(str::to_owned),
+        // Retain the qualified identity: a local bare name cannot prove its ancestry.
+        "attribute" => super::python_rule_facts::node_text(source, node).map(str::to_owned),
         _ => None,
     }
 }
@@ -1231,6 +1238,9 @@ fn method_override_flags(
                 let mut pending = classes[*base_index].bases.clone();
                 let mut visited = HashSet::from([*base_index]);
                 while let Some(ancestor_name) = pending.pop() {
+                    if ancestor_name == "object" {
+                        continue;
+                    }
                     match class_by_name.get(&ancestor_name) {
                         Some(Some(ancestor)) => {
                             if classes[*ancestor].methods.contains(method_name) {
@@ -1513,20 +1523,22 @@ fn loop_iterable_is_range(
         return false;
     };
     let scope = effective_scope(iterable, scopes, scope_by_node);
-    definitions.iter().any(|definition| {
-        definition.name == name
-            && definition.scope == scope
-            && definition.node.start_byte() < loop_node.start_byte()
-            && definition
+    definitions
+        .iter()
+        .filter(|definition| {
+            definition.name == name
+                && definition.scope == scope
+                && definition.node.start_byte() < loop_node.start_byte()
+        })
+        .max_by_key(|definition| definition.node.start_byte())
+        .is_some_and(|definition| {
+            definition
                 .node
                 .parent()
-                .is_some_and(|assignment| assignment.kind() == "assignment")
-            && definition
-                .node
-                .parent()
+                .filter(|assignment| assignment.kind() == "assignment")
                 .and_then(|assignment| assignment.child_by_field_name("right"))
                 .is_some_and(|right| is_range_call(right, source, scopes, scope_by_node, locals))
-    })
+        })
 }
 
 fn has_continue(body: Node<'_>) -> bool {
@@ -1540,6 +1552,14 @@ fn is_integer_literal(node: Node<'_>) -> bool {
 }
 
 fn is_increment(statement: Node<'_>, source: &str) -> bool {
+    let statement = if statement.kind() == "expression_statement" {
+        let Some(expression) = statement.named_child(0) else {
+            return false;
+        };
+        expression
+    } else {
+        statement
+    };
     if statement.kind() == "augmented_assignment" {
         return statement
             .child_by_field_name("right")
@@ -2134,6 +2154,7 @@ fn variable_row(file: &ProjectFile, facts: Arc<PythonVariableFacts>) -> Pipeline
     let anchor = first_definition.start_byte..first_definition.end_byte;
     let range = first_definition.range;
     let mut value = make_row(
+        Incompleteness::Content,
         "lexical_variable",
         file,
         anchor,
@@ -2294,6 +2315,7 @@ fn variable_peers(
         .map(|peer| {
             let complete = facts.complete && peer.complete;
             let mut row = make_row(
+                Incompleteness::Content,
                 "lexical_variable_peer",
                 file,
                 first_definition.start_byte..first_definition.end_byte,
@@ -2404,6 +2426,7 @@ pub(super) fn nested_loop_expansions(value: &PythonRuleFactValue) -> Vec<Pipelin
                     })
             });
             let mut row = make_row(
+                Incompleteness::Content,
                 "nested_loop_same_variable",
                 &value.file,
                 inner.start_byte..inner.end_byte,
@@ -2459,6 +2482,7 @@ pub(super) fn definitions(value: &PythonRuleFactValue) -> Vec<PipelineExpansion>
         .iter()
         .map(|definition| {
             let mut row = make_row(
+                Incompleteness::Content,
                 "lexical_variable_definition",
                 &value.file,
                 definition.start_byte..definition.end_byte,
@@ -2515,6 +2539,7 @@ pub(super) fn uses(value: &PythonRuleFactValue) -> Vec<PipelineExpansion> {
         .iter()
         .map(|usage| {
             let mut row = make_row(
+                Incompleteness::Content,
                 "lexical_variable_use",
                 &value.file,
                 usage.start_byte..usage.end_byte,

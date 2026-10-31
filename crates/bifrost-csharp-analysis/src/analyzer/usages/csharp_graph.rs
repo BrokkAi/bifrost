@@ -45,6 +45,8 @@ use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdgeWeights;
 
 use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges;
 
+use brokk_bifrost_core::analyzer::usages::inverted_edges::PerFileEdges;
+
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::build_edge_output;
 
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::build_edge_output_with_completeness;
@@ -244,16 +246,26 @@ where
     let language = tree_sitter_c_sharp::LANGUAGE.into();
     let graph = csharp_graph_source(analyzer);
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect_with_domain(
-            analyzer,
-            file,
-            domain,
-            brokk_bifrost_csharp::preprocessor::csharp_parse_spec(&language),
-            |input| {
-                brokk_bifrost_csharp::graph::inverted::scan_file(&graph, csharp, token, file, input)
-            },
-        )
+        scan_csharp_file(analyzer, &graph, csharp, token, file, domain, &language)
     })
+}
+
+fn scan_csharp_file(
+    analyzer: &dyn IAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &CSharpAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    domain: EdgeNodeDomain<'_>,
+    language: &tree_sitter::Language,
+) -> Option<PerFileEdges> {
+    parse_and_collect_with_domain(
+        analyzer,
+        file,
+        domain,
+        brokk_bifrost_csharp::preprocessor::csharp_parse_spec(language),
+        |input| brokk_bifrost_csharp::graph::inverted::scan_file(graph, csharp, token, file, input),
+    )
 }
 
 fn build_csharp_edges_with_completeness<Output, F>(
@@ -271,15 +283,7 @@ where
     let language = tree_sitter_c_sharp::LANGUAGE.into();
     let graph = csharp_graph_source(analyzer);
     build_edge_output_with_completeness(files, keep_file, |file| {
-        parse_and_collect_with_domain(
-            analyzer,
-            file,
-            domain,
-            brokk_bifrost_csharp::preprocessor::csharp_parse_spec(&language),
-            |input| {
-                brokk_bifrost_csharp::graph::inverted::scan_file(&graph, csharp, token, file, input)
-            },
-        )
+        scan_csharp_file(analyzer, &graph, csharp, token, file, domain, &language)
     })
 }
 

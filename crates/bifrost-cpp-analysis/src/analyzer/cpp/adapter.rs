@@ -29,7 +29,7 @@ use tree_sitter::Tree;
 ///
 /// Shaped like the TypeScript pair (`typescript:ts` / `typescript:tsx`): a
 /// language-qualified key, so a `.c` blob and a byte-identical `.cpp` blob
-/// cannot collide in `blobs`/`code_units`, which are keyed `(blob_oid, lang)`.
+/// cannot collide in `blobs`/`code_units`, which are keyed `(blob_oid, lang, parse_variant)`.
 pub(crate) const CPP_C_STORAGE_LANGUAGE_KEY: &str = "cpp:c";
 
 #[derive(Debug, Clone, Default)]
@@ -63,7 +63,7 @@ impl LanguageAdapter for CppAdapter {
     /// aggregate's member list at the enclosing non-aggregate scope, which a
     /// `.cpp` or `.h` file mints as a nested class. The two projections of one
     /// blob's contents must therefore never share cache rows, and rows are
-    /// keyed `(blob_oid, lang)` -- so `.c` gets its own storage language key,
+    /// keyed `(blob_oid, lang, parse_variant)` -- so `.c` gets its own storage language key,
     /// exactly as `.tsx` does against `.ts`.
     ///
     /// Every other case keeps the default answer: the key is derived from the

@@ -59,6 +59,7 @@ mod ruby_reference_edges;
 
 mod go_module_overlay;
 
+mod csharp_demand;
 mod csharp_imports;
 mod csharp_namespaces;
 mod csharp_receiver_query;
@@ -400,3 +401,4 @@ pub(crate) mod jvm_generated_fixture;
 mod store_jvm_package_context;
 
 mod resolution_rows_dump;
+mod structural_rows_dump;

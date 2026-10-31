@@ -171,7 +171,10 @@ impl TopologyTraversalCache {
         if !self.reported.insert((subject.to_string(), detail)) {
             return;
         }
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+            ),
             related: Vec::new(),
             source: None,
             code,
@@ -184,7 +187,7 @@ impl TopologyTraversalCache {
             message,
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
 }
 

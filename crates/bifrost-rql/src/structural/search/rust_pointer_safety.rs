@@ -1,5 +1,6 @@
 //! Query-local Rust pointer findings projected from the shared provenance solver.
 
+use super::{DerivationExecutionCause, Incompleteness};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ pub(super) struct RustPointerFindingValue {
 }
 
 pub(super) struct RustPointerFindings {
+    pub(super) incompleteness: Incompleteness,
     pub(super) rows: Vec<RustPointerFindingValue>,
     pub(super) complete: bool,
     pub(super) reasons: Vec<String>,
@@ -273,6 +275,8 @@ fn modeled_value_owners(
             let source = source.id();
             let target = target.id();
             if ambiguous.contains(&source) {
+                changed |= ambiguous.insert(target);
+                owners.remove(&target);
                 continue;
             }
             let Some(owner) = owners.get(&source).cloned() else {
@@ -436,6 +440,57 @@ pub(super) fn analyze(
         cancellation,
     )
     .map_err(|error| format!("pointer procedure closure failed: {error}"))?;
+    let from_status = |status| {
+        use brokk_bifrost_flow::dataflow::SemanticInputStatus;
+        match status {
+            SemanticInputStatus::Cancelled => {
+                Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+            }
+            SemanticInputStatus::ExceededBudget { .. } => {
+                Incompleteness::Operational(DerivationExecutionCause::Budget)
+            }
+            SemanticInputStatus::Complete
+            | SemanticInputStatus::Ambiguous
+            | SemanticInputStatus::Unknown
+            | SemanticInputStatus::Unsupported { .. }
+            | SemanticInputStatus::Unproven => Incompleteness::Content,
+        }
+    };
+    let mut incompleteness = if closure.truncated {
+        Incompleteness::Operational(DerivationExecutionCause::Budget)
+    } else {
+        Incompleteness::Content
+    };
+    for status in closure
+        .snapshots
+        .iter()
+        .map(|input| input.status())
+        .chain(closure.bindings.iter().map(|input| input.status()))
+    {
+        incompleteness = incompleteness.combine(from_status(status));
+    }
+    for (_, reason) in &closure.skipped {
+        use brokk_bifrost_flow::dataflow::SemanticInputStatus;
+        use brokk_bifrost_flow::value_flow::SkipReason;
+        incompleteness = incompleteness.combine(match reason {
+            SkipReason::ProviderError { .. } => {
+                Incompleteness::Operational(DerivationExecutionCause::Provider)
+            }
+            SkipReason::RelationsUnavailable { status } => match status {
+                SemanticInputStatus::Cancelled => {
+                    Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+                }
+                SemanticInputStatus::ExceededBudget { .. } => {
+                    Incompleteness::Operational(DerivationExecutionCause::Budget)
+                }
+                SemanticInputStatus::Complete
+                | SemanticInputStatus::Ambiguous
+                | SemanticInputStatus::Unknown
+                | SemanticInputStatus::Unsupported { .. }
+                | SemanticInputStatus::Unproven => Incompleteness::Content,
+            },
+        });
+    }
     let mut reasons = closure
         .skipped
         .iter()
@@ -462,6 +517,7 @@ pub(super) fn analyze(
         .map_err(|error| format!("pointer ICFG snapshot failed: {error}"))?;
     let input = IcfgSolveInput::from_outcome(&icfg)
         .map_err(|error| format!("pointer ICFG snapshot has no solve input: {error}"))?;
+    incompleteness = incompleteness.combine(from_status(input.status()));
     let mut solver_budget = SolverBudget::new(solver_work);
     let result = solve_pointer_provenance_on_snapshot(
         &icfg_provider,
@@ -473,6 +529,20 @@ pub(super) fn analyze(
     )
     .map_err(|error| format!("pointer provenance solver failed: {error}"))?;
 
+    incompleteness = incompleteness.combine(match result.value_flow().result().termination() {
+        brokk_bifrost_flow::dataflow::SolverTermination::Cancelled => {
+            Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+        }
+        brokk_bifrost_flow::dataflow::SolverTermination::ExceededBudget(_) => {
+            Incompleteness::Operational(DerivationExecutionCause::Budget)
+        }
+        brokk_bifrost_flow::dataflow::SolverTermination::FixedPoint => Incompleteness::Content,
+    });
+    if !result.value_flow().is_complete() && incompleteness == Incompleteness::Content {
+        // The composed value-flow result no longer exposes which discovery
+        // input remained open. Do not infer content from its rendered reasons.
+        incompleteness = Incompleteness::Operational(DerivationExecutionCause::Provider);
+    }
     if !result.is_complete() {
         reasons.push("value-flow discovery is incomplete".to_owned());
     }
@@ -636,6 +706,7 @@ pub(super) fn analyze(
     reasons.sort_unstable();
     reasons.dedup();
     Ok(RustPointerFindings {
+        incompleteness,
         rows,
         complete: reasons.is_empty(),
         reasons,

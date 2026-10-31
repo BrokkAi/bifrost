@@ -102,6 +102,111 @@ pub mod jvm_extraction_tests {
     use brokk_bifrost_analysis::analyzer::store::resolution_operation::resolution_operation_tests_go_support::operation_fixture_support::assert_empty_context_metrics as assert_empty_context_metrics;
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#8290: a repeated read through one forward operation lost the closed root's closure discharges"
+    )]
+    fn jvm_repeated_parent_reference_preserves_closure_discharges() {
+        use brokk_bifrost_analysis::analyzer::resolution::batch::ResolutionBatchMetrics;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+            LocatedSemantic, jvm_context::JvmImportContext, jvm_demand::JvmForwardOperationContext,
+        };
+
+        let fixture = JavaRootResolutionOperationFixture::with_source_texts(
+            [
+                "class D extends a.Base {}",
+                "package a; public class Base {}",
+                "package b; public class Base {}",
+            ],
+            ["D.java", "a/Base.java", "b/Base.java"],
+            &[],
+        );
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        let site = fixture
+            .consumer_facts
+            .identifiers_named(
+                "Base",
+                ResolutionIdentifierRole::Reference,
+                ResolutionNamespace::Type,
+            )
+            .first()
+            .expect("qualified parent reference")
+            .site;
+        let lexical = operation.ready.lexical_source();
+        let typed = operation.ready.typed_source();
+        let LocatedSemantic::Found(reference) = operation
+            .ready
+            .lookup_locator(
+                &lexical,
+                &SelectedSemanticLocator::new(
+                    "java",
+                    "D.java",
+                    site,
+                    LoweredSemanticRole::Reference,
+                ),
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("parent reference is selected");
+        };
+        let JvmImportContext::Ready {
+            context,
+            scoped_gaps,
+            ..
+        } = operation
+            .jvm_import_context(Language::Java, "D.java", &cancellation)
+            .unwrap()
+        else {
+            panic!("Java context is ready");
+        };
+        let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+            .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+            .unwrap()
+        else {
+            panic!("Java context validates");
+        };
+        let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+            .ready
+            .collect_blueprint(context, &cancellation)
+            .unwrap()
+        else {
+            panic!("Java blueprint is ready");
+        };
+        operation
+            .ready
+            .register_context(&blueprint, &cancellation)
+            .unwrap();
+        operation
+            .with_jvm_forward_operation_for_test(
+                JvmForwardOperationContext {
+                    storage_language: "java",
+                    blueprint: &blueprint,
+                    caller_path: "D.java",
+                    import_gaps: &scoped_gaps,
+                    lexical: &lexical,
+                    typed: &typed,
+                    cancellation: &cancellation,
+                    session: &ResolutionSession::unbounded(),
+                },
+                |forward| {
+                    let mut answers = Vec::new();
+                    for _ in 0..3 {
+                        answers.push(forward.resolve_reference_with_metrics(
+                            reference,
+                            &mut ResolutionBatchMetrics::default(),
+                        )?);
+                    }
+                    assert_eq!(answers[0].completion(), &ResolutionCompletion::Complete);
+                    assert_eq!(answers[0], answers[1]);
+                    assert_eq!(answers[1], answers[2]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#5600: JVM preparation classified and checked one reference at a time"
     )]
     fn jvm_preparation_batches_classification_membership_and_recipe_reads() {
@@ -2332,8 +2437,7 @@ pub mod jvm_extraction_tests {
                 );
                 prepared.push(
                     AnalyzerStore::prepare_parsed_blob(
-                        oid,
-                        "java",
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
                         generation,
                         &JavaAdapter,
                         state,

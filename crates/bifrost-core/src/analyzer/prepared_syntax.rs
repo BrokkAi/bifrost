@@ -18,6 +18,20 @@ use tree_sitter::{Node, Tree};
 use crate::analyzer::model::{CodeUnit, ImportInfo, LanguageDialect, Range};
 use crate::analyzer::project::OverlayRevision;
 
+/// Source-local preprocessing evidence produced once before parsing. It travels
+/// with that tree through the existing bounded syntax cache; it is not a second
+/// memo or a workspace index. The language retains its concrete scan for native
+/// fact production while shared consumers read conditional activation.
+pub trait SourcePreprocessor: std::fmt::Debug + Send + Sync {
+    fn included_ranges(&self) -> Option<&[tree_sitter::Range]>;
+    fn conditional_regions(
+        &self,
+        source: &str,
+    ) -> crate::analyzer::structural::conditional_regions::ConditionalRegions;
+    fn estimated_retained_bytes(&self) -> usize;
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// The declaration facts a prepared tree consults when it was prepared from an
 /// indexed file rather than a bare source snapshot.
 pub trait PreparedSourceIndex: std::fmt::Debug + Send + Sync {
@@ -93,6 +107,7 @@ pub struct PreparedSyntaxTree {
     #[cfg(debug_assertions)]
     source_key: (usize, usize),
     tree: Tree,
+    preprocessor: Option<Arc<dyn SourcePreprocessor>>,
     line_starts: Vec<usize>,
     dialect: LanguageDialect,
     origin: PreparedSourceOrigin,
@@ -122,11 +137,29 @@ impl PreparedSyntaxTree {
             #[cfg(debug_assertions)]
             source_key,
             tree,
+            preprocessor: None,
             line_starts,
             dialect,
             origin,
             overlay_revision,
         }
+    }
+
+    pub fn with_preprocessor(mut self, preprocessor: Option<Arc<dyn SourcePreprocessor>>) -> Self {
+        self.preprocessor = preprocessor;
+        self
+    }
+
+    pub fn preprocessor(&self) -> Option<&Arc<dyn SourcePreprocessor>> {
+        self.preprocessor.as_ref()
+    }
+
+    pub fn conditional_regions(
+        &self,
+    ) -> crate::analyzer::structural::conditional_regions::ConditionalRegions {
+        self.preprocessor()
+            .map(|p| p.conditional_regions(self.source()))
+            .unwrap_or_default()
     }
 
     pub fn source(&self) -> &str {

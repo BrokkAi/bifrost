@@ -860,7 +860,7 @@ impl ScanCtx<'_> {
             || self
                 .graph
                 .hierarchy
-                .map(|provider| provider.get_ancestors(receiver_type))
+                .map(|provider| provider.get_ancestors(receiver_type).definite().to_vec())
                 .unwrap_or_default()
                 .into_iter()
                 .any(|ancestor| ancestor == *target_owner)
@@ -1342,7 +1342,7 @@ fn constructed_class_matches_target_owner(
         || ctx
             .graph
             .hierarchy
-            .map(|provider| provider.get_ancestors(constructed))
+            .map(|provider| provider.get_ancestors(constructed).definite().to_vec())
             .unwrap_or_default()
             .into_iter()
             .any(|ancestor| &ancestor == target_owner)
@@ -1662,7 +1662,7 @@ fn call_result_matches_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             || ctx
                 .graph
                 .hierarchy
-                .map(|provider| provider.get_ancestors(&class))
+                .map(|provider| provider.get_ancestors(&class).definite().to_vec())
                 .unwrap_or_default()
                 .into_iter()
                 .any(|ancestor| &ancestor == target_owner)

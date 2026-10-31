@@ -2031,13 +2031,22 @@ where
         session: Option<
             &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
         >,
-    ) -> StoreResult<Option<Option<String>>> {
+    ) -> StoreResult<Option<Option<super::fact_source::ModelCallableResultDeclaration>>> {
         let mut frontier = frontier.clone();
         frontier.member = frontier
             .member
             .map(|(fragment, lookup)| (self.argument(&fragment), self.argument(&lookup)));
         self.inner
             .unindexed_model_callable_result(&frontier, cancellation, session)
+    }
+
+    fn model_member_callable_result(
+        &self,
+        member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<super::fact_source::ModelCallableResultDeclaration>>> {
+        self.inner
+            .model_member_callable_result(member, cancellation)
     }
 
     fn go_model_owner_declarations(
@@ -2524,7 +2533,7 @@ mod tests {
         assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
-        assert_eq!(typed.len(), 95, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 96, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

@@ -1967,18 +1967,22 @@ pub struct CodeQueryDecoratedParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_id: Option<String>,
     pub decorator_name: String,
-    /// Exact Java annotation declaration, independently proved from its type
-    /// namespace and lexical position. Missing evidence never admits a source.
+    /// Exact Java annotation or C# attribute class declaration, independently
+    /// proved from its type namespace and lexical position. Missing evidence
+    /// never admits a source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotation_type: Option<Box<CodeQueryDeclaration>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotation_status: Option<crate::analyzer::JavaAnnotationTypeStatus>,
-    /// Qualified name of the resolved Java annotation type. It is present for
-    /// a source declaration and for a type an import or qualified name spells
-    /// without an indexed declaration.
+    /// Qualified name of the resolved Java annotation type or C# attribute
+    /// class. Java publishes it for a source declaration and for a type an
+    /// import or qualified name spells without an indexed declaration; C#
+    /// publishes it for a workspace class or one external declaration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotation_fq_name: Option<String>,
-    /// The type-name tier that decided `annotation_fq_name`.
+    /// The type-name tier that decided `annotation_fq_name`. C# has no import
+    /// tier: it reports `source_declaration` for a workspace class and leaves
+    /// the route absent for an external declaration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotation_route: Option<crate::analyzer::JavaAnnotationTypeRoute>,
     /// The external declaration of a route-resolved annotation, when a jar or

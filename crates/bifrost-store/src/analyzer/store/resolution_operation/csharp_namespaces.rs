@@ -56,14 +56,12 @@ pub(super) struct NamespaceMember {
     fragment: BindingFragmentId,
     member: LoweredPackageMember,
 }
-pub(super) struct CSharpNamespaceRules<'a, 'store, 'input> {
-    ready: &'a ReadySelectedResolution<'store, 'input>,
-    units: RefCell<CSharpUnitReader<'a, 'store>>,
+pub(super) struct CSharpNamespaceRules<'a, 'unit, 'store, 'input> {
+    ready: &'unit ReadySelectedResolution<'store, 'input>,
+    units: &'a RefCell<CSharpUnitReader<'unit, 'store>>,
     source: BindingFragmentId,
-    // Return admitted source coordinates with the bridges, for the source half.
-    admitted: RefCell<Vec<(SelectedResolutionMountOrdinal, SemanticId)>>,
 }
-impl PackagePlanRules for CSharpNamespaceRules<'_, '_, '_> {
+impl PackagePlanRules for CSharpNamespaceRules<'_, '_, '_, '_> {
     type Source = CSharpNamespaceLevel;
     type Index = Vec<NamespaceMember>;
     fn read_index(
@@ -72,7 +70,7 @@ impl PackagePlanRules for CSharpNamespaceRules<'_, '_, '_> {
         references: &[LoweredPackageReference],
         cancellation: &CancellationToken,
     ) -> Result<SelectedPackageRows<Self::Index>> {
-        let ready = &self.ready;
+        let ready = self.ready;
         let conn = ready.inventory.connection();
         let names = ready.shared_names();
         let segments = serde_json::to_string(&source.path).expect("namespace segments serialize");
@@ -146,7 +144,7 @@ impl PackagePlanRules for CSharpNamespaceRules<'_, '_, '_> {
         Ok(SelectedPackageRows::Ready(result))
     }
 }
-impl PackagePairingRules for CSharpNamespaceRules<'_, '_, '_> {
+impl PackagePairingRules for CSharpNamespaceRules<'_, '_, '_, '_> {
     type Bridges = Self;
     fn matching_members<'a>(
         &'a self,
@@ -168,7 +166,7 @@ impl PackagePairingRules for CSharpNamespaceRules<'_, '_, '_> {
             })
     }
 }
-impl PackageBridgeRules for CSharpNamespaceRules<'_, '_, '_> {
+impl PackageBridgeRules for CSharpNamespaceRules<'_, '_, '_, '_> {
     type Extra = CSharpUnitPlacement;
     type Admission = PackageBridgeAdmission<BindingFragmentId>;
     fn admit(
@@ -194,9 +192,6 @@ impl PackageBridgeRules for CSharpNamespaceRules<'_, '_, '_> {
         pair: &PackageBridgePair<'_, Self::Extra>,
         admission: Self::Admission,
     ) -> SelectedPackageBridgeDescriptor {
-        self.admitted
-            .borrow_mut()
-            .push((pair.target_mount, pair.member.definition));
         SelectedPackageBridgeDescriptor::new(
             self.source,
             admission.evidence,
@@ -206,6 +201,51 @@ impl PackageBridgeRules for CSharpNamespaceRules<'_, '_, '_> {
             admission.completion,
         )
     }
+}
+
+pub(super) struct AdmittedNamespaceMember {
+    pub mount: SelectedResolutionMountOrdinal,
+    pub member: LoweredPackageMember,
+    pub completion: ResolutionCompletion,
+}
+
+/// C# has no set admission: retain targets from the shared ordered pair join.
+pub(super) fn namespace_members<'unit, 'store, 'input>(
+    ready: &'unit ReadySelectedResolution<'store, 'input>,
+    units: &RefCell<CSharpUnitReader<'unit, 'store>>,
+    source: BindingFragmentId,
+    sources: &[CSharpNamespaceLevel],
+    references: &[LoweredPackageReference],
+    cancellation: &CancellationToken,
+) -> Result<SelectedPackageRows<Vec<AdmittedNamespaceMember>>> {
+    let rules = CSharpNamespaceRules {
+        ready,
+        units,
+        source,
+    };
+    let SelectedPackageRows::Ready(plan) =
+        build_package_plan(sources, references, &rules, cancellation)?
+    else {
+        return Ok(SelectedPackageRows::Cancelled);
+    };
+    let mut targets = Vec::new();
+    for pair in package_bridge_pairs(&plan, references, &rules, cancellation) {
+        if cancellation.is_cancelled() {
+            return Ok(SelectedPackageRows::Cancelled);
+        }
+        if let Some(admission) = rules.admit(ready, &pair, cancellation)? {
+            targets.push(AdmittedNamespaceMember {
+                mount: pair.target_mount,
+                member: *pair.member,
+                completion: admission.completion,
+            });
+        }
+    }
+    Ok(if cancellation.is_cancelled() {
+        SelectedPackageRows::Cancelled
+    } else {
+        SelectedPackageRows::Ready(targets)
+    })
 }
 
 /// Exercise the dormant A5 adapter on selected source references, returning exact
@@ -243,31 +283,21 @@ pub fn probe_namespace_members(
             path: namespace.to_vec(),
         })
         .collect::<Vec<_>>();
-    let rules = CSharpNamespaceRules {
-        ready: &operation.ready,
-        units: RefCell::new(units),
-        source: mount.fragment(),
-        admitted: RefCell::default(),
-    };
-    let assembly = drive_package_bridges(
+    let units = RefCell::new(units);
+    let SelectedPackageRows::Ready(admitted) = namespace_members(
         &operation.ready,
+        &units,
+        mount.fragment(),
         &sources,
         &references,
-        &rules,
-        &rules,
         cancellation,
-    )?;
-    if assembly
-        .completion
-        .contains_reason(ResolutionIncompleteReason::Cancelled)
-    {
+    )?
+    else {
         return Ok(None);
-    }
-    assert_eq!(assembly.descriptors.len(), rules.admitted.borrow().len());
-    let admitted = rules.admitted.into_inner();
+    };
     let definitions = admitted
         .iter()
-        .map(|(_, definition)| *definition)
+        .map(|target| target.member.definition)
         .collect::<Vec<_>>();
     let SelectedNativeDefinitions::Ready(projected) =
         native_units::project_native_definition_units(
@@ -281,13 +311,16 @@ pub fn probe_namespace_members(
     };
     assert_eq!(admitted.len(), projected.len());
     let mut result = Vec::new();
-    for ((mount, _), (_, definition)) in admitted.into_iter().zip(projected) {
+    for (target, (_, definition)) in admitted.into_iter().zip(projected) {
         let SelectedNativeDefinition::Unit(unit) = definition else {
             return Err(StoreError::corrupt(
                 "C# namespace member is not a source declaration",
             ));
         };
-        let record = operation.ready.inventory.mount_record_by_ordinal(mount)?;
+        let record = operation
+            .ready
+            .inventory
+            .mount_record_by_ordinal(target.mount)?;
         result.push((
             record.persisted_relative_path().to_owned(),
             unit.fq_name_str().to_owned(),

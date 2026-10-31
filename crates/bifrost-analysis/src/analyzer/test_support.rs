@@ -20,6 +20,7 @@ pub fn authored_declaration_facts(
 }
 
 #[doc(hidden)]
+#[track_caller]
 pub fn assert_dead_code_cache_reset_after_update_paths<A>(
     analyzer: &A,
     key: &std::sync::Arc<[String]>,

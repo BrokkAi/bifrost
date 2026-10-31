@@ -320,6 +320,7 @@ fn selected_mount_status_joins(mount_alias: &str, language_column: &str) -> Stri
         "LEFT JOIN main.blobs AS blobs\n\
            ON blobs.blob_oid = {mount_alias}.blob_oid\n\
           AND blobs.lang = {mount_alias}.{language_column}\n\
+          AND blobs.parse_variant = x''\n\
          LEFT JOIN main.blob_meta AS meta\n\
            ON meta.blob_id = blobs.id\n\
           AND meta.lang = blobs.lang\n\
@@ -548,6 +549,9 @@ impl SelectedResolutionContentMountRequest {
         hash.field("revision", &owner.revision.to_be_bytes());
         hash.field("blob_id", &witness.blob_id().to_be_bytes());
         hash.field("blob_oid", witness.blob_oid().as_bytes());
+        if witness.key.variant != super::ParseVariant::Empty {
+            hash.field("parse_variant", witness.key.variant.as_bytes());
+        }
         hash.field("manifest", &witness.manifest_digest());
         hash.field("producer", witness.producer_epoch().as_bytes());
         hash.field("logical_rows", &witness.logical_rows().to_be_bytes());
@@ -616,7 +620,7 @@ impl SelectedResolutionContentMountRequest {
             JOIN blob_meta AS meta ON meta.blob_id=blob.id AND meta.is_complete=1
             JOIN source_fact_readiness AS source ON source.blob_id=blob.id AND source.available=1
             JOIN workspace_resolution_content_roots AS root ON root.blob_id=blob.id
-            WHERE blob.id=?1 AND blob.blob_oid=?2 AND blob.lang=?3 AND blob.generation=?4
+            WHERE blob.id=?1 AND blob.blob_oid=?2 AND blob.lang=?3 AND blob.generation=?4 AND blob.parse_variant=?7
             AND manifest.lang=?3 AND manifest.publication_state='complete'
             AND root.workspace_id=?5 AND root.lang=?3 AND root.generation=?4 AND root.revision=?6");
         let actual = conn
@@ -628,7 +632,8 @@ impl SelectedResolutionContentMountRequest {
                     owner.lang,
                     owner.generation.get(),
                     owner.workspace_id.as_str(),
-                    owner.revision
+                    owner.revision,
+                    witness.key.variant
                 ],
                 |row| {
                     let digest: Vec<u8> = row.get(0)?;
@@ -730,14 +735,14 @@ impl SelectedResolutionContentMountRequest {
     ) -> Self {
         use super::resolution_publication::ResolutionContentInput;
         let ResolutionContentInput::Parsed {
-            content_oid,
+            key,
             semantic_language,
         } = publication.input()
         else {
             panic!("ordinary content mounts require published parsed content");
         };
         assert_eq!(
-            *content_oid, file.blob_oid,
+            key.oid, file.blob_oid,
             "parsed publication input has the mounted source OID"
         );
         assert_eq!(
@@ -1275,6 +1280,10 @@ impl SelectedResolutionMountRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum SelectedResolutionUnavailable {
+    NativeDemandUnavailable {
+        storage_language: String,
+        persisted_relative_path: String,
+    },
     JvmContextUnavailable {
         storage_language: String,
         persisted_relative_path: String,
@@ -4545,7 +4554,12 @@ pub mod tests {
             .ensure_resolution_producer_epoch("go", Language::Go)
             .unwrap();
         let oid = Oid::from_str("0000000000000000000000000000000000000001").unwrap();
-        store.register_blobs(&[oid], "go", generation).unwrap();
+        store
+            .register_blobs(
+                &[brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go")],
+                generation,
+            )
+            .unwrap();
         let mut rows = PreparedResolutionBundleRows::default();
         rows.semantic_catalog.push(PreparedResolutionRow::new(vec![
             0_i64.into(),
@@ -4572,7 +4586,7 @@ pub mod tests {
         let writer_workspace = workspace_id.0.clone();
         store.conn.execute(move |conn| {
             let tx = conn.transaction().unwrap();
-            let blob_id = tx.query_row("SELECT id FROM blobs WHERE blob_oid=?1 AND lang='go'", [oid.to_string()], |row| row.get::<_, i64>(0)).unwrap();
+            let blob_id = tx.query_row("SELECT id FROM blobs WHERE blob_oid=?1 AND lang='go' AND parse_variant=x''", [oid.to_string()], |row| row.get::<_, i64>(0)).unwrap();
             tx.execute("INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,stored_unit_count,range_count,signature_count,signature_metadata_count,supertype_count,child_count,import_statement_count,type_identifier_count,is_complete) VALUES(?1,'go',0,'',0,0,0,0,0,0,0,0,1)", [blob_id]).unwrap();
             assert!(insert_prepared_bundle_tx(&tx, blob_id, "go", &bundle, &CancellationToken::new()).unwrap());
             tx.execute("INSERT INTO workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,'go',?2,1)", params![writer_workspace, generation.0]).unwrap();

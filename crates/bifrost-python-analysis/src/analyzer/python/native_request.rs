@@ -118,8 +118,7 @@ impl PythonAnalyzer {
                 .analyzer_store()
                 .write_parsed_blob_at_generation(
                     &file,
-                    oid,
-                    "python",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
                     snapshot.generation,
                     self.inner.adapter(),
                     &state,

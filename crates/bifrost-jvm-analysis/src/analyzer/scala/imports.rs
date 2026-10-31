@@ -48,6 +48,14 @@ use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
+fn scala_sorted_package_namespace_exists(sorted_packages: &[String], candidate: &str) -> bool {
+    let descendant_prefix = format!("{candidate}.");
+    let index = sorted_packages.partition_point(|package| package.as_str() < candidate);
+    sorted_packages
+        .get(index)
+        .is_some_and(|package| package == candidate || package.starts_with(&descendant_prefix))
+}
+
 #[derive(Default)]
 pub(crate) struct ScalaFileDependencyIndex {
     package_by_file: HashMap<ProjectFile, String>,
@@ -186,13 +194,7 @@ impl ScalaFileDependencyIndex {
     }
 
     fn package_exists(&self, candidate: &str) -> bool {
-        let descendant_prefix = format!("{candidate}.");
-        let index = self
-            .package_namespaces
-            .partition_point(|package| package.as_str() < candidate);
-        self.package_namespaces
-            .get(index)
-            .is_some_and(|package| package == candidate || package.starts_with(&descendant_prefix))
+        scala_sorted_package_namespace_exists(&self.package_namespaces, candidate)
     }
 
     fn declaration_files(&self, candidate: &str) -> impl Iterator<Item = ProjectFile> + '_ {
@@ -522,12 +524,8 @@ impl ScalaAnalyzer {
     }
 
     fn package_namespace_exists(&self, candidate: &str) -> bool {
-        let descendant_prefix = format!("{candidate}.");
         let packages = self.package_namespaces();
-        let index = packages.partition_point(|package| package.as_str() < candidate);
-        packages
-            .get(index)
-            .is_some_and(|package| package == candidate || package.starts_with(&descendant_prefix))
+        scala_sorted_package_namespace_exists(&packages, candidate)
     }
 
     fn explicit_import_tier(
@@ -714,13 +712,7 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         &self,
         files: &[ProjectFile],
     ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
-        Some(
-            self.inner
-                .bulk_import_facts(files.iter().cloned())
-                .into_iter()
-                .map(|(file, facts)| (file, facts.imports))
-                .collect(),
-        )
+        Some(self.inner.bulk_import_infos_for_files(files))
     }
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {

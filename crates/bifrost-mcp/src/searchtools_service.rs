@@ -1209,6 +1209,14 @@ struct RunPolicyParams {
     /// Advisory dispatch order only; leaves the report unchanged.
     #[serde(default)]
     policy_cost_hints: crate::policy::PolicyCostHints,
+    /// Per-policy time limits; a policy past its own ends inconclusive with
+    /// `rule_deadline_exceeded` while the others continue (#7557).
+    #[serde(default)]
+    policy_deadlines_ms: crate::policy::PolicyDeadlines,
+    /// Send each policy's run as a progress notification when it finishes,
+    /// for a caller that supplied a progress token (#7557).
+    #[serde(default)]
+    stream_runs: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2818,17 +2826,22 @@ fn mark_pack_acquisition_pending(
     let Some(result) = response.result_mut() else {
         return;
     };
-    result.diagnostics.push(crate::rql::CodeQueryDiagnostic {
-        related: Vec::new(),
-        source: None,
-        code: crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending,
-        impact: crate::rql::CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: "workspace",
-        message,
-        exhausted_roots: Vec::new(),
-        withheld_rows_path: None,
-    });
+    result
+        .diagnostics
+        .push(crate::rql::CodeQueryDiagnostic::new(
+            crate::rql::CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: Vec::new(),
+                source: None,
+                code: crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending,
+                impact: crate::rql::CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message,
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+        ));
     result.cap_flow_status_by_run();
 }
 
@@ -3622,7 +3635,9 @@ fn decode_run_policy_arguments(
             .with_fail_on(fail_on)
             .with_incremental(params.incremental.unwrap_or(true))
             .with_policy_timings(params.include_stage_timings)
-            .with_policy_cost_hints(params.policy_cost_hints);
+            .with_policy_cost_hints(params.policy_cost_hints)
+            .with_policy_deadlines(params.policy_deadlines_ms)
+            .with_run_streaming(params.stream_runs);
     if let Some(revision) = params.diff_base {
         if revision.is_empty()
             || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
@@ -8245,6 +8260,24 @@ mod watcher_startup_tests {
             }))
             .err()
             .expect("malformed hints must be rejected");
+            assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        }
+    }
+
+    #[test]
+    fn run_policy_accepts_policy_deadlines_of_at_least_one_millisecond() {
+        let request = |deadlines: Value| {
+            decode_run_policy_arguments(json!({
+                "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                "evaluation_date": "2026-10-30", "policy_deadlines_ms": deadlines
+            }))
+        };
+        request(json!({"bifrost.correctness.dynamic-evaluation": 1}))
+            .expect("a one-millisecond deadline is a valid request");
+        for deadlines in [json!({"id": 0}), json!({"": 1}), json!({"id": -1})] {
+            let error = request(deadlines)
+                .err()
+                .expect("malformed deadlines must be rejected");
             assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
         }
     }

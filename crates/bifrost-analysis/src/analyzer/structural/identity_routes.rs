@@ -70,6 +70,17 @@ use std::collections::HashSet;
 /// length is zero, so a nongeneric declaration in a recording language is
 /// `Some(0)` and is never equal to an unrecorded one.
 pub fn canonical_identity_of(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> CanonicalIdentity {
+    canonical_member_identity(analyzer, unit).0
+}
+
+pub(crate) fn canonical_member_identity(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> (CanonicalIdentity, Option<[u8; 32]>) {
+    let metadata = analyzer.signature_metadata(unit);
+    let discriminator = metadata
+        .iter()
+        .find_map(|metadata| metadata.overload_discriminator().copied());
     let namespace = if unit.is_module() {
         Namespace::Module
     } else if unit.is_class() {
@@ -78,7 +89,7 @@ pub fn canonical_identity_of(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Canon
         Namespace::Value
     };
     let mut generic_arity: Option<u32> = None;
-    for metadata in analyzer.signature_metadata(unit) {
+    for metadata in &metadata {
         let parameters = metadata.type_parameters();
         if parameters.is_empty() && !metadata.type_parameters_recorded() {
             continue;
@@ -93,13 +104,38 @@ pub fn canonical_identity_of(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Canon
             }
         }
     }
-    CanonicalIdentity::from_fq(
-        language_for_file(unit.source()),
-        namespace,
-        unit.fq(),
-        crate::analyzer::fq_name::segment_interner(),
-        generic_arity,
+    (
+        CanonicalIdentity::from_fq(
+            language_for_file(unit.source()),
+            namespace,
+            unit.fq(),
+            crate::analyzer::fq_name::segment_interner(),
+            generic_arity,
+        ),
+        discriminator,
     )
+}
+
+/// Stable member identity shared by candidate rows and member-family roots.
+/// The declaration producer records canonical overload type tokens as a digest.
+pub fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
+    let (identity, discriminator) = canonical_member_identity(analyzer, unit);
+    canonical_member_digest_from_identity(&identity, discriminator.as_ref())
+}
+
+pub(crate) fn canonical_member_digest_from_identity(
+    identity: &CanonicalIdentity,
+    discriminator: Option<&[u8; 32]>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost.canonical_member_id.v1");
+    hasher.update(serde_json::to_vec(identity).expect("canonical identity serializes"));
+    if let Some(discriminator) = discriminator {
+        hasher.update(b"overload-discriminator");
+        hasher.update(discriminator);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// One concrete source location of a canonical declaration.

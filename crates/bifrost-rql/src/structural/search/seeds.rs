@@ -52,7 +52,12 @@ pub(super) fn scan_seed_file(
     }
     let mut projected = state.budget;
     projected.scanned_files = projected.scanned_files.saturating_add(1);
-    if projected.scanned_files > limits.max_scanned_files {
+    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        projected.scanned_files,
+        limits.max_scanned_files,
+    )
+    .allows(0)
+    {
         push_budget_diagnostic(diagnostics, &projected);
         return SeedFileScanStatus::BudgetExhausted;
     }
@@ -719,7 +724,8 @@ pub(super) fn execute_occurrence_seed(
                 },
             ) {
                 truncated = true;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted,
@@ -731,7 +737,7 @@ pub(super) fn execute_occurrence_seed(
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
                 break;
             }
         }
@@ -840,7 +846,8 @@ pub(super) fn execute_environment_seed(
                 || retain.then_some(value),
             ) {
                 truncated = true;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
@@ -852,7 +859,7 @@ pub(super) fn execute_environment_seed(
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
                 break;
             }
         }
@@ -952,7 +959,8 @@ pub(super) fn execute_materialization_seed(
                 || Some(value),
             ) {
                 truncated = true;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted,
@@ -964,7 +972,7 @@ pub(super) fn execute_materialization_seed(
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
                 break;
             }
         }
@@ -1051,7 +1059,8 @@ pub(super) fn execute_path_seed(
                 || Some(value),
             ) {
                 truncated = true;
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
@@ -1063,7 +1072,7 @@ pub(super) fn execute_path_seed(
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
                 break;
             }
         }
@@ -1140,7 +1149,8 @@ fn push_recovered_syntax_diagnostic(
         }
         message.push_str(&line);
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete,
@@ -1150,7 +1160,7 @@ fn push_recovered_syntax_diagnostic(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 /// These domains never outlive one query. No persisted structural field or
@@ -1287,10 +1297,13 @@ fn push_comparison_chain_roles_diagnostic(
                     return false;
                 }
             }
-        } else if projected
-            .fact_nodes
-            .saturating_add(projected.examined_references)
-            > limits.max_fact_nodes
+        } else if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            projected
+                .fact_nodes
+                .saturating_add(projected.examined_references),
+            limits.max_fact_nodes,
+        )
+        .allows(0)
         {
             push_budget_diagnostic(diagnostics, &projected);
             stop = SeedFileScanStatus::BudgetExhausted;
@@ -1400,7 +1413,8 @@ fn push_comparison_chain_roles_diagnostic(
         return SeedFileScanStatus::Scanned;
     }
     // No matcher or capture state was evaluated by this negative proof.
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -1413,7 +1427,7 @@ fn push_comparison_chain_roles_diagnostic(
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
     SeedFileScanStatus::Scanned
 }
 
@@ -1545,16 +1559,19 @@ pub(super) fn execute_seed(
                 .unsupported_by(|feature| provider_supports_feature(provider, feature))
                 .into_diagnostics(language)
                 .into_iter()
-                .map(|diagnostic| CodeQueryDiagnostic {
-                    related: Vec::new(),
-                    source: None,
-                    code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
-                    impact: CodeQueryDiagnosticImpact::Incomplete,
-                    branch: Vec::new(),
-                    language: diagnostic.language().config_label(),
-                    message: diagnostic.message(),
-                    exhausted_roots: Vec::new(),
-                    withheld_rows_path: None,
+                .map(|diagnostic| {
+                    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                        related: Vec::new(),
+                        source: None,
+                        code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: diagnostic.language().config_label(),
+                        message: diagnostic.message(),
+                        exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
+                    })
                 })
         };
         if unrestricted_explicit_scope
@@ -1628,7 +1645,8 @@ pub(super) fn execute_seed(
             && !supported.contains(&language)
             && (explicitly_requested || scoped_languages.contains(&language))
         {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::MissingStructuralAdapter,
@@ -1641,7 +1659,7 @@ pub(super) fn execute_seed(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }));
         }
     }
 
@@ -1764,8 +1782,16 @@ pub(super) fn execute_seed(
                 }
             }
         } else if !state.seed_scan_ledger.scanned.contains(&ledger_key) {
-            if projected.scanned_files > limits.max_scanned_files
-                || projected.scanned_source_bytes > limits.max_scanned_source_bytes
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                projected.scanned_files,
+                limits.max_scanned_files,
+            )
+            .allows(0)
+                || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    projected.scanned_source_bytes,
+                    limits.max_scanned_source_bytes,
+                )
+                .allows(0)
             {
                 push_budget_diagnostic(diagnostics, &projected);
                 truncated = true;
@@ -1915,10 +1941,13 @@ pub(super) fn execute_seed(
                 }
             }
         } else if charged_fact_nodes > 0 {
-            if projected
-                .fact_nodes
-                .saturating_add(projected.examined_references)
-                > limits.max_fact_nodes
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                projected
+                    .fact_nodes
+                    .saturating_add(projected.examined_references),
+                limits.max_fact_nodes,
+            )
+            .allows(0)
             {
                 push_budget_diagnostic(diagnostics, &projected);
                 truncated = true;
@@ -2163,10 +2192,13 @@ pub(super) fn execute_seed(
                             return cancelled_plan_execution();
                         }
                     }
-                } else if projected
-                    .fact_nodes
-                    .saturating_add(projected.examined_references)
-                    > limits.max_fact_nodes
+                } else if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    projected
+                        .fact_nodes
+                        .saturating_add(projected.examined_references),
+                    limits.max_fact_nodes,
+                )
+                .allows(0)
                 {
                     push_budget_diagnostic(diagnostics, &projected);
                     truncated = true;
@@ -2237,7 +2269,8 @@ pub(super) fn execute_seed(
         }
     }
     if signature_incomplete.visibility_unrecorded.get() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -2247,10 +2280,11 @@ pub(super) fn execute_seed(
             message: "callable visibility is unrecorded or recorded as unknown for at least one declaration; results that depend on it are incomplete rather than a clean miss".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     if signature_incomplete.parameter_types_unrecorded.get() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -2260,13 +2294,14 @@ pub(super) fn execute_seed(
             message: "callable parameter types are unrecorded for at least one declaration; results that depend on them are incomplete rather than a clean miss".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     if signature_incomplete
         .duplicate_dictionary_key_unrecorded
         .get()
     {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -2276,10 +2311,11 @@ pub(super) fn execute_seed(
             message: "duplicate dictionary-key equality is incomplete because at least one Python key form is unsupported".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     if signature_incomplete.string_literal_value_unrecorded.get() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -2289,10 +2325,25 @@ pub(super) fn execute_seed(
             message: "decoded string-value comparison is incomplete because at least one selected value is non-literal or uses an unsupported literal form".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
+    }
+    if signature_incomplete.role_target_unrecorded.get() {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "structural role-target matching is incomplete because a selected target has no normalized fact for the requested predicate".to_string(),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        }));
     }
     if signature_incomplete.local_value_unresolved.get() {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -2302,7 +2353,7 @@ pub(super) fn execute_seed(
             message: "Python local-value matching could not prove a unique direct assignment guaranteed before the read and exact normalized RHS for at least one selected variable read".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     if selected_index_content
         .iter()
@@ -2314,7 +2365,8 @@ pub(super) fn execute_seed(
         state.access_failure.get_or_insert_with(|| {
             "workspace content changed during structural posting replay".to_string()
         });
-        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
+        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -2324,7 +2376,7 @@ pub(super) fn execute_seed(
             message: "workspace content changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }, Some(DerivationExecutionCause::Snapshot)));
+        }), Some(DerivationExecutionCause::Snapshot)));
     }
     if pending.len() > desired_rows {
         pending.truncate(desired_rows);

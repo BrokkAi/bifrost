@@ -1,7 +1,7 @@
 //! Revision publication shared by source projections and retained configuration.
 
 use git2::Oid;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::analyzer::semantic::source_admission::SourceAdmissionRefusal;
 use crate::hash::{HashMap, HashSet};
@@ -274,9 +274,18 @@ impl super::AnalyzerStore {
         snapshot: &WorkspaceSnapshotId,
         relative_path: &str,
     ) -> Result<Option<String>> {
-        self.read_conn()?
-            .query_row(
-                "SELECT anchors.package_name FROM workspace_file_versions versions
+        let conn = self.read_conn()?;
+        Self::selected_module_name_with_conn(&conn, snapshot, relative_path)
+    }
+
+    /// Read a selected module without checking out another store connection.
+    pub fn selected_module_name_with_conn(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        relative_path: &str,
+    ) -> Result<Option<String>> {
+        conn.query_row(
+            "SELECT anchors.package_name FROM workspace_file_versions versions
              JOIN workspace_file_anchor_rows anchors USING(file_version_id)
              WHERE versions.workspace_id=?1 AND versions.lang=?2
                AND versions.generation=?3 AND versions.rel_path=?4
@@ -284,17 +293,17 @@ impl super::AnalyzerStore {
                AND versions.valid_from<=?5
                AND (versions.valid_until IS NULL OR ?5<versions.valid_until)
                AND anchors.anchor_kind='own_module' AND anchors.anchor_pop=0",
-                params![
-                    snapshot.workspace_id.as_str(),
-                    snapshot.lang,
-                    snapshot.generation.get(),
-                    relative_path,
-                    snapshot.revision
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(StoreError::from)
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.lang,
+                snapshot.generation.get(),
+                relative_path,
+                snapshot.revision
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
     }
 
     /// Exact configuration bytes, including absence, selected by this revision.
@@ -304,20 +313,29 @@ impl super::AnalyzerStore {
         snapshot: &WorkspaceSnapshotId,
         relative_path: &str,
     ) -> Result<Option<Vec<u8>>> {
-        self.read_conn()?
-            .query_row(
-                SELECTED_CONFIGURATION_BYTES_SQL,
-                params![
-                    snapshot.workspace_id.as_str(),
-                    snapshot.lang,
-                    snapshot.generation.get(),
-                    relative_path,
-                    snapshot.revision
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(StoreError::from)
+        let conn = self.read_conn()?;
+        Self::selected_configuration_source_with_conn(&conn, snapshot, relative_path)
+    }
+
+    /// Read retained configuration without checking out a second connection.
+    pub fn selected_configuration_source_with_conn(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        relative_path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        conn.query_row(
+            SELECTED_CONFIGURATION_BYTES_SQL,
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.lang,
+                snapshot.generation.get(),
+                relative_path,
+                snapshot.revision
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
     }
 
     /// Return the first native configuration overlay that cannot use the disk

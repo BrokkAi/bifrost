@@ -31,16 +31,16 @@ struct MutableDefault {
 }
 
 struct MutableDefaultFlow<'a, 'tree> {
+    incompleteness: Incompleteness,
     source: &'a str,
     aliases: HashMap<String, HashSet<usize>>,
     defaults: &'a [MutableDefault],
     uncertain_sources: HashSet<usize>,
     function: Node<'tree>,
-    file: &'a ProjectFile,
-    declaration: &'a DeclarationValue,
     reasons: Vec<&'static str>,
     expansions: Vec<PipelineExpansion>,
     emitted: HashSet<String>,
+    mutations: Vec<(Node<'tree>, usize, bool, bool, bool)>,
 }
 
 pub(super) fn expansions(
@@ -58,10 +58,17 @@ pub(super) fn expansions(
 
     let file = unit.source();
     let Some(source) = analyzer.get_source(&CodeUnit::file_scope(file.clone()), false) else {
-        return vec![open_fact(file, declaration, None, "source_unavailable")];
+        return vec![open_fact(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            file,
+            declaration,
+            None,
+            "source_unavailable",
+        )];
     };
     let Some(tree) = parse_python(&source) else {
         return vec![open_fact(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             file,
             declaration,
             Some(&source),
@@ -70,6 +77,7 @@ pub(super) fn expansions(
     };
     if tree.root_node().has_error() {
         return vec![open_fact(
+            Incompleteness::Content,
             file,
             declaration,
             Some(&source),
@@ -78,6 +86,7 @@ pub(super) fn expansions(
     }
     let Some(function) = python_definition_node(&tree, unit, &declaration.range) else {
         return vec![open_fact(
+            Incompleteness::Content,
             file,
             declaration,
             Some(&source),
@@ -86,6 +95,7 @@ pub(super) fn expansions(
     };
     let Some(parameters) = function.child_by_field_name("parameters") else {
         return vec![open_fact(
+            Incompleteness::Content,
             file,
             declaration,
             Some(&source),
@@ -110,6 +120,7 @@ pub(super) fn expansions(
     }
     let Some(body) = function.child_by_field_name("body") else {
         return vec![open_fact(
+            Incompleteness::Content,
             file,
             declaration,
             Some(&source),
@@ -145,20 +156,21 @@ pub(super) fn expansions(
     events.sort_by_key(|node| (node.end_byte(), node.start_byte()));
 
     let mut flow = MutableDefaultFlow {
+        incompleteness: Incompleteness::Content,
         source: &source,
         aliases,
         defaults: &sources,
         uncertain_sources: HashSet::default(),
         function,
-        file,
-        declaration,
         reasons: Vec::new(),
         expansions: Vec::new(),
         emitted: HashSet::default(),
+        mutations: Vec::new(),
     };
 
     for event in events {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            flow.incompleteness = Incompleteness::Operational(DerivationExecutionCause::Cancelled);
             flow.reasons.push("cancelled");
             break;
         }
@@ -260,12 +272,61 @@ pub(super) fn expansions(
         }
     }
 
+    let mut reachable = flow
+        .defaults
+        .iter()
+        .map(|default| {
+            (
+                default.emptiness != Emptiness::NonEmpty,
+                default.emptiness != Emptiness::Empty,
+            )
+        })
+        .collect::<Vec<_>>();
+    loop {
+        let mut changed = false;
+        for (_, index, excludes_empty, excludes_nonempty, cannot_empty) in &flow.mutations {
+            let (empty, nonempty) = reachable[*index];
+            if empty && !excludes_empty && !nonempty {
+                reachable[*index].1 = true;
+                changed = true;
+            }
+            if nonempty && !excludes_nonempty && !cannot_empty && !empty {
+                reachable[*index].0 = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (operation, index, excludes_empty, excludes_nonempty, _) in &flow.mutations {
+        let (empty, nonempty) = reachable[*index];
+        if flow.defaults[*index].emptiness == Emptiness::Unknown
+            || (empty && !excludes_empty)
+            || (nonempty && !excludes_nonempty)
+        {
+            emit_mutation(
+                *operation,
+                &source,
+                file,
+                declaration,
+                &mut flow.expansions,
+                &mut flow.emitted,
+            );
+        }
+    }
+
     flow.reasons.sort_unstable();
     flow.reasons.dedup();
     if !flow.reasons.is_empty() {
         let reason = flow.reasons.join(", ");
-        flow.expansions
-            .push(open_fact(file, declaration, Some(&source), &reason));
+        flow.expansions.push(open_fact(
+            flow.incompleteness,
+            file,
+            declaration,
+            Some(&source),
+            &reason,
+        ));
     }
     flow.expansions
 }
@@ -294,7 +355,7 @@ fn mutable_default(expression: Node<'_>) -> Option<(CollectionKind, Emptiness)> 
     Some((kind, emptiness))
 }
 
-fn analyze_call(call: Node<'_>, flow: &mut MutableDefaultFlow<'_, '_>) {
+fn analyze_call<'tree>(call: Node<'tree>, flow: &mut MutableDefaultFlow<'_, 'tree>) {
     let names = alias_names(&flow.aliases);
     let call_target = call
         .child_by_field_name("function")
@@ -316,23 +377,30 @@ fn analyze_call(call: Node<'_>, flow: &mut MutableDefaultFlow<'_, '_>) {
                     continue;
                 }
                 if is_mutating_method(flow.defaults[*source_index].kind, method) {
-                    if !branch_excludes_mutation(
+                    flow.mutations.push((
                         call,
-                        flow.function,
-                        flow.source,
-                        &flow.aliases,
                         *source_index,
-                        flow.defaults[*source_index].emptiness,
-                    ) {
-                        emit_mutation(
+                        branch_excludes_mutation(
                             call,
+                            flow.function,
                             flow.source,
-                            flow.file,
-                            flow.declaration,
-                            &mut flow.expansions,
-                            &mut flow.emitted,
-                        );
-                    }
+                            &flow.aliases,
+                            *source_index,
+                            Emptiness::Empty,
+                        ),
+                        branch_excludes_mutation(
+                            call,
+                            flow.function,
+                            flow.source,
+                            &flow.aliases,
+                            *source_index,
+                            Emptiness::NonEmpty,
+                        ),
+                        matches!(
+                            method,
+                            "append" | "add" | "insert" | "extend" | "update" | "setdefault"
+                        ),
+                    ));
                 } else if !is_known_read_method(flow.defaults[*source_index].kind, method) {
                     flow.reasons.push("unknown_receiver_method_flow");
                 }
@@ -361,10 +429,10 @@ fn analyze_call(call: Node<'_>, flow: &mut MutableDefaultFlow<'_, '_>) {
     }
 }
 
-fn record_subscript_mutations(
-    target: Node<'_>,
-    operation: Node<'_>,
-    flow: &mut MutableDefaultFlow<'_, '_>,
+fn record_subscript_mutations<'tree>(
+    target: Node<'tree>,
+    operation: Node<'tree>,
+    flow: &mut MutableDefaultFlow<'_, 'tree>,
 ) {
     let mut stack = vec![target];
     while let Some(node) = stack.pop() {
@@ -381,7 +449,11 @@ fn record_subscript_mutations(
     }
 }
 
-fn emit_for_name(identifier: Node<'_>, operation: Node<'_>, flow: &mut MutableDefaultFlow<'_, '_>) {
+fn emit_for_name<'tree>(
+    identifier: Node<'tree>,
+    operation: Node<'tree>,
+    flow: &mut MutableDefaultFlow<'_, 'tree>,
+) {
     let Some(name) = node_text(flow.source, identifier) else {
         return;
     };
@@ -389,26 +461,35 @@ fn emit_for_name(identifier: Node<'_>, operation: Node<'_>, flow: &mut MutableDe
         return;
     };
     for source_index in source_indices {
-        if flow.uncertain_sources.contains(source_index)
-            || branch_excludes_mutation(
+        if !flow.uncertain_sources.contains(source_index) {
+            flow.mutations.push((
                 operation,
-                flow.function,
-                flow.source,
-                &flow.aliases,
                 *source_index,
-                flow.defaults[*source_index].emptiness,
-            )
-        {
-            continue;
+                branch_excludes_mutation(
+                    operation,
+                    flow.function,
+                    flow.source,
+                    &flow.aliases,
+                    *source_index,
+                    Emptiness::Empty,
+                ),
+                branch_excludes_mutation(
+                    operation,
+                    flow.function,
+                    flow.source,
+                    &flow.aliases,
+                    *source_index,
+                    Emptiness::NonEmpty,
+                ),
+                operation.kind() == "assignment"
+                    && operation.child_by_field_name("left").is_some_and(|left| {
+                        left.kind() == "subscript"
+                            && !named_children(left)
+                                .iter()
+                                .any(|node| node.kind() == "slice")
+                    }),
+            ));
         }
-        emit_mutation(
-            operation,
-            flow.source,
-            flow.file,
-            flow.declaration,
-            &mut flow.expansions,
-            &mut flow.emitted,
-        );
     }
 }
 
@@ -560,7 +641,43 @@ fn is_copy_expression(
             .and_then(|object| direct_identifier(object, source));
         return match (receiver, method) {
             (Some(receiver), Some("copy")) => aliases.contains_key(receiver),
-            (Some("copy"), Some("deepcopy")) => true,
+            (Some(receiver), Some("deepcopy")) => {
+                use brokk_bifrost_python::bindings::{
+                    PythonDirectScopeBindingKind, PythonLexicalNameResolution,
+                    python_name_resolution_at, python_unambiguous_module_binding_node_bounded,
+                };
+                use brokk_bifrost_python::imports::python_import_bindings_from_tree;
+                if !matches!(
+                    python_name_resolution_at(receiver, function, source),
+                    PythonLexicalNameResolution::Global | PythonLexicalNameResolution::Unbound
+                ) {
+                    return false;
+                }
+                let mut module = function;
+                while let Some(parent) = module.parent() {
+                    module = parent;
+                }
+                let Some(Some(binder)) = python_unambiguous_module_binding_node_bounded(
+                    module,
+                    source,
+                    receiver,
+                    || true,
+                ) else {
+                    return false;
+                };
+                if binder.kind != PythonDirectScopeBindingKind::Import {
+                    return false;
+                }
+                python_import_bindings_from_tree(module, source)
+                    .iter()
+                    .any(|binding| {
+                        binding.local_name == receiver
+                            && binding.qualified_name == "copy"
+                            && binding.start_byte <= binder.declaration.start_byte()
+                            && binder.declaration.end_byte() <= binding.scope_end_byte
+                            && !binding.is_function_scoped()
+                    })
+            }
             _ => false,
         };
     }
@@ -581,6 +698,7 @@ fn emit_mutation(
 ) {
     let span = mutation.start_byte()..mutation.end_byte();
     let fact = make_row(
+        Incompleteness::Content,
         RELATION,
         file,
         span.clone(),
@@ -599,6 +717,7 @@ fn emit_mutation(
 }
 
 fn open_fact(
+    incompleteness: Incompleteness,
     file: &ProjectFile,
     declaration: &DeclarationValue,
     source: Option<&str>,
@@ -610,6 +729,7 @@ fn open_fact(
         |source| row_range(source, anchor.clone()),
     );
     let fact = make_row(
+        incompleteness,
         RELATION,
         file,
         anchor,

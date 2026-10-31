@@ -110,7 +110,7 @@ pub mod fixtures {
         let conn = store.conn.lock().unwrap();
         conn.query_row(
             &crate::analyzer::store::stored_blob_cascade_costs_sql(1),
-            params![oid, "python"],
+            params![oid, "python", super::super::ParseVariant::Empty],
             |row| Ok((row.get(3)?, row.get::<_, Option<usize>>(4)?.unwrap())),
         )
         .unwrap()

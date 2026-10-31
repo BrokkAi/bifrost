@@ -10,7 +10,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 use crate::analyzer::{Language, ProjectFile};
 use crate::hash::HashMap;
-use git2::Oid;
+use brokk_bifrost_core::gitblob::BlobKey;
 use std::sync::Arc;
 use tree_sitter::Language as TsLanguage;
 #[doc(hidden)]
@@ -20,8 +20,7 @@ pub trait AnalyzerStoreEngineExt {
     fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         file: &ProjectFile,
         syntax: &PreparedSyntaxTree,
-        oid: Oid,
-        lang: &str,
+        key: &BlobKey,
         generations: &HashMap<String, GenerationId>,
         adapter: &A,
         state: Arc<FileState>,
@@ -33,8 +32,7 @@ pub trait AnalyzerStoreEngineExt {
     #[doc(hidden)]
     fn write_parsed_blob<A: LanguageAdapter>(
         &self,
-        oid: Oid,
-        lang: &str,
+        key: &BlobKey,
         adapter: &A,
         state: &FileState,
     ) -> Result<()>;
@@ -43,8 +41,7 @@ pub trait AnalyzerStoreEngineExt {
     fn write_parsed_blob_at_generation<A: LanguageAdapter>(
         &self,
         file: &ProjectFile,
-        oid: Oid,
-        lang: &str,
+        key: &BlobKey,
         generation: GenerationId,
         adapter: &A,
         state: &FileState,
@@ -53,8 +50,7 @@ pub trait AnalyzerStoreEngineExt {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     fn prepare_parsed_blob<A: LanguageAdapter>(
-        oid: Oid,
-        lang: &str,
+        key: &BlobKey,
         generation: GenerationId,
         adapter: &A,
         state: Arc<FileState>,
@@ -73,8 +69,7 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
     fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         file: &ProjectFile,
         syntax: &PreparedSyntaxTree,
-        oid: Oid,
-        lang: &str,
+        key: &BlobKey,
         generations: &HashMap<String, GenerationId>,
         adapter: &A,
         state: Arc<FileState>,
@@ -84,8 +79,7 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
         prepare_parsed_blob_at_generations(
             file,
             syntax,
-            oid,
-            lang,
+            key,
             generations,
             adapter,
             state,
@@ -98,32 +92,26 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
     #[doc(hidden)]
     fn write_parsed_blob<A: LanguageAdapter>(
         &self,
-        oid: Oid,
-        lang: &str,
+        key: &BlobKey,
         adapter: &A,
         state: &FileState,
     ) -> Result<()> {
+        let lang = key.lang.as_str();
         let generation = self.current_generation(lang)?;
-        self.write_parsed_blob_at_generation(
-            &test_blob_file(),
-            oid,
-            lang,
-            generation,
-            adapter,
-            state,
-        )
+        self.write_parsed_blob_at_generation(&test_blob_file(), key, generation, adapter, state)
     }
 
     #[doc(hidden)]
     fn write_parsed_blob_at_generation<A: LanguageAdapter>(
         &self,
         file: &ProjectFile,
-        oid: Oid,
-        lang: &str,
+        key: &BlobKey,
         generation: GenerationId,
         adapter: &A,
         state: &FileState,
     ) -> Result<()> {
+        let oid = key.oid;
+        let lang = key.lang.as_str();
         let mut generations = HashMap::default();
         generations.insert(lang.to_owned(), generation);
         if !state.additional_projections.is_empty() {
@@ -169,8 +157,7 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
         let prepared = match prepare_parsed_blob_at_generations(
             file,
             &syntax,
-            oid,
-            lang,
+            key,
             &generations,
             adapter,
             Arc::new(state.clone()),
@@ -194,13 +181,12 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     fn prepare_parsed_blob<A: LanguageAdapter>(
-        oid: Oid,
-        lang: &str,
+        key: &BlobKey,
         generation: GenerationId,
         adapter: &A,
         state: Arc<FileState>,
     ) -> Result<PreparedParsedBlob> {
-        prepare_parsed_blob(oid, lang, generation, adapter, state)
+        prepare_parsed_blob(key, generation, adapter, state)
     }
 
     fn ensure_language_epoch(
@@ -216,12 +202,12 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn prepare_parsed_blob<A: LanguageAdapter>(
-    oid: Oid,
-    lang: &str,
+    key: &BlobKey,
     generation: GenerationId,
     adapter: &A,
     state: Arc<FileState>,
 ) -> Result<PreparedParsedBlob> {
+    let lang = key.lang.as_str();
     if !state.additional_projections.is_empty() {
         return Err(StoreError::new(
             "preparing projected parsed blobs requires the captured generation map",
@@ -234,8 +220,7 @@ pub fn prepare_parsed_blob<A: LanguageAdapter>(
     match prepare_parsed_blob_at_generations(
         &file,
         &syntax,
-        oid,
-        lang,
+        key,
         &generations,
         adapter,
         state,
@@ -275,14 +260,15 @@ use crate::hash::HashSet;
 pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     file: &ProjectFile,
     syntax: &PreparedSyntaxTree,
-    oid: Oid,
-    lang: &str,
+    key: &BlobKey,
     generations: &HashMap<String, GenerationId>,
     adapter: &A,
     state: Arc<FileState>,
     required_existing_additional_storage_languages: &[String],
     cancellation: &CancellationToken,
 ) -> Result<PreparedParsedBlobPreparation> {
+    let oid = key.oid;
+    let lang = key.lang.as_str();
     macro_rules! stop_if_cancelled {
         () => {
             if cancellation.is_cancelled() {
@@ -496,14 +482,8 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     // reading has its own dialect and carries no semantic IR rows (C++ only).
     let semantic_ir = match adapter.parse_time_semantic_lowerer() {
         Some(lowerer) if lang == adapter.storage_language_key_for_file(file) => {
-            let Some(prepared) = prepare_parse_time_semantic_ir(
-                lowerer.lowerer(),
-                file,
-                syntax,
-                oid,
-                lang,
-                cancellation,
-            )?
+            let Some(prepared) =
+                prepare_parse_time_semantic_ir(lowerer.lowerer(), file, syntax, key, cancellation)?
             else {
                 return Ok(PreparedParsedBlobPreparation::Cancelled);
             };
@@ -536,8 +516,11 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         let projection = prepare_parsed_blob_at_generations(
             file,
             syntax,
-            oid,
-            projection_lang,
+            &BlobKey {
+                oid,
+                lang: projection_lang.to_string(),
+                variant: key.variant,
+            },
             generations,
             adapter,
             Arc::clone(projection_state),
@@ -581,8 +564,11 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         let projection = prepare_parsed_blob_at_generations(
             file,
             syntax,
-            oid,
-            projection_lang,
+            &BlobKey {
+                oid,
+                lang: projection_lang.to_string(),
+                variant: key.variant,
+            },
             generations,
             adapter,
             Arc::new(projection_state),
@@ -995,9 +981,7 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     });
     Ok(PreparedParsedBlobPreparation::Prepared(Box::new(
         PreparedParsedBlob {
-            oid,
-            oid_text: oid.to_string(),
-            lang: lang.to_string(),
+            key: key.clone(),
             generation,
             state,
             units,
@@ -1192,8 +1176,7 @@ impl PythonEnvironmentPublicationEngineExt for PythonEnvironmentPublication {
         let prepared = AnalyzerStore::prepare_parsed_blob_at_generations(
             &file,
             syntax,
-            oid,
-            "python",
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
             &generations,
             adapter,
             state,
@@ -1214,9 +1197,9 @@ impl PythonEnvironmentPublicationEngineExt for PythonEnvironmentPublication {
         let cached = self.store.admit_cached_selected_content(
             &snapshot,
             &portable(file.rel_path()),
-            oid,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
             &ResolutionContentInput::Parsed {
-                content_oid: oid,
+                key: brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
                 semantic_language: Language::Python,
             },
             &CancellationToken::default(),

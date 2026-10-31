@@ -406,7 +406,8 @@ impl OccurrenceTraversalCache {
                             .expect("one unsupported occurrence role yields one diagnostic")
                             .message(),
                     };
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
                         code,
@@ -416,7 +417,7 @@ impl OccurrenceTraversalCache {
                         message,
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                 }
                 OccurrenceIncompleteReason::NoStructuralAdapter
                 | OccurrenceIncompleteReason::FactsUnavailable => {
@@ -430,7 +431,18 @@ impl OccurrenceTraversalCache {
                         }
                         _ => "has no structural facts in this workspace",
                     };
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        incompleteness: match reason {
+                            OccurrenceIncompleteReason::NoStructuralAdapter => {
+                                brokk_bifrost_rql::Incompleteness::Content
+                            }
+                            OccurrenceIncompleteReason::FactsUnavailable => {
+                                brokk_bifrost_rql::Incompleteness::Operational(
+                                    brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                                )
+                            }
+                            _ => unreachable!("this arm handles acquisition outcomes"),
+                        },
                         related: Vec::new(),
                         source: None,
                         code,
@@ -443,7 +455,7 @@ impl OccurrenceTraversalCache {
                         ),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }));
                 }
             }
         }

@@ -97,6 +97,7 @@ impl PythonImportSiteCache {
                         .cloned()
                         .or_else(|| Some(incomplete_site(start_byte, "unavailable"))),
                     PythonImportFileFacts::Unavailable => {
+                        analyzer.mark_execution_dependent();
                         Some(incomplete_site(start_byte, "unavailable"))
                     }
                 }
@@ -139,7 +140,10 @@ impl PythonImportSiteCache {
                             .map(|(&start, site)| (start, site.clone()))
                             .collect(),
                     ),
-                    PythonImportFileFacts::Unavailable => None,
+                    PythonImportFileFacts::Unavailable => {
+                        analyzer.mark_execution_dependent();
+                        None
+                    }
                 }
             })
         })

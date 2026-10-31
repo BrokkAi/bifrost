@@ -3851,6 +3851,9 @@ fn seed_procedure(
                     let location_row = semantics
                         .memory_location(*location)
                         .expect("a load effect's location is retained");
+                    if adapter.memory_load_presents_name_read(location_row) {
+                        continue;
+                    }
                     let member = adapter.accessed_member(
                         workspace,
                         procedure,

@@ -248,7 +248,12 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
             nested_entries: 1 + context.calls().len(),
             ..SemanticWork::default()
         });
-        if limits.max_contexts == 0 {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            0,
+            limits.max_contexts,
+        )
+        .allows(1)
+        {
             result.truncated = true;
             result.status = result.status.merge(SemanticInputStatus::Unknown);
             break;
@@ -256,7 +261,12 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
         let procedure = provider.canonical_procedure(&procedure);
         let key = procedure.durable_key();
         if !acquired.contains(&key) {
-            if acquired.len() >= limits.max_procedures {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                acquired.len(),
+                limits.max_procedures,
+            )
+            .allows(1)
+            {
                 result.truncated = true;
                 result.status = result.status.merge(SemanticInputStatus::Unknown);
                 break;
@@ -273,7 +283,13 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
             }
             acquired.insert(key);
         }
-        if context.was_truncated() || context.calls().len() > limits.oracle.call_context_depth() {
+        if context.was_truncated()
+            || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                context.calls().len(),
+                limits.oracle.call_context_depth(),
+            )
+            .allows(0)
+        {
             result.truncated = true;
             result.status = result.status.merge(SemanticInputStatus::Unknown);
             continue;
@@ -329,7 +345,12 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
                         result.truncated = true;
                         result.status = result.status.merge(SemanticInputStatus::Unknown);
                     } else if !queued.contains(&(target.durable_key(), next.clone())) {
-                        if queued.len() >= limits.max_contexts {
+                        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                            queued.len(),
+                            limits.max_contexts,
+                        )
+                        .allows(1)
+                        {
                             result.truncated = true;
                             result.status = result.status.merge(SemanticInputStatus::Unknown);
                         } else {
@@ -543,7 +564,12 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
         // for the same durable key. Remove it before checking the cap so this
         // full acquisition consumes the slot that the surface had reserved.
         hydrated_surfaces.remove(&procedure_key);
-        if seen.len().saturating_add(hydrated_surfaces.len()) >= limits.max_procedures {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            seen.len().saturating_add(hydrated_surfaces.len()),
+            limits.max_procedures,
+        )
+        .allows(1)
+        {
             closure.truncated = true;
             // Keep the refused procedure with the other queued work so the
             // truncation pass marks every call site whose entered candidate
@@ -840,7 +866,12 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
         if seen.contains(&key) {
             continue;
         }
-        if closure.procedures.len() == limits.max_procedures {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            closure.procedures.len(),
+            limits.max_procedures,
+        )
+        .allows(1)
+        {
             closure.truncated = true;
             break;
         }

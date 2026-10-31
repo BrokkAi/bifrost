@@ -39,10 +39,17 @@ pub(super) fn expansions(
 
     let file = unit.source();
     let Some(source) = analyzer.get_source(&CodeUnit::file_scope(file.clone()), false) else {
-        return vec![open_fact(file, declaration, None, "source_unavailable")];
+        return vec![open_fact(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            file,
+            declaration,
+            None,
+            "source_unavailable",
+        )];
     };
     let Some(tree) = parse_python(&source) else {
         return vec![open_fact(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             file,
             declaration,
             Some(&source),
@@ -51,6 +58,7 @@ pub(super) fn expansions(
     };
     if tree.root_node().has_error() {
         return vec![open_fact(
+            Incompleteness::Content,
             file,
             declaration,
             Some(&source),
@@ -59,6 +67,7 @@ pub(super) fn expansions(
     }
     let Some(class_node) = python_class_node_for_unit(analyzer, unit, &tree) else {
         return vec![open_fact(
+            Incompleteness::Content,
             file,
             declaration,
             Some(&source),
@@ -90,6 +99,7 @@ pub(super) fn expansions(
 
     let Some(provider) = analyzer.python_class_hierarchy_provider_for(unit) else {
         return vec![open_fact(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             file,
             declaration,
             Some(&source),
@@ -101,6 +111,7 @@ pub(super) fn expansions(
         super::python_class_hierarchy::hierarchy_premise(analyzer, unit, &hierarchy)
     else {
         return vec![open_fact(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             file,
             declaration,
             Some(&source),
@@ -110,6 +121,7 @@ pub(super) fn expansions(
     let mut expansions = (|| {
         if hierarchy.outcome != PythonHierarchyOutcome::Complete {
             return vec![open_fact(
+                Incompleteness::Content,
                 file,
                 declaration,
                 Some(&source),
@@ -132,6 +144,7 @@ pub(super) fn expansions(
                     continue;
                 }
                 expansions.push(open_fact(
+                    Incompleteness::Content,
                     file,
                     declaration,
                     Some(&source),
@@ -140,13 +153,20 @@ pub(super) fn expansions(
                 continue;
             };
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                expansions.push(open_fact(file, declaration, Some(&source), "cancelled"));
+                expansions.push(open_fact(
+                    Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+                    file,
+                    declaration,
+                    Some(&source),
+                    "cancelled",
+                ));
                 break;
             }
             let Some(ancestor_source) =
                 analyzer.get_source(&CodeUnit::file_scope(ancestor.source().clone()), false)
             else {
                 expansions.push(open_fact(
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     file,
                     declaration,
                     Some(&source),
@@ -156,6 +176,7 @@ pub(super) fn expansions(
             };
             let Some(ancestor_tree) = parse_python(&ancestor_source) else {
                 expansions.push(open_fact(
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     file,
                     declaration,
                     Some(&source),
@@ -165,6 +186,7 @@ pub(super) fn expansions(
             };
             if ancestor_tree.root_node().has_error() {
                 expansions.push(open_fact(
+                    Incompleteness::Content,
                     file,
                     declaration,
                     Some(&source),
@@ -176,6 +198,7 @@ pub(super) fn expansions(
                 python_class_node_for_unit(analyzer, ancestor, &ancestor_tree)
             else {
                 expansions.push(open_fact(
+                    Incompleteness::Content,
                     file,
                     declaration,
                     Some(&source),
@@ -212,6 +235,7 @@ pub(super) fn expansions(
             };
             if initializer_node.kind() != "function_definition" {
                 expansions.push(open_fact(
+                    Incompleteness::Content,
                     file,
                     declaration,
                     Some(&source),
@@ -222,7 +246,13 @@ pub(super) fn expansions(
 
             let analysis = initializer_writes(initializer_node, &ancestor_source);
             if let Some(reason) = analysis.open_reason {
-                expansions.push(open_fact(file, declaration, Some(&source), reason));
+                expansions.push(open_fact(
+                    Incompleteness::Content,
+                    file,
+                    declaration,
+                    Some(&source),
+                    reason,
+                ));
             }
             for write in &analysis.writes {
                 for (method_name, name) in &shadowable {
@@ -231,6 +261,7 @@ pub(super) fn expansions(
                     }
                     let method_range = method_name.start_byte()..method_name.end_byte();
                     let fact = make_row(
+                        Incompleteness::Content,
                         RELATION,
                         file,
                         method_range.clone(),
@@ -284,6 +315,7 @@ fn direct_class_methods(class: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn open_fact(
+    incompleteness: Incompleteness,
     file: &ProjectFile,
     declaration: &DeclarationValue,
     source: Option<&str>,
@@ -295,6 +327,7 @@ fn open_fact(
         |source| row_range(source, anchor.clone()),
     );
     let fact = make_row(
+        incompleteness,
         RELATION,
         file,
         anchor,

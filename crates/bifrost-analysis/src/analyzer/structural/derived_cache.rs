@@ -1196,6 +1196,9 @@ impl RequestLocalDirectImportGraph {
             files_are_canonical,
         } = limits;
         let previously_omitted = files.iter().any(|file| self.budget_omitted.contains(file));
+        if previously_omitted {
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+        }
         let mut pending = files
             .iter()
             .filter(|file| {
@@ -1213,8 +1216,13 @@ impl RequestLocalDirectImportGraph {
         }
 
         let available_files = max_files.saturating_sub(self.attempted_files);
-        let mut exhausted = previously_omitted || pending.len() > available_files;
-        if pending.len() > available_files {
+        let files_fit = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            self.attempted_files,
+            max_files,
+        )
+        .allows(pending.len());
+        let mut exhausted = previously_omitted || !files_fit;
+        if !files_fit {
             pending.truncate(available_files);
         }
 
@@ -1235,6 +1243,7 @@ impl RequestLocalDirectImportGraph {
                 if maximum_working_bytes
                     .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
                 {
+                    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
                     return (true, true);
                 }
             }
@@ -1250,7 +1259,12 @@ impl RequestLocalDirectImportGraph {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return (true, false);
             }
-            if self.attempted_edges >= max_edges {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                self.attempted_edges,
+                max_edges,
+            )
+            .allows(1)
+            {
                 exhausted = true;
                 self.budget_omitted.extend(grouped_files.iter().cloned());
                 self.compact = None;
@@ -1334,6 +1348,7 @@ impl RequestLocalDirectImportGraph {
                             .saturating_add(provenance_bytes)
                             > maximum
                     }) {
+                        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
                         self.budget_omitted.insert(file.clone());
                         self.compact = None;
                         byte_budget_exhausted.set(true);
@@ -1342,7 +1357,12 @@ impl RequestLocalDirectImportGraph {
 
                     let available_edges =
                         max_edges.saturating_sub(self.attempted_edges.saturating_sub(edge_work));
-                    if edge_work > available_edges {
+                    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                        edge_work,
+                        available_edges,
+                    )
+                    .allows(0)
+                    {
                         exhausted = true;
                         self.budget_omitted.insert(file.clone());
                         self.budget_omitted
@@ -1361,6 +1381,7 @@ impl RequestLocalDirectImportGraph {
                     if maximum_working_bytes
                         .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
                     {
+                        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
                         byte_budget_exhausted.set(true);
                         return false;
                     }
@@ -1470,6 +1491,7 @@ impl RequestLocalDirectImportGraph {
                 if maximum_working_bytes
                     .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
                 {
+                    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
                     return (true, true);
                 }
             }

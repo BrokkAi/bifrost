@@ -8,6 +8,7 @@ use brokk_bifrost_core::analyzer::cpp_class_facts::{
 use brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn cpp_class_fact_expansions(
     analyzer: &dyn IAnalyzer,
     class_cache: &mut HashMap<ProjectFile, Arc<CppClassFactRows>>,
@@ -15,6 +16,8 @@ pub(super) fn cpp_class_fact_expansions(
     token: QueryToken<'_>,
     seed: &Arc<SeedMatch>,
     kind: CppClassFactKind,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     if seed.language != Language::Cpp {
         return Vec::new();
@@ -38,14 +41,36 @@ pub(super) fn cpp_class_fact_expansions(
             })
     };
     let range = super::relations::seed_range(seed);
-    if matches_cpp_fact(
-        declarations
-            .as_deref()
-            .map(|declarations| declarations.as_slice()),
-        &class_facts,
-        range,
-        kind,
-    ) {
+    let matches = if kind == CppClassFactKind::UndisciplinedMultipleInheritance {
+        match resolved_multiple_inheritance(analyzer, token, seed, &class_facts, cancellation) {
+            Ok(matches) => matches,
+            Err(incompleteness) => {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness,
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: Language::Cpp.config_label(),
+                    message: format!("cpp-undisciplined-multiple-inheritance: base declaration evidence is incomplete for {}", rel_path_string(&seed.file)),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                }));
+                false
+            }
+        }
+    } else {
+        matches_cpp_fact(
+            declarations
+                .as_deref()
+                .map(|declarations| declarations.as_slice()),
+            &class_facts,
+            range,
+            kind,
+        )
+    };
+    if matches {
         vec![pipeline_expansion(PipelineValue::StructuralMatch(
             Arc::clone(seed),
         ))]
@@ -103,9 +128,9 @@ fn matches_cpp_fact(
                 && thrown.operand_shape == CppThrowOperandShape::Pointer
                 && !is_mfc_exception(declarations, &thrown.thrown_type)
         }),
-        CppClassFactKind::UndisciplinedMultipleInheritance => rows.classes.iter().any(|class| {
-            class.range == range && is_undisciplined_multiple_inheritance(declarations, rows, class)
-        }),
+        CppClassFactKind::UndisciplinedMultipleInheritance => {
+            unreachable!("multiple inheritance requires resolved base declarations")
+        }
     }
 }
 
@@ -145,7 +170,7 @@ fn is_mfc_exception(
     declarations: Option<&[CppDeclarationSourceFact]>,
     thrown_type: &[String],
 ) -> bool {
-    if thrown_type.last().is_some_and(|name| name == "CException") {
+    if thrown_type == ["CException"] {
         return true;
     }
     let Some(declarations) = declarations else {
@@ -157,7 +182,7 @@ fn is_mfc_exception(
         if path.is_empty() || seen.iter().any(|candidate| candidate == &path) {
             continue;
         }
-        if path.last().is_some_and(|name| name == "CException") {
+        if path == ["CException"] {
             return true;
         }
         seen.push(path.clone());
@@ -169,28 +194,68 @@ fn is_mfc_exception(
     false
 }
 
-fn is_undisciplined_multiple_inheritance(
-    declarations: Option<&[CppDeclarationSourceFact]>,
+fn resolved_multiple_inheritance(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    seed: &SeedMatch,
     rows: &CppClassFactRows,
-    class: &brokk_bifrost_core::analyzer::cpp_class_facts::CppClassFact,
-) -> bool {
-    let Some(declarations) = declarations else {
-        return false;
+    cancellation: Option<&CancellationToken>,
+) -> Result<bool, Incompleteness> {
+    use brokk_bifrost_cpp::graph_support::CppSource;
+    use brokk_bifrost_cpp::hierarchy::cpp_resolve_base_type;
+    use brokk_bifrost_cpp_analysis::analyzer::CppAnalyzer;
+
+    let stopped = || {
+        Incompleteness::Operational(if cancellation.is_some_and(|token| token.is_cancelled()) {
+            DerivationExecutionCause::Cancelled
+        } else {
+            DerivationExecutionCause::Provider
+        })
     };
-    let Some(declaration) = declarations
+    let keep_going = || !cancellation.is_some_and(|token| token.is_cancelled());
+    let range = super::relations::seed_range(seed);
+    let Some(class) = rows.classes.iter().find(|class| class.range == range) else {
+        return Ok(false);
+    };
+    let cpp = crate::analyzer::resolve_analyzer::<CppAnalyzer>(analyzer).ok_or_else(stopped)?;
+    let visible =
+        CppSource::visible_type_units_while(cpp, &seed.file, &keep_going).ok_or_else(stopped)?;
+    let unit = visible
+        .iter()
+        .find(|unit| unit.source() == &seed.file && analyzer.ranges(unit).contains(&range))
+        .ok_or(Incompleteness::Content)?;
+    let declarations = cpp
+        .declaration_source_properties(token, unit)
+        .ok_or_else(stopped)?;
+    let declaration = declarations
         .iter()
         .find(|fact| fact.lexical_path == class.path)
-    else {
-        return false;
-    };
-    declaration.bases.len() > 1
-        && declaration.bases.iter().any(|base| {
-            base.access == CppAccessSpecifier::Public && !base_is_interface(rows, &base.components)
-        })
-}
-
-fn base_is_interface(rows: &CppClassFactRows, components: &[String]) -> bool {
-    rows.classes.iter().any(|class| {
-        class.is_interface && (class.path == components || class.path.ends_with(components))
-    })
+        .ok_or(Incompleteness::Content)?;
+    if declaration.bases.len() <= 1 {
+        return Ok(false);
+    }
+    let mut undisciplined = false;
+    for base in &declaration.bases {
+        let resolved = cpp_resolve_base_type(
+            cpp,
+            token,
+            unit,
+            &base.components,
+            base.absolute,
+            &visible,
+            &keep_going,
+        )
+        .ok_or_else(stopped)?
+        .ok_or(Incompleteness::Content)?;
+        let facts = analyzer
+            .cpp_class_source_facts(resolved.source())
+            .ok_or_else(stopped)?;
+        let resolved_class = facts
+            .classes
+            .iter()
+            .find(|class| analyzer.ranges(&resolved).contains(&class.range))
+            .ok_or(Incompleteness::Content)?;
+        undisciplined |= base.access == CppAccessSpecifier::Public && !resolved_class.is_interface;
+    }
+    Ok(undisciplined)
 }

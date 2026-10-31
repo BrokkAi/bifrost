@@ -10,7 +10,7 @@
 
 use super::aliases::{PhpFileContext, PhpUseAliases, resolve_php_type};
 use crate::source_facts::PhpSourceFactProvider;
-use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+use brokk_bifrost_core::analyzer::capabilities::{HierarchyAnswer, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::php_facts::{PhpAliasKind, PhpDeclarationKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -121,6 +121,8 @@ pub fn php_direct_declared_class_parent(
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
     php.get_direct_ancestors(code_unit)
+        .definite()
+        .to_vec()
         .into_iter()
         .find(|ancestor| !php_is_interface(php, ancestor) && !php_is_trait(php, ancestor))
 }
@@ -149,11 +151,11 @@ pub fn php_import_alias_candidates(
     hierarchy: Option<&dyn TypeHierarchyProvider>,
     php: &dyn PhpSource,
     analyzed_php_files: &dyn Fn() -> Vec<ProjectFile>,
-) -> HashSet<ProjectFile> {
+) -> Result<HashSet<ProjectFile>, HierarchyAnswer> {
     let mut candidates = HashSet::default();
-    let relevant_types = php_relevant_candidate_types(target, hierarchy, php);
+    let relevant_types = php_relevant_candidate_types(target, hierarchy, php)?;
     if relevant_types.is_empty() {
-        return candidates;
+        return Ok(candidates);
     }
     for fq_name in &relevant_types {
         candidates.extend(
@@ -173,14 +175,14 @@ pub fn php_import_alias_candidates(
             candidates.insert(file);
         }
     }
-    candidates
+    Ok(candidates)
 }
 
 fn php_relevant_candidate_types(
     target: &CodeUnit,
     hierarchy: Option<&dyn TypeHierarchyProvider>,
     php: &dyn PhpSource,
-) -> HashSet<String> {
+) -> Result<HashSet<String>, HierarchyAnswer> {
     let mut types = HashSet::default();
     let owner = if target.is_class() {
         Some(target.clone())
@@ -188,18 +190,17 @@ fn php_relevant_candidate_types(
         php.parent_of(target)
     };
     let Some(owner) = owner else {
-        return types;
+        return Ok(types);
     };
     types.insert(owner.fq_name());
     if let Some(provider) = hierarchy {
-        types.extend(
-            provider
-                .get_descendants(&owner)
-                .into_iter()
-                .map(|unit| unit.fq_name()),
-        );
+        let answer = provider.get_descendants(&owner);
+        if !answer.is_complete() {
+            return Err(answer);
+        }
+        types.extend(answer.edges.into_iter().map(|unit| unit.fq_name()));
     }
-    types
+    Ok(types)
 }
 
 #[cfg(test)]
@@ -222,10 +223,16 @@ mod graph_publication_tests {
         }
     }
     impl TypeHierarchyProvider for Source {
-        fn get_direct_ancestors(&self, _: &CodeUnit) -> Vec<CodeUnit> {
+        fn get_direct_ancestors(
+            &self,
+            _: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
             unimplemented!()
         }
-        fn get_direct_descendants(&self, _: &CodeUnit) -> HashSet<CodeUnit> {
+        fn get_direct_descendants(
+            &self,
+            _: &CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
             unimplemented!()
         }
     }

@@ -126,7 +126,12 @@ where
             return None;
         }
         let descendant = index_by_node[&candidate];
-        for ancestor in provider.get_direct_ancestors_within(&candidate, scope)? {
+        for ancestor in provider
+            .get_direct_ancestors_within(&candidate, scope)
+            .ok()?
+            .definite()
+            .to_vec()
+        {
             let ancestor = *index_by_node.entry(ancestor.clone()).or_insert_with(|| {
                 let index = u32::try_from(nodes.len())
                     .expect("hierarchy index declarations must fit in a u32");

@@ -7,6 +7,8 @@
 //! persisted candidates and the base's own coverage.
 
 use super::*;
+use crate::analyzer::resolution::ClosedQueryScope;
+
 use crate::analyzer::resolution::{
     BatchCandidateCompletionOutcome, BatchCandidateMatch, BatchCandidateOutcome,
     BatchCandidateRequest, BatchDefinitionNode, BatchEndpointClassification,
@@ -62,6 +64,7 @@ pub(crate) struct LanguagePrefixInputs {
 /// Completion and any placeholder reasons discharged by one closed root.
 #[doc(hidden)]
 pub struct LanguageClosure {
+    pub(crate) query_scope: Option<ClosedQueryScope>,
     pub(crate) outcome: RootClosure,
     pub(crate) discharges: Option<DemandClosureDischarges>,
 }
@@ -74,6 +77,7 @@ impl LanguageClosure {
     pub(crate) fn cancelled(completion: ResolutionCompletion) -> Self {
         Self {
             outcome: RootClosure::Cancelled(completion),
+            query_scope: None,
             discharges: None,
         }
     }
@@ -83,6 +87,7 @@ impl LanguageClosure {
         }
         Self {
             outcome: RootClosure::settled(completion),
+            query_scope: None,
             discharges: None,
         }
     }
@@ -224,6 +229,20 @@ pub(crate) trait DemandLanguage {
         unreachable!("a language requesting member selection installs its result")
     }
 
+    /// Attach the evidence scope at the common sync/async completion boundary.
+    fn finish_closure(
+        &mut self,
+        _endpoint: &DemandRelationKey,
+        _question: &Self::RootQuestion,
+        _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+        _closure: &mut LanguageClosure,
+    ) {
+    }
+
+    fn retained_query_scope(&self, _endpoint: &DemandRelationKey) -> Option<ClosedQueryScope> {
+        None
+    }
+
     fn reverse_dependencies(
         &mut self,
         _endpoint: &EndpointSignature,
@@ -254,6 +273,7 @@ pub(crate) struct DemandProvider<L: DemandLanguage> {
     language: L,
     contexts: HashMap<L::ContextKey, PreparedContext<L::ContextData>>,
     pending: HashMap<DemandRelationKey, PendingRoot<L::RootQuestion, L::ContextKey>>,
+    query_scopes: HashMap<DemandRelationKey, ClosedQueryScope>,
     discharges: HashMap<DemandRelationKey, DemandClosureDischarges>,
 }
 
@@ -263,6 +283,7 @@ impl<L: DemandLanguage> DemandProvider<L> {
             language,
             contexts: HashMap::default(),
             pending: HashMap::default(),
+            query_scopes: HashMap::default(),
             discharges: HashMap::default(),
         }
     }
@@ -270,20 +291,36 @@ impl<L: DemandLanguage> DemandProvider<L> {
     fn finish_closure(
         &mut self,
         endpoint: &DemandRelationKey,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         closure: LanguageClosure,
     ) -> Result<RootClosure> {
-        let closure = self.language.finalize_closure(endpoint, closure)?;
+        let mut closure = self.language.finalize_closure(endpoint, closure)?;
         let root = self
             .pending
             .get_mut(endpoint)
             .expect("only discovered roots may close");
+        self.language
+            .finish_closure(endpoint, &root.question, inputs, &mut closure);
         root.closed = !matches!(closure.outcome, RootClosure::Cancelled(_));
         if root.closed {
             debug_assert!(self.language.root_has_receipt(endpoint));
             root.closed_completion = Some(closure.outcome.completion().clone());
-            if let Some(discharges) = closure.discharges {
-                self.discharges.insert(endpoint.clone(), discharges);
-            }
+        }
+        // Query scope describes consumed evidence even when cancellation prevents
+        // publication. Closure proof receipts require a closed root.
+        if let Some(scope) = closure.query_scope {
+            self.query_scopes
+                .entry(endpoint.clone())
+                .or_default()
+                .merge(scope);
+        }
+        if root.closed
+            && let Some(discharges) = closure.discharges
+        {
+            self.discharges
+                .entry(endpoint.clone())
+                .or_default()
+                .merge(discharges);
         }
         Ok(closure.outcome)
     }
@@ -337,7 +374,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
                 resume,
             )? {
                 CloseProgress::Ready(closure) => {
-                    CloseProgress::Ready(self.finish_closure(endpoint, closure)?)
+                    CloseProgress::Ready(self.finish_closure(endpoint, inputs, closure)?)
                 }
                 CloseProgress::Reference {
                     continuation,
@@ -528,7 +565,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
             inputs,
             member_completion,
         )?;
-        self.finish_closure(endpoint, closure)
+        self.finish_closure(endpoint, inputs, closure)
     }
 
     fn member_selection(
@@ -571,7 +608,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
             inputs,
             selection,
         )?;
-        self.finish_closure(endpoint, closure)
+        self.finish_closure(endpoint, inputs, closure)
     }
 
     fn retain_member_provider_reasons(
@@ -596,6 +633,15 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
             .filter(|reasons| !reasons.is_empty())
     }
 
+    fn resolved_query_scope(&self, endpoint: &DemandRelationKey) -> Option<ClosedQueryScope> {
+        let mut retained = self.language.retained_query_scope(endpoint);
+        if let Some(local) = self.query_scopes.get(endpoint) {
+            retained
+                .get_or_insert_with(Default::default)
+                .merge(local.clone());
+        }
+        retained
+    }
     fn resolved_closure_discharges(
         &self,
         endpoint: &DemandRelationKey,
@@ -669,6 +715,7 @@ mod tests {
         ) -> Result<LanguageClosure> {
             Ok(LanguageClosure {
                 outcome: RootClosure::Published(self.closure_completion.clone()),
+                query_scope: None,
                 discharges: Some(DemandClosureDischarges::exact([self.discharged])),
             })
         }

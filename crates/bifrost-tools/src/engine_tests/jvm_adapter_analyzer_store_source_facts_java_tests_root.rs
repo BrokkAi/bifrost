@@ -27,7 +27,11 @@ mod jvm_extraction_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store.current_generation("java").unwrap();
         store
-            .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
         store
             .conn
@@ -67,14 +71,22 @@ mod jvm_extraction_tests {
         let generation = store.current_generation("java").unwrap();
         let oid = oid_for(SOURCE.as_bytes());
         store
-            .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
         // Distinct content identities populate the publication inventory without
         // introducing extra parser work into a query-planner regression.
         for index in 0..32 {
             let other = oid_for(format!("planner publication {index}").as_bytes());
             store
-                .write_parsed_blob(other, "java", &JavaAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(other, "java"),
+                    &JavaAdapter,
+                    &state,
+                )
                 .unwrap();
         }
         brokk_bifrost_analysis::analyzer::store::source_facts::assert_source_lookup_plan(
@@ -171,7 +183,11 @@ mod jvm_extraction_tests {
         {
             let store = AnalyzerStore::open_persistent(&path).unwrap();
             store
-                .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    &JavaAdapter,
+                    &state,
+                )
                 .unwrap();
         }
         std::fs::remove_file(file.abs_path()).unwrap();
@@ -223,12 +239,20 @@ mod jvm_extraction_tests {
         let facts = state.source_facts.as_mut().unwrap().java.take().unwrap();
         assert!(
             store
-                .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    &JavaAdapter,
+                    &state
+                )
                 .is_err()
         );
         state.source_facts.as_mut().unwrap().java = Some(facts);
         store
-            .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
         let read = store
             .java_source_facts(oid, generation, &JavaAdapter, &file, &|| true)
@@ -261,7 +285,13 @@ mod jvm_extraction_tests {
             .unwrap();
         brokk_bifrost_analysis::analyzer::store::source_facts::assert_missing_then_republished(
             || store.java_source_facts(oid, generation, &JavaAdapter, &file, &|| true),
-            || store.write_parsed_blob(oid, "java", &JavaAdapter, &state),
+            || {
+                store.write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
+                    &JavaAdapter,
+                    &state,
+                )
+            },
         );
     }
 }

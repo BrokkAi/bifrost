@@ -679,14 +679,23 @@ fn materialize_receiver_family(
     let scope = DescendantIndexScope::whole_workspace(&cancellation);
     let descendants = provider
         .get_descendants_within(root, &scope)
-        .ok_or_else(|| {
+        .map_err(|failure| {
             locator_error(
                 locator,
                 LocatorRole::ReceiverType,
                 LocatorFailure::Incomplete,
-                "the complete descendant hierarchy build was cancelled",
+                format!("descendant hierarchy is unavailable: {failure:?}"),
             )
         })?;
+    if !descendants.is_complete() {
+        return Err(locator_error(
+            locator,
+            LocatorRole::ReceiverType,
+            LocatorFailure::Incomplete,
+            "the descendant hierarchy evidence is incomplete",
+        ));
+    }
+    let descendants = descendants.definite();
     let mut identities = Vec::with_capacity(descendants.len() + 1);
     identities.push(root_id.clone());
     identities.extend(

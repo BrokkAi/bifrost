@@ -47,7 +47,7 @@ use crate::analyzer::resolution::{
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionConstructionRequirementKind, ResolutionGapKind, ResolutionImportRouteKind,
     ResolutionImportSelectorKind, ResolutionMemberAccess, ResolutionMemberKind,
-    ResolutionNamespace, ResolutionSiteId, ResolutionSupertypeKind,
+    ResolutionNamespace, ResolutionRootImportKind, ResolutionSiteId, ResolutionSupertypeKind,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{DeclaredVisibility, PrecedenceTier};
 use brokk_bifrost_jvm::java::import_split::{
@@ -112,6 +112,7 @@ struct JvmPackageImportContext<'a> {
     caller_package: Option<&'a str>,
     lookup: Option<&'a str>,
     package_plan: &'a JvmFilePackagePlan,
+    prepared: &'a JvmContextPreparation,
 }
 
 // The mount language remains part of every candidate row. Package equality
@@ -415,7 +416,11 @@ pub(super) struct JvmContextPreparation {
     java_imports: ContextPlanMemo<CandidatePathIdentity, Arc<JavaDerivedImport>>,
     implicit: ContextPlanCell<Arc<JvmImplicitContextParts>>,
     external_providers: JvmExternalProviderBlueprint,
+    on_demand_types: ContextPlanMemo<SemanticId, JvmOnDemandTypeChoice>,
+    on_demand_bindings: ContextPlanMemo<SemanticId, JvmOnDemandBindings>,
 }
+
+type JvmOnDemandBindings = Arc<[super::jvm_demand::JvmImportBinding]>;
 
 type JvmScalaImports = BTreeMap<(BindingNodeId, String), Vec<ResolutionLookupSemanticRecipe>>;
 type JvmScalaWildcards = BTreeMap<BindingNodeId, Vec<Vec<ResolutionLookupSemanticRecipe>>>;
@@ -597,6 +602,55 @@ pub(super) struct JvmPackageTargetKey {
 
 pub(super) type JvmPackageTargetMemo = ExactReadMemo<JvmPackageTargetKey, Arc<JvmImportTargetRows>>;
 pub(super) type JvmPackagePresenceMemo = ExactReadMemo<JvmImportTargetKey, bool>;
+
+#[derive(Clone)]
+pub(super) struct JvmDeclaredType {
+    fqn: String,
+    owner: Option<crate::analyzer::resolution::ExternalOwnerIdentity>,
+    indexed: bool,
+}
+
+pub(super) type JvmDeclaredTypeMemo = ExactReadMemo<(Language, String), Option<JvmDeclaredType>>;
+pub(super) type JvmDeclaredOwnerMemo =
+    ExactReadMemo<String, Option<Option<crate::analyzer::resolution::ExternalOwnerIdentity>>>;
+pub(super) type JvmDeclarationPackageMemo = ExactReadMemo<(SemanticId, (u64, u64)), Option<String>>;
+
+#[derive(Clone)]
+struct JvmOnDemandType {
+    declared: JvmDeclaredType,
+    precedence: super::jvm_demand::JvmBindingPrecedence,
+    package: String,
+}
+
+#[derive(Clone)]
+enum JvmOnDemandTypeChoice {
+    Unavailable,
+    Competing,
+    OpenDefault,
+    Indexed(JvmOnDemandType),
+    Intrinsic(JvmOnDemandType),
+}
+
+fn jvm_on_demand_import(binder: &ImportBinder) -> bool {
+    match binder.route.as_ref().map(|route| route.kind) {
+        Some(SelectedImportRouteKind::TypeOnDemand | SelectedImportRouteKind::Star) => true,
+        Some(SelectedImportRouteKind::SingleStatic | SelectedImportRouteKind::StaticOnDemand) => {
+            false
+        }
+        _ => binder
+            .selector
+            .as_ref()
+            .is_some_and(|selector| selector.kind == ResolutionImportSelectorKind::Star),
+    }
+}
+
+fn jvm_on_demand_package(binder: &ImportBinder) -> String {
+    binder.recipes[..binder.recipes.len() - 1]
+        .iter()
+        .map(ResolutionLookupSemanticRecipe::spelling)
+        .collect::<Vec<_>>()
+        .join(".")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct JvmPackageMemberKey {
@@ -875,6 +929,7 @@ struct JvmPackageBridgeRules<'a, 'store, 'input> {
     caller_version: Option<i64>,
     caller_package: Option<&'a str>,
     same_package_lookups: RefCell<&'a mut BTreeSet<SemanticId>>,
+    prepared: &'a JvmContextPreparation,
 }
 
 impl<'a> PackageBridgeRules for JvmPackageBridgeRules<'a, '_, '_> {
@@ -895,13 +950,27 @@ impl<'a> PackageBridgeRules for JvmPackageBridgeRules<'a, '_, '_> {
         debug_assert_ne!(pair.target_mount, self.source.ordinal());
         let target_language = target_mount.semantic_language();
         let target_version = candidate.candidate.version;
-        let relation = JvmDeclarationAccessContext::between(self.caller_package, candidate.package)
-            .with_reference(Some(reference.reference));
         if member.namespace != reference.namespace
             || member.lookup != candidate.target_lookup_semantic
         {
             return Ok(None);
         }
+        if Some(candidate.package) == self.caller_package
+            && !matches!(
+                self.operation.jvm_current_package_candidate(
+                    self.prepared,
+                    reference.lookup,
+                    member.definition,
+                    candidate.package,
+                    cancellation,
+                )?,
+                SelectedPackageRows::Ready(true)
+            )
+        {
+            return Ok(None);
+        }
+        let relation = JvmDeclarationAccessContext::between(self.caller_package, candidate.package)
+            .with_reference(Some(reference.reference));
         let completion = match self.operation.jvm_declaration_access(
             member.definition,
             relation,
@@ -1028,6 +1097,7 @@ struct JavaPackageBridgeRules<'a, 'store, 'input> {
     operation: &'a SelectedResolutionOperation<'store, 'input>,
     source: &'a SelectedResolutionOperationMount,
     caller_package: Option<&'a str>,
+    prepared: &'a JvmContextPreparation,
 }
 
 impl<'a> PackageBridgeRules for JavaPackageBridgeRules<'a, '_, '_> {
@@ -1044,6 +1114,18 @@ impl<'a> PackageBridgeRules for JavaPackageBridgeRules<'a, '_, '_> {
         if pair.member.domain != pair.reference.domain
             || pair.member.namespace != pair.reference.namespace
         {
+            return Ok(None);
+        }
+        if !matches!(
+            self.operation.jvm_current_package_candidate(
+                self.prepared,
+                pair.reference.lookup,
+                pair.member.definition,
+                self.caller_package.unwrap_or(""),
+                cancellation,
+            )?,
+            SelectedPackageRows::Ready(true)
+        ) {
             return Ok(None);
         }
         let access = match self.operation.jvm_declaration_access(
@@ -1937,21 +2019,22 @@ impl SelectedResolutionOperation<'_, '_> {
             recipes: provider_recipes,
             registered: Mutex::default(),
         };
-        let Some(package_plan) = self.jvm_file_package_plan(
-            source_language,
-            source.fragment(),
-            source_package.as_deref(),
-            &package_references,
-            cancellation,
-        )?
-        else {
-            return Ok(None);
-        };
         let Some(binders) = self.jvm_import_binders(
             source_language,
             source_record.blob_id(),
             source.fragment(),
             import_halves,
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(package_plan) = self.jvm_file_package_plan(
+            source_language,
+            source.fragment(),
+            source_package.as_deref(),
+            &package_references,
+            &binders,
             cancellation,
         )?
         else {
@@ -1975,6 +2058,8 @@ impl SelectedResolutionOperation<'_, '_> {
             java_imports: ContextPlanMemo::default(),
             implicit: ContextPlanCell::default(),
             external_providers,
+            on_demand_types: ContextPlanMemo::default(),
+            on_demand_bindings: ContextPlanMemo::default(),
         })))
     }
 
@@ -2045,6 +2130,9 @@ impl SelectedResolutionOperation<'_, '_> {
                 .as_ref()
                 .is_some_and(|retained| !retained.contains(&binder.identity))
             {
+                continue;
+            }
+            if self.jvm_indexed_on_demand_import(&prepared, binder, cancellation)? {
                 continue;
             }
             let half = binder.half.clone();
@@ -2740,7 +2828,11 @@ impl SelectedResolutionOperation<'_, '_> {
                             .collect::<Vec<_>>()
                             .join(".");
                         let declared = format!("{owner}.{}", source_demand.spelling());
-                        if self.declares_jvm_type(source_language, &declared)? {
+                        let competing_type = self.jvm_on_demand_import_competes(&prepared, binder);
+                        if let Some(declared_type) = self
+                            .jvm_declared_type(source_language, &declared)?
+                            .filter(|_| !competing_type)
+                        {
                             // The reviewed model declares this type, so the import
                             // closes with a model-declared identity instead of an
                             // open route. The shared registration checks whether
@@ -2748,7 +2840,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             model_declared_routes.push(ModelDeclaredJvmImportRoute {
                                 source_token: token,
                                 lookup: source_demand.clone(),
-                                owner: self.declared_jvm_owner(source_language, &declared)?,
+                                owner: declared_type.owner,
                                 declared_fqn: declared,
                             });
                         } else {
@@ -2768,12 +2860,17 @@ impl SelectedResolutionOperation<'_, '_> {
                             gap.boundary_status = Some(
                         crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
                     );
-                            let identity = model_declared_jvm_type_identity(
-                                &declared,
-                                &self.ready.shared_names(),
-                            );
-                            identities.record_jvm_unindexed_import_owner(identity, &declared);
-                            gap.nominal_type_identity = Some(identity);
+                            // A tie is an open route, not a nominal claim for
+                            // either provider. The existing glob rank keeps
+                            // this gap even when another glob finds a source.
+                            if !competing_type {
+                                let identity = model_declared_jvm_type_identity(
+                                    &declared,
+                                    &self.ready.shared_names(),
+                                );
+                                identities.record_jvm_unindexed_import_owner(identity, &declared);
+                                gap.nominal_type_identity = Some(identity);
+                            }
                             scoped_gaps.push(gap);
                         }
                         route_inventory_open |= rules.has_context_import_inventory();
@@ -2824,6 +2921,7 @@ impl SelectedResolutionOperation<'_, '_> {
             caller_package: source_package.as_deref(),
             lookup,
             package_plan: &prepared.package_plan,
+            prepared: &prepared,
         };
         let cached_implicit = prepared.implicit.get();
         let implicit = if let Some(implicit) = cached_implicit {
@@ -2879,6 +2977,12 @@ impl SelectedResolutionOperation<'_, '_> {
                     let JvmImplicitRootProvider::Package(package) = provider else {
                         continue;
                     };
+                    if prepared.package_plan.get(*package).is_some_and(|plan| {
+                        plan.candidates
+                            .contains_key(&gap.lookup.semantic(&self.ready.shared_names()))
+                    }) {
+                        continue;
+                    }
                     let fqn = format!("{package}.{}", gap.lookup.spelling());
                     if let Some(owner) = self.declared_jvm_owner(source_language, &fqn)? {
                         durable_implicit_owners.insert(fqn, owner);
@@ -2905,6 +3009,13 @@ impl SelectedResolutionOperation<'_, '_> {
                         let JvmImplicitRootProvider::Package(package) = provider else {
                             continue;
                         };
+                        if prepared
+                            .package_plan
+                            .get(*package)
+                            .is_some_and(|plan| plan.candidates.contains_key(&reference.lookup))
+                        {
+                            continue;
+                        }
                         let fqn = format!("{package}.{}", lookup.spelling());
                         if let Some(owner) = self.declared_jvm_owner(source_language, &fqn)? {
                             durable_implicit_owners.insert(fqn, owner);
@@ -2968,8 +3079,45 @@ impl SelectedResolutionOperation<'_, '_> {
         model_bound_references.extend(current_package_references);
         // A proven import binder owns its references. Lower-precedence implicit
         // providers must not replace that indexed identity during registration.
+        let mut competing_references = BTreeSet::new();
+        for (&(_, lookup), references) in &prepared.external_providers.references_by_route {
+            let recipe = &prepared.external_providers.recipes[&lookup];
+            for &reference in references {
+                let Some(choice) =
+                    self.jvm_on_demand_type(&prepared, reference, lookup, recipe, cancellation)?
+                else {
+                    return Ok(JvmImportContext::Cancelled);
+                };
+                match choice {
+                    JvmOnDemandTypeChoice::Indexed(winner)
+                    | JvmOnDemandTypeChoice::Intrinsic(winner)
+                        if !model_bound_references.contains(&reference) =>
+                    {
+                        register_model_declared_jvm_type_identity(
+                            self,
+                            reference,
+                            &winner.declared.fqn,
+                            winner.declared.owner.as_ref(),
+                            &identities,
+                            &names,
+                        )?;
+                        if winner.declared.indexed {
+                            self.jvm_on_demand_type_ranks
+                                .borrow_mut()
+                                .insert(reference, winner.precedence);
+                        }
+                        model_bound_references.insert(reference);
+                    }
+                    JvmOnDemandTypeChoice::Competing | JvmOnDemandTypeChoice::OpenDefault => {
+                        competing_references.insert(reference);
+                    }
+                    _ => {}
+                }
+            }
+        }
         let implicit_type_references = unqualified_type_references
             .difference(&model_bound_references)
+            .filter(|reference| !competing_references.contains(reference))
             .copied()
             .collect::<BTreeSet<_>>();
         let durable_implicit_owners = &implicit.durable_owners;
@@ -3041,6 +3189,420 @@ impl SelectedResolutionOperation<'_, '_> {
             open_jvm_alias_imports,
             scoped_gaps,
         })
+    }
+
+    // The spelling and lexical reference are known here, including when a
+    // name-independent implicit plan is first prepared for another lookup.
+    // Exact owner reads are memoized by name and binding inputs by lookup.
+    // The decision belongs to this reference's scope, independent of lookup order.
+    fn jvm_on_demand_type(
+        &self,
+        prepared: &JvmContextPreparation,
+        reference: SemanticId,
+        lookup: SemanticId,
+        recipe: &ResolutionLookupSemanticRecipe,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<JvmOnDemandTypeChoice>> {
+        if let Some(choice) = prepared.on_demand_types.get(&reference) {
+            return Ok(Some(choice));
+        }
+        if self
+            .jvm_external_provider_ids
+            .get_or_init(|| self.ready.selected_jvm_external_providers())
+            .is_empty()
+        {
+            return Ok(Some(JvmOnDemandTypeChoice::Unavailable));
+        }
+        let language = prepared.source.semantic_language();
+        let rules = nominal_language_rules(language).expect("JVM caller");
+        let Some(bindings) = self.jvm_on_demand_bindings(prepared, lookup, recipe, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let local = super::imports::authored_reference_local_path_evidence(
+            &self.ready,
+            reference,
+            cancellation,
+        )?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let same_package = prepared.source_package.as_deref().unwrap_or("");
+        // A package plan can contain enclosing-prefix hosts and imported
+        // names. Its lookup bucket is not proof of same-package ownership.
+        // Package bridges establish that stronger rank during binding.
+        self.profile_jvm_read(
+            "on_demand_scope",
+            (
+                reference,
+                lookup,
+                recipe.spelling(),
+                same_package,
+                prepared.same_package_lookups.contains(&lookup),
+                local.as_ref().map(|local| local.local_definitions()),
+            ),
+        );
+        if prepared.same_package_lookups.contains(&lookup)
+            || local.is_some_and(|local| !local.local_definitions().is_empty())
+        {
+            return Ok(Some(JvmOnDemandTypeChoice::Unavailable));
+        }
+        let mut packages = rules
+            .implicit_root_providers()
+            .iter()
+            .filter_map(|provider| match provider {
+                JvmImplicitRootProvider::Package(package) => {
+                    binding_origin_rank(language, BindingOrigin::DefaultImport).map(|rank| {
+                        (
+                            (*package).to_owned(),
+                            super::jvm_demand::JvmBindingPrecedence {
+                                rank,
+                                depth: rules
+                                    .implicit_root_precedence(*provider)
+                                    .unwrap_or(u32::MAX),
+                            },
+                        )
+                    })
+                }
+                JvmImplicitRootProvider::ScalaPredef => None,
+            })
+            .collect::<Vec<_>>();
+        for binder in prepared
+            .binders
+            .iter()
+            .filter(|binder| jvm_on_demand_import(binder))
+        {
+            let SelectedRootPathHalf::Import { token, .. } = &binder.half else {
+                unreachable!("binder is an import")
+            };
+            if binder
+                .recipes
+                .last()
+                .is_none_or(|demand| demand.spelling() != recipe.spelling())
+            {
+                continue;
+            }
+            let package = jvm_on_demand_package(binder);
+            for binding in bindings
+                .iter()
+                .filter(|binding| binding.token == *token && binding.reference == reference)
+            {
+                packages.push((package.clone(), binding.precedence));
+            }
+        }
+        // FQNs, rather than mounts or import clauses, distinguish candidates.
+        // Repeated imports of P.N are the same candidate; mounted P.N shadows
+        // its external half and is never sent to the external owner reader.
+        let default_rank =
+            binding_origin_rank(language, BindingOrigin::DefaultImport).expect("default rank");
+        let priority = |precedence: super::jvm_demand::JvmBindingPrecedence| {
+            (
+                precedence.rank,
+                if precedence.rank == default_rank {
+                    precedence.depth
+                } else {
+                    u32::MAX
+                },
+            )
+        };
+        packages.sort_by_key(|(_, precedence)| priority(*precedence));
+        let mut deciding_rank = packages
+            .iter()
+            .filter(|(package, _)| {
+                prepared
+                    .package_plan
+                    .get(package)
+                    .is_some_and(|plan| plan.candidates.contains_key(&lookup))
+            })
+            .map(|(_, precedence)| priority(*precedence))
+            .min();
+        let mut candidates = HashMap::default();
+        let mut open_default = false;
+        for (package, precedence) in packages {
+            if deciding_rank.is_some_and(|best| priority(precedence) > best) {
+                continue;
+            }
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if bindings.iter().any(|binding| {
+                binding.reference == reference
+                    && binding.precedence.rank < precedence.rank
+                    && binding_origin_rank(
+                        language,
+                        super::jvm_demand::jvm_root_import_origin(
+                            language,
+                            ResolutionRootImportKind::Glob,
+                        ),
+                    )
+                    .is_some_and(|glob| binding.precedence.rank < glob)
+            }) {
+                continue;
+            }
+            let plan = prepared
+                .package_plan
+                .get(&package)
+                .expect("on-demand package was planned");
+            let fqn = format!("{package}.{}", recipe.spelling());
+            let external = if plan.candidates.contains_key(&lookup) {
+                None
+            } else {
+                if !plan.empty {
+                    continue;
+                }
+                if !rules.imports_nested_types_on_demand()
+                    && !rules.implicit_root_providers().iter().any(|provider| matches!(provider, JvmImplicitRootProvider::Package(name) if *name == package))
+                    && self.jvm_declared_type(language, &package)?.is_some()
+                {
+                    continue;
+                }
+                let key = (language, fqn.clone());
+                if self.jvm_declared_type_memo.borrow().get(&key).is_none() {
+                    self.profile_jvm_read("on_demand_external_type", (&package, recipe.spelling()));
+                }
+                let Some(declared) = self.jvm_declared_type(language, &fqn)? else {
+                    continue;
+                };
+                Some(declared)
+            };
+            // Discover positive owners before testing shadowing. The certified
+            // default-provider tables prove name absence without acquiring the
+            // provider; a mounted positive member still takes precedence.
+            if precedence.rank == default_rank
+                && rules.implicit_root_providers().iter().any(|root| {
+                    let name = match root {
+                        JvmImplicitRootProvider::Package(name) => *name,
+                        JvmImplicitRootProvider::ScalaPredef => SCALA_PREDEF_DEFAULT_IMPORT,
+                    };
+                    rules
+                        .implicit_root_precedence(*root)
+                        .is_some_and(|priority| priority < precedence.depth)
+                        && if let Some(plan) = prepared.package_plan.get(name)
+                            && plan.candidates.contains_key(&lookup)
+                        {
+                            true
+                        } else {
+                            !brokk_bifrost_jvm::intrinsics::default_provider_excludes_name(
+                                language,
+                                name,
+                                recipe.spelling(),
+                            )
+                        }
+                })
+            {
+                open_default = true;
+                continue;
+            }
+            deciding_rank = Some(
+                deciding_rank.map_or(priority(precedence), |best| best.min(priority(precedence))),
+            );
+            let entry = candidates
+                .entry(fqn)
+                .or_insert_with(|| (precedence, package.clone(), external.clone()));
+            if precedence < entry.0 {
+                *entry = (precedence, package, external);
+            }
+        }
+        let best = candidates
+            .values()
+            .map(|(precedence, _, _)| priority(*precedence))
+            .min();
+        let mut winners = candidates
+            .into_values()
+            .filter(|(precedence, _, _)| Some(priority(*precedence)) == best);
+        let choice = match (winners.next(), winners.next()) {
+            (Some((precedence, package, Some(declared))), None) if declared.indexed => {
+                JvmOnDemandTypeChoice::Indexed(JvmOnDemandType {
+                    declared,
+                    precedence,
+                    package,
+                })
+            }
+            (Some((precedence, package, Some(declared))), None)
+                if declared
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.provider_id.as_ref() == "jvm-intrinsic") =>
+            {
+                JvmOnDemandTypeChoice::Intrinsic(JvmOnDemandType {
+                    declared,
+                    precedence,
+                    package,
+                })
+            }
+            (Some((_, _, Some(declared))), None) if declared.owner.is_some() => {
+                // Preserve the existing modeled/intrinsic fallback when one
+                // declaration lacks indexed authority. Only a tie or NULL
+                // provider prevents that old path from recording its identity.
+                JvmOnDemandTypeChoice::Unavailable
+            }
+            (None, _) if open_default => JvmOnDemandTypeChoice::OpenDefault,
+            (None, _) | (Some((_, _, None)), None) => JvmOnDemandTypeChoice::Unavailable,
+            _ => JvmOnDemandTypeChoice::Competing,
+        };
+        prepared.on_demand_types.insert(reference, choice.clone());
+        Ok(Some(choice))
+    }
+
+    fn jvm_on_demand_bindings(
+        &self,
+        prepared: &JvmContextPreparation,
+        lookup: SemanticId,
+        recipe: &ResolutionLookupSemanticRecipe,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<JvmOnDemandBindings>> {
+        if let Some(bindings) = prepared.on_demand_bindings.get(&lookup) {
+            return Ok(Some(bindings));
+        }
+        let Some(bindings) = super::jvm_demand::jvm_import_bindings_for_lookup(
+            self,
+            prepared.source.ordinal(),
+            recipe,
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let bindings: JvmOnDemandBindings = bindings.into();
+        prepared
+            .on_demand_bindings
+            .insert(lookup, Arc::clone(&bindings));
+        Ok(Some(bindings))
+    }
+
+    fn jvm_competing_on_demand_gaps(
+        &self,
+        prepared: &JvmContextPreparation,
+        reference: &LoweredPackageReference,
+        recipe: &ResolutionLookupSemanticRecipe,
+        scoped_gaps: &mut Vec<JvmImportContextGap>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<()>> {
+        let Some(bindings) =
+            self.jvm_on_demand_bindings(prepared, reference.lookup, recipe, cancellation)?
+        else {
+            return Ok(None);
+        };
+        for binding in bindings
+            .iter()
+            .filter(|binding| binding.reference == reference.reference)
+        {
+            let Some(binder) = prepared.binders.iter().find(|binder| {
+                jvm_on_demand_import(binder)
+                    && matches!(&binder.half, SelectedRootPathHalf::Import { token, .. } if *token == binding.token)
+            }) else { continue; };
+            let package = jvm_on_demand_package(binder);
+            if !prepared
+                .package_plan
+                .get(&package)
+                .expect("on-demand package was planned")
+                .empty
+            {
+                continue;
+            }
+            // This gap belongs to the authored reference and its explicit glob,
+            // not to the weaker implicit default. The existing binding metadata
+            // therefore keeps an equal-rank source glob from discharging it.
+            let mut gap = self.jvm_import_context_gap(JvmImportContextGapSpec {
+                source: prepared.source.fragment(),
+                source_token: binding.token,
+                source_reference: Some(reference.reference),
+                kind: "jvm-import-owner-open",
+                owner: Some(package),
+                lookup: recipe.clone(),
+                detail: format!("{} on-demand type `{}` has competing selected providers or ambiguous provider authority",
+                    prepared.source.semantic_language().config_label(), recipe.spelling()),
+            }, cancellation)?;
+            gap.boundary_status =
+                Some(crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed);
+            scoped_gaps.push(gap);
+        }
+        Ok(Some(()))
+    }
+
+    fn jvm_indexed_on_demand_import(
+        &self,
+        prepared: &JvmContextPreparation,
+        binder: &ImportBinder,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        if !jvm_on_demand_import(binder)
+            || self
+                .jvm_external_provider_ids
+                .get_or_init(|| self.ready.selected_jvm_external_providers())
+                .is_empty()
+        {
+            return Ok(false);
+        }
+        let recipe = binder.recipes.last().expect("an import has a demand");
+        if recipe.namespace() != ResolutionNamespace::Type {
+            return Ok(false);
+        }
+        let package = jvm_on_demand_package(binder);
+        let mut found = false;
+        for (&(_, lookup), references) in &prepared.external_providers.references_by_route {
+            if prepared.external_providers.recipes[&lookup].spelling() != recipe.spelling() {
+                continue;
+            }
+            for &reference in references {
+                let Some(choice) =
+                    self.jvm_on_demand_type(prepared, reference, lookup, recipe, cancellation)?
+                else {
+                    return Ok(false);
+                };
+                match choice {
+                    JvmOnDemandTypeChoice::Indexed(winner) if winner.package == package => {
+                        found = true;
+                    }
+                    _ => return Ok(false),
+                }
+            }
+        }
+        if found
+            && prepared.source.semantic_language() == Language::Java
+            && let Some(route) = &binder.route
+            && let Some(source_site) = route.source_site
+        {
+            // The positive candidate completes this reference's type import.
+            // Retire the authored route placeholder just as the single-type
+            // indexed-destination path does; otherwise unsupported_route leaks.
+            for reason in selected_java_import_route_gap_reasons(
+                &self.ready.inventory,
+                prepared.source_record.blob_id(),
+                prepared.source.ordinal(),
+                source_site,
+                route.staged,
+            )? {
+                self.ready
+                    .context_identities
+                    .record_java_import_route_gap_reason(reason);
+            }
+        }
+        Ok(found)
+    }
+
+    fn jvm_on_demand_import_competes(
+        &self,
+        prepared: &JvmContextPreparation,
+        binder: &ImportBinder,
+    ) -> bool {
+        if !jvm_on_demand_import(binder) {
+            return false;
+        }
+        let recipe = binder.recipes.last().expect("an import has a demand");
+        prepared
+            .external_providers
+            .references_by_route
+            .iter()
+            .any(|(&(_, lookup), references)| {
+                prepared.external_providers.recipes[&lookup].spelling() == recipe.spelling()
+                    && references.iter().any(|reference| {
+                        matches!(
+                            prepared.on_demand_types.get(reference),
+                            Some(JvmOnDemandTypeChoice::Competing)
+                        )
+                    })
+            })
     }
 
     /// The current package outranks on-demand imports, including java.lang.
@@ -3788,6 +4350,7 @@ impl SelectedResolutionOperation<'_, '_> {
         fragment: BindingFragmentId,
         source_package: Option<&str>,
         references: &[LoweredPackageReference],
+        binders: &[ImportBinder],
         cancellation: &CancellationToken,
     ) -> Result<Option<JvmFilePackagePlan>> {
         self.profile_jvm_read("derive_file_package_plan", (language, fragment));
@@ -3803,6 +4366,25 @@ impl SelectedResolutionOperation<'_, '_> {
             })
             .collect::<Vec<_>>();
         packages.extend(source_package.map(str::to_owned));
+        if binders.iter().any(jvm_on_demand_import)
+            && !self
+                .jvm_external_provider_ids
+                .get_or_init(|| self.ready.selected_jvm_external_providers())
+                .is_empty()
+        {
+            packages.extend(
+                binders
+                    .iter()
+                    .filter(|binder| jvm_on_demand_import(binder))
+                    .map(|binder| {
+                        binder.recipes[..binder.recipes.len() - 1]
+                            .iter()
+                            .map(ResolutionLookupSemanticRecipe::spelling)
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    }),
+            );
+        }
         packages.sort_unstable();
         packages.dedup();
         let names = self.ready.shared_names();
@@ -3947,6 +4529,7 @@ impl SelectedResolutionOperation<'_, '_> {
             caller_package,
             lookup,
             package_plan,
+            prepared,
         } = *import_context;
         let source_language = self
             .mount_table()
@@ -3974,7 +4557,45 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         let names = self.ready.shared_names();
         let mut candidates = Vec::new();
+        let has_implicit_packages = packages.iter().any(|package| {
+            implicit_root_providers.iter().any(|provider| {
+            matches!(provider, JvmImplicitRootProvider::Package(name) if *name == package.as_str())
+        })
+        });
         for (reference, source_recipe) in &reference_recipes {
+            if has_implicit_packages
+                && prepared
+                    .unqualified_type_references
+                    .contains(&reference.reference)
+                && prepared
+                    .external_providers
+                    .recipes
+                    .contains_key(&reference.lookup)
+            {
+                let Some(choice) = self.jvm_on_demand_type(
+                    prepared,
+                    reference.reference,
+                    reference.lookup,
+                    source_recipe,
+                    cancellation,
+                )?
+                else {
+                    return Ok(None);
+                };
+                if matches!(choice, JvmOnDemandTypeChoice::Competing)
+                    && self
+                        .jvm_competing_on_demand_gaps(
+                            prepared,
+                            reference,
+                            source_recipe,
+                            scoped_gaps,
+                            cancellation,
+                        )?
+                        .is_none()
+                {
+                    return Ok(None);
+                }
+            }
             for package in packages {
                 if cancellation.is_cancelled() {
                     return Ok(None);
@@ -3990,7 +4611,37 @@ impl SelectedResolutionOperation<'_, '_> {
                 {
                     continue;
                 }
-                if is_default_import && planned.empty {
+                let (indexed_external, intrinsic_external) = if prepared
+                    .unqualified_type_references
+                    .contains(&reference.reference)
+                    && prepared
+                        .external_providers
+                        .recipes
+                        .contains_key(&reference.lookup)
+                {
+                    let Some(choice) = self.jvm_on_demand_type(
+                        prepared,
+                        reference.reference,
+                        reference.lookup,
+                        source_recipe,
+                        cancellation,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    match choice {
+                        JvmOnDemandTypeChoice::Indexed(winner) => {
+                            (winner.package == *package, false)
+                        }
+                        JvmOnDemandTypeChoice::Intrinsic(winner) => {
+                            (false, winner.package == *package)
+                        }
+                        _ => (false, false),
+                    }
+                } else {
+                    (false, false)
+                };
+                if is_default_import && planned.empty && !indexed_external {
                     scoped_gaps.push(self.jvm_import_context_boundary_gap_with_same_package_shadow(
                         JvmImportContextGapSpec {
                             source: source_mount.fragment(),
@@ -3999,11 +4650,11 @@ impl SelectedResolutionOperation<'_, '_> {
                             kind: "jvm-default-import-package-open",
                             owner: Some(package.to_owned()),
                             lookup: source_recipe.clone(),
-                            detail: format!(
-                            "{} default import package `{package}` has no selected source or classpath owner for `{}`",
-                            source_language.config_label(),
-                            source_recipe.spelling()
-                        ),
+                            detail: if intrinsic_external {
+                                format!("{} default import package `{package}` is unacquired; the language-defined root `{package}.{}` has a fixed intrinsic owner", source_language.config_label(), source_recipe.spelling())
+                            } else {
+                                format!("{} default import package `{package}` has no selected source or classpath owner for `{}`", source_language.config_label(), source_recipe.spelling())
+                            },
                         },
                         cancellation,
                     )?);
@@ -4083,6 +4734,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 caller_version,
                 caller_package,
                 same_package_lookups: RefCell::new(same_package_lookups),
+                prepared,
             },
             cancellation,
         )?;
@@ -4128,6 +4780,7 @@ impl SelectedResolutionOperation<'_, '_> {
             caller_package,
             lookup: _,
             package_plan: _,
+            prepared: _,
         } = *import_context;
         let connection = self.ready.inventory.connection();
         let names = self.ready.shared_names();
@@ -5310,6 +5963,9 @@ impl SelectedResolutionOperation<'_, '_> {
             else {
                 continue;
             };
+            if self.jvm_indexed_on_demand_import(&prepared, binder, cancellation)? {
+                continue;
+            }
             let Some(import_route) = &binder.route else {
                 continue;
             };
@@ -5584,11 +6240,13 @@ impl SelectedResolutionOperation<'_, '_> {
                                             .query_map([&owner], |row| row.get::<_, u32>(0))?;
                                         let package_prefix_found =
                                             selected_packages.next().transpose()?.is_some();
-                                        if !package_prefix_found
-                                            && self.declares_jvm_type(Language::Java, &declared)?
-                                        {
-                                            let model_owner =
-                                                self.declared_jvm_owner(Language::Java, &declared)?;
+                                        let declared_type = if package_prefix_found {
+                                            None
+                                        } else {
+                                            self.jvm_declared_type(Language::Java, &declared)?
+                                        };
+                                        if let Some(declared_type) = declared_type {
+                                            let model_owner = declared_type.owner;
                                             let boundary =
                                                 register_model_declared_jvm_type_identity(
                                                     self,
@@ -5860,6 +6518,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 operation: self,
                 source,
                 caller_package: source_package.as_deref(),
+                prepared: &prepared,
             },
             cancellation,
         )?;
@@ -6042,6 +6701,133 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Whether an indexed artifact, reviewed model, or language-defined root
     /// declares this type. Fixed roots fill unavailable detail only when an
     /// indexed provider has not already supplied its own inventory.
+    fn jvm_declared_type(&self, language: Language, fqn: &str) -> Result<Option<JvmDeclaredType>> {
+        let key = (language, fqn.to_owned());
+        if let Some(candidate) = self.jvm_declared_type_memo.borrow().get(&key) {
+            return Ok(candidate.clone());
+        }
+        let candidate = if self.declares_jvm_type(language, fqn)? {
+            let owner = self.declared_jvm_owner(language, fqn)?;
+            let indexed = match &owner {
+                Some(owner) => self.jvm_external_type_is_indexed(owner)?,
+                None => false,
+            };
+            Some(JvmDeclaredType {
+                fqn: fqn.to_owned(),
+                owner,
+                indexed,
+            })
+        } else {
+            None
+        };
+        self.jvm_declared_type_memo
+            .borrow_mut()
+            .insert(key, candidate.clone());
+        Ok(candidate)
+    }
+
+    /// A package host can contain declarations in nested packages. Validate
+    /// ownership before letting a current-package bridge outrank a new external
+    /// candidate. Both JVM context composers use the same predicate.
+    fn jvm_current_package_candidate(
+        &self,
+        prepared: &JvmContextPreparation,
+        lookup: SemanticId,
+        definition: SemanticId,
+        package: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedPackageRows<bool>> {
+        if self
+            .jvm_external_provider_ids
+            .get_or_init(|| self.ready.selected_jvm_external_providers())
+            .is_empty()
+        {
+            return Ok(SelectedPackageRows::Ready(true));
+        }
+        let Some(recipe) = prepared.external_providers.recipes.get(&lookup) else {
+            return Ok(SelectedPackageRows::Ready(true));
+        };
+        let mut external_comparison = false;
+        for (&(_, candidate_lookup), references) in &prepared.external_providers.references_by_route
+        {
+            if candidate_lookup != lookup {
+                continue;
+            }
+            for &reference in references {
+                let Some(choice) =
+                    self.jvm_on_demand_type(prepared, reference, lookup, recipe, cancellation)?
+                else {
+                    return Ok(SelectedPackageRows::Cancelled);
+                };
+                if matches!(
+                    choice,
+                    JvmOnDemandTypeChoice::Indexed(_) | JvmOnDemandTypeChoice::Competing
+                ) {
+                    external_comparison = true;
+                    break;
+                }
+            }
+            if external_comparison {
+                break;
+            }
+        }
+        if !external_comparison {
+            return Ok(SelectedPackageRows::Ready(true));
+        }
+        let SelectedPackageRows::Ready(actual_package) =
+            self.jvm_declaration_package(definition, cancellation)?
+        else {
+            return Ok(SelectedPackageRows::Cancelled);
+        };
+        Ok(SelectedPackageRows::Ready(
+            actual_package.as_deref().unwrap_or("") == package,
+        ))
+    }
+
+    fn jvm_declaration_package(
+        &self,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedPackageRows<Option<String>>> {
+        let key = (definition, self.ready.inventory.staged_read_epoch());
+        if let Some(package) = self.jvm_declaration_package_memo.borrow().get(&key) {
+            return Ok(SelectedPackageRows::Ready(package.clone()));
+        }
+        let Some(endpoints) = self
+            .ready
+            .typed_source()
+            .jvm_access_endpoints(&[definition], cancellation)?
+        else {
+            return Ok(SelectedPackageRows::Cancelled);
+        };
+        let package = endpoints.iter().find(|endpoint| endpoint.semantic == definition)
+            .ok_or_else(|| StoreError::corrupt(format!(
+                "selected JVM package member {definition:?} lacks package metadata in {endpoints:?}"
+            )))?.package.clone();
+        self.profile_jvm_read("on_demand_source_package", (definition, &package));
+        self.jvm_declaration_package_memo
+            .borrow_mut()
+            .insert(key, package.clone());
+        Ok(SelectedPackageRows::Ready(package))
+    }
+
+    fn jvm_external_type_is_indexed(
+        &self,
+        owner: &crate::analyzer::resolution::ExternalOwnerIdentity,
+    ) -> Result<bool> {
+        if let Some(indexed) = self.jvm_indexed_type_memo.borrow().get(owner) {
+            return Ok(*indexed);
+        }
+        let indexed = self
+            .ready
+            .typed_source()
+            .external_owner_type_is_indexed(owner)?;
+        self.jvm_indexed_type_memo
+            .borrow_mut()
+            .insert(owner.clone(), indexed);
+        Ok(indexed)
+    }
+
     fn declares_jvm_type(&self, language: Language, fqn: &str) -> Result<bool> {
         if self
             .ready
@@ -6051,7 +6837,11 @@ impl SelectedResolutionOperation<'_, '_> {
         {
             return Ok(true);
         }
-        Ok(self.declared_jvm_owner(language, fqn)?.is_some())
+        // A NULL selected provider is a declaration with ambiguous authority,
+        // not absence. Keep it in the on-demand comparison so another package
+        // cannot win by dropping this provider.
+        Ok(self.jvm_declared_owner_selection(language, fqn)?.is_some()
+            || brokk_bifrost_jvm::intrinsics::language_has_member_inventory(language, fqn))
     }
 
     fn declared_jvm_owner(
@@ -6067,6 +6857,27 @@ impl SelectedResolutionOperation<'_, '_> {
                 }
             })
         };
+        Ok(self
+            .jvm_declared_owner_selection(language, fqn)?
+            .unwrap_or_else(intrinsic))
+    }
+
+    /// Preserve absence, ambiguous authority, and a unique selected owner as
+    /// separate results. The selected provider set is immutable for an operation.
+    fn jvm_declared_owner_selection(
+        &self,
+        language: Language,
+        fqn: &str,
+    ) -> Result<Option<Option<crate::analyzer::resolution::ExternalOwnerIdentity>>> {
+        let providers = self
+            .jvm_external_provider_ids
+            .get_or_init(|| self.ready.selected_jvm_external_providers());
+        let key = fqn.to_owned();
+        if !providers.is_empty()
+            && let Some(owner) = self.jvm_declared_owner_memo.borrow().get(&key)
+        {
+            return Ok(owner.clone());
+        }
         let authority = self
             .ready
             .analyzer
@@ -6075,15 +6886,19 @@ impl SelectedResolutionOperation<'_, '_> {
             .expect("caller belongs to a nominal family")
             .family()
             .external_owners();
-        let providers = relations.providers(self.ready.analyzer);
-        Ok(super::selected_jvm_declaration_owner(
+        let owner = super::selected_jvm_declaration_owner(
             relations,
             self.ready.inventory.connection(),
             authority.as_deref(),
-            &providers,
+            providers,
             fqn,
-        )?
-        .unwrap_or_else(intrinsic))
+        )?;
+        if !providers.is_empty() {
+            self.jvm_declared_owner_memo
+                .borrow_mut()
+                .insert(key, owner.clone());
+        }
+        Ok(owner)
     }
 
     /// Prove a conventional visibility-domain relation between two selected
@@ -6845,10 +7660,7 @@ fn register_model_declared_jvm_type_identity(
     // Type destinations require independent enumeration and closed type and
     // supertype inventories, just as subsequent member reads do.
     if let Some(owner) = owner
-        && operation
-            .ready
-            .typed_source()
-            .external_owner_type_is_indexed(owner)?
+        && operation.jvm_external_type_is_indexed(owner)?
     {
         identities.record_jvm_provider_type_reference(reference, identity);
         return Ok(None);
@@ -10930,6 +11742,9 @@ impl SelectedResolutionOperation<'_, '_> {
         self.jvm_package_uncertainty_memo
             .replace(Default::default());
         self.jvm_package_presence_memo.replace(Default::default());
+        // External providers are immutable for the operation. Their exact
+        // owner and inventory reads survive changes to staged source facts.
+        self.jvm_on_demand_type_ranks.replace(Default::default());
         self.jvm_endpoint_memo.replace(Default::default());
         self.import_token_memo.replace(Default::default());
         self.jvm_visibility_memo.replace(Default::default());

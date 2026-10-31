@@ -1,3 +1,4 @@
+use crate::analyzer::scala::syntax::{enclosing_template, template_kind};
 use crate::analyzer::usages::get_definition::scala;
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 
@@ -21,6 +22,7 @@ use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceConfig;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use tree_sitter::Node;
 use tree_sitter::Tree;
@@ -231,6 +233,17 @@ enum ScalaOwnerKind {
     Class,
     SingletonObject,
     TypeNamespace,
+}
+
+impl ScalaOwnerKind {
+    fn exact_name(self, candidate: String) -> String {
+        match self {
+            Self::Class => candidate.trim_end_matches('$').to_string(),
+            Self::SingletonObject if candidate.ends_with('$') => candidate,
+            Self::SingletonObject => format!("{candidate}$"),
+            Self::TypeNamespace => candidate,
+        }
+    }
 }
 
 fn scala_unit_matches_owner_kind(
@@ -1375,17 +1388,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         candidates.dedup();
         let mut owners = Vec::new();
         for candidate in candidates {
-            let exact = match kind {
-                ScalaOwnerKind::Class => candidate.trim_end_matches('$').to_string(),
-                ScalaOwnerKind::SingletonObject => {
-                    if candidate.ends_with('$') {
-                        candidate
-                    } else {
-                        format!("{candidate}$")
-                    }
-                }
-                ScalaOwnerKind::TypeNamespace => candidate,
-            };
+            let exact = kind.exact_name(candidate);
             owners.extend(
                 self.support
                     .fqn(&exact)
@@ -6638,12 +6641,21 @@ fn scala_primary_constructor_candidates(
     let class_name = class.fq_name();
     let class_fqn = class_name.trim_end_matches('$');
     let constructor_fqn = format!("{class_fqn}.{}", scala_constructor_member_name(class_fqn));
+    scala_primary_constructor_candidates_for_fqn(ctx, class, &constructor_fqn, call_shape)
+}
+
+fn scala_primary_constructor_candidates_for_fqn(
+    ctx: ScalaLookupCtx<'_>,
+    owner: &CodeUnit,
+    constructor_fqn: &str,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> Vec<CodeUnit> {
     let constructors = ctx
         .support
-        .fqn(&constructor_fqn)
+        .fqn(constructor_fqn)
         .into_iter()
         .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
-        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(class))
+        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
         .collect();
     scala_filter_callable_units(
         ctx.scala,
@@ -7063,17 +7075,7 @@ fn scala_exact_primary_constructor_candidates(
     let class_fqn = owner.fq_name();
     let constructor_name = scala_constructor_member_name(&class_fqn);
     let constructor_fqn = format!("{class_fqn}.{constructor_name}");
-    scala_filter_callable_units(
-        ctx.scala,
-        ctx.support
-            .fqn(&constructor_fqn)
-            .into_iter()
-            .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
-            .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
-            .collect(),
-        call_shape,
-        ScalaCallableSiteRole::PrimaryConstruction,
-    )
+    scala_primary_constructor_candidates_for_fqn(ctx, owner, &constructor_fqn, call_shape)
 }
 
 fn scala_exact_type_apply_or_constructor_outcome(
@@ -8101,19 +8103,10 @@ fn scala_projected_type_outcome(
 }
 
 fn scala_enclosing_type_definition_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let is_type_definition = |kind: &str| {
-        matches!(
-            kind,
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        )
-    };
-    let definition = if is_type_definition(node.kind()) {
+    let definition = if template_kind(node.kind()).is_some() {
         node
     } else {
-        brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(
-            node,
-            is_type_definition,
-        )?
+        enclosing_template(node)?
     };
     Some((definition.start_byte(), definition.end_byte()))
 }
@@ -10557,6 +10550,72 @@ fn scala_tied_owner_member_candidates(
     candidates
 }
 
+// One lookup's inheritance tiers. Named ties contribute declarations only at
+// their current tier; only resolved ancestors advance to further supertypes.
+struct ScalaAncestorFrontier {
+    resolved: Vec<CodeUnit>,
+    tied: Vec<CodeUnit>,
+    seen: HashSet<CodeUnit>,
+}
+
+impl ScalaAncestorFrontier {
+    fn new(owner: &CodeUnit, ancestors: ScalaDirectAncestorResolution) -> ControlFlow<(), Self> {
+        let (resolved, tied) = Self::tier_parts(ancestors)?;
+        ControlFlow::Continue(Self {
+            resolved,
+            tied,
+            seen: HashSet::from_iter([owner.clone()]),
+        })
+    }
+
+    fn mark_seen(&mut self, owner: &CodeUnit) -> bool {
+        self.seen.insert(owner.clone())
+    }
+
+    fn enqueue(
+        &mut self,
+        ancestors: ScalaDirectAncestorResolution,
+    ) -> ControlFlow<(), &[CodeUnit]> {
+        let (resolved, tied) = Self::tier_parts(ancestors)?;
+        let start = self.resolved.len();
+        self.resolved.extend(resolved);
+        self.tied.extend(tied);
+        ControlFlow::Continue(&self.resolved[start..])
+    }
+
+    fn tier_parts(
+        ancestors: ScalaDirectAncestorResolution,
+    ) -> ControlFlow<(), (Vec<CodeUnit>, Vec<CodeUnit>)> {
+        match ancestors {
+            ScalaDirectAncestorResolution::Resolved(ancestors)
+            | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+                ControlFlow::Continue((ancestors, Vec::new()))
+            }
+            ScalaDirectAncestorResolution::Ambiguous {
+                resolved,
+                tied: ScalaTiedSupertypes::Named(tied),
+            } => ControlFlow::Continue((resolved, tied)),
+            // No contenders: the tie is the supertype name's and its
+            // declarations are unnamed, so what they declare is unknowable
+            // (#2167). Stop even if the current tier already found candidates.
+            ScalaDirectAncestorResolution::Ambiguous {
+                tied: ScalaTiedSupertypes::Unnamed,
+                ..
+            } => ControlFlow::Break(()),
+        }
+    }
+
+    fn advance(&mut self) -> Option<(Vec<CodeUnit>, Vec<CodeUnit>)> {
+        if self.resolved.is_empty() && self.tied.is_empty() {
+            return None;
+        }
+        Some((
+            std::mem::take(&mut self.resolved),
+            std::mem::take(&mut self.tied),
+        ))
+    }
+}
+
 fn scala_exact_owner_member_candidate_units(
     ctx: ScalaLookupCtx<'_>,
     token: QueryToken<'_>,
@@ -10574,37 +10633,24 @@ fn scala_exact_owner_member_candidate_units(
         return ScalaExactMemberResolution::Found(direct);
     }
 
-    let (mut level, mut tied) = match ctx.direct_ancestors_for_owner(token, owner) {
-        ScalaDirectAncestorResolution::Resolved(ancestors)
-        | ScalaDirectAncestorResolution::Incomplete(ancestors) => (ancestors, Vec::new()),
-        ScalaDirectAncestorResolution::Ambiguous {
-            resolved,
-            tied: ScalaTiedSupertypes::Named(tied),
-        } => (resolved, tied),
-        // no contenders: the tie is the SUPERTYPE name's and its declarations
-        // are unnamed here, so whether they declare `member` is unknowable
-        // (#2167).
-        ScalaDirectAncestorResolution::Ambiguous {
-            tied: ScalaTiedSupertypes::Unnamed,
-            ..
-        } => return ScalaExactMemberResolution::Ambiguous(Vec::new()),
+    let ControlFlow::Continue(mut frontier) =
+        ScalaAncestorFrontier::new(owner, ctx.direct_ancestors_for_owner(token, owner))
+    else {
+        return ScalaExactMemberResolution::Ambiguous(Vec::new());
     };
     if let Some(state) = member_trace.as_mut() {
-        state.record_supertypes(ctx.scala, owner, &level);
+        state.record_supertypes(ctx.scala, owner, &frontier.resolved);
     }
-    let mut seen = HashSet::from_iter([owner.clone()]);
     let mut depth = 0_usize;
-    while !level.is_empty() || !tied.is_empty() {
+    while let Some((level, tied)) = frontier.advance() {
         depth += 1;
         // The tied declarations answer for THIS tier alongside its resolved
         // supertypes, so a member one of them declares competes with -- and a
         // member none of them declares does not stop -- the ordinary walk
         // (#2229).
         let mut matches = scala_tied_owner_member_candidates(ctx, &tied, member);
-        let mut next = Vec::new();
-        let mut next_tied = Vec::new();
         for ancestor in level {
-            if !seen.insert(ancestor.clone()) {
+            if !frontier.mark_seen(&ancestor) {
                 continue;
             }
             let found = scala_direct_member_candidate_units_for_owner(ctx, &ancestor, member);
@@ -10612,29 +10658,13 @@ fn scala_exact_owner_member_candidate_units(
                 state.record_found(ctx.scala, &found, &ancestor, depth);
             }
             matches.extend(found);
-            match ctx.direct_ancestors_for_owner(token, &ancestor) {
-                ScalaDirectAncestorResolution::Resolved(ancestors)
-                | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
-                    if let Some(state) = member_trace.as_mut() {
-                        state.record_supertypes(ctx.scala, &ancestor, &ancestors);
-                    }
-                    next.extend(ancestors);
-                }
-                ScalaDirectAncestorResolution::Ambiguous {
-                    resolved,
-                    tied: ScalaTiedSupertypes::Named(tied),
-                } => {
-                    if let Some(state) = member_trace.as_mut() {
-                        state.record_supertypes(ctx.scala, &ancestor, &resolved);
-                    }
-                    next.extend(resolved);
-                    next_tied.extend(tied);
-                }
-                // no contenders: see the direct-ancestor arm above.
-                ScalaDirectAncestorResolution::Ambiguous {
-                    tied: ScalaTiedSupertypes::Unnamed,
-                    ..
-                } => return ScalaExactMemberResolution::Ambiguous(Vec::new()),
+            let ControlFlow::Continue(ancestors) =
+                frontier.enqueue(ctx.direct_ancestors_for_owner(token, &ancestor))
+            else {
+                return ScalaExactMemberResolution::Ambiguous(Vec::new());
+            };
+            if let Some(state) = member_trace.as_mut() {
+                state.record_supertypes(ctx.scala, &ancestor, ancestors);
             }
         }
         sort_units(&mut matches);
@@ -10650,8 +10680,6 @@ fn scala_exact_owner_member_candidate_units(
             // member: the site's contenders are those declarations (#2229).
             return ScalaExactMemberResolution::Found(matches);
         }
-        level = next;
-        tied = next_tied;
     }
 
     if include_companion && !owner.fq_name().ends_with('$') {
@@ -11998,12 +12026,7 @@ fn scala_source_ancestor_member_units(
 }
 
 fn scala_enclosing_definition_node(node: Node<'_>) -> Option<Node<'_>> {
-    brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(node, |kind| {
-        matches!(
-            kind,
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        )
-    })
+    enclosing_template(node)
 }
 
 fn scala_collect_extends_type_text(node: Node<'_>, source: &str, out: &mut Vec<String>) {
@@ -13352,54 +13375,26 @@ fn scala_exact_owner_namespace_children(
         return ScalaExactMemberResolution::Found(direct);
     }
 
-    let (mut level, mut tied) = match ctx.direct_ancestors_for_owner(token, owner) {
-        ScalaDirectAncestorResolution::Resolved(ancestors)
-        | ScalaDirectAncestorResolution::Incomplete(ancestors) => (ancestors, Vec::new()),
-        ScalaDirectAncestorResolution::Ambiguous {
-            resolved,
-            tied: ScalaTiedSupertypes::Named(tied),
-        } => (resolved, tied),
-        // no contenders: the tie is the SUPERTYPE name's and its declarations
-        // are unnamed here, so no declaration of `name` was ever in hand
-        // (#2167).
-        ScalaDirectAncestorResolution::Ambiguous {
-            tied: ScalaTiedSupertypes::Unnamed,
-            ..
-        } => {
-            return ScalaExactMemberResolution::Ambiguous(Vec::new());
-        }
+    let ControlFlow::Continue(mut frontier) =
+        ScalaAncestorFrontier::new(owner, ctx.direct_ancestors_for_owner(token, owner))
+    else {
+        return ScalaExactMemberResolution::Ambiguous(Vec::new());
     };
-    let mut seen = HashSet::from_iter([owner.clone()]);
-    while !level.is_empty() || !tied.is_empty() {
+    while let Some((level, tied)) = frontier.advance() {
         let mut matches = scala_tied_tier_declarations(&tied, name, |owner, member| {
             scala_exact_direct_namespace_children(ctx, owner, member, None)
         });
-        let mut next = Vec::new();
-        let mut next_tied = Vec::new();
         for ancestor in level {
-            if !seen.insert(ancestor.clone()) {
+            if !frontier.mark_seen(&ancestor) {
                 continue;
             }
             matches.extend(scala_exact_direct_namespace_children(
                 ctx, &ancestor, name, None,
             ));
-            match ctx.direct_ancestors_for_owner(token, &ancestor) {
-                ScalaDirectAncestorResolution::Resolved(ancestors)
-                | ScalaDirectAncestorResolution::Incomplete(ancestors) => next.extend(ancestors),
-                ScalaDirectAncestorResolution::Ambiguous {
-                    resolved,
-                    tied: ScalaTiedSupertypes::Named(tied),
-                } => {
-                    next.extend(resolved);
-                    next_tied.extend(tied);
-                }
-                // no contenders: see the direct-ancestor arm above.
-                ScalaDirectAncestorResolution::Ambiguous {
-                    tied: ScalaTiedSupertypes::Unnamed,
-                    ..
-                } => {
-                    return ScalaExactMemberResolution::Ambiguous(Vec::new());
-                }
+            if let ControlFlow::Break(()) =
+                frontier.enqueue(ctx.direct_ancestors_for_owner(token, &ancestor))
+            {
+                return ScalaExactMemberResolution::Ambiguous(Vec::new());
             }
         }
         sort_units(&mut matches);
@@ -13407,8 +13402,6 @@ fn scala_exact_owner_namespace_children(
         if !matches.is_empty() {
             return ScalaExactMemberResolution::Found(matches);
         }
-        level = next;
-        tied = next_tied;
     }
     ScalaExactMemberResolution::NoMatch
 }
@@ -13457,12 +13450,7 @@ fn scala_same_file_type_owner(
     let candidates = scala_nested_type_candidates(package, segments, false);
     let mut matches = Vec::new();
     for candidate in candidates {
-        let fqn = match kind {
-            ScalaOwnerKind::Class => candidate.trim_end_matches('$').to_string(),
-            ScalaOwnerKind::SingletonObject if candidate.ends_with('$') => candidate,
-            ScalaOwnerKind::SingletonObject => format!("{candidate}$"),
-            ScalaOwnerKind::TypeNamespace => candidate,
-        };
+        let fqn = kind.exact_name(candidate);
         matches.extend(ctx.support.fqn(&fqn).into_iter().filter(|unit| {
             unit.fq_name() == fqn
                 && unit.source() == ctx.file

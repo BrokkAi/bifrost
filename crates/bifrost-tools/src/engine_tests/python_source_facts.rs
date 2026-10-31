@@ -54,7 +54,11 @@ mod python_tests {
         {
             let store = AnalyzerStore::open_persistent(&path).unwrap();
             store
-                .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                    &PythonAdapter::for_test_file(&file),
+                    &state,
+                )
                 .unwrap();
         }
         std::fs::remove_file(file.abs_path()).unwrap();
@@ -100,12 +104,20 @@ mod python_tests {
         let facts = state.source_facts.as_mut().unwrap().python.take().unwrap();
         assert!(
             store
-                .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                    &PythonAdapter::for_test_file(&file),
+                    &state
+                )
                 .is_err()
         );
         state.source_facts.as_mut().unwrap().python = Some(facts);
         store
-            .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &PythonAdapter::for_test_file(&file),
+                &state,
+            )
             .unwrap();
         assert!(
             store
@@ -128,7 +140,11 @@ mod python_tests {
                 .is_err()
         );
         store
-            .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &PythonAdapter::for_test_file(&file),
+                &state,
+            )
             .unwrap();
         assert!(
             store
@@ -149,13 +165,19 @@ mod python_tests {
         let oid = oid_for(SOURCE.as_bytes());
         let generation = store.current_generation("python").unwrap();
         store
-            .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                &PythonAdapter::for_test_file(&file),
+                &state,
+            )
             .unwrap();
         for index in 0..32 {
             store
                 .write_parsed_blob(
-                    oid_for(format!("publication {index}").as_bytes()),
-                    "python",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oid_for(format!("publication {index}").as_bytes()),
+                        "python",
+                    ),
                     &PythonAdapter::for_test_file(&file),
                     &state,
                 )

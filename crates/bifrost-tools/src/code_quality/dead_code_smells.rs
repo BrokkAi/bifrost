@@ -974,7 +974,11 @@ mod tests {
         store.delete_rust_facts_for_test("rust");
         assert!(
             store
-                .blobs_with_rust_facts("rust", generation, &[oid])
+                .blobs_with_rust_facts(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &[oid]
+                )
                 .unwrap()
                 .is_empty()
         );
@@ -999,7 +1003,11 @@ mod tests {
         assert!(skipped.is_empty(), "{skipped:?}");
         assert!(
             store
-                .blobs_with_rust_facts("rust", generation, &[oid])
+                .blobs_with_rust_facts(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    generation,
+                    &[oid]
+                )
                 .unwrap()
                 .contains(&oid)
         );

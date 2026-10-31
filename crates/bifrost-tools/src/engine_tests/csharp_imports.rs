@@ -7,6 +7,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResol
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
 use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
 use brokk_bifrost_core::{analyzer::Language, cancellation::CancellationToken};
+use brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAdapter;
 
 #[test]
 fn csharp_import_rules_join_real_scopes_and_activation() {
@@ -32,11 +33,16 @@ fn csharp_import_rules_join_real_scopes_and_activation() {
     let source = r#"namespace A {
     using Name = Outer.Name;
     namespace B.C {
-        class Before { Local earlier; }
+        class Before { object earlier = Local /* before activation */; }
         using Inner;
         using Local = Same.Local;
         using static Helpers;
-        class Caller { Name field; Local local; void Run() { Invoke(); } }
+        class Caller {
+            Name field; Local local;
+            object nameValue = Name /* alias expression */;
+            object localValue = Local /* alias expression */;
+            void Run() { Invoke(); }
+        }
     }
 }
 "#;
@@ -98,31 +104,65 @@ fn csharp_import_rules_join_real_scopes_and_activation() {
             .map(|(_, precedence)| *precedence)
             .collect::<Vec<_>>()
     };
-    let name = precedences(at("Name field"));
-    let local = precedences(at("Local local"));
+    let name = precedences(at("Name /* alias expression */"));
+    let local = precedences(at("Local /* alias expression */"));
     let invoke = precedences(at("Invoke()"));
-    println!("{probe:?}");
-    assert!(
-        probe.references.contains(&at("Local earlier")),
-        "before-activation reference is stored: {probe:?}"
+    let state = brokk_bifrost_analysis::analyzer::store::test_support::parse_state(
+        &CSharpAdapter,
+        &fixture.file("Imports.cs"),
     );
+    let facts = &state.resolution_facts;
+    let rooted = |position| {
+        facts
+            .root_references
+            .iter()
+            .any(|root| facts.sites[root.reference.index()].start_byte == position)
+    };
+    for needle in [
+        "Name /* alias expression */",
+        "Local /* alias expression */",
+        "Local /* before activation */",
+        "Invoke()",
+    ] {
+        assert!(
+            !rooted(at(needle)),
+            "ordinary using reference {needle}: {facts:?}"
+        );
+        assert!(
+            probe.references.contains(&at(needle)),
+            "{needle}: {probe:?}"
+        );
+    }
+    // C1-4d resolves usings for rooted Type names through the root closure.
+    for needle in ["Name field", "Local local"] {
+        assert!(rooted(at(needle)), "Type reference {needle}: {facts:?}");
+        assert!(precedences(at(needle)).is_empty(), "{needle}: {probe:?}");
+    }
+    // Field initializers add one lexical scope compared with Type-position
+    // fields. TypeOrValue also adds a Value demand for the static using;
+    // namespace and alias using ranks remain unchanged.
     assert_eq!(
         name,
         vec![
-            CSharpImportPrecedence { depth: 1, rank: 1 },
-            CSharpImportPrecedence { depth: 1, rank: 1 },
-            CSharpImportPrecedence { depth: 3, rank: 0 }
+            CSharpImportPrecedence { depth: 2, rank: 1 },
+            CSharpImportPrecedence { depth: 2, rank: 1 },
+            CSharpImportPrecedence { depth: 2, rank: 1 },
+            CSharpImportPrecedence { depth: 4, rank: 0 }
         ]
     );
     assert_eq!(
         local,
         vec![
-            CSharpImportPrecedence { depth: 1, rank: 0 },
-            CSharpImportPrecedence { depth: 1, rank: 1 },
-            CSharpImportPrecedence { depth: 1, rank: 1 }
+            CSharpImportPrecedence { depth: 2, rank: 0 },
+            CSharpImportPrecedence { depth: 2, rank: 1 },
+            CSharpImportPrecedence { depth: 2, rank: 1 },
+            CSharpImportPrecedence { depth: 2, rank: 1 }
         ]
     );
     assert_eq!(invoke, vec![CSharpImportPrecedence { depth: 3, rank: 1 }]);
-    // The stored earlier field reference precedes the using sequence activation.
-    assert!(precedences(at("Local earlier")).is_empty(), "{probe:?}");
+    // The stored earlier initializer reference precedes using activation.
+    assert!(
+        precedences(at("Local /* before activation */")).is_empty(),
+        "{probe:?}"
+    );
 }

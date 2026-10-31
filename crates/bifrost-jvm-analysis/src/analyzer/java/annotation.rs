@@ -469,17 +469,21 @@ fn inherited_member_type_gap(
             }
             let written = java.raw_supertypes_of(&current);
             let ancestors = hierarchy.get_direct_ancestors(&current);
-            if ancestors.len() != written.len() {
+            if !ancestors.is_complete() || ancestors.edges.len() != written.len() {
                 return Some(JavaAnnotationTypeResolution::gap(
                     Status::Incomplete,
                     format!(
                         "inherited annotation member types of {} are unproven: supertypes {written:?} resolve only to workspace types {:?}",
                         current.fq_name(),
-                        ancestors.iter().map(CodeUnit::fq_name).collect::<Vec<_>>()
+                        ancestors
+                            .edges
+                            .iter()
+                            .map(CodeUnit::fq_name)
+                            .collect::<Vec<_>>()
                     ),
                 ));
             }
-            for ancestor in ancestors {
+            for ancestor in ancestors.edges {
                 let shadows = analyzer
                     .get_direct_children(&ancestor)
                     .into_iter()

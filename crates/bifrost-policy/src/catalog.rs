@@ -97,7 +97,6 @@ impl CatalogSourceIdentity {
         }
         Ok(Self(label.into()))
     }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -140,40 +139,9 @@ impl Default for CatalogRegistryLimits {
 }
 
 impl CatalogRegistryLimits {
-    pub fn max_identities(self) -> usize {
-        self.max_identities
-    }
-
-    pub fn max_entries(self) -> usize {
-        self.max_entries
-    }
-
-    pub fn max_retained_canonical_bytes(self) -> usize {
-        self.max_retained_canonical_bytes
-    }
-
     pub fn with_max_identities(mut self, value: usize) -> Result<Self, CatalogRegistryLimitError> {
         validate_lowered_limit("max_identities", value, MAX_CATALOG_IDENTITIES)?;
         self.max_identities = value;
-        Ok(self)
-    }
-
-    pub fn with_max_entries(mut self, value: usize) -> Result<Self, CatalogRegistryLimitError> {
-        validate_lowered_limit("max_entries", value, MAX_CATALOG_ENTRIES)?;
-        self.max_entries = value;
-        Ok(self)
-    }
-
-    pub fn with_max_retained_canonical_bytes(
-        mut self,
-        value: usize,
-    ) -> Result<Self, CatalogRegistryLimitError> {
-        validate_lowered_limit(
-            "max_retained_canonical_bytes",
-            value,
-            MAX_CATALOG_RETAINED_CANONICAL_BYTES,
-        )?;
-        self.max_retained_canonical_bytes = value;
         Ok(self)
     }
 }
@@ -214,7 +182,6 @@ pub struct RegisteredTaintCatalog {
     semantic_hash: TaintCatalogHash,
     definition: TaintCatalogDefinition,
     canonical_json: Box<[u8]>,
-    source: Option<CatalogSourceIdentity>,
 }
 
 impl RegisteredTaintCatalog {
@@ -232,10 +199,6 @@ impl RegisteredTaintCatalog {
 
     pub fn canonical_json(&self) -> &[u8] {
         &self.canonical_json
-    }
-
-    pub fn source(&self) -> Option<&CatalogSourceIdentity> {
-        self.source.as_ref()
     }
 }
 
@@ -285,7 +248,7 @@ impl TaintCatalogRegistry {
         &mut self,
         catalog: TaintCatalogDefinition,
     ) -> Result<TaintCatalogHash, CatalogRegistryError> {
-        self.register_with_source(catalog, None)
+        self.register_normalized(catalog)
     }
 
     pub fn register_json_bytes(
@@ -306,7 +269,7 @@ impl TaintCatalogRegistry {
                 message: error.to_string(),
             })?;
         let catalog = TaintCatalogDefinition::try_from(wire)?;
-        self.register_with_source(catalog, Some(source))
+        self.register_normalized(catalog)
     }
 
     pub fn register_json_path(
@@ -409,10 +372,9 @@ impl TaintCatalogRegistry {
         self.catalogs.is_empty()
     }
 
-    fn register_with_source(
+    fn register_normalized(
         &mut self,
         catalog: TaintCatalogDefinition,
-        source: Option<CatalogSourceIdentity>,
     ) -> Result<TaintCatalogHash, CatalogRegistryError> {
         let catalog = normalize_and_validate_catalog(catalog)?;
         let identity = TaintCatalogIdentity::from_definition(&catalog);
@@ -471,7 +433,6 @@ impl TaintCatalogRegistry {
                 semantic_hash,
                 definition: catalog,
                 canonical_json: canonical_json.into_boxed_slice(),
-                source,
             },
         );
         self.retained_entries = next_entries;

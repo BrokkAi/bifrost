@@ -2,6 +2,7 @@ use super::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryResultRef, CodeQueryTaintFinding,
     CodeQueryTaintLimits, SemanticProcedureValue, incomplete_diagnostic,
 };
+use super::{DerivationExecutionCause, Incompleteness};
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::structural::analysis_context::{
@@ -38,6 +39,7 @@ impl TaintQueryState {
         if cancellation.is_cancelled() {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::Cancelled,
+                Incompleteness::Operational(DerivationExecutionCause::Cancelled),
                 "taint finding projection was cancelled".to_owned(),
             );
             return Vec::new();
@@ -45,6 +47,7 @@ impl TaintQueryState {
         let Some(analysis_context) = analysis_context else {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::UnresolvedTaintResultReference,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!("taint result reference `{taint_ref}` was not supplied by the host"),
             );
             return Vec::new();
@@ -53,6 +56,7 @@ impl TaintQueryState {
         else {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::UnresolvedTaintResultReference,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!("taint result reference `{taint_ref}` is not registered"),
             );
             return Vec::new();
@@ -113,6 +117,7 @@ impl TaintQueryState {
             Err(error) => {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::TaintProjectionFailed,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     error.to_string(),
                 );
                 return Vec::new();
@@ -121,12 +126,13 @@ impl TaintQueryState {
         if projection.cancelled {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::Cancelled,
+                Incompleteness::Operational(DerivationExecutionCause::Cancelled),
                 "taint finding projection was cancelled".to_owned(),
             );
         }
         if projection.truncated {
             self.push_diagnostic(
-                CodeQueryDiagnosticCode::TaintFindingTruncated,
+                CodeQueryDiagnosticCode::TaintFindingTruncated, Incompleteness::Operational(DerivationExecutionCause::Budget),
                 format!(
                     "taint finding projection retained {} findings in {} bytes before reaching a query limit",
                     projection.findings.len(),
@@ -172,12 +178,26 @@ impl TaintQueryState {
             QueryAnalysisContextError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
             _ => CodeQueryDiagnosticCode::TaintRegistrationStale,
         };
-        self.push_diagnostic(code, error.to_string());
+        self.push_diagnostic(
+            code,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            error.to_string(),
+        );
     }
 
-    fn push_diagnostic(&mut self, code: CodeQueryDiagnosticCode, message: String) {
-        self.diagnostics
-            .push(incomplete_diagnostic(code, "all", message, Vec::new()));
+    fn push_diagnostic(
+        &mut self,
+        code: CodeQueryDiagnosticCode,
+        incompleteness: Incompleteness,
+        message: String,
+    ) {
+        self.diagnostics.push(incomplete_diagnostic(
+            code,
+            incompleteness,
+            "all",
+            message,
+            Vec::new(),
+        ));
     }
 }
 

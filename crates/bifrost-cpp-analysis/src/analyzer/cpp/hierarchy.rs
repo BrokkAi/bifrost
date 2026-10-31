@@ -8,11 +8,9 @@
 
 use crate::analyzer::cpp::*;
 
-use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
+use brokk_bifrost_core::analyzer::capabilities::{DescendantIndexScope, HierarchyAnswer};
 
 use brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index;
-
-use brokk_bifrost_core::analyzer::capabilities::descendants_from_variant_index;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_cpp::hierarchy::{build_cpp_visible_type_units, cpp_resolve_direct_ancestors};
@@ -114,58 +112,72 @@ impl CppAnalyzer {
 }
 
 impl TypeHierarchyProvider for CppAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.cached_complete_read(&self.direct_ancestors, code_unit, || {
-            let scope = AnalyzerQueryScope::new(self);
-            cpp_resolve_direct_ancestors(self, scope.token(), code_unit, ALWAYS).unwrap_or_else(
-                || {
-                    assert!(
-                        scope.read_completion().is_err(),
-                        "an unstopped ancestor walk must report an incomplete dependency"
-                    );
-                    // cached_complete_read propagates the recorded reason and
-                    // retains its incompleteness with this compatibility value.
-                    Vec::new()
-                },
-            )
-        })
-        .as_ref()
-        .clone()
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+        HierarchyAnswer::complete(
+            self.cached_complete_read(&self.direct_ancestors, code_unit, || {
+                let scope = AnalyzerQueryScope::new(self);
+                cpp_resolve_direct_ancestors(self, scope.token(), code_unit, ALWAYS).unwrap_or_else(
+                    || {
+                        assert!(
+                            scope.read_completion().is_err(),
+                            "an unstopped ancestor walk must report an incomplete dependency"
+                        );
+                        // cached_complete_read propagates the recorded reason and
+                        // retains its incompleteness with this compatibility value.
+                        Vec::new()
+                    },
+                )
+            })
+            .as_ref()
+            .clone(),
+        )
     }
 
     fn get_direct_ancestors_within(
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<Vec<CodeUnit>> {
-        self.direct_ancestors_while(code_unit, &scope.keep_going())
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
+        let ancestors = self.direct_ancestors_while(code_unit, &scope.keep_going());
+        if scope.cancellation().is_cancelled() {
+            return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
+        }
+        Ok(match ancestors {
+            Some(edges) => HierarchyAnswer::complete(edges),
+            None => HierarchyAnswer {
+                open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::MemberFamily(
+                    brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason::HierarchyTruncated,
+                )],
+                ..HierarchyAnswer::default()
+            },
+        })
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let uncancelled = CancellationToken::default();
         self.get_direct_descendants_within(
             code_unit,
             &DescendantIndexScope::whole_workspace(&uncancelled),
         )
-        .expect("a descendant index that cannot stop always completes")
+        .expect("an uncancelled descendant query cannot be cancelled")
     }
 
     fn get_direct_descendants_within(
         &self,
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         self.direct_descendant_index.read(
             &memo_attribution(self),
             |memo| {
-                descendants_from_variant_index(memo, scope, code_unit, || {
-                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
-                        self,
-                        || build_direct_descendant_index(self, self, scope),
-                    )
-                    .ok()
-                    .flatten()
-                })
+                brokk_bifrost_analysis::analyzer::common::complete_descendant_query(
+                    self,
+                    scope,
+                    code_unit,
+                    memo,
+                    || build_direct_descendant_index(self, self, scope),
+                    |_| {},
+                )
             },
             |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
         )

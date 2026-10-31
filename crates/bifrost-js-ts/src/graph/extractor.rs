@@ -3017,10 +3017,7 @@ fn reassignment_class_evidence(declarator: Node<'_>, ctx: &ScanCtx<'_>) -> (bool
 
 fn expression_is_target_constructor(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     match node.kind() {
-        "new_expression" => node
-            .child_by_field_name("constructor")
-            .and_then(|constructor| simple_identifier_text(constructor, ctx.source))
-            .is_some_and(|name| ctx.binds_target(name, node.start_byte())),
+        "new_expression" => expression_resolves_to_target_owner(node, ctx),
         "identifier" | "type_identifier" => {
             let text = slice(node, ctx.source);
             ctx.binds_target(text, node.start_byte())

@@ -105,13 +105,21 @@ mod source_import_path_tests {
         let store_path = fixture.root().join("canonical-import-path-presence.db");
         let store = AnalyzerStore::open_persistent(&store_path).unwrap();
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         drop(store);
 
         let reopened = AnalyzerStore::open_persistent(&store_path).unwrap();
         let typed = reopened
-            .hydrate_file_state(oid, "rust", &RustAdapter, &file)
+            .hydrate_file_state(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &file,
+            )
             .unwrap()
             .expect("canonical publication should hydrate");
         assert_eq!(typed.imports.len(), 2);
@@ -148,7 +156,11 @@ mod source_import_path_tests {
             .expect("canonical source imports should be readable");
         assert_eq!(canonical, expected_source_imports);
 
-        let generic = read_import_infos(&conn, &oid.to_string(), "rust").unwrap();
+        let generic = read_import_infos(
+            &conn,
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+        )
+        .unwrap();
         assert_eq!(generic, expected_generic_imports);
         let (generic_rows, linked_generic_rows, link_only_generic_rows): (i64, i64, i64) = conn
             .query_row(

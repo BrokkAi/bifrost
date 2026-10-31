@@ -184,6 +184,7 @@ fn classify_comment_group(
             let last = &comments[end];
             let anchor = first.span.start_byte..last.span.end_byte;
             let mut fact = python_rule_facts::make_row(
+                Incompleteness::Content,
                 "commented_out_code_block",
                 file,
                 anchor.clone(),

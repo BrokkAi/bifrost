@@ -173,7 +173,8 @@ fn report(
     if cache.reported.insert((seed.file.clone(), relation, cause)) {
         diagnostics.push(super::QueryExecutionState::diagnostic(
             analyzer,
-            CodeQueryDiagnostic {
+            CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,
@@ -184,7 +185,7 @@ fn report(
                 exhausted_roots: Vec::new(),
                 // A branch relation row is a row of its seed's file.
                 withheld_rows_path: Some(rel_path_string(&seed.file)),
-            },
+            }),
             CodeQueryDiagnosticCode::from_execution_reason(
                 CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,
                 cause,
@@ -419,12 +420,9 @@ pub(super) fn branch_relation_expansions(
         cache
             .regions
             .read_mut(&memo_attribution(analyzer), |regions| {
-                let regions = regions.entry(seed.file.clone()).or_insert_with(|| {
-                    brokk_bifrost_analysis::analyzer::languages::language_knowledge(seed.language)
-                        .expect("branch language is registered")
-                        .structural_spec()
-                        .conditional_regions(syntax.tree().root_node(), syntax.source())
-                });
+                let regions = regions
+                    .entry(seed.file.clone())
+                    .or_insert_with(|| syntax.conditional_regions());
                 branch_relations::relations_for_if(
                     &syntax,
                     seed.language,
@@ -1141,6 +1139,18 @@ fn scalar_condition_expansions(
     verdicts
         .into_iter()
         .map(|(ordinal, range, verdict)| {
+            let incompleteness = match &verdict {
+                Ok(ScalarConditionVerdict::Open(ScalarConditionGap::Cancelled)) => {
+                    Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+                }
+                Ok(ScalarConditionVerdict::Open(ScalarConditionGap::StaleSource)) => {
+                    Incompleteness::Operational(DerivationExecutionCause::Snapshot)
+                }
+                Ok(ScalarConditionVerdict::Open(ScalarConditionGap::WorkLimit)) => {
+                    Incompleteness::Operational(DerivationExecutionCause::Budget)
+                }
+                _ => Incompleteness::Content,
+            };
             let (verdict, reason, orientation) = match verdict {
                 Ok(ScalarConditionVerdict::AlwaysFalse) => ("proven", None, Some("always_false")),
                 Ok(ScalarConditionVerdict::AlwaysTrue) => ("proven", None, Some("always_true")),
@@ -1161,6 +1171,7 @@ fn scalar_condition_expansions(
                 }) {
                     let mut diagnostic = super::incomplete_diagnostic(
                         CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,
+                        incompleteness,
                         seed.language.config_label(),
                         message,
                         Vec::new(),

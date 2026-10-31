@@ -85,6 +85,7 @@ JOIN main.source_go_manifests AS replacement ON replacement.blob_id = mounted.bl
 JOIN main.blobs AS predecessor_blob
   ON predecessor_blob.lang = 'go' AND predecessor_blob.generation = mounted.generation
  AND predecessor_blob.blob_oid = mask.masked_blob_oid
+ AND predecessor_blob.parse_variant = x''
 JOIN main.source_go_manifests AS predecessor ON predecessor.blob_id = predecessor_blob.id
 WHERE mask.storage_language = 'go' AND mounted.file_version_id IS NULL
   AND replacement.membership_digest = predecessor.membership_digest;
@@ -952,7 +953,7 @@ impl super::super::resolution_typed::GoDefinitionContextBinder
                 ));
             }
         }
-        let Some(snapshot) = &self.go_snapshot else {
+        let Some(snapshot) = self.snapshot("go") else {
             return Ok(None);
         };
         let base = self.go_base_profile.get().unwrap_or_else(|| {

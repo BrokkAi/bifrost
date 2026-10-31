@@ -260,27 +260,26 @@ fn manifest_count_columns_match_the_persisted_schema_by_name() {
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub fn persisted_physical_logical_rows(store: &AnalyzerStore, keys: &[(Oid, &str)]) -> Vec<usize> {
-    let keys = keys
-        .iter()
-        .map(|(oid, language)| (oid.to_string(), (*language).to_owned()))
-        .collect::<Vec<_>>();
+pub fn persisted_physical_logical_rows(
+    store: &AnalyzerStore,
+    keys: &[super::BlobKey],
+) -> Vec<usize> {
+    let keys = keys.to_vec();
     store.conn.execute(move |conn| {
         let mut statement = conn
             .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
             .expect("prepare physical cascade-row recomputation");
         keys.iter()
-            .map(|(oid, language)| {
-                let cascade =
-                    persisted_blob_mutation_cost_fallback_statement(&mut statement, oid, language)
-                        .expect("recompute persisted cascade rows");
+            .map(|key| {
+                let cascade = persisted_blob_mutation_cost_fallback_statement(&mut statement, key)
+                    .expect("recompute persisted cascade rows");
                 let payload_cost_rows = conn
                     .query_row(
                         "SELECT COUNT(*)
                          FROM blob_payload_costs AS costs
                          JOIN blobs AS blob ON blob.id = costs.blob_id
-                         WHERE blob.blob_oid = ?1 AND blob.lang = ?2",
-                        params![oid, language],
+                         WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.parse_variant = ?3",
+                        params![key.oid.to_string(), key.lang, key.variant],
                         |row| row.get::<_, usize>(0),
                     )
                     .expect("count the persisted payload-cost row");
@@ -948,16 +947,14 @@ fn rust_m6a_first_tranche_facts_all_prepare() {
 fn complete_analysis_queries_seek_persistent_authority_tables() {
     let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
     let request = CompleteAnalysisBlobRequest::new(
-        oid(b"complete analysis query plan"),
-        PRIMARY,
+        brokk_bifrost_core::gitblob::BlobKey::unvaried(
+            oid(b"complete analysis query plan"),
+            PRIMARY,
+        ),
         [PROJECTION.to_owned()],
     );
     let conn = store.conn.lock().expect("store mutex");
-    sync_requested_parsed_blobs(
-        &conn,
-        &[(request.oid(), request.storage_language().to_owned())],
-    )
-    .expect("sync requested primary");
+    sync_requested_parsed_blobs(&conn, &[request.key().clone()]).expect("sync requested primary");
     sync_requested_analysis_projections(&conn, std::slice::from_ref(&request))
         .expect("sync requested projections");
 
@@ -980,7 +977,7 @@ fn complete_analysis_queries_seek_persistent_authority_tables() {
     for (alias, index) in [
         ("primary_epoch", "PRIMARY KEY"),
         ("primary_resolution_epoch", "PRIMARY KEY"),
-        ("primary_blob", "idx_blobs_lang_generation"),
+        ("primary_blob", "sqlite_autoindex_blobs_1"),
         ("primary_meta", "PRIMARY KEY"),
         ("primary_interior", "PRIMARY KEY"),
         ("projection", "PRIMARY KEY"),
@@ -993,7 +990,11 @@ fn complete_analysis_queries_seek_persistent_authority_tables() {
         assert_plan_search(&missing_plan, alias, index);
     }
     assert_plan_search(&missing_plan, "projection_blob", "sqlite_autoindex_blobs_1");
-    assert_plan_search(&missing_plan, "projection_blob", "(blob_oid=? AND lang=?)");
+    assert_plan_search(
+        &missing_plan,
+        "projection_blob",
+        "(blob_oid=? AND lang=? AND parse_variant=?)",
+    );
     assert!(
         missing_plan
             .iter()
@@ -1019,7 +1020,7 @@ fn complete_analysis_queries_seek_persistent_authority_tables() {
     assert_plan_search(
         &projection_plan,
         "projection_blob",
-        "(blob_oid=? AND lang=?)",
+        "(blob_oid=? AND lang=? AND parse_variant=?)",
     );
 }
 
@@ -1053,9 +1054,8 @@ fn stale_generation_reclamation_cost_plan_uses_gc_order_and_keyed_probes() {
         "GC may scan only the ordered blob inventory: {plan:#?}"
     );
     assert!(
-        plan.iter().any(|detail| {
-            detail.contains("SCAN blobs USING COVERING INDEX idx_blobs_lang_generation")
-        }),
+        plan.iter()
+            .any(|detail| { detail.contains("SCAN blobs USING INDEX idx_blobs_lang_generation") }),
         "GC must consume stale blobs in its indexed order: {plan:#?}"
     );
     for alias in [

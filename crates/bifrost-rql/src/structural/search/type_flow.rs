@@ -9,6 +9,7 @@
 //! solve, or a failed root is a diagnostic, never an empty answer that reads
 //! as "no classes" or "no finding".
 
+use super::{DerivationExecutionCause, Incompleteness};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -760,6 +761,7 @@ pub(super) struct TypeFlowQueryState {
     /// Held until the diagnostics are taken so one diagnostic per code can
     /// carry the complete attribution instead of one opaque line per root.
     incomplete_roots: Vec<CodeQueryExhaustedRoot>,
+    incomplete_root_cause: Incompleteness,
     semantic_exhausted_roots: Vec<CodeQueryExhaustedRoot>,
     work: CodeQueryTypeFlowWork,
     semantic_budget_exhausted: bool,
@@ -830,6 +832,7 @@ impl TypeFlowQueryState {
             witness_projection_cache: HashMap::default(),
             diagnostics: Vec::new(),
             incomplete_roots: Vec::new(),
+            incomplete_root_cause: Incompleteness::Content,
             semantic_exhausted_roots: Vec::new(),
             work: CodeQueryTypeFlowWork::default(),
             semantic_budget_exhausted: false,
@@ -1385,6 +1388,7 @@ impl TypeFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::TypeFlowWitnessTruncated,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             format!(
                 "absent-member witness projection omitted at least {omitted_lower_bound} witness(es)"
             ),
@@ -1396,6 +1400,7 @@ impl TypeFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::TypeFlowWitnessTruncated,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             format!(
                 "absent-member witness projection omitted at least {omitted_lower_bound} step(s)"
             ),
@@ -1406,6 +1411,7 @@ impl TypeFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::TypeFlowWitnessUnavailable,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             format!(
                 "absent-member witness unavailable: {}",
                 bounded_reason(&error.to_string())
@@ -1550,6 +1556,7 @@ impl TypeFlowQueryState {
                     push_deduplicated_diagnostic(
                         &mut self.diagnostics,
                         CodeQueryDiagnosticCode::Cancelled,
+                        Incompleteness::Operational(DerivationExecutionCause::Cancelled),
                         "class-set root-result hydration was cancelled".to_string(),
                     );
                     self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
@@ -1720,6 +1727,7 @@ impl TypeFlowQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     format!(
                         "class-set propagation is unsupported for {}",
                         language.config_label()
@@ -1832,6 +1840,7 @@ impl TypeFlowQueryState {
                                 push_deduplicated_diagnostic(
                                     &mut self.diagnostics,
                                     CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                                     refusal.to_string(),
                                 );
                             }
@@ -1844,6 +1853,7 @@ impl TypeFlowQueryState {
                                 push_deduplicated_diagnostic(
                                     &mut self.diagnostics,
                                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                                    Incompleteness::Operational(DerivationExecutionCause::Budget),
                                     format!(
                                         "class-set field index exceeded its semantic budget: {}",
                                         detail
@@ -1868,6 +1878,7 @@ impl TypeFlowQueryState {
                             push_deduplicated_diagnostic(
                                 &mut self.diagnostics,
                                 code,
+                                Incompleteness::Operational(DerivationExecutionCause::Provider),
                                 format!("class-set field index failed: {error}"),
                             );
                             self.field_slots.insert(field_slot_key, None);
@@ -1963,6 +1974,7 @@ impl TypeFlowQueryState {
                             push_deduplicated_diagnostic(
                                 &mut self.diagnostics,
                                 CodeQueryDiagnosticCode::Cancelled,
+                                Incompleteness::Operational(DerivationExecutionCause::Cancelled),
                                 "class-set root-result publication was cancelled".to_string(),
                             );
                             child_budget.release_resident();
@@ -2097,7 +2109,12 @@ impl TypeFlowQueryState {
             }
         }
         if let Some((code, message)) = &product.failure {
-            push_deduplicated_diagnostic(&mut self.diagnostics, *code, message.clone());
+            push_deduplicated_diagnostic(
+                &mut self.diagnostics,
+                *code,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
+                message.clone(),
+            );
         } else {
             if product.semantic_budget_exhausted {
                 self.semantic_budget_exhausted = true;
@@ -2123,6 +2140,7 @@ impl TypeFlowQueryState {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                Incompleteness::Operational(DerivationExecutionCause::Budget),
                 format!("class-set root product admission failed: {exceeded}"),
             );
             self.cache.insert(key, CachedTypeFlowAnalysis::Failed);
@@ -2182,6 +2200,7 @@ impl TypeFlowQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::Cancelled,
+                    Incompleteness::Operational(DerivationExecutionCause::Cancelled),
                     "class-set root memo acquisition was cancelled".to_owned(),
                 );
                 RootProductAcquisition::Applied(None)
@@ -2284,6 +2303,17 @@ impl TypeFlowQueryState {
         procedure: &SemanticProcedureValue,
         evidence: &RootIncompleteEvidence,
     ) {
+        for lane in &evidence.lanes {
+            let cause = match lane {
+                RootExhaustedLane::Cancelled => DerivationExecutionCause::Cancelled,
+                RootExhaustedLane::Solver(_) | RootExhaustedLane::Semantic { .. } => {
+                    DerivationExecutionCause::Budget
+                }
+            };
+            self.incomplete_root_cause = self
+                .incomplete_root_cause
+                .combine(Incompleteness::Operational(cause));
+        }
         let entries = exhausted_root_entries(procedure, evidence, evidence.lanes.iter());
         extend_distinct(&mut self.incomplete_roots, entries);
     }
@@ -2298,6 +2328,7 @@ impl TypeFlowQueryState {
             );
             self.push_exhaustion_diagnostic(
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                Incompleteness::Operational(DerivationExecutionCause::Budget),
                 message,
                 semantic_roots,
             );
@@ -2309,8 +2340,11 @@ impl TypeFlowQueryState {
                 &incomplete_roots,
                 MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES,
             );
+            let incompleteness =
+                std::mem::replace(&mut self.incomplete_root_cause, Incompleteness::Content);
             self.push_exhaustion_diagnostic(
                 CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                incompleteness,
                 message,
                 incomplete_roots,
             );
@@ -2321,11 +2355,13 @@ impl TypeFlowQueryState {
     fn push_exhaustion_diagnostic(
         &mut self,
         code: CodeQueryDiagnosticCode,
+        incompleteness: Incompleteness,
         message: String,
         exhausted_roots: Vec<CodeQueryExhaustedRoot>,
     ) {
         self.diagnostics.push(incomplete_diagnostic(
             code,
+            incompleteness,
             "workspace",
             message,
             exhausted_roots,

@@ -98,7 +98,7 @@ pub fn cpp_resolve_direct_ancestors(
     let mut ancestors = Vec::new();
     for fact in facts {
         for base in fact.bases {
-            if let Some(ancestor) = resolve_base_type(
+            if let Some(ancestor) = cpp_resolve_base_type(
                 cpp,
                 token,
                 code_unit,
@@ -115,7 +115,9 @@ pub fn cpp_resolve_direct_ancestors(
     Some(ancestors)
 }
 
-fn resolve_base_type(
+/// Resolve one written base in its declaring class scope, canonicalizing aliases.
+/// `None` means the walk stopped; `Some(None)` means unresolved.
+pub fn cpp_resolve_base_type(
     cpp: &dyn CppSource,
     token: QueryToken<'_>,
     code_unit: &CodeUnit,

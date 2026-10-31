@@ -425,6 +425,13 @@ pub trait TypeFlowAdapter: Send + Sync {
     ) -> bool {
         false
     }
+    /// Whether a load only presents a name read whose value the adapter
+    /// classifies from the name itself, such as a module-global slot read.
+    /// The planner seeds nothing for such a load, so its result is treated
+    /// exactly as the unproduced name value it presents.
+    fn memory_load_presents_name_read(&self, _location: &MemoryLocation) -> bool {
+        false
+    }
     /// Class of a value produced by an exact attribute or subscript access.
     /// Implementations must return a class only when the access declaration
     /// explicitly claims an exact runtime return class.

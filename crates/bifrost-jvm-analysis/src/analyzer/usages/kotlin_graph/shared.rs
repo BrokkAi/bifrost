@@ -426,15 +426,16 @@ impl<'a> KotlinEdgeResolver<'a> {
         Some(Self { files, kotlin })
     }
 
-    #[cfg(test)]
-    pub(crate) fn build_edges<F>(
+    fn build_selected_edges<Output, F>(
         &self,
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
-        nodes: &HashSet<String>,
+        domain: EdgeNodeDomain<'_>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> Output
     where
+        Output:
+            brokk_bifrost_analysis::analyzer::usages::inverted_edges::UsageEdgeBuildOutput<String>,
         F: Fn(&ProjectFile) -> bool + Sync,
     {
         let selected_files =
@@ -450,9 +451,23 @@ impl<'a> KotlinEdgeResolver<'a> {
             token,
             &self.files,
             &file_states,
-            EdgeNodeDomain::Closed(nodes),
+            domain,
             keep_file,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        self.build_selected_edges(analyzer, token, EdgeNodeDomain::Closed(nodes), keep_file)
     }
 
     pub(crate) fn build_rooted_edges<F>(
@@ -465,22 +480,7 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files =
-            brokk_bifrost_analysis::analyzer::usages::common::select_usage_graph_files(
-                &self.files,
-                &keep_file,
-            );
-        let file_states = self
-            .kotlin
-            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
-        build_kotlin_edges(
-            analyzer,
-            token,
-            &self.files,
-            &file_states,
-            EdgeNodeDomain::Rooted(callers),
-            keep_file,
-        )
+        self.build_selected_edges(analyzer, token, EdgeNodeDomain::Rooted(callers), keep_file)
     }
 
     pub(crate) fn build_inbound_edges_with_completeness<F>(
@@ -521,22 +521,7 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files =
-            brokk_bifrost_analysis::analyzer::usages::common::select_usage_graph_files(
-                &self.files,
-                &keep_file,
-            );
-        let file_states = self
-            .kotlin
-            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
-        build_kotlin_edges(
-            analyzer,
-            token,
-            &self.files,
-            &file_states,
-            EdgeNodeDomain::Closed(nodes),
-            keep_file,
-        )
+        self.build_selected_edges(analyzer, token, EdgeNodeDomain::Closed(nodes), keep_file)
     }
 }
 

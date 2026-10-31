@@ -517,7 +517,9 @@ mod persistence_tests {
         });
         assert!(
             store
-                .semantic_ir_publication(oid, "java")
+                .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "java"
+                ))
                 .unwrap()
                 .is_some()
         );
@@ -541,7 +543,9 @@ mod persistence_tests {
         let store = AnalyzerStore::open_persistent(&database).unwrap();
         assert!(
             store
-                .semantic_ir_publication(oid, "java")
+                .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    oid, "java"
+                ))
                 .unwrap()
                 .is_none(),
             "old adapter publication must miss under current producer"
@@ -562,7 +566,7 @@ mod persistence_tests {
         drop(connection);
         let store = AnalyzerStore::open_persistent(&database).unwrap();
         let publication = store
-            .semantic_ir_publication(oid, "java")
+            .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"))
             .unwrap()
             .expect("current publication");
         let scope =

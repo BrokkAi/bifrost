@@ -170,117 +170,59 @@ code_query_labeled_enum! {
 }
 
 impl CodeQueryDiagnosticCode {
-    /// Unit admission is fail-closed even when an origin forgot to mark.
-    /// Collapsed content gaps are admitted only where operational causes mark
-    /// the request and capture/replay preserves that execution dependence.
+    /// Codes whose meaning is inherently operational, independent of content.
+    /// Partial content/operational outcomes use the diagnostic's explicit
+    /// Incompleteness instead of blanket classification by code.
     pub const fn is_execution_state(self) -> bool {
+        self.inherent_execution_cause().is_some()
+    }
+    pub const fn inherent_execution_cause(self) -> Option<DiagnosticExecutionCause> {
         match self {
-            Self::InvalidPlan
-            | Self::CrossDomainDocumentIncomplete
-            | Self::PythonHierarchyDerivationIncomplete
-            | Self::JsxProjectionIncomplete
-            | Self::CallShapeCoverageIncomplete
-            | Self::Cancelled
-            | Self::SemanticResultsOmitted
-            | Self::SemanticAnalysisPartial
-            | Self::CallBindingDispatchPartial
-            | Self::CallBindingSelectorRejected
+            Self::Cancelled => Some(DiagnosticExecutionCause::Cancelled),
+            Self::SemanticResultsOmitted
             | Self::SemanticBudgetExhausted
-            | Self::SemanticProviderFailed
-            | Self::SemanticPackAcquisitionPending
-            | Self::UnresolvedProtocolReference
-            | Self::TypestateRegistrationStale
-            | Self::TypestateHandleStale
-            | Self::TypestateRootMismatch
-            | Self::TypestateAnalysisPartial
-            | Self::TypestateProviderFailed
             | Self::TypestateSolverBudgetExhausted
             | Self::TypestateFindingBudgetExhausted
             | Self::TypestateWitnessTruncated
-            | Self::UnresolvedValueFlowPlanReference
-            | Self::ValueFlowRegistrationStale
-            | Self::ValueFlowHandleStale
-            | Self::ValueFlowRootMismatch
-            | Self::ValueFlowAnalysisPartial
-            | Self::ValueFlowProviderFailed
             | Self::ValueFlowSolverBudgetExhausted
             | Self::ValueFlowWitnessTruncated
             | Self::TypeFlowWitnessTruncated
-            | Self::TypeFlowWitnessUnavailable
-            | Self::UnresolvedTaintResultReference
-            | Self::TaintRegistrationStale
-            | Self::TaintHandleStale
-            | Self::TaintRootMismatch
-            | Self::TaintPlanReportMismatch
-            | Self::TaintProjectionFailed
             | Self::TaintFindingTruncated
-            | Self::ReceiverAnalysisPartial
-            | Self::ReceiverAnalysisFailed
             | Self::CallRelationBudgetExhausted
-            | Self::CallRelationParseFailed
-            | Self::CallRelationCandidatesOmitted
             | Self::CallRelationCandidateLimit
-            | Self::CallRelationAnalysisFailed
             | Self::ReferenceSourceBytesTruncated
             | Self::ReferenceCandidateFilesTruncated
-            | Self::ReferenceCandidatesOmitted
             | Self::ReferenceCallsiteLimit
-            | Self::ReferenceAnalysisFailed
             | Self::UsesCandidateLimit
-            | Self::UsesCandidatesOmitted
             | Self::ExecutionBudgetExhausted
             | Self::PipelineBudgetExhausted
             | Self::ImportGraphBudgetExhausted
-            | Self::OccurrenceResolutionIncomplete
             | Self::OccurrenceRowBudgetExhausted
-            | Self::MaterializationDerivationIncomplete
             | Self::MaterializationRowBudgetExhausted
-            | Self::EnvironmentDerivationIncomplete
             | Self::EnvironmentRowBudgetExhausted
-            | Self::ResolutionTraceIncomplete
-            | Self::EdgeDerivationIncomplete
             | Self::EffectBudgetExhausted
-            | Self::ResultLimitReached => true,
-            Self::UnsupportedStructuralFeature
-            | Self::MissingStructuralAdapter
-            | Self::RecoveredSyntaxIncomplete
-            | Self::UnsupportedImportAnalysis
-            | Self::DynamicImportTarget
-            | Self::SemanticWorkspaceRequired
-            | Self::NoEnclosingProcedure
-            | Self::SemanticCapabilityUnsupported
-            | Self::TypestateCapabilityUnsupported
-            | Self::ValueFlowCapabilityUnsupported
-            | Self::CallRelationTargetsAmbiguous
-            | Self::ReferenceTargetsAmbiguous
-            | Self::UsesParserUnsupported
-            | Self::UsesTargetsAmbiguous
-            | Self::OccurrenceRoleUnsupported
-            | Self::EnvironmentAxisUnsupported
-            | Self::MaterializationAxisUnsupported
-            | Self::EdgeAxisUnsupported
-            | Self::FlowStateAxisUnsupported
-            | Self::RewriteDomainUnsupported
-            | Self::IdentityAxisUnsupported
-            | Self::RewritePathDerivationIncomplete
-            | Self::ControlRelationDerivationIncomplete
-            | Self::BranchRelationDerivationIncomplete
-            | Self::LoopRelationDerivationIncomplete
-            | Self::FailureHandlerDerivationIncomplete
-            | Self::StatementReachabilityDerivationIncomplete
-            | Self::PendingCleanupFlowDerivationIncomplete
-            | Self::TopologyDerivationIncomplete
-            | Self::TopologyOwnershipAmbiguous
-            | Self::PathDerivationIncomplete
-            | Self::FlowStateDerivationIncomplete
-            | Self::EffectDerivationIncomplete
-            | Self::ResultContractDerivationIncomplete
-            | Self::ResultObligationDerivationIncomplete
-            | Self::ControlRelationExitPartitionPartial
-            | Self::CrossDomainBindingUnproven
-            | Self::CrossDomainKeyUnsupported
-            | Self::CrossDomainCorrelationAmbiguous
-            | Self::BroadQuery => false,
+            | Self::ResultLimitReached => Some(DiagnosticExecutionCause::Budget),
+            Self::SemanticProviderFailed
+            | Self::SemanticPackAcquisitionPending
+            | Self::UnresolvedProtocolReference
+            | Self::TypestateProviderFailed
+            | Self::UnresolvedValueFlowPlanReference
+            | Self::ValueFlowProviderFailed
+            | Self::UnresolvedTaintResultReference
+            | Self::TaintPlanReportMismatch
+            | Self::ReceiverAnalysisFailed
+            | Self::CallRelationAnalysisFailed
+            | Self::ReferenceAnalysisFailed => Some(DiagnosticExecutionCause::Provider),
+            Self::TypestateRegistrationStale
+            | Self::TypestateHandleStale
+            | Self::TypestateRootMismatch
+            | Self::ValueFlowRegistrationStale
+            | Self::ValueFlowHandleStale
+            | Self::ValueFlowRootMismatch
+            | Self::TaintRegistrationStale
+            | Self::TaintHandleStale
+            | Self::TaintRootMismatch => Some(DiagnosticExecutionCause::Snapshot),
+            _ => None,
         }
     }
 
@@ -311,8 +253,45 @@ code_query_labeled_enum! {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+/// Why a producer could not close a partial result. Content gaps are stable
+/// under their recorded reads; operational stops cannot authorize unit reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Incompleteness {
+    Content,
+    Operational(DiagnosticExecutionCause),
+}
+
+pub use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause as DiagnosticExecutionCause;
+
+impl Incompleteness {
+    pub(crate) fn combine(self, other: Self) -> Self {
+        match self {
+            Self::Operational(_) => self,
+            Self::Content => other,
+        }
+    }
+
+    pub(crate) fn from_execution_reason(reason: &str) -> Self {
+        match DiagnosticExecutionCause::from_reason(reason) {
+            Some(cause) => Self::Operational(cause),
+            None => Self::Content,
+        }
+    }
+
+    pub(crate) fn execution_cause(self) -> Option<DiagnosticExecutionCause> {
+        match self {
+            Self::Content => None,
+            Self::Operational(cause) => Some(cause),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDiagnostic {
+    /// Admission metadata, excluded from the public result and its identity.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub incompleteness: Incompleteness,
     pub code: CodeQueryDiagnosticCode,
     pub impact: CodeQueryDiagnosticImpact,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -346,6 +325,70 @@ pub struct CodeQueryDiagnostic {
     /// withheld rows may lie anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld_rows_path: Option<String>,
+}
+
+impl CodeQueryDiagnostic {
+    /// Construct admission metadata together with the diagnostic code.
+    pub fn new(mut diagnostic: Self) -> Self {
+        if diagnostic.incompleteness == Incompleteness::Content
+            && let Some(cause) = diagnostic.code.inherent_execution_cause()
+        {
+            diagnostic.incompleteness = Incompleteness::Operational(cause);
+        }
+        diagnostic
+    }
+}
+
+impl PartialEq for CodeQueryDiagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            incompleteness: _,
+            code,
+            impact,
+            branch,
+            language,
+            message,
+            source,
+            related,
+            exhausted_roots,
+            withheld_rows_path,
+        } = self;
+        code == &other.code
+            && impact == &other.impact
+            && branch == &other.branch
+            && language == &other.language
+            && message == &other.message
+            && source == &other.source
+            && related == &other.related
+            && exhausted_roots == &other.exhausted_roots
+            && withheld_rows_path == &other.withheld_rows_path
+    }
+}
+impl Eq for CodeQueryDiagnostic {}
+impl std::hash::Hash for CodeQueryDiagnostic {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            incompleteness: _,
+            code,
+            impact,
+            branch,
+            language,
+            message,
+            source,
+            related,
+            exhausted_roots,
+            withheld_rows_path,
+        } = self;
+        std::hash::Hash::hash(code, state);
+        std::hash::Hash::hash(impact, state);
+        std::hash::Hash::hash(branch, state);
+        std::hash::Hash::hash(language, state);
+        std::hash::Hash::hash(message, state);
+        std::hash::Hash::hash(source, state);
+        std::hash::Hash::hash(related, state);
+        std::hash::Hash::hash(exhausted_roots, state);
+        std::hash::Hash::hash(withheld_rows_path, state);
+    }
 }
 
 impl std::fmt::Debug for CodeQueryDiagnostic {
@@ -521,6 +564,9 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             ))
         })?;
         Ok(Self {
+            // Wire diagnostics do not carry execution provenance. Only an
+            // admitted unit's read receipt can certify that cached provenance.
+            incompleteness: Incompleteness::Operational(DiagnosticExecutionCause::Provider),
             code: wire.code,
             impact: wire.impact,
             branch: wire.branch,

@@ -173,6 +173,7 @@ pub(super) fn comparison_using_is_expansions(
     if matches!(left_class, OperandClass::Unknown) || matches!(right_class, OperandClass::Unknown) {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "the runtime class of a comparison operand is unresolved",
         );
@@ -225,6 +226,7 @@ pub(super) fn comparison_using_is_non_portable_expansions(
         {
             resolution_incomplete(
                 diagnostics,
+                brokk_bifrost_rql::Incompleteness::Content,
                 seed,
                 "the literal value needed for CPython interning classification is unresolved",
             );
@@ -267,6 +269,7 @@ pub(super) fn comparison_using_is_non_portable_expansions(
     if matches!(left_class, OperandClass::Unknown) || matches!(right_class, OperandClass::Unknown) {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "the runtime class of a non-portable identity operand is unresolved",
         );
@@ -301,7 +304,16 @@ fn parse_comparison_source(
             seed.facts.source_identity(),
             seed.facts.source(),
         )
-        .map_err(|reason| resolution_incomplete(diagnostics, seed, reason))
+        .map_err(|reason| {
+            resolution_incomplete(
+                diagnostics,
+                brokk_bifrost_rql::Incompleteness::Operational(
+                    brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                ),
+                seed,
+                reason,
+            )
+        })
         .ok()
 }
 
@@ -332,6 +344,7 @@ fn ast_comparison<'tree>(
     ) else {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "the left operand AST range is unavailable",
         );
@@ -344,6 +357,7 @@ fn ast_comparison<'tree>(
     ) else {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "the right operand AST range is unavailable",
         );
@@ -354,13 +368,19 @@ fn ast_comparison<'tree>(
         comparison.range.start_byte,
         comparison.range.end_byte,
     ) else {
-        resolution_incomplete(diagnostics, seed, "the comparison AST range is unavailable");
+        resolution_incomplete(
+            diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
+            seed,
+            "the comparison AST range is unavailable",
+        );
         return None;
     };
     let Some(operator) = source.get(operator_role.span.start_byte..operator_role.span.end_byte)
     else {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "the selected operator text is unavailable",
         );
@@ -824,7 +844,12 @@ fn unresolved_operand_class(
     diagnostics: &mut Vec<super::results::CodeQueryDiagnostic>,
     detail: &str,
 ) -> OperandClass {
-    resolution_incomplete(diagnostics, seed, detail);
+    resolution_incomplete(
+        diagnostics,
+        brokk_bifrost_rql::Incompleteness::Content,
+        seed,
+        detail,
+    );
     OperandClass::Unknown
 }
 
@@ -1086,6 +1111,7 @@ pub(super) fn python_missing_self_expansions(
     let Some(method_scope) = scope_for_fact(&environment, method) else {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "the method's lexical scope has no matching binding scope",
         );
@@ -1138,6 +1164,7 @@ pub(super) fn python_missing_self_expansions(
         | (BindingLookup::NoBinding, BindingLookup::Bound(_)) => {
             resolution_incomplete(
                 diagnostics,
+                brokk_bifrost_rql::Incompleteness::Content,
                 seed,
                 "the two same-spelled operands have different binding outcomes",
             );
@@ -1390,6 +1417,7 @@ fn binding_for_identifier(
     let Some(occurrence) = occurrence_for_identifier(seed, occurrences, identifier) else {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "a grammar-selected identifier operand has no classified reference occurrence",
         );
@@ -1412,6 +1440,7 @@ fn binding_for_identifier(
     if unresolved_is_incomplete {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "a supported comparison operand has no exact lexical binding identity",
         );
@@ -1572,6 +1601,7 @@ fn self_attribute_witness(
     if open {
         resolution_incomplete(
             diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
             seed,
             "a candidate self-attribute access could not be resolved to a method parameter",
         );
@@ -1591,11 +1621,13 @@ fn unsupported(
         seed,
         detail,
         super::results::CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+        brokk_bifrost_rql::Incompleteness::Content,
     );
 }
 
 fn resolution_incomplete(
     diagnostics: &mut Vec<super::results::CodeQueryDiagnostic>,
+    incompleteness: brokk_bifrost_rql::Incompleteness,
     seed: &SeedMatch,
     detail: &str,
 ) {
@@ -1604,6 +1636,7 @@ fn resolution_incomplete(
         seed,
         detail,
         super::results::CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete,
+        incompleteness,
     );
 }
 
@@ -1612,6 +1645,7 @@ fn push_incomplete_diagnostic(
     seed: &SeedMatch,
     detail: &str,
     code: super::results::CodeQueryDiagnosticCode,
+    incompleteness: brokk_bifrost_rql::Incompleteness,
 ) {
     use super::results::{CodeQueryDiagnostic, CodeQueryDiagnosticImpact};
     let comparison = seed.facts.node(seed.fact_match.node);
@@ -1627,7 +1661,8 @@ fn push_incomplete_diagnostic(
     {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         related: Vec::new(),
         source: None,
         code,
@@ -1637,5 +1672,5 @@ fn push_incomplete_diagnostic(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }

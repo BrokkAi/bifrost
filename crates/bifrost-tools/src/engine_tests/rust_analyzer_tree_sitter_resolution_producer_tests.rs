@@ -440,7 +440,7 @@ mod third { pub type SelfSuper = self::super::z::T; }
             let persisted_usage = analyzer
                 .store_context
                 .store
-                .rust_usage_facts(oid, "rust")
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
                 .expect("read persisted Rust usage facts");
             assert_eq!(persisted_usage, parsed.rust_usage_facts);
             saw_named_alias_export |= persisted_usage.exports.iter().any(|export| {
@@ -933,7 +933,7 @@ passthrough! {
         assert_eq!(
             warm.store_context
                 .store
-                .rust_usage_facts(oid, "rust")
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
                 .expect("reopened Rust usage facts"),
             cold_rust_facts,
             "reopened context ids and owner semantics remain source-identical"

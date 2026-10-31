@@ -74,6 +74,8 @@ pub struct NativePointBatch {
         Option<NativePointPublication<crate::analyzer::semantic_model::SemanticModelOverlay>>,
     ),
     entries: std::cell::RefCell<std::collections::HashMap<NativePointKey, NativePointEntry>>,
+    persisted_reads:
+        std::rc::Rc<crate::analyzer::store::resolution_operation::SelectedPointReadMemos>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -190,6 +192,7 @@ impl NativePointBatch {
                 mounts,
             },
             entries: std::cell::RefCell::default(),
+            persisted_reads: std::rc::Rc::default(),
         };
         Ok(batch.current(analyzer).then_some(batch))
     }
@@ -246,6 +249,10 @@ impl NativePointBatch {
             role,
             budget: query.budget,
         })
+    }
+
+    pub fn persisted_read_counts_for_test(&self) -> (usize, usize, usize) {
+        self.persisted_reads.read_counts_for_test()
     }
 
     pub fn definition<A: LanguageAdapter>(
@@ -930,11 +937,12 @@ fn resolve_native_definition_reference<A: LanguageAdapter>(
                 selected_import_gap,
             )
         },
-        |mut answer, work, selected_import_model| match answer.definitions {
+        |answer, work, selected_import_model| match answer.definitions {
             SelectedNativeDefinitions::Cancelled => BoundedResolution::Cancelled { work },
             _ => {
-                let absent_member_owners = std::mem::take(&mut answer.absent_member_owners);
-                let mut value = adapt_definition_answer_with_import_model(
+                let obligations = answer.query_obligations.clone();
+                let owners = answer.absent_member_owners.clone();
+                let mut value = adapt_definition_answer_impl(
                     query.site,
                     inner.adapter().language(),
                     answer,
@@ -943,8 +951,10 @@ fn resolve_native_definition_reference<A: LanguageAdapter>(
                 let member = query
                     .source
                     .get(query.site.focus_start_byte..query.site.focus_end_byte)
-                    .expect("a resolved reference site's focus lies inside its source");
-                state_absent_member(&mut value, member, &absent_member_owners);
+                    .expect("a resolved reference focus lies inside its source");
+                // Interpret absence before adding independent selected-environment scope.
+                state_absent_member(&mut value, member, &owners);
+                append_query_obligation_diagnostics(&mut value, &obligations);
                 BoundedResolution::Complete { value, work }
             }
         },
@@ -956,8 +966,9 @@ fn resolve_native_definition_reference<A: LanguageAdapter>(
 /// complete owner inventories and none declares the member.
 ///
 /// JVM member points and Go composite-literal labels report this shared
-/// absent-member proof as `no_indexed_definition`. An answer that already
-/// carries a diagnostic keeps it. The caller supplies the structurally
+/// absent-member proof as `no_indexed_definition`. Binding diagnostics retain
+/// their existing interpretation; query scope does not suppress absence.
+/// The caller supplies the structurally
 /// selected member token; this helper does not interpret source syntax.
 fn state_absent_member(
     value: &mut DefinitionLookupOutcome,
@@ -968,7 +979,10 @@ fn state_absent_member(
         || value.status != DefinitionLookupStatus::NoDefinition
         || !value.definitions.is_empty()
         || value.lexical_definition.is_some()
-        || !value.diagnostics.is_empty()
+        || value
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind != "query_obligation")
     {
         return;
     }
@@ -1110,6 +1124,12 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
         };
         #[cfg(any(test, feature = "test-support"))]
         NATIVE_POINT_OPERATION_OPEN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        #[cfg(any(test, feature = "test-support"))]
+        let operation = if let Some(batch) = frozen {
+            Box::new(operation.with_point_read_memos(std::rc::Rc::clone(&batch.persisted_reads)))
+        } else {
+            operation
+        };
         after_open();
         if cancellation.is_cancelled() {
             return Ok(cancelled());
@@ -1241,10 +1261,28 @@ pub fn adapt_definition_answer(
     language: Language,
     answer: SelectedNativeReferenceUnits,
 ) -> DefinitionLookupOutcome {
-    adapt_definition_answer_with_import_model(site, language, answer, None)
+    let obligations = answer.query_obligations.clone();
+    let mut outcome = adapt_definition_answer_impl(site, language, answer, None);
+    append_query_obligation_diagnostics(&mut outcome, &obligations);
+    outcome
 }
 
-fn adapt_definition_answer_with_import_model(
+fn append_query_obligation_diagnostics(
+    outcome: &mut DefinitionLookupOutcome,
+    obligations: &brokk_bifrost_store::analyzer::resolution::QueryObligations,
+) {
+    outcome.diagnostics.extend(
+        obligations
+            .iter()
+            .map(|obligation| DefinitionLookupDiagnostic {
+                claim: None,
+                kind: "query_obligation".into(),
+                message: obligation.to_string(),
+            }),
+    );
+}
+
+fn adapt_definition_answer_impl(
     site: &ResolvedReferenceSite,
     language: Language,
     answer: SelectedNativeReferenceUnits,

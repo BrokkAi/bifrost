@@ -87,9 +87,9 @@ impl RustAnalyzer {
         &self,
         file: &ProjectFile,
         generation: brokk_bifrost_analysis::analyzer::store::GenerationId,
-        oid: git2::Oid,
+        key: &brokk_bifrost_core::gitblob::BlobKey,
     ) -> Result<(), RustCargoRouteError> {
-        if self.selected_rust_source(file)? != (generation, oid) {
+        if self.selected_rust_source(file)? != (generation, key.clone()) {
             return Err(RustCargoRouteError::Unavailable);
         }
         let missing = self
@@ -105,7 +105,7 @@ impl RustAnalyzer {
         }
 
         self.inner.persist_live_blobs(&missing);
-        if self.selected_rust_source(file)? != (generation, oid) {
+        if self.selected_rust_source(file)? != (generation, key.clone()) {
             return Err(RustCargoRouteError::Unavailable);
         }
         let still_missing = self
@@ -335,9 +335,11 @@ impl RustAnalyzer {
             .inner
             .language_generation("rust")
             .expect("Rust analyzer has a Rust storage generation");
-        let present = self
-            .analyzer_store()
-            .blobs_with_rust_facts("rust", generation, &oids)?;
+        let present = self.analyzer_store().blobs_with_rust_facts(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(git2::Oid::zero(), "rust"),
+            generation,
+            &oids,
+        )?;
         let mut missing = Vec::new();
         for (file, oid) in mounts {
             if present.contains(&oid)

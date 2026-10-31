@@ -1300,6 +1300,18 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "additionalProperties": { "type": "integer", "minimum": 0 },
                         "description": "Optional policy id to expected evaluation milliseconds. Parallel batches start unknown policies first, then hinted policies by descending cost. Advisory only; never changes the report."
                     },
+                    "policy_deadlines_ms": {
+                        "type": "object",
+                        "maxProperties": crate::policy::PolicyBatchBudget::default().max_policies(),
+                        "propertyNames": { "minLength": 1 },
+                        "additionalProperties": { "type": "integer", "minimum": 1 },
+                        "description": "Optional policy id to the most milliseconds that policy's evaluation may take, counted from when it starts. A policy that reaches its limit ends inconclusive with reason `rule_deadline_exceeded` and the exit status is unreliable; the other policies continue, and `report.execution.timed_out_policy_ids` lists it. A policy without an entry runs until the request budget. The request budget still bounds the whole call."
+                    },
+                    "stream_runs": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true and the request carries a progress token, each policy's run is sent as soon as that policy finishes, as a `notifications/progress` whose `_meta[\"io.bifrost/policy-run\"]` is `{policy_id, progress, run}`; `progress` is `completed`, `interrupted`, `timed_out` or `pending`. These runs are sent before the result, in the order policies finish, and are not yet reviewed: suppressions, the scope file, the baseline and the diff_base classification apply only in the final report, which stays authoritative. Delivery is best effort: a client that cannot keep up may miss one. A call run as an MCP task streams nothing."
+                    },
                     "include_stage_timings": {
                         "type": "boolean",
                         "default": false,

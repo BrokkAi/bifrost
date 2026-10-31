@@ -196,6 +196,12 @@ mod tests {
         fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
             self.project.read_source(file)
         }
+        fn read_file_snapshot(
+            &self,
+            file: &ProjectFile,
+        ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectFileSnapshot> {
+            self.project.read_file_snapshot(file)
+        }
         fn read_source_snapshot(
             &self,
             file: &ProjectFile,

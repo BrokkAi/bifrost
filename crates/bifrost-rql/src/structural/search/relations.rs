@@ -23,7 +23,12 @@ pub(super) fn direct_member_expansions(
     let mut expansions = Vec::new();
     let mut exhausted = false;
     for unit in children {
-        if budget.pipeline_rows >= max_pipeline_rows {
+        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            budget.pipeline_rows,
+            max_pipeline_rows,
+        )
+        .allows(1)
+        {
             exhausted = true;
             break;
         }
@@ -83,6 +88,9 @@ pub(super) fn call_site_expansions(
         diagnostics,
         cache_profile,
     );
+    if filter.proof == Some(UsageProof::Proven) {
+        mark_proven_call_ambiguity_incomplete(&result, diagnostics);
+    }
     let mut sites = result
         .sites
         .into_iter()
@@ -111,7 +119,8 @@ pub(super) fn call_site_expansions(
                             .contains(&site.caller.fq_name().to_string())
                 })
             {
-                diagnostics.push(CodeQueryDiagnostic {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -124,7 +133,7 @@ pub(super) fn call_site_expansions(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
-                });
+                }));
             }
             pipeline_expansion(PipelineValue::CallSite(CallSiteValue::new(
                 site,
@@ -180,7 +189,13 @@ fn call_site_identity_facts(
     let Some(source) = analyzer.indexed_source(&site.file).map(Arc::<str>::from) else {
         return facts;
     };
-    let Some(tree) = parse_tree_for_language(&site.file, language, &source) else {
+    let parsed = crate::analyzer::usages::get_definition::parse_tree_for_language_outcome(
+        &site.file, language, &source,
+    );
+    if parsed.is_err() {
+        analyzer.mark_execution_dependent();
+    }
+    let Ok(Some(tree)) = parsed else {
         return facts;
     };
     if let Some(receiver) = site.receiver
@@ -432,6 +447,33 @@ pub(super) fn cached_call_relation(
     })
 }
 
+/// A complete candidate relation remains usable by reverse-caller consumers.
+/// Selecting only proven targets cannot establish absence from ambiguous edges.
+pub(super) fn mark_proven_call_ambiguity_incomplete(
+    result: &CallRelationResult,
+    diagnostics: &mut [CodeQueryDiagnostic],
+) {
+    if !result
+        .sites
+        .iter()
+        .any(|site| site.proof == UsageProof::Unproven)
+    {
+        return;
+    }
+    for source in result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == CallRelationDiagnosticCode::TargetsAmbiguous)
+    {
+        for diagnostic in diagnostics.iter_mut().filter(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
+                && diagnostic.message == source.message
+        }) {
+            diagnostic.impact = CodeQueryDiagnosticImpact::Incomplete;
+        }
+    }
+}
+
 pub(super) fn call_relation_result_complete(result: &CallRelationResult) -> bool {
     !result.truncated
         && !result.cancelled
@@ -482,7 +524,10 @@ pub(super) fn map_call_relation_diagnostic(
         diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
     );
     let (code, impact) = map_call_relation_diagnostic_code(diagnostic.code);
-    CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+            brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+        ),
         related: Vec::new(),
         source: None,
         code,
@@ -492,7 +537,7 @@ pub(super) fn map_call_relation_diagnostic(
         message: diagnostic.message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    }
+    })
 }
 
 pub(super) fn call_input_expansions(
@@ -569,9 +614,21 @@ pub(super) fn charge_reference_scan(
     budget.examined_references = budget
         .examined_references
         .saturating_add(examined_references);
-    budget.scanned_files > limits.max_scanned_files
-        || budget.scanned_source_bytes > limits.max_scanned_source_bytes
-        || budget.fact_nodes.saturating_add(budget.examined_references) > limits.max_fact_nodes
+    !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        budget.scanned_files,
+        limits.max_scanned_files,
+    )
+    .allows(0)
+        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            budget.scanned_source_bytes,
+            limits.max_scanned_source_bytes,
+        )
+        .allows(0)
+        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            budget.fact_nodes.saturating_add(budget.examined_references),
+            limits.max_fact_nodes,
+        )
+        .allows(0)
 }
 
 pub(super) fn reference_hit_matches(hit: &ReferenceHit, filter: &ReferenceTraversalFilter) -> bool {
@@ -697,7 +754,8 @@ pub(super) fn outbound_reference_expansions(
         exhausted = true;
         diagnostics
             .retain(|diagnostic| diagnostic.code != CodeQueryDiagnosticCode::UsesTargetsAmbiguous);
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
@@ -712,7 +770,7 @@ pub(super) fn outbound_reference_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }));
     }
     sort_reference_sites(&mut sites);
     sites.dedup();
@@ -793,18 +851,24 @@ pub(super) fn expand_hierarchy(
     let mut exhausted = false;
 
     while let Some(work) = queue.pop_front() {
-        let mut related = match step {
+        let answer = match step {
             QueryStep::Supertypes(_) => provider.get_direct_ancestors(&work.unit),
-            QueryStep::Subtypes(_) => provider
-                .get_direct_descendants(&work.unit)
-                .into_iter()
-                .collect(),
+            QueryStep::Subtypes(_) => provider.get_direct_descendants(&work.unit),
             _ => unreachable!("hierarchy expansion requires a hierarchy step"),
         };
+        if !answer.is_complete() {
+            return (expansions, true);
+        }
+        let mut related = answer.definite().to_vec();
         related.sort();
         related.dedup();
         for unit in related {
-            if budget.pipeline_rows >= max_pipeline_rows {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                budget.pipeline_rows,
+                max_pipeline_rows,
+            )
+            .allows(1)
+            {
                 return (expansions, true);
             }
             budget.pipeline_rows += 1;
@@ -826,7 +890,12 @@ pub(super) fn expand_hierarchy(
                 continue;
             };
             let next_depth = work.depth + 1;
-            if budget.provenance_steps.saturating_add(next_depth) > max_pipeline_rows {
+            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                budget.provenance_steps,
+                max_pipeline_rows,
+            )
+            .allows(next_depth)
+            {
                 return (expansions, true);
             }
             budget.provenance_steps += next_depth;
@@ -962,6 +1031,7 @@ pub(super) fn append_semantic_omission_diagnostics(
     for ((language, reason), count) in omissions {
         diagnostics.push(incomplete_diagnostic(
             CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            brokk_bifrost_rql::Incompleteness::Content,
             language.config_label(),
             format!(
                 "{} omitted {count} input{} because {reason}",
@@ -1055,11 +1125,11 @@ impl CallableSignatureOracle for FileCallableSignatureOracle<'_> {
     fn lookup(&self, range: Range) -> Option<CallableSignatureFacts> {
         let declaration = self.index.exact(range)?;
         let entries = self.analyzer.signature_metadata(&declaration.unit);
-        // Signature metadata is keyed by CodeUnit and not by range, so a
-        // callable whose fq_name is overloaded carries one entry per overload
-        // and nothing here can tell the overloads apart. Read every callable
-        // fact from a single entry so visibility and parameter types cannot
-        // describe two different declarations.
+        // The metadata lookup keys on the whole CodeUnit, including its
+        // signature, so overloads with distinct signatures have separate
+        // entries. It still returns a list. Read every callable fact from one
+        // entry so visibility and parameter types cannot describe two
+        // different declarations.
         let Some(recorded) = entries.iter().find(|entry| {
             entry.callable_modifiers_recorded() || entry.callable_parameter_types().is_some()
         }) else {

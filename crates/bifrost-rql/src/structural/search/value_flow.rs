@@ -1,3 +1,4 @@
+use super::{DerivationExecutionCause, Incompleteness};
 use std::sync::Arc;
 
 use super::witness_projection::{
@@ -108,6 +109,7 @@ impl ValueFlowQueryState {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::UnresolvedValueFlowPlanReference,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!("value-flow plan reference `{plan_ref}` was not supplied by the host"),
             );
             return Vec::new();
@@ -117,6 +119,7 @@ impl ValueFlowQueryState {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::UnresolvedValueFlowPlanReference,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!("value-flow plan reference `{plan_ref}` is not registered"),
             );
             return Vec::new();
@@ -192,6 +195,7 @@ impl ValueFlowQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::ValueFlowProviderFailed,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             format!("value-flow analysis failed: {error}"),
                         );
                         self.cache
@@ -217,6 +221,7 @@ impl ValueFlowQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::Cancelled,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             "value-flow solver was cancelled".to_string(),
                         );
                     }
@@ -234,6 +239,7 @@ impl ValueFlowQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted,
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             exceeded.to_string(),
                         );
                     }
@@ -246,6 +252,7 @@ impl ValueFlowQueryState {
                     push_deduplicated_diagnostic(
                         &mut self.diagnostics,
                         CodeQueryDiagnosticCode::ValueFlowAnalysisPartial,
+                        Incompleteness::Operational(DerivationExecutionCause::Provider),
                         "value-flow analysis retained incomplete semantic evidence".to_string(),
                     );
                 }
@@ -488,6 +495,7 @@ impl ValueFlowQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     format!(
                         "value-flow witness projection omitted at least {removed_steps} step(s)"
                     ),
@@ -504,6 +512,7 @@ impl ValueFlowQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     format!(
                         "value-flow witness reconstruction or retention omitted at least {} step(s)",
                         witness.omitted_steps_lower_bound()
@@ -570,6 +579,7 @@ impl ValueFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::PipelineBudgetExhausted,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             format!(
                 "value-flow endpoint projection omitted at least {omitted_lower_bound} endpoint(s)"
             ),
@@ -586,6 +596,7 @@ impl ValueFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             format!(
                 "value-flow request witness budget omitted at least {omitted_lower_bound} witness(es)"
             ),
@@ -597,6 +608,7 @@ impl ValueFlowQueryState {
             SemanticInputStatus::Unsupported { capability } => push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!(
                     "value-flow analysis requires unsupported semantic capability `{}`",
                     capability.label()
@@ -607,12 +619,14 @@ impl ValueFlowQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     format!("value-flow semantic input exceeded its budget: {exceeded}"),
                 );
             }
             SemanticInputStatus::Cancelled => push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::Cancelled,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 "value-flow semantic input materialization was cancelled".to_string(),
             ),
             SemanticInputStatus::Ambiguous
@@ -620,6 +634,7 @@ impl ValueFlowQueryState {
             | SemanticInputStatus::Unproven => push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::ValueFlowAnalysisPartial,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 format!("value-flow semantic input is {}", status.label()),
             ),
             SemanticInputStatus::Complete => {}
@@ -649,7 +664,12 @@ impl ValueFlowQueryState {
             }
             _ => CodeQueryDiagnosticCode::ValueFlowRegistrationStale,
         };
-        push_deduplicated_diagnostic(&mut self.diagnostics, code, error.to_string());
+        push_deduplicated_diagnostic(
+            &mut self.diagnostics,
+            code,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            error.to_string(),
+        );
     }
 
     pub(super) fn take_diagnostics(&mut self) -> Vec<CodeQueryDiagnostic> {

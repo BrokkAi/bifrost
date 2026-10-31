@@ -52,6 +52,7 @@ const MAX_PYTHON_TUPLE_RETURN_ARITIES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub(super) struct PythonRuleFactValue {
+    pub(super) incompleteness: Incompleteness,
     pub(super) hierarchy_premises: Vec<PythonHierarchyFactValue>,
     pub(super) file: ProjectFile,
     pub(super) anchor: Range,
@@ -87,6 +88,7 @@ struct ReturnObservation {
 
 #[derive(Debug, Clone)]
 struct ProcedureReturnFacts {
+    incompleteness: Incompleteness,
     explicit_value_returns: usize,
     none_returns: usize,
     explicit_return_statements: usize,
@@ -112,6 +114,7 @@ pub(super) fn row_range(source: &str, range: std::ops::Range<usize>) -> CodeQuer
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn make_row(
+    incompleteness: Incompleteness,
     relation: &'static str,
     file: &ProjectFile,
     anchor: std::ops::Range<usize>,
@@ -131,6 +134,7 @@ pub(super) fn make_row(
         digest.push(owner_id.as_bytes());
     }
     PythonRuleFactValue {
+        incompleteness,
         hierarchy_premises: Vec::new(),
         file: file.clone(),
         anchor: Range {
@@ -534,6 +538,7 @@ pub(super) fn python_assertion_context_expansions(
     let assertion = find_exact_node(tree.root_node(), &bytes, &["assert_statement"]);
     let range = row_range(source, bytes.clone());
     let mut fact = make_row(
+        Incompleteness::Content,
         "assertion_context",
         &seed.file,
         bytes,
@@ -695,6 +700,7 @@ pub(super) fn implicit_string_concatenation_expansions(seed: &SeedMatch) -> Vec<
             let bytes = part.start_byte()..part.end_byte();
             let range = row_range(source, bytes.clone());
             let fact = make_row(
+                Incompleteness::Content,
                 "implicit_string_concatenation",
                 &seed.file,
                 bytes,
@@ -1300,41 +1306,14 @@ fn python_receiver_identifier_is_read(identifier: Node<'_>) -> bool {
     let Some(parent) = identifier.parent() else {
         return false;
     };
-    if parent.kind() == "argument_list" {
-        return true;
-    }
-    if parent.kind() != "attribute"
+    !matches!(parent.kind(), "attribute" | "keyword_argument")
         || !parent
-            .child_by_field_name("object")
-            .is_some_and(|object| object.id() == identifier.id())
-    {
-        return false;
-    }
-    let attribute = parent;
-    let mut child = attribute;
-    while let Some(ancestor) = child.parent() {
-        if ancestor.kind() == "augmented_assignment" {
-            return true;
-        }
-        let store_fields = python_store_targets(ancestor);
-        if !store_fields.is_empty() {
-            return !store_fields.iter().any(|target| {
-                target.start_byte() <= attribute.start_byte()
-                    && target.end_byte() >= attribute.end_byte()
-            });
-        }
-        if ancestor.kind() == "delete_statement" {
-            return false;
-        }
-        if matches!(
-            ancestor.kind(),
-            "expression_statement" | "return_statement" | "if_statement"
-        ) {
-            return true;
-        }
-        child = ancestor;
-    }
-    true
+            .child_by_field_name(if parent.kind() == "attribute" {
+                "attribute"
+            } else {
+                "name"
+            })
+            .is_some_and(|name| name.id() == identifier.id())
 }
 
 fn python_function_intrinsic_needs_docstring(
@@ -1376,53 +1355,115 @@ fn python_function_intrinsic_needs_docstring(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PythonRuleFactFailure {
+    incompleteness: Incompleteness,
+    reason: &'static str,
+}
+
+impl PythonRuleFactFailure {
+    fn content(reason: &'static str) -> Self {
+        Self {
+            incompleteness: Incompleteness::Content,
+            reason,
+        }
+    }
+
+    fn operational(reason: &'static str, cause: DerivationExecutionCause) -> Self {
+        Self {
+            incompleteness: Incompleteness::Operational(cause),
+            reason,
+        }
+    }
+
+    // These are raw labels from the CFG pruning producers, before namespaces
+    // or joined prose. Unknown labels remain operational.
+    fn from_execution_reason(reason: &'static str) -> Self {
+        Self {
+            incompleteness: Incompleteness::from_execution_reason(reason),
+            reason,
+        }
+    }
+}
+
+impl std::fmt::Display for PythonRuleFactFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason)
+    }
+}
+
 fn python_method_needs_docstring(
     analyzer: &dyn IAnalyzer,
     start: &CodeUnit,
     cancellation: Option<&CancellationToken>,
-) -> HierarchyDecision<Result<bool, &'static str>> {
+) -> HierarchyDecision<Result<bool, PythonRuleFactFailure>> {
     let mut premises = Vec::new();
     let value = (|| {
         let Some(provider) = analyzer.python_class_hierarchy_provider_for(start) else {
-            return Err("python_hierarchy_provider_unavailable");
+            return Err(PythonRuleFactFailure::operational(
+                "python_hierarchy_provider_unavailable",
+                DerivationExecutionCause::Provider,
+            ));
         };
         let mut current = start.clone();
         let mut visited = HashSet::default();
         loop {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return Err("cancelled");
+                return Err(PythonRuleFactFailure::operational(
+                    "cancelled",
+                    DerivationExecutionCause::Cancelled,
+                ));
             }
             if !visited.insert(current.clone()) {
-                return Err("override_cycle");
+                return Err(PythonRuleFactFailure::content("override_cycle"));
             }
-            let range =
-                python_range_for_unit(analyzer, &current).ok_or("override_range_unavailable")?;
+            let range = python_range_for_unit(analyzer, &current)
+                .ok_or(PythonRuleFactFailure::content("override_range_unavailable"))?;
             let source = analyzer
                 .get_source(&CodeUnit::file_scope(current.source().clone()), false)
-                .ok_or("override_source_unavailable")?;
-            let tree = parse_python(&source).ok_or("override_syntax_unavailable")?;
+                .ok_or(PythonRuleFactFailure::operational(
+                    "override_source_unavailable",
+                    DerivationExecutionCause::Provider,
+                ))?;
+            let tree = parse_python(&source).ok_or(PythonRuleFactFailure::operational(
+                "override_syntax_unavailable",
+                DerivationExecutionCause::Provider,
+            ))?;
             if tree.root_node().has_error() {
-                return Err("override_syntax_recovered");
+                return Err(PythonRuleFactFailure::content("override_syntax_recovered"));
             }
-            let definition = python_definition_node(&tree, &current, &range)
-                .ok_or("override_definition_unavailable")?;
-            let needs_docstring = python_function_intrinsic_needs_docstring(definition, &source)?;
+            let definition = python_definition_node(&tree, &current, &range).ok_or(
+                PythonRuleFactFailure::content("override_definition_unavailable"),
+            )?;
+            let needs_docstring = python_function_intrinsic_needs_docstring(definition, &source)
+                .map_err(PythonRuleFactFailure::content)?;
             if !needs_docstring {
                 return Ok(false);
             }
             let answer = provider.method_override(&current, cancellation);
-            premises.push(
-                override_premise(analyzer, &current, &answer)
-                    .ok_or("override_premise_anchor_unavailable")?,
-            );
+            premises.push(override_premise(analyzer, &current, &answer).ok_or(
+                PythonRuleFactFailure::content("override_premise_anchor_unavailable"),
+            )?);
             match answer.outcome {
                 PythonOverrideOutcome::NoOverride => return Ok(true),
                 PythonOverrideOutcome::Overrides => {
-                    let target = answer.target.ok_or("override_target_unavailable")?;
+                    let target = answer.target.ok_or(PythonRuleFactFailure::content(
+                        "override_target_unavailable",
+                    ))?;
                     current = target;
                 }
                 PythonOverrideOutcome::Incomplete | PythonOverrideOutcome::Unsupported => {
-                    return Err("override_resolution_incomplete");
+                    return Err(PythonRuleFactFailure {
+                        incompleteness: answer.reason.map_or(
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
+                            |reason| {
+                                super::python_class_hierarchy::hierarchy_incompleteness(Some(
+                                    reason,
+                                ))
+                            },
+                        ),
+                        reason: "override_resolution_incomplete",
+                    });
                 }
             }
         }
@@ -1434,7 +1475,7 @@ fn python_method_override_answer(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
     cancellation: Option<&CancellationToken>,
-) -> HierarchyDecision<Result<Option<PythonOverrideAnswer>, &'static str>> {
+) -> HierarchyDecision<Result<Option<PythonOverrideAnswer>, PythonRuleFactFailure>> {
     let mut premises = Vec::new();
     let value = (|| {
         if !analyzer
@@ -1444,19 +1485,29 @@ fn python_method_override_answer(
             return Ok(None);
         }
         let Some(provider) = analyzer.python_class_hierarchy_provider_for(unit) else {
-            return Err("python_hierarchy_provider_unavailable");
+            return Err(PythonRuleFactFailure::operational(
+                "python_hierarchy_provider_unavailable",
+                DerivationExecutionCause::Provider,
+            ));
         };
         let answer = provider.method_override(unit, cancellation);
-        premises.push(
-            override_premise(analyzer, unit, &answer)
-                .ok_or("override_premise_anchor_unavailable")?,
-        );
+        premises.push(override_premise(analyzer, unit, &answer).ok_or(
+            PythonRuleFactFailure::content("override_premise_anchor_unavailable"),
+        )?);
         match answer.outcome {
             PythonOverrideOutcome::Overrides | PythonOverrideOutcome::NoOverride => {
                 Ok(Some(answer))
             }
             PythonOverrideOutcome::Incomplete | PythonOverrideOutcome::Unsupported => {
-                Err("override_resolution_incomplete")
+                Err(PythonRuleFactFailure {
+                    incompleteness: answer.reason.map_or(
+                        Incompleteness::Operational(DerivationExecutionCause::Provider),
+                        |reason| {
+                            super::python_class_hierarchy::hierarchy_incompleteness(Some(reason))
+                        },
+                    ),
+                    reason: "override_resolution_incomplete",
+                })
             }
         }
     })();
@@ -1464,6 +1515,7 @@ fn python_method_override_answer(
 }
 
 fn report_rule_fact_incomplete(
+    incompleteness: Incompleteness,
     file: &ProjectFile,
     namespace: &str,
     reason: &'static str,
@@ -1477,7 +1529,8 @@ fn report_rule_fact_incomplete(
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -1487,23 +1540,37 @@ fn report_rule_fact_incomplete(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 fn report_documentation_incomplete(
+    incompleteness: Incompleteness,
     file: &ProjectFile,
     reason: &'static str,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    report_rule_fact_incomplete(file, PYTHON_DOCUMENTATION_REASON, reason, diagnostics);
+    report_rule_fact_incomplete(
+        incompleteness,
+        file,
+        PYTHON_DOCUMENTATION_REASON,
+        reason,
+        diagnostics,
+    );
 }
 
 fn report_useless_class_incomplete(
+    incompleteness: Incompleteness,
     file: &ProjectFile,
     reason: &'static str,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    report_rule_fact_incomplete(file, PYTHON_USELESS_CLASS_REASON, reason, diagnostics);
+    report_rule_fact_incomplete(
+        incompleteness,
+        file,
+        PYTHON_USELESS_CLASS_REASON,
+        reason,
+        diagnostics,
+    );
 }
 
 pub(super) fn documentation_expansions(
@@ -1522,20 +1589,36 @@ pub(super) fn documentation_expansions(
     }
     let file = unit.source();
     let Some(source) = analyzer.get_source(&CodeUnit::file_scope(file.clone()), false) else {
-        report_documentation_incomplete(file, "source unavailable", diagnostics);
+        report_documentation_incomplete(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            file,
+            "source unavailable",
+            diagnostics,
+        );
         return Vec::new();
     };
     let anchor = declaration.range.start_byte..declaration.range.end_byte;
     let Some(tree) = parse_python(&source).filter(|tree| !tree.root_node().has_error()) else {
-        report_documentation_incomplete(file, "syntax unavailable", diagnostics);
+        report_documentation_incomplete(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            file,
+            "syntax unavailable",
+            diagnostics,
+        );
         return Vec::new();
     };
     let Some(node) = python_definition_node(&tree, unit, &declaration.range) else {
-        report_documentation_incomplete(file, "declaration range unavailable", diagnostics);
+        report_documentation_incomplete(
+            Incompleteness::Content,
+            file,
+            "declaration range unavailable",
+            diagnostics,
+        );
         return Vec::new();
     };
     let Some(public) = python_scope_is_public(analyzer, unit) else {
         let mut fact = make_row(
+            Incompleteness::Content,
             "documentation",
             file,
             anchor.clone(),
@@ -1611,6 +1694,10 @@ pub(super) fn documentation_expansions(
         None
     };
 
+    let mut incompleteness = match &override_answer {
+        Err(failure) => failure.incompleteness,
+        Ok(_) => Incompleteness::Content,
+    };
     let mut reason = None;
     let mut complete = true;
     let (docstring_present, docstring_value) = match docstring {
@@ -1643,6 +1730,7 @@ pub(super) fn documentation_expansions(
             Ok(false) => needs_docstring = false,
             Ok(true) => match &override_answer {
                 Err(override_reason) => {
+                    incompleteness = incompleteness.combine(override_reason.incompleteness);
                     complete = false;
                     reason.get_or_insert_with(|| override_reason.to_string());
                     needs_docstring = false;
@@ -1652,6 +1740,7 @@ pub(super) fn documentation_expansions(
                 Ok(Some(answer)) => {
                     let Some(target) = answer.target.as_ref() else {
                         let mut fact = make_row(
+                            Incompleteness::Content,
                             "documentation",
                             file,
                             anchor.clone(),
@@ -1681,6 +1770,7 @@ pub(super) fn documentation_expansions(
                             needs_docstring = base_needs_docstring;
                         }
                         Err(override_reason) => {
+                            incompleteness = incompleteness.combine(override_reason.incompleteness);
                             complete = false;
                             reason.get_or_insert_with(|| override_reason.to_string());
                             needs_docstring = false;
@@ -1703,6 +1793,7 @@ pub(super) fn documentation_expansions(
     };
     let anchor = declaration.range.start_byte..declaration.range.end_byte;
     let mut fact = make_row(
+        incompleteness,
         "documentation",
         file,
         anchor.clone(),
@@ -1813,25 +1904,46 @@ pub(super) fn useless_class_expansions(
     let source = analyzer.get_source(&CodeUnit::file_scope(file.clone()), false);
     let anchor = declaration.range.start_byte..declaration.range.end_byte;
     let Some(source) = source else {
-        report_useless_class_incomplete(file, "source unavailable", diagnostics);
+        report_useless_class_incomplete(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            file,
+            "source unavailable",
+            diagnostics,
+        );
         return Vec::new();
     };
     let Some(tree) = parse_python(&source) else {
-        report_useless_class_incomplete(file, "syntax unavailable", diagnostics);
+        report_useless_class_incomplete(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            file,
+            "syntax unavailable",
+            diagnostics,
+        );
         return Vec::new();
     };
     let Some(class) = python_class_node_for_unit(analyzer, unit, &tree) else {
-        report_useless_class_incomplete(file, "class range unavailable", diagnostics);
+        report_useless_class_incomplete(
+            Incompleteness::Content,
+            file,
+            "class range unavailable",
+            diagnostics,
+        );
         return Vec::new();
     };
     let Some(name) = class
         .child_by_field_name("name")
         .and_then(|name| node_text(&source, name))
     else {
-        report_useless_class_incomplete(file, "class name unavailable", diagnostics);
+        report_useless_class_incomplete(
+            Incompleteness::Content,
+            file,
+            "class name unavailable",
+            diagnostics,
+        );
         return Vec::new();
     };
 
+    let mut incompleteness = Incompleteness::Content;
     let mut reason = None;
     let mut complete = !tree.root_node().has_error();
     if !complete {
@@ -1866,11 +1978,14 @@ pub(super) fn useless_class_expansions(
                 unit,
                 &crate::analyzer::DescendantIndexScope::whole_workspace(&token),
             )
-            .map(|descendants| !descendants.is_empty())
+            .ok()
+            .filter(|answer| answer.is_complete())
+            .map(|descendants| !descendants.definite().is_empty())
     } else {
         None
     };
     if has_subclasses.is_none() {
+        incompleteness = Incompleteness::Operational(DerivationExecutionCause::Provider);
         complete = false;
         reason.get_or_insert("subclass_index_unavailable");
     }
@@ -1948,6 +2063,7 @@ pub(super) fn useless_class_expansions(
         && !is_probable_mixin
         && !is_stateful;
     let mut fact = make_row(
+        incompleteness,
         "useless_class",
         file,
         anchor.clone(),
@@ -1972,7 +2088,12 @@ pub(super) fn useless_class_expansions(
     fact.row.is_stateful = Some(is_stateful);
     fact.row.is_top_level = is_top_level;
     if !complete {
-        report_useless_class_incomplete(file, "useless-class evidence unavailable", diagnostics);
+        report_useless_class_incomplete(
+            incompleteness,
+            file,
+            "useless-class evidence unavailable",
+            diagnostics,
+        );
     }
     debug_assert!(!eligible || complete);
     vec![pipeline_expansion(PipelineValue::PythonRuleFact(Box::new(
@@ -2006,16 +2127,19 @@ pub(super) fn overly_complex_delete_expansions(
     let file = unit.source();
     let anchor = declaration.range.start_byte..declaration.range.end_byte;
     let source = analyzer.get_source(&CodeUnit::file_scope(file.clone()), false);
+    let mut incompleteness = Incompleteness::Content;
     let mut reason = None;
     let mut hierarchy_premises = Vec::new();
     let complexity = match source.as_deref() {
         None => {
+            incompleteness = Incompleteness::Operational(DerivationExecutionCause::Provider);
             reason = Some("source_unavailable");
             None
         }
         Some(source) => {
             let Some(tree) = parse_python(source) else {
                 let fact = make_row(
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     "overly_complex_delete",
                     file,
                     anchor.clone(),
@@ -2027,6 +2151,7 @@ pub(super) fn overly_complex_delete_expansions(
                     Some(format!("{PYTHON_COMPLEX_DELETE_REASON}_syntax_unavailable")),
                 );
                 report_rule_fact_incomplete(
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     file,
                     PYTHON_COMPLEX_DELETE_REASON,
                     "syntax_unavailable",
@@ -2060,11 +2185,13 @@ pub(super) fn overly_complex_delete_expansions(
                 match complexity.value {
                     Ok(complexity) => Some(complexity),
                     Err(incomplete_reason) => {
-                        reason = Some(incomplete_reason);
+                        incompleteness = incompleteness.combine(incomplete_reason.incompleteness);
+                        reason = Some(incomplete_reason.reason);
                         None
                     }
                 }
             } else {
+                incompleteness = Incompleteness::Operational(DerivationExecutionCause::Provider);
                 reason = Some("semantic_procedure_unavailable");
                 None
             }
@@ -2073,6 +2200,7 @@ pub(super) fn overly_complex_delete_expansions(
 
     let complete = complexity.is_some();
     let mut fact = make_row(
+        incompleteness,
         "overly_complex_delete",
         file,
         anchor.clone(),
@@ -2089,6 +2217,7 @@ pub(super) fn overly_complex_delete_expansions(
     fact.row.cyclomatic_complexity = complexity;
     if !complete {
         report_rule_fact_incomplete(
+            incompleteness,
             file,
             PYTHON_COMPLEX_DELETE_REASON,
             reason.unwrap_or("CFG_unavailable"),
@@ -2117,7 +2246,7 @@ fn python_destructor_complexity<'a, 'workspace>(
     analyzer: &dyn IAnalyzer,
     environment_cache: &mut super::environment::EnvironmentTraversalCache,
     input: PythonDestructorComplexityInput<'a, 'workspace>,
-) -> HierarchyDecision<Result<usize, &'static str>> {
+) -> HierarchyDecision<Result<usize, PythonRuleFactFailure>> {
     let mut premises = Vec::new();
     let value = (|| {
         let PythonDestructorComplexityInput {
@@ -2133,7 +2262,10 @@ fn python_destructor_complexity<'a, 'workspace>(
             cancellation,
         } = input;
         if procedure.exact_selection_incomplete_reason().is_some() {
-            return Err("procedure_selection_incomplete");
+            return Err(PythonRuleFactFailure::operational(
+                "procedure_selection_incomplete",
+                DerivationExecutionCause::Provider,
+            ));
         }
         let semantics = procedure.handle.semantics();
         let capabilities = procedure.handle.artifact().capabilities();
@@ -2141,10 +2273,10 @@ fn python_destructor_complexity<'a, 'workspace>(
             || !capabilities.is_complete(SemanticCapability::ProgramPoints)
             || !capabilities.is_complete(SemanticCapability::EntryBoundary)
         {
-            return Err("cfg_structure_incomplete");
+            return Err(PythonRuleFactFailure::content("cfg_structure_incomplete"));
         }
         let method = python_definition_node(tree, unit, declaration_range)
-            .ok_or("method_syntax_unavailable")?;
+            .ok_or(PythonRuleFactFailure::content("method_syntax_unavailable"))?;
         let pruned_edges = python_unlikely_exception_edges(
             analyzer,
             environment_cache,
@@ -2155,7 +2287,9 @@ fn python_destructor_complexity<'a, 'workspace>(
             cancellation,
         );
         premises.extend(pruned_edges.premises);
-        let pruned_edges = pruned_edges.value?;
+        let pruned_edges = pruned_edges
+            .value
+            .map_err(PythonRuleFactFailure::from_execution_reason)?;
         let pruned_edges = python_unlikely_call_edges(
             analyzer,
             environment_cache,
@@ -2168,13 +2302,14 @@ fn python_destructor_complexity<'a, 'workspace>(
             cancellation,
             diagnostics,
             pruned_edges,
-        )?;
+        )
+        .map_err(PythonRuleFactFailure::from_execution_reason)?;
         let constant_branches = python_constant_branch_edges(source, tree.root_node(), semantics);
 
         let blocks = semantics.blocks();
         let points = semantics.points();
         let Some(entry) = semantics.point(semantics.entry_point()) else {
-            return Err("entry_point_unavailable");
+            return Err(PythonRuleFactFailure::content("entry_point_unavailable"));
         };
         let mut reachable_blocks = vec![false; blocks.len()];
         let mut reachable_points = vec![false; points.len()];
@@ -2182,16 +2317,19 @@ fn python_destructor_complexity<'a, 'workspace>(
         let mut edges = HashSet::default();
         while let Some(block_index) = pending.pop() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return Err("cancelled");
+                return Err(PythonRuleFactFailure::operational(
+                    "cancelled",
+                    DerivationExecutionCause::Cancelled,
+                ));
             }
             let Some(block) = blocks.get(block_index) else {
-                return Err("block_identity_unavailable");
+                return Err(PythonRuleFactFailure::content("block_identity_unavailable"));
             };
             if std::mem::replace(&mut reachable_blocks[block_index], true) {
                 continue;
             }
             let Some(block_evidence) = semantics.evidence_row(block.evidence) else {
-                return Err("block_evidence_unavailable");
+                return Err(PythonRuleFactFailure::content("block_evidence_unavailable"));
             };
             if !matches!(
                 block_evidence.proof,
@@ -2200,15 +2338,17 @@ fn python_destructor_complexity<'a, 'workspace>(
                 block_evidence.completeness,
                 crate::analyzer::semantic::EvidenceCompleteness::Complete
             ) {
-                return Err("block_evidence_incomplete");
+                return Err(PythonRuleFactFailure::content("block_evidence_incomplete"));
             }
             for point_id in block.points.iter().copied() {
                 let Some(point) = semantics.point(point_id) else {
-                    return Err("program_point_unavailable");
+                    return Err(PythonRuleFactFailure::content("program_point_unavailable"));
                 };
                 reachable_points[point_id.index()] = true;
                 let Some(point_evidence) = semantics.evidence_row(point.evidence) else {
-                    return Err("program_point_evidence_unavailable");
+                    return Err(PythonRuleFactFailure::content(
+                        "program_point_evidence_unavailable",
+                    ));
                 };
                 if !matches!(
                     point_evidence.proof,
@@ -2217,11 +2357,15 @@ fn python_destructor_complexity<'a, 'workspace>(
                     point_evidence.completeness,
                     crate::analyzer::semantic::EvidenceCompleteness::Complete
                 ) {
-                    return Err("program_point_evidence_incomplete");
+                    return Err(PythonRuleFactFailure::content(
+                        "program_point_evidence_incomplete",
+                    ));
                 }
                 for (_, edge) in semantics.successor_edges(point_id) {
                     let Some(edge_evidence) = semantics.evidence_row(edge.evidence) else {
-                        return Err("control_edge_evidence_unavailable");
+                        return Err(PythonRuleFactFailure::content(
+                            "control_edge_evidence_unavailable",
+                        ));
                     };
                     if !matches!(
                         edge_evidence.proof,
@@ -2230,7 +2374,9 @@ fn python_destructor_complexity<'a, 'workspace>(
                         edge_evidence.completeness,
                         crate::analyzer::semantic::EvidenceCompleteness::Complete
                     ) {
-                        return Err("control_edge_evidence_incomplete");
+                        return Err(PythonRuleFactFailure::content(
+                            "control_edge_evidence_incomplete",
+                        ));
                     }
                     if edge.kind == ControlEdgeKind::Exceptional
                         && edge.target_point == semantics.exceptional_exit_point()
@@ -2252,7 +2398,9 @@ fn python_destructor_complexity<'a, 'workspace>(
                         continue;
                     }
                     let Some(target) = semantics.point(edge.target_point) else {
-                        return Err("control_edge_target_unavailable");
+                        return Err(PythonRuleFactFailure::content(
+                            "control_edge_target_unavailable",
+                        ));
                     };
                     let target_block = target.block.index();
                     let sequential = target_block == block_index
@@ -2290,7 +2438,18 @@ fn python_destructor_complexity<'a, 'workspace>(
             if gap.kind == SemanticGapKind::ExceededBudget
                 || gap.discharge != SemanticGapDischarge::RetainedControlTopology
             {
-                return Err("control_flow_gap");
+                return Err(PythonRuleFactFailure {
+                    reason: "control_flow_gap",
+                    incompleteness: match gap.kind {
+                        SemanticGapKind::ExceededBudget => {
+                            Incompleteness::Operational(DerivationExecutionCause::Budget)
+                        }
+                        SemanticGapKind::Ambiguous
+                        | SemanticGapKind::Unknown
+                        | SemanticGapKind::Unsupported
+                        | SemanticGapKind::Unproven => Incompleteness::Content,
+                    },
+                });
             }
         }
 
@@ -2377,50 +2536,59 @@ fn python_constant_branch_edges(
 }
 
 fn python_literal_truth(source: &str, node: Node<'_>) -> Option<bool> {
-    match node.kind() {
-        "true" => Some(true),
-        "false" | "none" => Some(false),
-        "parenthesized_expression" => {
-            let children = named_children(node);
-            let [inner] = children.as_slice() else {
-                return None;
-            };
-            python_literal_truth(source, *inner)
-        }
-        "not_operator" => {
-            let argument = node.child_by_field_name("argument")?;
-            Some(!python_literal_truth(source, argument)?)
-        }
-        "integer" => {
-            let value = node_text(source, node)?.replace('_', "");
-            let digits = value
-                .strip_prefix("0x")
-                .or_else(|| value.strip_prefix("0X"))
-                .or_else(|| value.strip_prefix("0o"))
-                .or_else(|| value.strip_prefix("0O"))
-                .or_else(|| value.strip_prefix("0b"))
-                .or_else(|| value.strip_prefix("0B"))
-                .unwrap_or(&value);
-            Some(digits.bytes().any(|byte| byte != b'0'))
-        }
-        "float" => {
-            let value = node_text(source, node)?.replace('_', "");
-            let value = value
-                .strip_suffix('j')
-                .or_else(|| value.strip_suffix('J'))
-                .unwrap_or(&value);
-            let value = value.parse::<f64>().ok()?;
-            (!value.is_nan()).then_some(value != 0.0)
-        }
-        "unary_operator" => {
-            let operator = node.child_by_field_name("operator")?;
-            let argument = node.child_by_field_name("argument")?;
-            (operator.kind() == "-")
-                .then(|| python_literal_truth(source, argument))
-                .flatten()
-        }
-        _ => None,
+    let mut pending = vec![(node, false)];
+    while let Some((node, negate)) = pending.pop() {
+        let truth = match node.kind() {
+            "true" => Some(true),
+            "false" | "none" => Some(false),
+            "parenthesized_expression" => {
+                let children = named_children(node);
+                let [inner] = children.as_slice() else {
+                    return None;
+                };
+                pending.push((*inner, negate));
+                continue;
+            }
+            "not_operator" => {
+                let argument = node.child_by_field_name("argument")?;
+                pending.push((argument, !negate));
+                continue;
+            }
+            "integer" => {
+                let value = node_text(source, node)?.replace('_', "");
+                let digits = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                    .or_else(|| value.strip_prefix("0o"))
+                    .or_else(|| value.strip_prefix("0O"))
+                    .or_else(|| value.strip_prefix("0b"))
+                    .or_else(|| value.strip_prefix("0B"))
+                    .unwrap_or(&value);
+                Some(digits.bytes().any(|byte| byte != b'0'))
+            }
+            "float" => {
+                let value = node_text(source, node)?.replace('_', "");
+                let value = value
+                    .strip_suffix('j')
+                    .or_else(|| value.strip_suffix('J'))
+                    .unwrap_or(&value);
+                let value = value.parse::<f64>().ok()?;
+                (!value.is_nan()).then_some(value != 0.0)
+            }
+            "unary_operator" => {
+                let operator = node.child_by_field_name("operator")?;
+                let argument = node.child_by_field_name("argument")?;
+                if operator.kind() != "-" {
+                    return None;
+                }
+                pending.push((argument, negate));
+                continue;
+            }
+            _ => None,
+        };
+        return truth.map(|truth| truth != negate);
     }
+    None
 }
 
 fn python_unlikely_exception_edges(
@@ -2685,7 +2853,7 @@ fn python_unlikely_call_edges(
         let never_returns = if quitter {
             false
         } else if let Some((_, target_unit)) =
-            exact_local_dispatch_target(semantic, file, call_range)
+            exact_local_dispatch_target(semantic, file, call_range).0
         {
             let declaration =
                 render::declaration_value_for_unit(analyzer, &target_unit, call_range);
@@ -3343,6 +3511,7 @@ fn procedure_return_facts(
     let mut tuple_arities = Vec::new();
     let mut tuple_complete = true;
     let mut tuple_reason = None;
+    let mut incompleteness = Incompleteness::Content;
     let mut complete = !properties.is_async && !properties.is_generator && !has_source_boundary;
     let mut reason = if complete {
         None
@@ -3360,6 +3529,15 @@ fn procedure_return_facts(
     for gap in semantics.gaps() {
         if reachable[gap.point.index()] && gap.impacts.contains(SemanticGapImpact::ReturnTransfer) {
             complete = false;
+            incompleteness = incompleteness.combine(match gap.kind {
+                SemanticGapKind::ExceededBudget => {
+                    Incompleteness::Operational(DerivationExecutionCause::Budget)
+                }
+                SemanticGapKind::Ambiguous
+                | SemanticGapKind::Unknown
+                | SemanticGapKind::Unsupported
+                | SemanticGapKind::Unproven => Incompleteness::Content,
+            });
             reason.get_or_insert_with(|| gap.detail.to_string());
         }
     }
@@ -3441,6 +3619,7 @@ fn procedure_return_facts(
     }
     debug_assert!(!proved_absent_tuple_returns || tuple_arities.is_empty());
     Some(ProcedureReturnFacts {
+        incompleteness,
         explicit_value_returns,
         none_returns,
         explicit_return_statements,
@@ -3468,6 +3647,7 @@ pub(super) fn procedure_return_profile_expansions(
     let public = procedure.public();
     let span = procedure.byte_span();
     let mut value = make_row(
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
         "procedure_return_profile",
         procedure.file(),
         span,
@@ -3479,6 +3659,7 @@ pub(super) fn procedure_return_profile_expansions(
         Some(PYTHON_RETURN_PROFILE_REASON.to_string()),
     );
     if let Some(facts) = procedure_return_facts(analyzer, traversal, procedure) {
+        value.incompleteness = facts.incompleteness;
         value.row.explicit_value_returns = Some(facts.explicit_value_returns);
         value.row.none_returns = Some(facts.none_returns);
         value.row.explicit_return_statements = Some(facts.explicit_return_statements);
@@ -3705,6 +3886,7 @@ pub(super) fn iterator_return_protocol_expansions(
                 let is_iterator = has_iter && has_next;
                 let mut fact = if is_iterator {
                     make_row(
+                        Incompleteness::Content,
                         "iterator_return_protocol",
                         &iter_set.site.file,
                         method_anchor.clone(),
@@ -3724,6 +3906,7 @@ pub(super) fn iterator_return_protocol_expansions(
                     {
                         let anchor = class_anchor.start_byte..class_anchor.end_byte;
                         make_row(
+                            Incompleteness::Content,
                             "iterator_return_protocol",
                             class_file,
                             anchor.clone(),
@@ -3736,6 +3919,7 @@ pub(super) fn iterator_return_protocol_expansions(
                         )
                     } else {
                         make_row(
+                            Incompleteness::Operational(DerivationExecutionCause::Provider),
                             "iterator_return_protocol",
                             &iter_set.site.file,
                             method_anchor.clone(),
@@ -3751,6 +3935,7 @@ pub(super) fn iterator_return_protocol_expansions(
                     // A class without a source range still has a complete
                     // protocol verdict. Anchor its witness at the returning method.
                     make_row(
+                        Incompleteness::Content,
                         "iterator_return_protocol",
                         &iter_set.site.file,
                         method_anchor.clone(),
@@ -3785,6 +3970,7 @@ pub(super) fn iterator_return_protocol_expansions(
                 next_set.flow_unknown
             );
             let mut fact = make_row(
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
                 "iterator_return_protocol",
                 &iter_set.site.file,
                 method_anchor,
@@ -3950,6 +4136,7 @@ fn python_call_callee_at(
 
 fn report_uninitialized_variable_incomplete(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    incompleteness: Incompleteness,
     row: &crate::analyzer::structural::occurrence_rows::OccurrenceRow,
     reason: impl std::fmt::Display,
 ) {
@@ -3966,7 +4153,8 @@ fn report_uninitialized_variable_incomplete(
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness,
         related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -3976,7 +4164,7 @@ fn report_uninitialized_variable_incomplete(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
-    });
+    }));
 }
 
 /// Check one exact Python value reference against its lexical binding and the
@@ -4033,6 +4221,7 @@ pub(super) fn uninitialized_variable_expansions(
         crate::analyzer::structural::lexical_environment::BindingOfOutcome::NoBinding => {
             report_uninitialized_variable_incomplete(
                 diagnostics,
+                Incompleteness::Content,
                 row,
                 "global or builtin lookup is outside local binding flow",
             );
@@ -4041,6 +4230,7 @@ pub(super) fn uninitialized_variable_expansions(
         crate::analyzer::structural::lexical_environment::BindingOfOutcome::Incomplete(axis) => {
             report_uninitialized_variable_incomplete(
                 diagnostics,
+                Incompleteness::Content,
                 row,
                 format!("lexical binding axis {axis:?} is incomplete"),
             );
@@ -4056,6 +4246,7 @@ pub(super) fn uninitialized_variable_expansions(
     ) {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Content,
             row,
             format!(
                 "binding kind {:?} is outside local-flow coverage",
@@ -4074,6 +4265,7 @@ pub(super) fn uninitialized_variable_expansions(
     ) {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Content,
             row,
             format!(
                 "binding scope {:?} is outside function-local flow",
@@ -4087,6 +4279,7 @@ pub(super) fn uninitialized_variable_expansions(
     let [procedure] = procedures.as_slice() else {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             row,
             "enclosing procedure is unavailable or ambiguous",
         );
@@ -4098,6 +4291,7 @@ pub(super) fn uninitialized_variable_expansions(
     {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Content,
             row,
             "binding belongs to an enclosing procedure or closure",
         );
@@ -4107,6 +4301,7 @@ pub(super) fn uninitialized_variable_expansions(
     let Some(outcome) = semantic.materialized_outcome(&row.file) else {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
             row,
             "semantic artifact is unavailable",
         );
@@ -4124,7 +4319,12 @@ pub(super) fn uninitialized_variable_expansions(
         .iter()
         .find(|derived| derived.procedure == procedure.handle.id())
     else {
-        report_uninitialized_variable_incomplete(diagnostics, row, "procedure flow is unavailable");
+        report_uninitialized_variable_incomplete(
+            diagnostics,
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            row,
+            "procedure flow is unavailable",
+        );
         return Vec::new();
     };
     let occurrence_ast_id = row.ast_id();
@@ -4166,6 +4366,7 @@ pub(super) fn uninitialized_variable_expansions(
     let [read] = matching_events.as_slice() else {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Content,
             row,
             format!(
                 "unique CFG read/binder/site join matched {} events",
@@ -4177,6 +4378,7 @@ pub(super) fn uninitialized_variable_expansions(
     let brokk_bifrost_flow::flow_state::FlowSubject::Binding { value } = &read.subject else {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Content,
             row,
             "CFG read is a property rather than an ordinary local binding",
         );
@@ -4186,6 +4388,7 @@ pub(super) fn uninitialized_variable_expansions(
     let Some(semantic_value) = semantics.value(*value) else {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Content,
             row,
             "CFG binding identity is absent",
         );
@@ -4199,6 +4402,7 @@ pub(super) fn uninitialized_variable_expansions(
     ) {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Content,
             row,
             format!(
                 "CFG value kind {:?} is not a local binding",
@@ -4220,6 +4424,7 @@ pub(super) fn uninitialized_variable_expansions(
     if !maps_to_lexical_binding {
         report_uninitialized_variable_incomplete(
             diagnostics,
+            Incompleteness::Content,
             row,
             "CFG value source does not identify the resolved lexical binder",
         );
@@ -4242,6 +4447,7 @@ pub(super) fn uninitialized_variable_expansions(
         | brokk_bifrost_flow::flow_state::BindingInitializationAnswer::Unreachable => Vec::new(),
         brokk_bifrost_flow::flow_state::BindingInitializationAnswer::MayBeUninitialized => {
             let fact = make_row(
+                Incompleteness::Content,
                 "undefined_placeholder_variable",
                 &row.file,
                 anchor,
@@ -4257,8 +4463,44 @@ pub(super) fn uninitialized_variable_expansions(
             )))]
         }
         brokk_bifrost_flow::flow_state::BindingInitializationAnswer::Open { reasons } => {
+            use brokk_bifrost_flow::flow_state::FlowStateIncompleteReason as Reason;
+            let incompleteness = reasons
+                .iter()
+                .fold(Incompleteness::Content, |cause, reason| {
+                    cause.combine(match reason {
+                        Reason::Cancelled => {
+                            Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+                        }
+                        Reason::BudgetExhausted { .. } => {
+                            Incompleteness::Operational(DerivationExecutionCause::Budget)
+                        }
+                        Reason::SourceGenerationChanged => {
+                            Incompleteness::Operational(DerivationExecutionCause::Snapshot)
+                        }
+                        Reason::NoSemanticProvider
+                        | Reason::SemanticProviderFailed { .. }
+                        | Reason::SemanticAnalysisPartial { .. }
+                        | Reason::NoStructuralFacts
+                        | Reason::PropertyProviderUnavailable
+                        | Reason::PropertyProviderFailed { .. }
+                        | Reason::PropertyAnalysisPartial { .. }
+                        | Reason::BindingScopeLivenessUnavailable { .. }
+                        | Reason::PropertyReaching { .. } => {
+                            Incompleteness::Operational(DerivationExecutionCause::Provider)
+                        }
+                        Reason::AxisUnsupported(_)
+                        | Reason::ControlProjectionRejected { .. }
+                        | Reason::ModeledControlProjectionIncomplete { .. }
+                        | Reason::LoweringGap { .. }
+                        | Reason::PropertyBaseNotCanonical { .. }
+                        | Reason::SelectedPropertyEndpointUnavailable { .. }
+                        | Reason::BindingWithoutEstablishment { .. }
+                        | Reason::BindingStateNotClosed { .. } => Incompleteness::Content,
+                    })
+                });
             report_uninitialized_variable_incomplete(
                 diagnostics,
+                incompleteness,
                 row,
                 format!("CFG initialization proof is open: {reasons:?}"),
             );
@@ -4459,6 +4701,7 @@ fn builtin_identity_row(
     resolution: BuiltinIdentityResolution,
 ) -> PythonRuleFactValue {
     let mut fact = make_row(
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
         relation,
         file,
         anchor,
@@ -4563,6 +4806,7 @@ pub(super) fn raise_not_implemented_expansions(
     let Some(tree) = parse_python(source).filter(|tree| !tree.root_node().has_error()) else {
         let range = row_range(source, seed_bytes.clone());
         let fact = make_row(
+            Incompleteness::Content,
             "raise_not_implemented",
             &seed.file,
             seed_bytes,
@@ -4668,6 +4912,7 @@ pub(super) fn tuple_return_group_expansions(
     let public = procedure.public();
     let span = procedure.byte_span();
     let mut value = make_row(
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
         "tuple_return_groups",
         procedure.file(),
         span,
@@ -4737,6 +4982,7 @@ pub(super) fn tuple_return_group_expansions(
             value.row.outcome = "open";
             value.row.proof = "none";
             value.row.completeness = "partial";
+            value.incompleteness = Incompleteness::Operational(DerivationExecutionCause::Budget);
             value.row.reason = Some("tuple_return_arity_limit_exceeded".to_owned());
         }
     }
@@ -4801,6 +5047,7 @@ pub(super) fn tuple_return_assignment_expansions(
     };
     let assignment_range = row_range(source, assignment_bytes.clone());
     let mut value = make_row(
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
         "tuple_return_groups",
         &seed.file,
         assignment_bytes,
@@ -4821,8 +5068,9 @@ pub(super) fn tuple_return_assignment_expansions(
         start_line: call_range.start_line,
         end_line: call_range.end_line,
     };
-    let Some((target_id, unit)) = exact_local_dispatch_target(semantic, &seed.file, dispatch_range)
-    else {
+    let (target, cause) = exact_local_dispatch_target(semantic, &seed.file, dispatch_range);
+    value.incompleteness = value.incompleteness.combine(cause);
+    let Some((target_id, unit)) = target else {
         return vec![pipeline_expansion(PipelineValue::PythonRuleFact(Box::new(
             value,
         )))];
@@ -4889,6 +5137,7 @@ pub(super) fn tuple_return_assignment_expansions(
         value.row.proof = "none";
         value.row.completeness = "partial";
         value.row.assignment_arity_match = Some("unknown");
+        value.incompleteness = Incompleteness::Operational(DerivationExecutionCause::Budget);
         value.row.reason = Some("tuple_return_arity_limit_exceeded".to_owned());
     }
     vec![pipeline_expansion(PipelineValue::PythonRuleFact(Box::new(
@@ -4900,22 +5149,30 @@ fn exact_local_dispatch_target(
     semantic: &mut SemanticQueryContext<'_>,
     file: &ProjectFile,
     range: Range,
-) -> Option<(String, CodeUnit)> {
-    let answer = semantic.dispatch_at_source(file, range);
+) -> (Option<(String, CodeUnit)>, Incompleteness) {
+    let (answer, dispatch_incompleteness) = semantic.dispatch_at_source_with_cause(file, range);
+    if dispatch_incompleteness.execution_cause().is_some() {
+        semantic.analyzer().mark_execution_dependent();
+    }
     if answer.outcome != "resolved"
         || !answer.coverage.is_exhaustive()
         || answer.call_site_count != 1
         || !answer.unnamed_boundaries.is_empty()
     {
-        return None;
+        return (None, dispatch_incompleteness);
     }
     let [arm] = answer.arms.as_slice() else {
-        return None;
+        return (None, dispatch_incompleteness);
     };
     if arm.proof != "proven" || arm.completeness != "complete" {
-        return None;
+        return (None, dispatch_incompleteness);
     }
-    Some((arm.target_id.clone(), arm.target_unit.clone()?))
+    (
+        arm.target_unit
+            .clone()
+            .map(|unit| (arm.target_id.clone(), unit)),
+        dispatch_incompleteness,
+    )
 }
 
 pub(super) fn call_result_use_expansions(
@@ -4935,6 +5192,7 @@ pub(super) fn call_result_use_expansions(
     let file = &shape.report.outcome.file;
     let public_range = row_range(source, call_span.clone());
     let mut value = make_row(
+        Incompleteness::Content,
         "call_result_use",
         file,
         call_span.clone(),
@@ -4951,7 +5209,9 @@ pub(super) fn call_result_use_expansions(
         value.row.proof = "proven";
         value.row.reason = Some("call_return_contract_unresolved".to_string());
         let range = shape.report.outcome.range;
-        if let Some((target_id, unit)) = exact_local_dispatch_target(semantic, file, range) {
+        let (target, cause) = exact_local_dispatch_target(semantic, file, range);
+        value.incompleteness = value.incompleteness.combine(cause);
+        if let Some((target_id, unit)) = target {
             value.row.target_id = Some(target_id);
             let declaration = render::declaration_value_for_unit(analyzer, &unit, range);
             let procedures = semantic.cfg().procedure_of_declaration(&declaration);
@@ -5107,6 +5367,7 @@ pub(super) fn lambda_forwarding_expansions(
         .and_then(|tree| find_exact_node(tree.root_node(), &lambda_bytes, &["lambda"]));
     let row_range = row_range(source, lambda_bytes.clone());
     let mut value = make_row(
+        Incompleteness::Content,
         "lambda_forwarding",
         &seed.file,
         lambda_bytes,
@@ -5166,9 +5427,9 @@ pub(super) fn lambda_forwarding_expansions(
             } else if evaluation_time == "stable_at_creation"
                 && value.row.default_equivalent == Some("yes")
             {
-                if let Some((target_id, _)) =
-                    exact_local_dispatch_target(semantic, &seed.file, range)
-                {
+                let (target, cause) = exact_local_dispatch_target(semantic, &seed.file, range);
+                value.incompleteness = value.incompleteness.combine(cause);
+                if let Some((target_id, _)) = target {
                     value.row.target_id = Some(target_id);
                 }
                 value.row.outcome = "forwarded";
@@ -5783,6 +6044,7 @@ fn make_raise_row(
 ) -> PythonRuleFactValue {
     let range = row_range(source, anchor.clone());
     let mut value = make_row(
+        Incompleteness::Operational(DerivationExecutionCause::Provider),
         relation,
         &seed.file,
         anchor,
@@ -6021,6 +6283,7 @@ pub(super) fn python_raise_legality_expansions(
         .and_then(|tree| find_exact_node(tree.root_node(), &span, &["raise_statement"]));
     let Some(raise) = raise else {
         let fallback = make_row(
+            Incompleteness::Content,
             "illegal_raise",
             &seed.file,
             span.clone(),

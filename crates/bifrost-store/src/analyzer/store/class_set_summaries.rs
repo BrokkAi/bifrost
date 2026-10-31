@@ -1150,8 +1150,10 @@ fn live_owner_blob_id(conn: &rusqlite::Connection, summary: &ClassSetSummaryRow)
     let storage_language_key = &summary.header.attachment.storage_language_key;
     super::live_class_set_owner_blob_id(
         conn,
-        &summary.header.attachment.blob_oid,
-        storage_language_key,
+        &super::BlobKey::unvaried(
+            git2::Oid::from_str(&summary.header.attachment.blob_oid)?,
+            storage_language_key.as_str(),
+        ),
     )?
     .ok_or_else(|| {
         StoreError::new(format!(

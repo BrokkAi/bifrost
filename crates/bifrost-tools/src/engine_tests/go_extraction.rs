@@ -4258,7 +4258,11 @@ func caller() { _, _ = os.Open("book.xlsx") }
 
                 let plan = bind(
                     "unit_summary_withdraw_replaced_blob",
-                    vec![Value::Text(blob_oid), Value::Text(lang)],
+                    vec![
+                        Value::Text(blob_oid),
+                        Value::Text(lang),
+                        Value::Blob(Vec::new()),
+                    ],
                 );
                 uses(&plan, "blobs USING", "withdraw replaced blob");
                 uses(&plan, "members USING", "withdraw replaced blob");
@@ -4637,9 +4641,13 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 .1;
             let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
             let (state, _) = crate::engine_tests::go_extraction::go_extraction_tests::go_move_11::parsed_go_state(fixture.root(), "util/util.go", source);
-            let prepared =
-                AnalyzerStore::prepare_parsed_blob(oid, "go", generation, &GoAdapter, state)
-                    .unwrap();
+            let prepared = AnalyzerStore::prepare_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                generation,
+                &GoAdapter,
+                state,
+            )
+            .unwrap();
             let (outcomes, _) =
                 store.persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
             assert!(
@@ -5209,8 +5217,7 @@ func main() { api.Public() }
                         let oid =
                             Oid::hash_object(ObjectType::Blob, SPELLING_SOURCE.as_bytes()).unwrap();
                         let prepared = AnalyzerStore::prepare_parsed_blob(
-                            oid,
-                            "go",
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                             snapshot.generation,
                             &GoAdapter,
                             Arc::clone(&state),
@@ -5464,8 +5471,7 @@ func main() { api.Public() }
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    oid,
-                    "go",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                     generation,
                     &GoAdapter,
                     &state,
@@ -5778,8 +5784,7 @@ func use(value *Item) *Item {
                 let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     .expect("hash the Go operation fixture source");
                 let prepared = AnalyzerStore::prepare_parsed_blob(
-                    oid,
-                    "go",
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                     generation,
                     &adapter,
                     Arc::clone(&state),
@@ -6031,8 +6036,7 @@ type Item struct{ Decoy bool }
                     let (state, facts) = parsed_go_state(project_root.path(), path, source);
                     prepared.push(
                         AnalyzerStore::prepare_parsed_blob(
-                            oid,
-                            "go",
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                             generation,
                             &adapter,
                             Arc::clone(&state),
@@ -6478,11 +6482,18 @@ type Item struct{ Decoy bool }
                 // cold/warm search statements, without additional decoded rows.
                 // #7509: sharing declaration-site selection adds one indexed
                 // statement and row, and one scope step, to Type searches.
-                let (cold_open, cold_search, warm_open, warm_search) = match kind {
-                    ProductionGoPointKind::Definition => {
-                        ((273, 241), (160, 156), (5, 4), (125, 96))
-                    }
-                    ProductionGoPointKind::Type => ((273, 241), (178, 153), (5, 4), (144, 94)),
+                // #7506: debug builds add three cold-open statements and rows, the
+                // debug_assert! COUNT checks of container placements (twice) and Rust
+                // summaries in resolution_selection.rs. Release-code builds (the
+                // measure profile) compile them out, so the production open is 270/238.
+                let cold_open = if cfg!(debug_assertions) {
+                    (273, 241)
+                } else {
+                    (270, 238)
+                };
+                let (cold_search, warm_open, warm_search) = match kind {
+                    ProductionGoPointKind::Definition => ((160, 156), (5, 4), (125, 96)),
+                    ProductionGoPointKind::Type => ((178, 153), (5, 4), (144, 94)),
                 };
                 let production_schema = cold
                     .open
@@ -9708,8 +9719,7 @@ func use() { provider.Rewrites.ReadFile() }
             let oid =
                 Oid::hash_object(ObjectType::Blob, GO_ROOT_CONSUMER_SOURCE.as_bytes()).unwrap();
             let prepared = AnalyzerStore::prepare_parsed_blob(
-                oid,
-                "go",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                 snapshot.generation,
                 &GoAdapter,
                 state,

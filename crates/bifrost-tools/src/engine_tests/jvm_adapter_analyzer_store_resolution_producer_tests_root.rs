@@ -258,7 +258,12 @@ mod jvm_extraction_tests {
             let mut requests = expected
                 .iter()
                 .copied()
-                .map(|oid| CompleteAnalysisBlobRequest::new(oid, PRIMARY, [PROJECTION.to_owned()]))
+                .map(|oid| {
+                    CompleteAnalysisBlobRequest::new(
+                        brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, PRIMARY),
+                        [PROJECTION.to_owned()],
+                    )
+                })
                 .collect::<Vec<_>>();
             requests.push(requests[17].clone());
             let missing = store
@@ -281,7 +286,12 @@ mod jvm_extraction_tests {
 
         let legacy_oid = oid(b"legacy parsed only");
         store
-            .register_blobs(&[legacy_oid], PRIMARY, generations[PRIMARY])
+            .register_blobs(
+                &[brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    legacy_oid, PRIMARY,
+                )],
+                generations[PRIMARY],
+            )
             .expect("register legacy parsed blob");
         let legacy_oid_text = legacy_oid.to_string();
         store.conn.execute(move |conn| {
@@ -309,8 +319,7 @@ mod jvm_extraction_tests {
             .unwrap();
         });
         let legacy_request = [CompleteAnalysisBlobRequest::new(
-            legacy_oid,
-            PRIMARY,
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(legacy_oid, PRIMARY),
             Vec::new(),
         )];
         let missing = store
@@ -350,8 +359,7 @@ mod jvm_extraction_tests {
             prepare(absent_optional_oid, Arc::clone(&state), &generations, &[]),
         );
         let absent_optional_request = [CompleteAnalysisBlobRequest::new(
-            absent_optional_oid,
-            PRIMARY,
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(absent_optional_oid, PRIMARY),
             [PROJECTION.to_owned()],
         )];
         assert!(
@@ -384,8 +392,10 @@ mod jvm_extraction_tests {
             )
             .unwrap();
         });
-        let owner_request =
-            CompleteAnalysisBlobRequest::new(optional_oid, PRIMARY, [PROJECTION.to_owned()]);
+        let owner_request = CompleteAnalysisBlobRequest::new(
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(optional_oid, PRIMARY),
+            [PROJECTION.to_owned()],
+        );
         let missing = store
             .missing_published_complete_analysis_blob_keys_at_generations(
                 std::slice::from_ref(&owner_request),
@@ -435,8 +445,10 @@ mod jvm_extraction_tests {
             )
             .unwrap();
         });
-        let independent_request =
-            CompleteAnalysisBlobRequest::new(optional_oid, PROJECTION, Vec::new());
+        let independent_request = CompleteAnalysisBlobRequest::new(
+            brokk_bifrost_core::gitblob::BlobKey::unvaried(optional_oid, PROJECTION),
+            Vec::new(),
+        );
         for requests in [
             vec![owner_request.clone(), independent_request.clone()],
             vec![independent_request.clone(), owner_request.clone()],
@@ -489,7 +501,14 @@ mod jvm_extraction_tests {
                 .is_some_and(|error| error.is_stale_resolution())
         );
         assert_eq!(stats.failed_transaction_attempts, 1);
-        assert!(!store.contains_parsed_blob(published_oid, PRIMARY).unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    published_oid,
+                    PRIMARY
+                ))
+                .unwrap()
+        );
 
         store
             .ensure_resolution_producer_epoch(PRIMARY, Language::Java)
@@ -511,7 +530,14 @@ mod jvm_extraction_tests {
                 .is_some_and(|error| error.is_stale_generation())
         );
         assert_eq!(stats.failed_transaction_attempts, 1);
-        assert!(!store.contains_parsed_blob(published_oid, PRIMARY).unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    published_oid,
+                    PRIMARY
+                ))
+                .unwrap()
+        );
     }
     #[cfg(test)]
     #[test]
@@ -545,8 +571,21 @@ mod jvm_extraction_tests {
             "good input must survive bisection"
         );
         assert_eq!((stats.committed_blobs, stats.failed_blobs), (1, 2));
-        assert!(!store.contains_parsed_blob(duplicate_oid, PRIMARY).unwrap());
-        assert!(store.contains_parsed_blob(good_oid, PRIMARY).unwrap());
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    duplicate_oid,
+                    PRIMARY
+                ))
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    good_oid, PRIMARY
+                ))
+                .unwrap()
+        );
     }
     #[cfg(test)]
     #[test]
@@ -561,8 +600,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                published_oid,
-                PRIMARY,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(published_oid, PRIMARY),
                 generation,
                 &JavaAdapter,
                 &state,
@@ -575,8 +613,7 @@ mod jvm_extraction_tests {
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                    published_oid,
-                    PRIMARY,
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(published_oid, PRIMARY),
                     generation,
                     &JavaAdapter,
                     &state,
@@ -714,7 +751,10 @@ mod jvm_extraction_tests {
         assert_eq!(stats.transactions, 1);
         let physical_fragment_rows = persisted_physical_logical_rows(
             &store,
-            &[(exact_oid, PRIMARY), (exact_oid, PROJECTION)],
+            &[
+                brokk_bifrost_core::gitblob::BlobKey::unvaried(exact_oid, PRIMARY),
+                brokk_bifrost_core::gitblob::BlobKey::unvaried(exact_oid, PROJECTION),
+            ],
         );
         assert_eq!(physical_fragment_rows, exact_expected_fragment_rows);
         let physical_rows = physical_fragment_rows
@@ -768,16 +808,29 @@ mod jvm_extraction_tests {
                 stats.peak_batch_payload_bytes,
                 exact_limits.max_payload_bytes
             );
-            assert!(store.contains_parsed_blob(oversized_oid, PRIMARY).unwrap());
             assert!(
                 store
-                    .contains_parsed_blob(oversized_oid, PROJECTION)
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oversized_oid,
+                        PRIMARY
+                    ))
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                        oversized_oid,
+                        PROJECTION
+                    ))
                     .unwrap()
             );
             assert_eq!(
                 persisted_physical_logical_rows(
                     &store,
-                    &[(oversized_oid, PRIMARY), (oversized_oid, PROJECTION)]
+                    &[
+                        brokk_bifrost_core::gitblob::BlobKey::unvaried(oversized_oid, PRIMARY),
+                        brokk_bifrost_core::gitblob::BlobKey::unvaried(oversized_oid, PROJECTION)
+                    ]
                 ),
                 exact_expected_fragment_rows,
             );
@@ -804,10 +857,20 @@ mod jvm_extraction_tests {
         assert!(cancellation.is_cancelled());
         assert_eq!(stats.failed_fragments, 2);
         assert_eq!(store.parsed_blob_transaction_starts_for_test(), starts + 1);
-        assert!(!store.contains_parsed_blob(cancelled_oid, PRIMARY).unwrap());
         assert!(
             !store
-                .contains_parsed_blob(cancelled_oid, PROJECTION)
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    cancelled_oid,
+                    PRIMARY
+                ))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    cancelled_oid,
+                    PROJECTION
+                ))
                 .unwrap()
         );
         let cancelled = outcomes.pop().expect("cancelled outcome").prepared;
@@ -836,10 +899,34 @@ mod jvm_extraction_tests {
         );
         assert_eq!((stats.committed_blobs, stats.failed_blobs), (2, 1));
         assert_eq!((stats.committed_fragments, stats.failed_fragments), (2, 2));
-        assert!(store.contains_parsed_blob(good_a_oid, PRIMARY).unwrap());
-        assert!(store.contains_parsed_blob(good_b_oid, PRIMARY).unwrap());
-        assert!(!store.contains_parsed_blob(bad_oid, PRIMARY).unwrap());
-        assert!(!store.contains_parsed_blob(bad_oid, PROJECTION).unwrap());
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    good_a_oid, PRIMARY
+                ))
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    good_b_oid, PRIMARY
+                ))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    bad_oid, PRIMARY
+                ))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                    bad_oid, PROJECTION
+                ))
+                .unwrap()
+        );
         let retry = persist_one(&store, prepare(bad_oid, projected, &generations, &[]));
         assert_eq!(retry.committed_fragments, 2);
     }
@@ -983,8 +1070,7 @@ mod jvm_extraction_tests {
         store
             .write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                content,
-                "java",
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(content, "java"),
                 generation,
                 &JavaAdapter,
                 &state,

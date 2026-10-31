@@ -39,8 +39,10 @@ use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
                         store
                             .write_parsed_blob_at_generation(
                                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
-                                git2::Oid::from_str(oid).unwrap(),
-                                storage_language,
+                                &brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                                    git2::Oid::from_str(oid).unwrap(),
+                                    storage_language,
+                                ),
                                 generation,
                                 &GoAdapter,
                                 &state,

@@ -990,6 +990,8 @@ pub struct CodeQueryFailureHandlerState {
     /// variable. Other handler languages leave this field null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rethrow_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throw_relation: Option<&'static str>,
 }
 
 /// One exact Java syntax statement and its procedure entry reachability.

@@ -454,6 +454,7 @@ fn emit_slots(
             let display = row_range(seed.facts.source(), range.clone());
             let complete = slot.reason.is_none();
             let mut value = make_row(
+                Incompleteness::Content,
                 RELATION,
                 &seed.file,
                 range.clone(),

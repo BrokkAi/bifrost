@@ -77,7 +77,11 @@ other! { }
         let oid = oid_for(MODULE_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral analyzer store");
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect("canonical module fixture publishes");
         (store, oid, state)
     }
@@ -126,7 +130,7 @@ other! { }
         F: FnOnce(&Connection, i64) + Send + 'static,
     {
         let expected = store
-            .rust_usage_facts(oid, "rust")
+            .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
             .expect("canonical module publication before rollback test");
         store.conn.execute(move |conn| {
             let id = blob_id(conn, oid);
@@ -170,7 +174,9 @@ other! { }
             assert_eq!(state, "complete");
         });
         assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap(),
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap(),
             expected,
             "failed canonical module seal changed the consumer view"
         );
@@ -481,7 +487,11 @@ other! { }
             .clear();
         assert!(
             store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &invalid)
+                .write_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                    &RustAdapter,
+                    &invalid
+                )
                 .is_err(),
             "invalid replacement must fail at the canonical module CHECK"
         );
@@ -616,13 +626,19 @@ broken! { mod malformed_module; let = ; }
         let path = fixture.root().join("raw-module-source.db");
         let store = AnalyzerStore::open_persistent(&path).expect("persistent analyzer store");
         store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
+            .write_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter,
+                &state,
+            )
             .expect("raw module source facts publish");
         drop(store);
 
         let reopened = AnalyzerStore::open_persistent(&path).expect("reopen persistent store");
         assert_eq!(
-            reopened.rust_usage_facts(oid, "rust").unwrap(),
+            reopened
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
+                .unwrap(),
             expected_usage,
             "reopen preserves the legacy module projections"
         );

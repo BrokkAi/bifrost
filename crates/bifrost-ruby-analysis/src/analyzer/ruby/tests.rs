@@ -209,7 +209,9 @@ mod canonical_source_tests {
         analyzer
             .inner
             .analyzer_store()
-            .mark_parsed_blob_incomplete_for_test(oid, "ruby");
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "ruby",
+            ));
         analyzer.inner.reset_full_hydration_count_for_test();
         assert!(analyzer.source_facts(&file).is_none());
         assert!(analyzer.autoload_constant_files().is_none());
@@ -276,10 +278,10 @@ mod canonical_lookup_tests {
         analyzer
             .inner
             .analyzer_store()
-            .mark_parsed_blob_incomplete_for_test(
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
                 git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap(),
                 "ruby",
-            );
+            ));
         analyzer.inner.reset_full_hydration_count_for_test();
         let edges = crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(
             &analyzer,
@@ -302,10 +304,10 @@ mod canonical_lookup_tests {
         analyzer
             .inner
             .analyzer_store()
-            .mark_parsed_blob_incomplete_for_test(
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
                 git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap(),
                 "ruby",
-            );
+            ));
         analyzer.inner.reset_full_hydration_count_for_test();
         let tree = parse_ruby_tree(source).unwrap();
         let start = source.rfind("Ready").unwrap();

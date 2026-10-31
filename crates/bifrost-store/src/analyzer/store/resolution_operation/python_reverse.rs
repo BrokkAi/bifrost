@@ -157,7 +157,6 @@ impl PythonReverseView {
         let gaps = conn.prepare_cached("SELECT gap_kind,subject,json(detail) FROM resolution_unit_summary_gaps WHERE summary_id=?1 ORDER BY gap_kind,subject")?
             .query_map([summary], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut obligations = Vec::new();
-        let mut query_obligations = Vec::new();
         let mut unplaced = Vec::new();
         let mutation_profile = match profile.as_str() {
             "runtime" => super::python_lexical::PythonBindingProfile::Runtime,
@@ -171,11 +170,17 @@ impl PythonReverseView {
             &ResolutionSession::unbounded(),
             cancellation,
         )?;
+        let mut query_obligations =
+            super::python_demand::selected_environment_obligations(&operation.ready, summary)?;
         if let Some(obligation) =
-            super::python_members::operations::dynamic_receiver_obligation(&mutations)
+            super::python_members::operations::dynamic_receiver_query_obligation(&mutations)
         {
-            query_obligations.push(obligation);
+            query_obligations.insert(obligation);
         }
+        let query_obligations = query_obligations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
         for (kind, subject, detail) in gaps {
             let label = format!("{kind}:{subject}:{detail}");
             // The selected environment is the certainty boundary. Runtime path
@@ -186,11 +191,9 @@ impl PythonReverseView {
                 // missing reference. The file's own source references still
                 // participate in nomination and confirmation below.
                 unplaced.push(subject);
-                query_obligations.push(label);
                 continue;
             }
             if kind == "python_environment_open" {
-                query_obligations.push(label);
                 continue;
             }
             let mut hash = CanonicalHasher::new(b"python-reverse-environment-obligation:v1");

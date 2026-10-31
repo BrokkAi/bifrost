@@ -1263,7 +1263,21 @@ pub fn classify_owner_relation(
         analyzer,
         site_enclosing,
         target,
-        |hierarchy, site, target| hierarchy.get_ancestors(site).contains(target),
+        |hierarchy, site, target| {
+            let answer = hierarchy.get_ancestors(site);
+            if !answer.is_complete() {
+                analyzer.record_query_incomplete(
+                    crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                        "incomplete owner hierarchy".into(),
+                    ),
+                );
+            }
+            if answer.edges.contains(target) {
+                Some(true)
+            } else {
+                answer.is_complete().then_some(false)
+            }
+        },
     )
 }
 
@@ -1311,17 +1325,30 @@ impl OwnerRelationMemo {
                             .get(site)
                             .cloned()
                         {
-                            return Ok::<_, Infallible>(entry);
+                            return Ok::<_, ()>(entry);
                         }
-                        let entry = Arc::new(capture.build(|| hierarchy.get_ancestors(site)));
+                        let mut complete = false;
+                        let entry = Arc::new(capture.build(|| {
+                            let answer = hierarchy.get_ancestors(site);
+                            complete = answer.is_complete();
+                            answer.edges
+                        }));
+                        if !complete {
+                            analyzer.record_query_incomplete(
+                                crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                                    "incomplete owner hierarchy".into(),
+                                ),
+                            );
+                            return Err(());
+                        }
                         cache
                             .lock()
                             .expect("owner relation memo poisoned")
                             .insert(site.clone(), Arc::clone(&entry));
                         Ok(entry)
                     })
-                    .unwrap()
-                    .contains(target)
+                    .ok()
+                    .map(|entry| entry.contains(target))
             },
         )
     }
@@ -1331,7 +1358,7 @@ fn classify_owner_relation_by(
     analyzer: &dyn IAnalyzer,
     site_enclosing: Option<&CodeUnit>,
     target: &CodeUnit,
-    inherits: impl FnOnce(&dyn TypeHierarchyProvider, &CodeUnit, &CodeUnit) -> bool,
+    inherits: impl FnOnce(&dyn TypeHierarchyProvider, &CodeUnit, &CodeUnit) -> Option<bool>,
 ) -> OwnerRelation {
     let Some(enclosing) = site_enclosing else {
         return OwnerRelation::Unknown;
@@ -1347,13 +1374,11 @@ fn classify_owner_relation_by(
     match (site_owner, target_owner) {
         (Owner::Type(site), Owner::Type(target)) if site == target => OwnerRelation::SameOwner,
         (Owner::Type(site), Owner::Type(target)) => match analyzer.type_hierarchy_provider() {
-            Some(hierarchy) => {
-                if inherits(hierarchy, &site, &target) {
-                    OwnerRelation::InheritedOwner
-                } else {
-                    OwnerRelation::External
-                }
-            }
+            Some(hierarchy) => match inherits(hierarchy, &site, &target) {
+                Some(true) => OwnerRelation::InheritedOwner,
+                Some(false) => OwnerRelation::External,
+                None => OwnerRelation::Unknown,
+            },
             None => OwnerRelation::Unknown,
         },
         (Owner::Namespace(site), Owner::Namespace(target)) => {

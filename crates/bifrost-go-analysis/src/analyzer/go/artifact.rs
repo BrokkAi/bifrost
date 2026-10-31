@@ -281,7 +281,8 @@ type_forwards: Vec::new(),
 pub struct GoModulePackProducer;
 
 /// Bump when generated Go pack content changes for unchanged inputs.
-const GO_PACK_PRODUCER_VERSION: u32 = 1;
+// #8264: package-local types take precedence over predeclared spellings.
+const GO_PACK_PRODUCER_VERSION: u32 = 2;
 
 fn go_pack_producer_version() -> &'static str {
     static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -2246,10 +2247,11 @@ fn resolve_nominal(path: &[&str], context: &TypeContext<'_>) -> Option<TypeRef> 
         });
     }
     let name = if path.len() == 1 {
-        if is_predeclared_go_type(first) {
-            first.to_owned()
+        let local_name = format!("{}.{}", context.package, first);
+        if context.type_ids.contains_key(&local_name) || !is_predeclared_go_type(first) {
+            local_name
         } else {
-            format!("{}.{}", context.package, first)
+            first.to_owned()
         }
     } else {
         let package = context
@@ -2323,8 +2325,14 @@ fn referenced_type_refs(
 }
 
 fn rendered_type_ref(node: Node<'_>, source: &str) -> TypeRef {
+    let name = go_node_text(node, source).trim();
+    assert!(
+        !is_predeclared_go_type(name),
+        "rendered fallback {name:?} at {:?} must not be a bare predeclared Go type: consumers trust these Named terms as universe identities",
+        node.range()
+    );
     TypeRef::Named {
-        name: go_node_text(node, source).trim().to_owned(),
+        name: name.to_owned(),
         arguments: Vec::new(),
         nullable: false,
     }
@@ -2601,6 +2609,34 @@ mod tests {
         let (diagnostics, suppressed) = diagnostics.finish();
         assert_eq!(suppressed, SuppressedDiagnostics::default());
         (facts.0, facts.1, diagnostics)
+    }
+
+    #[test]
+    #[hardwon("#8264: package-local error and int were encoded as predeclared results")]
+    fn producer_predeclared_names_respect_package_shadowing() {
+        let (types, members, diagnostics) = facts(
+            "package api\ntype error int\ntype int uint\nfunc F() error { return 0 }\nfunc G() int { return 0 }\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (callable, local) in [("F", "error"), ("G", "int")] {
+            let id = &types
+                .iter()
+                .find(|ty| ty.name == format!("example.com/dep/api.{local}"))
+                .unwrap()
+                .id;
+            let member = members
+                .iter()
+                .find(|member| member.name == callable)
+                .unwrap();
+            assert_eq!(
+                member.signature.as_ref().unwrap().returns,
+                Some(TypeRef::Declared {
+                    id: id.clone(),
+                    arguments: Vec::new(),
+                    nullable: false
+                })
+            );
+        }
     }
 
     #[test]

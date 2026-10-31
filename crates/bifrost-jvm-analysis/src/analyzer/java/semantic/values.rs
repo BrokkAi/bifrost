@@ -403,11 +403,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         name: &str,
         declaration_start: usize,
     ) -> Option<ValueId> {
-        self.locals
-            .get(name)?
-            .iter()
-            .find(|binding| binding.declaration_start == declaration_start)
-            .map(|binding| binding.value)
+        brokk_bifrost_analysis::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)?
+                .iter()
+                .map(|binding| (binding.declaration_start, binding.value)),
+            declaration_start,
+        )
     }
 
     pub(in crate::analyzer::java::semantic) fn emit_procedure_inputs(
@@ -1062,6 +1064,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         ))
     }
 
+    #[track_caller]
+    fn implicit_instance_field_address(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+    ) -> Result<Option<(MemoryLocationId, SourceAnchor, Box<str>)>, JavaLoweringError> {
+        let Some((member, name)) = self.implicit_instance_field_locator(node) else {
+            return Ok(None);
+        };
+        let base = self
+            .receiver
+            .expect("implicit_instance_field_locator only resolves when a receiver exists");
+        let field_anchor = member.anchor();
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Field { base, member },
+        )?;
+        Ok(Some((location, field_anchor, name)))
+    }
+
     /// The single, per-procedure "virtual local" carrier this procedure
     /// tracks for reads/writes of `name` through an implicit `this.field`
     /// access (#2573), lazily minted on first use and reused for every later
@@ -1177,18 +1201,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
             return Ok(());
         }
-        let Some((member, name)) = self.implicit_instance_field_locator(node) else {
+        let Some((location, field_anchor, name)) =
+            self.implicit_instance_field_address(builder, node, point)?
+        else {
             return Ok(());
         };
-        let base = self
-            .receiver
-            .expect("implicit_instance_field_locator only resolves when a receiver exists");
-        let field_anchor = member.anchor();
-        let location = self.session.add_memory_location(
-            builder,
-            point,
-            MemoryLocationKind::Field { base, member },
-        )?;
         self.append_effect(
             builder,
             point,
@@ -1373,18 +1390,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         receiver_value: ValueId,
     ) -> Result<(), JavaLoweringError> {
-        let Some((member, name)) = self.implicit_instance_field_locator(node) else {
+        let Some((location, field_anchor, name)) =
+            self.implicit_instance_field_address(builder, node, point)?
+        else {
             return Ok(());
         };
-        let base = self
-            .receiver
-            .expect("implicit_instance_field_locator only resolves when a receiver exists");
-        let field_anchor = member.anchor();
-        let location = self.session.add_memory_location(
-            builder,
-            point,
-            MemoryLocationKind::Field { base, member },
-        )?;
         self.append_effect(
             builder,
             point,
@@ -1720,15 +1730,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         location: MemoryLocationId,
     ) -> Result<(), JavaLoweringError> {
-        self.session.add_gap_with_impacts(
+        self.session.add_unknown_field_identity_gap(
             builder,
             point,
-            SemanticGapSubject::MemoryLocation(location),
-            SemanticCapability::FieldMemory,
-            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
-                .with(SemanticGapImpact::HeapWrite)
-                .with(SemanticGapImpact::Aliasing),
-            SemanticGapKind::Unknown,
+            location,
             "field occurrence is structured, but its declaration identity is not yet resolved",
         )?;
         Ok(())

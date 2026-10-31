@@ -177,6 +177,9 @@ use rusqlite::OptionalExtension;
 pub(super) struct PythonMemberContext<'a, 'store, 'input> {
     pub rules: &'a PythonRules<'a, 'store, 'input>,
     pub reference: SemanticId,
+    pub query_obligations: &'a std::cell::RefCell<
+        crate::analyzer::resolution::query_obligations::NodeQueryObligations,
+    >,
     pub environment: crate::analyzer::resolution::EnvironmentId,
     pub rows: &'a crate::analyzer::store::python_binding_rows::PythonBindingRows,
     pub blob: i64,
@@ -806,13 +809,16 @@ impl PythonMemberContext<'_, '_, '_> {
         operations: &[operations::OperationRow],
         answers: &[(DemandReferenceKey, &FactResolutionAnswer)],
     ) -> Result<std::ops::ControlFlow<DemandReferenceKey, ResolutionCompletion>> {
-        if let Some(cached) = self
+        let cached = self
             .rules
             .attribute_mutations
             .borrow()
             .get(&(owner, lookup))
-        {
-            return Ok(std::ops::ControlFlow::Continue(cached.clone()));
+            .cloned();
+        self.rules
+            .record_dynamic_receiver_scope(self.reference, self.query_obligations)?;
+        if let Some(cached) = cached {
+            return Ok(std::ops::ControlFlow::Continue(cached));
         }
         let mut completion = ResolutionCompletion::Complete;
         for operation in operations {

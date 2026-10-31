@@ -58,7 +58,7 @@ A second source is rejected. Unknown fields are rejected.
 | `paths` | `(paths ...)`, `(path ...)` | path filter | every path | Seed qualified-path rows. |
 | `generation_sites` | `(generation-sites ...)`, `(generation_sites ...)` | generation-site filter | every site | Seed generation-site rows from recorded materialization provenance. |
 | `exports` | `(exports ...)`, `(export ...)` | export filter | every export | Seed export rows from recorded materialization provenance and Python module-level `__all__` literals. |
-| `dependency_evidence` | `(dependency-evidence ...)`, `(dependency_evidence ...)` | dependency filter | every stored fact | Revision-selected declared and exact locked Cargo and JS/TS evidence; no query-time dependency discovery. |
+| `dependency_evidence` | `(dependency-evidence ...)`, `(dependency_evidence ...)` | dependency filter | every stored fact | Revision-selected declared and exact locked Cargo, JS/TS and NuGet evidence; no query-time dependency discovery. |
 | `configuration_facts` | `(configuration-facts ...)`, `(configuration_facts ...)` | configuration filter | every fact | Seed facts from YAML, TOML, JSON, XML, and properties documents. |
 | `where` | `(where "glob" ... Q)` | array of globs, or array of glob arrays | whole workspace | Workspace-relative path globs. A flat list means any glob. Nested lists mean every group, with any glob inside a group. Repeated RQL `where` forms combine like nested lists. |
 | `languages` | `(language label ... Q)`, `(languages label ... Q)` | array of language labels | every language | Restrict to these languages. Repeated RQL forms intersect. Disjoint sets are rejected. `configuration_facts` rejects this field. |
@@ -331,8 +331,8 @@ slice, including blank lines between comments.
 
 | JSON `op` | RQL form | Input -> output | Options | Meaning |
 | --- | --- | --- | --- | --- |
-| `supertypes` | `supertypes` | `declaration` -> `declaration` | `depth` or `transitive` | Indexed supertypes: direct by default, up to `depth` hops, or the full closure. |
-| `subtypes` | `subtypes` | `declaration` -> `declaration` | `depth` or `transitive` | Indexed subtypes: direct by default, up to `depth` hops, or the full closure. |
+| `supertypes` | `supertypes` | `declaration` -> `declaration` | `depth` or `transitive` | Indexed supertypes: direct by default, up to `depth` hops, or the full closure. A semantic-model hierarchy that names a type no model declares stops there and reports the answer incomplete. |
+| `subtypes` | `subtypes` | `declaration` -> `declaration` | `depth` or `transitive` | Indexed subtypes: direct by default, up to `depth` hops, or the full closure. A semantic-model hierarchy that names a type no model declares stops there and reports the answer incomplete. |
 | `members` | `members` | `declaration` -> `declaration` | none | Direct indexed members of a type. |
 | `owner` | `owner` | `declaration` -> `declaration` | none | The exact indexed type that declares a member. |
 | `member_family` | `member-family`, `member_family` | `declaration` -> `member_family` | none | One method-family outcome row per member: the family ID when proven, otherwise a typed reason and unread ancestor names. Coverage is reported for the whole family and for each direction. |
@@ -866,7 +866,7 @@ shows the variable, definition, use, and same-name peer steps together.
 
 | Axis | Labels |
 | --- | --- |
-| `formats` | `yaml` (alias `yml`), `toml`, `json`, `xml`, `properties` (aliases `props`, `property`) |
+| `formats` | `yaml` (alias `yml`), `toml`, `json`, `xml`, `properties` (aliases `props`, `property`), `hocon` (alias `conf`; discovered but not yet read, so each document reports `missing_structural_adapter`) |
 | `node_kinds` | `document`, `object`, `section`, `sequence`, `member`, `scalar` |
 | `roles` | `object_member`, `table_entry`, `property`, `xml_attribute`, `xml_element`. Result rows spell these with `-`, such as `object-member`. |
 | `scalar_kinds` | `string`, `boolean`, `integer`, `decimal`, `null`, `url`, `duration`, `opaque` |
@@ -1309,23 +1309,38 @@ limits remain separate.
 
 ## Static dependency evidence
 
-`dependency_evidence` reads facts acquired from selected Cargo and JS/TS
-manifests and lockfiles before query execution. A files-only checkout can supply
+`dependency_evidence` reads facts acquired from selected Cargo, JS/TS and C#
+(NuGet) manifests and lockfiles before query execution. A files-only checkout can supply
 these facts without installed dependencies, declaration files, a build or a
 semantic-pack artifact. Acquisition does not execute package managers, target
 project scripts, lifecycle hooks or network requests. JS/TS supported formats
 and their limitations are documented in [Language Support](/reference/languages/).
+
+For C#, a `.csproj` `PackageReference` is a `declared` requirement owned by
+that project; a version-less reference takes the nearest ancestor
+`Directory.Packages.props` version and records that file as the
+`nuget.central_version_file` condition. A central `PackageVersion` is a
+`constraint`. A `packages.lock.json` entry is `locked` with its `requested`
+range and `resolved` exact version. A restored `obj/project.assets.json`
+target library is `installed`, with its target framework, runtime identifier,
+directness and `nuget.asset_role` conditions. Lock and assets rows name the
+single project in their project directory as `declared_by`; with no single
+owner they stay unowned and report an unresolved gap. `FrameworkReference`
+shared frameworks such as `Microsoft.AspNetCore.App`, including those restore
+adds implicitly, are separate `declared` rows with source `framework` and
+`provided` scope, because the runtime, not restore, picks their version.
+MSBuild property references in a version leave the row incomplete.
 
 Each axis is an array of exact alternatives; different axes combine with AND.
 JSON axes and their RQL options are:
 
 | JSON | RQL | Meaning |
 | --- | --- | --- |
-| `ecosystems` | `:ecosystem`, `:ecosystems` | Package ecosystem; Cargo uses `cargo`, JS/TS packages use `npm`, and JS toolchain constraints use `npm-toolchain`. |
+| `ecosystems` | `:ecosystem`, `:ecosystems` | Package ecosystem; Cargo uses `cargo`, JS/TS packages use `npm`, JS toolchain constraints use `npm-toolchain`, and C# packages and shared frameworks use `nuget`. |
 | `packages` | `:package`, `:packages` | Actual package names, independent of manifest aliases. |
 | `kinds` | `:kind`, `:kinds` | `declared`, `constraint`, `locked`, `installed`, or `checksum`. Cargo file acquisition emits declared and locked facts. |
 | `exact_versions` | `:exact-version`, `:exact_versions` | Exact recorded version strings. Declarations have requirements, not exact versions. |
-| `version_ranges` | `:version-range`, `:version_ranges` | Version requirements matched against complete exact locked/installed evidence. Requires exactly `ecosystems: ["cargo"]` or `["npm"]`; each uses its ecosystem semantics, including prerelease rules. npm supports comparator sets, unions, caret/tilde, partial/wildcard and hyphen ranges. Arbitrary sources and tags remain unresolved. |
+| `version_ranges` | `:version-range`, `:version_ranges` | Version requirements matched against complete exact locked/installed evidence. Requires exactly `ecosystems: ["cargo"]`, `["npm"]` or `["nuget"]`; each uses its ecosystem semantics, including prerelease rules. npm supports comparator sets, unions, caret/tilde, partial/wildcard and hyphen ranges. NuGet supports interval notation (`[1.0,2.0)`, `[1.2.3]`, `(,1.0]`), a bare inclusive minimum (`1.0`), whitespace-joined comparators (`>=1.2 <1.5.51`) and `\|\|` unions, with NuGet's ordering: up to four numeric parts, a prerelease below its release, and case-insensitive labels. Arbitrary sources and tags remain unresolved. |
 | `sources` | `:source`, `:sources` | Exact source identities. Registry URL and git revision identities remain distinct. |
 | `declared_by` | `:declared-by`, `:declared_by` | Established owning BuildProject IDs from build topology identity. |
 | `scopes` | `:scope`, `:scopes` | Recorded `compile`, `runtime`, `test`, `provided`, `optional`, `feature_gated`, or `unknown` scope. Cargo build requirements use `unknown` and retain their build kind as a condition. |
@@ -1432,8 +1447,8 @@ runtime configuration.
 ```
 
 The JSON relation is `dependency_configuration` with `owner`, `ecosystem`,
-`version_ranges`, `documents`, `overrides`, and `values`. npm and Cargo ranges
-use their existing ecosystem semantics. The same exact dependency row supplies
+`version_ranges`, `documents`, `overrides`, and `values`. npm, Cargo and NuGet
+ranges use their existing ecosystem semantics. The same exact dependency row supplies
 owner and version; declared ranges and peer constraints cannot prove mitigation.
 The configuration input selects one flat `.properties` key. Desired `values`
 are exact plain scalar spellings; escaped, continued, or interpolated values

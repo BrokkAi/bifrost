@@ -87,6 +87,7 @@ pub fn fully_populated_signature_metadata() -> SignatureMetadata {
     .with_cpp_field_linkage(CppFieldLinkage::InternalUnlessExternalPeer)
     .with_companion_object(true)
     .with_callable_modifiers(true, true, DeclaredVisibility::PackagePrivate)
+    .with_overload_discriminator(Some([0x75; 32]))
     .with_callable_parameter_types(vec!["String".to_string(), "Widget".to_string()])
     .with_callable_native(true)
     .with_class_like_kind(brokk_bifrost_core::analyzer::model::ClassLikeKind::Interface)

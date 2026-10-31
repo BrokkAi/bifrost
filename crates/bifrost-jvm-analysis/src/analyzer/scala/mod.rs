@@ -15,7 +15,7 @@ pub(crate) mod source_publication;
 #[doc(hidden)]
 pub mod source_storage;
 mod structural;
-mod syntax;
+pub(crate) mod syntax;
 
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
@@ -956,7 +956,7 @@ pub struct ScalaAnalyzer {
     source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
-            git2::Oid,
+            brokk_bifrost_core::gitblob::BlobKey,
             ProjectFile,
         ),
         Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>,
@@ -1484,17 +1484,27 @@ impl ScalaAnalyzer {
             '_,
         >,
     ) -> Option<ScalaProjectTypesSeed> {
-        let cached = memo.get()?;
-        session.adopt_answers(&cached.answers);
-        Some(
-            cached
-                .seed
-                .clone()
-                .with_file_facts_provider(scala_query_file_facts_provider(
-                    &self.inner,
-                    Arc::clone(&self.scala_query_file_facts_touched),
-                )),
-        )
+        let winner = memo.get()?;
+        Some(self.request_seed_from_winner(winner, session))
+    }
+
+    /// Adopt the published hierarchy answers and return its seed with fresh
+    /// request-local file facts. The published provider is inert.
+    fn request_seed_from_winner(
+        &self,
+        winner: &ScalaResolvedQuerySeed,
+        session: &brokk_bifrost_analysis::analyzer::relational_frontier::RelationalFrontierSession<
+            '_,
+        >,
+    ) -> ScalaProjectTypesSeed {
+        session.adopt_answers(&winner.answers);
+        winner
+            .seed
+            .clone()
+            .with_file_facts_provider(scala_query_file_facts_provider(
+                &self.inner,
+                Arc::clone(&self.scala_query_file_facts_touched),
+            ))
     }
 
     /// Resolve one already-built workspace seed and publish its hierarchy for
@@ -1539,13 +1549,7 @@ impl ScalaAnalyzer {
         });
         // A concurrent resolver may have published the winning seed. Its
         // hierarchy and recorded answers must travel together in this session.
-        session.adopt_answers(&cached.answers);
-        ScalaResolvedSeedOutcome::Ready(
-            cached
-                .seed
-                .clone()
-                .with_file_facts_provider(fresh_provider()),
-        )
+        ScalaResolvedSeedOutcome::Ready(self.request_seed_from_winner(cached, session))
     }
 
     fn retained_external_declaration_index(&self) -> Option<&JvmExternalDeclarationIndex> {
@@ -2492,11 +2496,11 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            let external_index = if changed_files.iter().any(is_jvm_dependency_input) {
-                Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new())
-            } else {
-                Arc::clone(&self.external_index)
-            };
+            let external_index = brokk_bifrost_analysis::analyzer::updated_external_index(
+                &self.external_index,
+                changed_files,
+                is_jvm_dependency_input,
+            );
             let mut updated = Self::from_inner(
                 self.inner.update(changed_files),
                 self.memo_budget,
@@ -3827,24 +3831,26 @@ mod dead_code_cache_tests {
             |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
         );
 
-        let updated = analyzer.update(&BTreeSet::new());
-        assert!(!updated.dead_code_usage_edges.read(
-            &memo_attribution(&updated),
-            |cache| cache.get(&key).is_some(),
-            |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
-        ));
-        let rebuilt = analyzer.update_all();
-        assert!(!rebuilt.dead_code_usage_edges.read(
-            &memo_attribution(&rebuilt),
-            |cache| cache.get(&key).is_some(),
-            |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
-        ));
-        let overlay = analyzer.clone_with_project(fixture.project_dyn());
-        assert!(!overlay.dead_code_usage_edges.read(
-            &memo_attribution(&overlay),
-            |cache| cache.get(&key).is_some(),
-            |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
-        ));
+        brokk_bifrost_analysis::analyzer::test_support::assert_dead_code_cache_reset_after_update_paths(
+            &analyzer,
+            &key,
+            |analyzer| {
+                analyzer.dead_code_usage_edges.read(
+                    &memo_attribution(analyzer),
+                    |cache| cache,
+                    |_| {
+                        AuthorityInputs::SourceOf(&[
+                            Language::Java,
+                            Language::Kotlin,
+                            Language::Scala,
+                        ])
+                    },
+                )
+            },
+            |analyzer| analyzer.update(&BTreeSet::new()),
+            |analyzer| analyzer.update_all(),
+            |analyzer| analyzer.clone_with_project(fixture.project_dyn()),
+        );
     }
 }
 

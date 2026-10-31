@@ -1,0 +1,117 @@
+== whole ==
+range=0..70 truncated=false
+(function :range (0 40) :name "first"
+  (identifier :range (3 8) :name "first"
+  )
+  (block :range (11 40)
+    (call :range (13 29) :name "alpha"
+      (callee :span (13 18) :name "alpha" :text "alpha")
+      (args :span (19 28) :name "long_name" :text "long_name")
+      (identifier :range (13 18) :name "alpha"
+      )
+      (identifier :range (19 28) :name "long_name"
+      )
+    )
+    (call :range (31 37) :name "beta"
+      (callee :span (31 35) :name "beta" :text "beta")
+      (identifier :range (31 35) :name "beta"
+      )
+    )
+  )
+)
+(function :range (41 70) :name "second_long"
+  (identifier :range (44 55) :name "second_long"
+  )
+  (block :range (58 70)
+    (call :range (60 67) :name "gamma"
+      (callee :span (60 65) :name "gamma" :text "gamma")
+      (identifier :range (60 65) :name "gamma"
+      )
+    )
+  )
+)
+
+== siblings ==
+range=0..70 truncated=false
+(function :range (0 40) :name "first"
+  (identifier :range (3 8) :name "first"
+  )
+  (block :range (11 40)
+    (call :range (13 29) :name "alpha"
+      (callee :span (13 18) :name "alpha" :text "alpha")
+      (args :span (19 28) :name "long_name" :text "long_name")
+      (identifier :range (13 18) :name "alpha"
+      )
+      (identifier :range (19 28) :name "long_name"
+      )
+    )
+    (call :range (31 37) :name "beta"
+      (callee :span (31 35) :name "beta" :text "beta")
+      (identifier :range (31 35) :name "beta"
+      )
+    )
+  )
+)
+(function :range (41 70) :name "second_long"
+  (identifier :range (44 55) :name "second_long"
+  )
+  (block :range (58 70)
+    (call :range (60 67) :name "gamma"
+      (callee :span (60 65) :name "gamma" :text "gamma")
+      (identifier :range (60 65) :name "gamma"
+      )
+    )
+  )
+)
+
+== call ==
+range=13..29 truncated=false
+(call :range (13 29) :name "alpha"
+  (callee :span (13 18) :name "alpha" :text "alpha")
+  (args :span (19 28) :name "long_name" :text "long_name")
+  (identifier :range (13 18) :name "alpha"
+  )
+  (identifier :range (19 28) :name "long_name"
+  )
+)
+
+== cursor ==
+range=19..28 truncated=false
+(identifier :range (19 28) :name "long_name"
+)
+
+== exact input ==
+range=0..70 truncated=false
+(function :range (0 40) :name "first"
+  (identifier :range (3 8) :name "first"
+  )
+  (block :range (11 40)
+    (call :range (13 29) :name "alpha"
+      (callee :span (13 18) :name "alpha" :text "alpha")
+      (args :span (19 28) :name "long_name" :text "long_name")
+      (identifier :range (13 18) :name "alpha"
+      )
+      (identifier :range (19 28) :name "long_name"
+      )
+    )
+    (call :range (31 37) :name "beta"
+      (callee :span (31 35) :name "beta" :text "beta")
+      (identifier :range (31 35) :name "beta"
+      )
+    )
+  )
+)
+(function :range (41 70) :name "second_long"
+  (identifier :range (44 55) :name "second_long"
+  )
+  (block :range (58 70)
+    (call :range (60 67) :name "gamma"
+      (callee :span (60 65) :name "gamma" :text "gamma")
+      (identifier :range (60 65) :name "gamma"
+      )
+    )
+  )
+)
+
+== over input ==
+source is 70 bytes; Rune IR accepts at most 69 bytes per request

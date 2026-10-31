@@ -851,7 +851,7 @@ fn php_interface_method_declaration_outcome(
     let mut stack = if let Some(session) = session {
         php_direct_ancestor_units_bounded(php, support, &owner, session)
     } else {
-        php.get_direct_ancestors(&owner)
+        php.get_direct_ancestors(&owner).definite().to_vec()
     };
     let mut seen = HashSet::default();
     while let Some(ancestor) = stack.pop() {
@@ -877,7 +877,7 @@ fn php_interface_method_declaration_outcome(
         stack.extend(if let Some(session) = session {
             php_direct_ancestor_units_bounded(php, support, &ancestor, session)
         } else {
-            php.get_direct_ancestors(&ancestor)
+            php.get_direct_ancestors(&ancestor).definite().to_vec()
         });
     }
     if candidates.is_empty() {
@@ -1746,7 +1746,7 @@ fn php_direct_member_owner_fqns(
     let ancestors = if let Some(session) = session {
         php_direct_ancestor_units_bounded(php, support, &child, session)
     } else {
-        php.get_direct_ancestors(&child)
+        php.get_direct_ancestors(&child).definite().to_vec()
     };
     ancestors
         .into_iter()

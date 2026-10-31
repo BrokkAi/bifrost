@@ -15,7 +15,8 @@ test("declares each Bifrost release target", () => {
   assert.deepEqual(
     PLATFORMS.map((platform) => platform.target),
     [
-      "universal-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
       "x86_64-unknown-linux-gnu",
       "aarch64-unknown-linux-gnu",
       "aarch64-linux-android",
@@ -63,5 +64,7 @@ test("narrows the packaged platforms to named targets and refuses unknown ones",
     ["@brokkai/bifrost-linux-x64-gnu"],
   );
   assert.throws(() => selectPlatforms(["x86_64-unknown-linux-musl"]), /unknown release targets/);
+  // npm refused the universal macOS tarball as too large (#8288); macOS ships one package per CPU.
+  assert.throws(() => selectPlatforms(["universal-apple-darwin"]), /unknown release targets/);
   assert.throws(() => selectPlatforms([]), /unknown release targets/);
 });

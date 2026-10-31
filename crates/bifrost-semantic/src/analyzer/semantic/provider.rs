@@ -1603,6 +1603,7 @@ impl SemanticExecutionBudget {
         let Some((_, attempted_traversal)) =
             Self::replay_charge_totals(&state, expected_before, charge)
         else {
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
             return false;
         };
         if !charge.materialized_files.is_empty() {
@@ -1634,6 +1635,7 @@ impl SemanticExecutionBudget {
             .saturating_add(state.materialized_files.len());
         if used >= state.max_materialized_files {
             state.exhausted = true;
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
             return false;
         }
         Arc::make_mut(&mut state.materialized_files).insert(file.clone());
@@ -1660,6 +1662,7 @@ impl SemanticExecutionBudget {
             .and_then(|used| used.checked_add(materialized_files))
         else {
             state.exhausted = true;
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
             return false;
         };
         let attempted_traversal = state.traversal_steps.saturating_add(traversal_steps);
@@ -1669,6 +1672,7 @@ impl SemanticExecutionBudget {
                 .is_some_and(|limit| traversal_steps > limit.saturating_sub(state.traversal_steps))
         {
             state.exhausted = true;
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
             return false;
         }
         state.externally_materialized_files += materialized_files;
@@ -2030,25 +2034,43 @@ pub enum SemanticProviderError {
 }
 
 impl SemanticProviderError {
+    pub fn invalid_artifact(error: SemanticIrError) -> Self {
+        error.into()
+    }
+
+    pub fn source_admission_refused(
+        file: brokk_bifrost_core::analyzer::model::ProjectFile,
+        reason: crate::analyzer::semantic::source_admission::SourceAdmissionRefusal,
+    ) -> Self {
+        if !reason.is_intrinsic_source_rejection() {
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+        }
+        Self::SourceAdmissionRefused { file, reason }
+    }
+
     pub fn is_intrinsic_source_rejection(&self) -> bool {
         matches!(self, Self::SourceAdmissionRefused { reason, .. } if reason.is_intrinsic_source_rejection())
     }
 
     pub fn source_access(detail: impl Into<String>) -> Self {
+        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
         Self::SourceAccess(detail.into().into_boxed_str())
     }
 
     pub fn invalid_identity(detail: impl Into<String>) -> Self {
+        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
         Self::InvalidIdentity(detail.into().into_boxed_str())
     }
 
     pub fn internal(detail: impl Into<String>) -> Self {
+        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
         Self::Internal(detail.into().into_boxed_str())
     }
 }
 
 impl From<SemanticIrError> for SemanticProviderError {
     fn from(error: SemanticIrError) -> Self {
+        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
         Self::InvalidArtifact(error)
     }
 }

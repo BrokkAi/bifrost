@@ -291,3 +291,76 @@ fn the_canonical_projection_round_trips_through_parse() {
     let second = parse(&source).to_normalized_authored_json();
     assert_eq!(first, second, "the projection must be deterministic");
 }
+
+#[test]
+fn exact_catalog_predicate_requires_the_named_registered_version() {
+    use crate::catalog::TaintCatalogDefinition;
+    use crate::definition::{PolicyCategoryId, PolicyId};
+    use crate::resolved::ResolvedEndpointIdentity;
+
+    let mut catalogs =
+        TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
+    catalogs
+        .register(TaintCatalogDefinition {
+            schema_version: 1,
+            name: PolicyId::new("test.inputs").unwrap(),
+            version: 1,
+            categories: vec![PolicyCategoryId::new("input.user").unwrap()],
+            sources: vec![crate::test_support::taint_source_spec(
+                "request",
+                "Request",
+                "request",
+                "untrusted",
+            )],
+            sinks: vec![],
+            sanitizers: vec![],
+            transforms: vec![],
+            external_models: vec![],
+        })
+        .unwrap();
+    let catalogs = Arc::new(catalogs);
+    for (name, version, accepted) in [
+        ("test.inputs", 1, true),
+        ("test.inputs", 2, false),
+        ("test.missing", 1, false),
+    ] {
+        let source = format!(
+            r#"(policy :id test.catalog :name "Catalog" :message "Flow" :severity warning
+          :analysis (analysis :type taint :mode may
+            :sources (endpoint-set :include-sets [(catalog :name test.inputs :version 1)])
+            :sinks (endpoint-set :entries [(sink :id output :display-name "Output" :categories [output.data]
+              :selector (rql (call :callee (name "sink"))) :dangerous-operand (argument :index 0) :accepts [untrusted])])
+            :finding-combinations [(finding-combination :id exact
+              :source (endpoints [(endpoint-ref :catalog (catalog :name {name} :version {version}) :entry request)])
+              :sink (endpoints [(endpoint-ref :local output)]) :message "Exact pair")]))"#
+        );
+        let mut registry = PolicyRegistry::new_without_workspace(
+            Arc::clone(&catalogs),
+            PolicyRegistryLimits::default(),
+        );
+        let result = registry.register_policy_bytes(
+            PolicySourceIdentity::new("test:catalog-predicate"),
+            source.as_bytes(),
+        );
+        if accepted {
+            let loaded = result.unwrap();
+            let resolved = loaded.resolved_taint().unwrap();
+            let [ResolvedEndpointIdentity::Catalog { catalog, entry_id }] =
+                resolved.finding_combinations[0].source_endpoints.as_slice()
+            else {
+                panic!("{:?}", resolved.finding_combinations);
+            };
+            assert_eq!(catalog.name.as_str(), "test.inputs");
+            assert_eq!(catalog.version, 1);
+            assert_eq!(entry_id.as_str(), "request");
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(name)
+                    && error.contains(&format!("version {version}"))
+                    && error.contains("not registered"),
+                "{error}"
+            );
+        }
+    }
+}

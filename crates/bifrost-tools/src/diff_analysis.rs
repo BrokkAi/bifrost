@@ -3147,6 +3147,22 @@ impl Project for RevisionImageProject {
         )
     }
 
+    fn read_file_snapshot(
+        &self,
+        file: &ProjectFile,
+    ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectFileSnapshot> {
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || match self.revision_bytes(file) {
+                Some(bytes) => {
+                    bytes.map(brokk_bifrost_core::analyzer::project::ProjectFileSnapshot::disk)
+                }
+                None => self.files.read_file_snapshot(file),
+            },
+            |snapshot| Some(snapshot.oid()),
+        )
+    }
     fn read_source_snapshot(
         &self,
         file: &ProjectFile,

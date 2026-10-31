@@ -195,8 +195,11 @@ if (run.policy_hash !== policies[0].resolved_semantic_hash) {
 const positiveStatus = readStatus("positive");
 const reasons = run.completion?.reasons ?? [];
 const diagnostics = run.diagnostics ?? [];
+// Bifrost's own inconclusive verdict is advisory (#8111): with no gating
+// finding and only warning diagnostics the batch exits 0, and the verdict
+// lives in the run's completion.
 const knownDispatchPartial =
-  positiveStatus === 2 &&
+  positiveStatus === 0 &&
   run.findings.length === 0 &&
   run.completion?.type === "inconclusive" &&
   reasons.length === 1 &&
@@ -228,14 +231,26 @@ if (positiveStatus === 0 && run.completion?.type === "complete" && run.findings.
 }
 
 for (const label of ["missing", "corrupt", "incompatible"]) {
-  if (readStatus(label) === 0) throw new Error(`${label} catalog was reported clean`);
   const value = readJson(label);
   if (value.runs?.some((candidate) => candidate.completion?.type === "complete" && candidate.findings?.length === 0)) {
     throw new Error(`${label} catalog produced a complete clean policy run`);
   }
 }
 
+// Without JAVA_HOME the run is Bifrost's own inconclusive verdict, which is
+// advisory and exits 0. An unreadable or too-new catalog is an error-severity
+// pack-activation-failed diagnostic, which still exits 2.
+const missingStatus = readStatus("missing");
 const missing = readJson("missing");
+const missingRun = missing.runs?.find((entry) => entry.policy_id === run.policy_id);
+if (missingStatus !== 0 || missingRun?.completion?.type !== "inconclusive") {
+  throw new Error(
+    `missing-JAVA_HOME acceptance was not an advisory inconclusive run: exit=${missingStatus} completion=${JSON.stringify(missingRun?.completion)}`,
+  );
+}
+for (const label of ["corrupt", "incompatible"]) {
+  if (readStatus(label) === 0) throw new Error(`${label} catalog was reported clean`);
+}
 if (missing.packs?.decisions?.some((decision) => decision.pack.startsWith("bifrost.jdk@") && decision.status === "selected")) {
   throw new Error("the missing-JAVA_HOME acceptance unexpectedly selected a curated JDK pack");
 }

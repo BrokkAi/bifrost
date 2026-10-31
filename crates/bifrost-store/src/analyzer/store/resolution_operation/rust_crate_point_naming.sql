@@ -2,6 +2,7 @@ SELECT json(naming.package_components), json(naming.root_components)
 FROM selected_workspace_file_versions AS file
 CROSS JOIN main.blobs AS blob
  ON blob.blob_oid=file.blob_oid AND blob.lang=file.lang AND blob.generation=file.generation
+AND blob.parse_variant=x''
 CROSS JOIN main.resolution_unit_summary_members AS candidate
  INDEXED BY resolution_unit_summary_members_blob
  ON candidate.blob_id=blob.id AND candidate.rel_path=file.rel_path

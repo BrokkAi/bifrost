@@ -114,12 +114,7 @@ impl EnvironmentOptionField {
     }
 }
 
-pub(super) fn validate_regex(
-    source: &str,
-    range: Range<usize>,
-    path: &str,
-    analysis: &mut Analysis,
-) {
+pub(super) fn validate_regex(source: &str, range: Range<usize>, analysis: &mut Analysis) {
     if source.len() > MAX_STRING_PREDICATE_LENGTH {
         analysis.error(
             range,
@@ -128,8 +123,6 @@ pub(super) fn validate_regex(
         );
     } else if let Err(error) = Regex::new(source) {
         analysis.error(range, "invalid-query", format!("invalid regex: {error}"));
-    } else {
-        analysis.path(path, range);
     }
 }
 

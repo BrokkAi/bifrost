@@ -1478,18 +1478,6 @@ pub(crate) enum StoredTypestateFindingAnchor {
     },
 }
 
-impl RetainedSize for TypestatePolicyProjectionFacts {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.source_endpoint))
-            .saturating_add(retained_extra(&self.source_categories))
-            .saturating_add(self.source_display_name.capacity())
-            .saturating_add(retained_extra(&self.violation_site))
-            .saturating_add(retained_extra(&self.violation))
-            .saturating_add(retained_extra(&self.scenario_ids))
-    }
-}
-
 /// What one typestate finding is, said only in facts the finding owns.
 ///
 /// Every field is derived from the violation itself and from mount-free

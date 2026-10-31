@@ -353,6 +353,7 @@ pub struct EnvironmentFileResult {
     /// candidate list a lookup returns is the same set the linear filter kept,
     /// in the same order.
     bindings_by_name: HashMap<Box<str>, Vec<usize>>,
+    type_parameter_barriers: Vec<Range>,
 }
 
 impl EnvironmentFileResult {
@@ -382,6 +383,7 @@ impl EnvironmentFileResult {
             package,
             completeness,
             bindings_by_name,
+            type_parameter_barriers: Vec::new(),
         }
     }
 
@@ -474,16 +476,15 @@ pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Env
     };
 
     let mut bindings = Vec::new();
+    let mut type_parameter_barriers = Vec::new();
     if support.is_supported(EnvironmentAxis::BindingIntervals) && !scopes.is_empty() {
         match parse_tree_for_language(file, language, facts.source()) {
-            Some(tree) => bindings.extend(binding_rows(
-                spec,
-                file,
-                &facts,
-                &scopes,
-                tree.root_node(),
-                &mut reasons,
-            )),
+            Some(tree) => {
+                let (rows, barriers) =
+                    binding_rows(spec, file, &facts, &scopes, tree.root_node(), &mut reasons);
+                bindings.extend(rows);
+                type_parameter_barriers = barriers;
+            }
             None => reasons.push(EnvironmentIncompleteReason::SyntaxUnavailable),
         }
     }
@@ -502,7 +503,9 @@ pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Env
 
     let package = package_clause(analyzer, file, language);
     let completeness = completeness(support, reasons);
-    EnvironmentFileResult::new(scopes, bindings, package, completeness)
+    let mut environment = EnvironmentFileResult::new(scopes, bindings, package, completeness);
+    environment.type_parameter_barriers = type_parameter_barriers;
+    environment
 }
 
 fn unavailable(file: &ProjectFile, reason: EnvironmentIncompleteReason) -> EnvironmentFileResult {
@@ -610,7 +613,7 @@ fn binding_rows(
     scopes: &[ScopeRow],
     root: tree_sitter::Node<'_>,
     reasons: &mut Vec<EnvironmentIncompleteReason>,
-) -> Vec<BindingRow> {
+) -> (Vec<BindingRow>, Vec<Range>) {
     let content_identity = facts.source_identity();
     let source = facts.source();
     let mut scope_of_node: Vec<Option<u32>> = vec![None; facts.nodes().len()];
@@ -653,77 +656,123 @@ fn binding_rows(
             import: None,
         }
     };
-    let mut rows = Vec::new();
-    for node in 0..facts.nodes().len() {
-        let node = u32::try_from(node).expect("facts arena node count fits in u32");
+    // Index only binding candidates. The syntax walk below also collects
+    // barriers, including owners such as static fields that have no scope row.
+    let mut candidates_by_syntax: HashMap<_, Vec<_>> = HashMap::new();
+    for (index, normalized) in facts.nodes().iter().enumerate() {
+        let node = u32::try_from(index).expect("facts arena node count fits in u32");
         let roles = facts.occurrence_roles(node);
-        let is_binder = roles.contains(&OccurrenceRole::Binder);
-        let is_declaration_name = roles.contains(&OccurrenceRole::DeclarationName);
-        if !is_binder && !is_declaration_name {
-            continue;
-        }
-        let normalized = facts.node(node);
-        binder_nodes_by_range.insert(
-            (normalized.range.start_byte, normalized.range.end_byte),
-            node,
-        );
-        // Facts select named syntax nodes. A contextual identifier can wrap an
-        // anonymous keyword at the same range; use the wrapper's binding role.
-        let Some(binder) = root.named_descendant_for_byte_range(
-            normalized.range.start_byte,
-            normalized.range.end_byte,
-        ) else {
-            super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
-            continue;
-        };
-        let mut candidate_index = enclosing_scope(facts, &scope_of_node, node);
-        let declaring_scope = loop {
-            let Some(candidate) = scope_syntax[candidate_index as usize] else {
-                break None;
-            };
-            match spec.binding_scope_selection(binder, candidate) {
-                BindingScopeSelection::Use => break Some(candidate_index),
-                BindingScopeSelection::Continue => {
-                    let Some(parent) = scopes[candidate_index as usize].parent_scope else {
-                        break None;
-                    };
-                    debug_assert!(parent < candidate_index, "scope parents precede children");
-                    candidate_index = parent;
-                }
-                BindingScopeSelection::Unknown => break None,
-            }
-        };
-        let Some(declaring_scope) = declaring_scope else {
-            super::note_once(
-                reasons,
-                EnvironmentIncompleteReason::BindingActivationUnknown,
-            );
-            continue;
-        };
-        // Member-space owners still declare members rather than lexical names.
-        if scopes[declaring_scope as usize]
-            .anchor
-            .kind()
-            .is_some_and(|kind| spec.scope_formation(kind) == ScopeFormation::MemberScope)
+        if roles.contains(&OccurrenceRole::Binder)
+            || roles.contains(&OccurrenceRole::DeclarationName)
         {
-            continue;
+            let range = (normalized.range.start_byte, normalized.range.end_byte);
+            binder_nodes_by_range.insert(range, node);
+            // Preserve the fact-to-syntax join for contextual wrappers and
+            // explicit subspans instead of assuming exact range equality.
+            let Some(binder) = root.named_descendant_for_byte_range(range.0, range.1) else {
+                super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
+                continue;
+            };
+            candidates_by_syntax
+                .entry(binder.id())
+                .or_default()
+                .push(node);
         }
-        let activation = if is_binder {
-            spec.binding_activation(binder, scopes[declaring_scope as usize].range)
-        } else {
-            spec.declaration_binding_activation(binder, scopes[declaring_scope as usize].range)
+    }
+    let mut rows = Vec::new();
+    let mut barriers = Vec::new();
+    let mut pending = vec![root];
+    while let Some(syntax) = pending.pop() {
+        let mut cursor = syntax.walk();
+        pending.extend(syntax.named_children(&mut cursor));
+        if spec.type_parameter_scope_barrier(syntax) {
+            barriers.push(Range {
+                start_byte: syntax.start_byte(),
+                end_byte: syntax.end_byte(),
+                start_line: syntax.start_position().row + 1,
+                end_line: syntax.end_position().row + 1,
+            });
+        }
+        let Some(candidates) = candidates_by_syntax.remove(&syntax.id()) else {
+            continue;
         };
-        let Some(activation) = activation else {
-            if is_binder {
+        for node in candidates {
+            let roles = facts.occurrence_roles(node);
+            let is_binder = roles.contains(&OccurrenceRole::Binder);
+            let binder = syntax;
+            let type_owner = spec.type_parameter_owner(binder);
+            let mut candidate_index = enclosing_scope(facts, &scope_of_node, node);
+            let declaring_scope = loop {
+                let Some(candidate) = scope_syntax[candidate_index as usize] else {
+                    break None;
+                };
+                let selection = if let Some(owner) = type_owner {
+                    if scopes[candidate_index as usize].range.start_byte == owner.start_byte()
+                        && scopes[candidate_index as usize].range.end_byte == owner.end_byte()
+                    {
+                        BindingScopeSelection::Use
+                    } else {
+                        BindingScopeSelection::Continue
+                    }
+                } else {
+                    spec.binding_scope_selection(binder, candidate)
+                };
+                match selection {
+                    BindingScopeSelection::Use => break Some(candidate_index),
+                    BindingScopeSelection::Continue => {
+                        let Some(parent) = scopes[candidate_index as usize].parent_scope else {
+                            break None;
+                        };
+                        debug_assert!(parent < candidate_index, "scope parents precede children");
+                        candidate_index = parent;
+                    }
+                    BindingScopeSelection::Unknown => break None,
+                }
+            };
+            let Some(declaring_scope) = declaring_scope else {
                 super::note_once(
                     reasons,
                     EnvironmentIncompleteReason::BindingActivationUnknown,
                 );
+                continue;
+            };
+            if type_owner.is_none()
+                && scopes[declaring_scope as usize]
+                    .anchor
+                    .kind()
+                    .is_some_and(|kind| spec.scope_formation(kind) == ScopeFormation::MemberScope)
+            {
+                continue;
             }
-            continue;
-        };
-        rows.push(make_row(node, declaring_scope, activation));
+            let activation = if type_owner.is_some() {
+                Some(super::resolution::BindingActivation {
+                    kind: BindingKind::TypeParameter,
+                    hoisting: HoistingClass::ScopeWide,
+                    activation: scopes[declaring_scope as usize].range,
+                })
+            } else if is_binder {
+                spec.binding_activation(binder, scopes[declaring_scope as usize].range)
+            } else {
+                spec.declaration_binding_activation(binder, scopes[declaring_scope as usize].range)
+            };
+            let Some(activation) = activation else {
+                if is_binder {
+                    super::note_once(
+                        reasons,
+                        EnvironmentIncompleteReason::BindingActivationUnknown,
+                    );
+                }
+                continue;
+            };
+            rows.push(make_row(node, declaring_scope, activation));
+        }
     }
+    debug_assert!(
+        candidates_by_syntax.is_empty(),
+        "all selected named nodes were visited"
+    );
+    // Keep fact order, including ties, before appending implicit binders.
+    rows.sort_by_key(|row| row.node);
     for (scope, syntax) in scopes.iter().zip(scope_syntax) {
         let Some(BindingScopeCandidate::Syntax(scope_node)) = syntax else {
             continue;
@@ -761,7 +810,7 @@ fn binding_rows(
             rows.push(make_row(node, scope.index, activation));
         }
     }
-    rows
+    (rows, barriers)
 }
 
 /// The local names this file's imports introduce.
@@ -1109,6 +1158,16 @@ pub fn binding_of(
                 .as_ref()
                 .is_some_and(|detail| detail.wildcard)
                 && namespace.is_none_or(|wanted| binding.occupies(wanted))
+                && (binding.kind != BindingKind::TypeParameter
+                    || !env.type_parameter_barriers.iter().any(|barrier| {
+                        let owner = &env.scopes[binding.declaring_scope as usize].range;
+                        barrier.start_byte <= position_byte
+                            && position_byte < barrier.end_byte
+                            && owner.start_byte <= barrier.start_byte
+                            && barrier.end_byte <= owner.end_byte
+                            && (owner.start_byte != barrier.start_byte
+                                || owner.end_byte != barrier.end_byte)
+                    }))
                 && binding.is_active_at(position_byte)
                 && ancestry.contains(&binding.declaring_scope)
         })
@@ -1212,7 +1271,7 @@ mod tests {
         }
         let scopes = scope_rows(spec, &file, &facts);
         let mut reasons = vec![];
-        let mut bindings =
+        let (mut bindings, _) =
             binding_rows(spec, &file, &facts, &scopes, tree.root_node(), &mut reasons);
         let query = AnalyzerQueryScope::new(&analyzer);
         bindings.extend(import_binder_rows(

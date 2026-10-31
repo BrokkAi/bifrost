@@ -181,7 +181,7 @@ pub const PRIOR_HEADS_SQL: &str =
 
 pub(crate) const CANONICAL_SOURCE_SQL: &str = "SELECT f.file_version_id,f.blob_oid,m.content_package,manifest.publication_state,manifest.facts_version
                              FROM workspace_file_versions f
-                             LEFT JOIN blobs b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.generation=f.generation
+                             LEFT JOIN blobs b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.parse_variant=x'' AND b.generation=f.generation
                              LEFT JOIN blob_meta m ON m.blob_id=b.id
                              LEFT JOIN source_fact_manifests manifest ON manifest.blob_id=b.id
                              WHERE f.workspace_id=?1 AND f.lang='go' AND f.generation=?2 AND f.input_kind='source'
@@ -1343,7 +1343,7 @@ pub(crate) const SOURCE_INVENTORY_SQL: &str =
      FROM workspace_file_versions f
      LEFT JOIN workspace_file_anchor_rows a ON a.file_version_id=f.file_version_id
        AND a.anchor_kind='own_module' AND a.anchor_pop=0
-     LEFT JOIN blobs b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.generation=f.generation
+     LEFT JOIN blobs b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.parse_variant=x'' AND b.generation=f.generation
      LEFT JOIN blob_meta m ON m.blob_id=b.id
      LEFT JOIN source_fact_manifests manifest ON manifest.blob_id=b.id
      LEFT JOIN source_go_manifests go_manifest ON go_manifest.blob_id=b.id
@@ -1786,9 +1786,9 @@ impl AnalyzerStore {
                AND previous.lang=current.lang AND previous.generation=current.generation
                AND previous.input_kind=current.input_kind AND previous.rel_path=current.rel_path
                AND previous.valid_from<=?4 AND (previous.valid_until IS NULL OR ?4<previous.valid_until)
-             JOIN blobs old_blob ON old_blob.blob_oid=previous.blob_oid AND old_blob.lang='go' AND old_blob.generation=current.generation
+             JOIN blobs old_blob ON old_blob.blob_oid=previous.blob_oid AND old_blob.lang='go' AND old_blob.parse_variant=x'' AND old_blob.generation=current.generation
              JOIN source_go_manifests old ON old.blob_id=old_blob.id
-             JOIN blobs new_blob ON new_blob.blob_oid=current.blob_oid AND new_blob.lang='go' AND new_blob.generation=current.generation
+             JOIN blobs new_blob ON new_blob.blob_oid=current.blob_oid AND new_blob.lang='go' AND new_blob.parse_variant=x'' AND new_blob.generation=current.generation
              JOIN source_go_manifests new ON new.blob_id=new_blob.id AND new.membership_digest=old.membership_digest
              WHERE current.workspace_id=?1 AND current.lang='go' AND current.generation=?2 AND current.input_kind='source'
                AND current.valid_from<=?3 AND (current.valid_until IS NULL OR ?3<current.valid_until)")?
@@ -1820,9 +1820,9 @@ impl AnalyzerStore {
                 // digests, including new unsaved files, never prove equality.
                 let same_disk_header: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM workspace_file_versions recorded
-                     JOIN blobs old_blob ON old_blob.blob_oid=recorded.blob_oid AND old_blob.lang=recorded.lang AND old_blob.generation=recorded.generation
+                     JOIN blobs old_blob ON old_blob.blob_oid=recorded.blob_oid AND old_blob.lang=recorded.lang AND old_blob.parse_variant=x'' AND old_blob.generation=recorded.generation
                      JOIN source_go_manifests old ON old.blob_id=old_blob.id
-                     JOIN blobs new_blob ON new_blob.blob_oid=?5 AND new_blob.lang=recorded.lang AND new_blob.generation=recorded.generation
+                     JOIN blobs new_blob ON new_blob.blob_oid=?5 AND new_blob.lang=recorded.lang AND new_blob.parse_variant=x'' AND new_blob.generation=recorded.generation
                      JOIN source_go_manifests new ON new.blob_id=new_blob.id AND new.membership_digest=old.membership_digest
                      WHERE recorded.workspace_id=?1 AND recorded.lang='go' AND recorded.generation=?2
                        AND recorded.input_kind='source' AND recorded.rel_path=?3 AND recorded.blob_oid=?4)",

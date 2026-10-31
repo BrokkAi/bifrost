@@ -1,6 +1,8 @@
 use super::super::demand::{DemandLanguage, LanguageClosure, LanguagePrefixInputs};
 use super::super::demand_closure::*;
 use super::*;
+use crate::analyzer::resolution::ClosedQueryScope;
+
 use crate::analyzer::resolution::{
     DemandMemberSelectionOutcome, DemandRelationKey, DemandRootDiscovery, DemandRootProvider,
 };
@@ -243,6 +245,9 @@ impl<P: DemandRootProvider> DemandRootProvider for Observed<'_, P> {
         reasons: &BTreeSet<SemanticId>,
     ) {
         self.inner.retain_member_provider_reasons(endpoint, reasons);
+    }
+    fn resolved_query_scope(&self, endpoint: &DemandRelationKey) -> Option<ClosedQueryScope> {
+        self.inner.resolved_query_scope(endpoint)
     }
     fn resolved_closure_discharges(
         &self,
@@ -1273,6 +1278,19 @@ impl DemandLanguage for OrderLanguage<'_, '_, '_> {
     ) -> Result<LanguageClosure> {
         self.inner
             .close_selected_members(endpoint, question, context, inputs, selection)
+    }
+    fn finish_closure(
+        &mut self,
+        endpoint: &DemandRelationKey,
+        question: &RootFrame,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+        closure: &mut LanguageClosure,
+    ) {
+        self.inner
+            .finish_closure(endpoint, question, inputs, closure);
+    }
+    fn retained_query_scope(&self, endpoint: &DemandRelationKey) -> Option<ClosedQueryScope> {
+        self.inner.retained_query_scope(endpoint)
     }
     fn cancel_close_root(&mut self, endpoint: &EndpointSignature) {
         self.inner.cancel_close_root(endpoint);
