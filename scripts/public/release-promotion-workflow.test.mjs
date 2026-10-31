@@ -3,6 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { PLATFORMS as NPM_PLATFORMS } from "../../npm/scripts/package-release.mjs";
+
 const release = readFileSync(
   new URL("../../.github/workflows/release.yml", import.meta.url),
   "utf8",
@@ -521,7 +523,11 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   assert.match(publishNpm, /actions\/download-artifact@[0-9a-f]{40}/u);
   assert.match(publishNpm, /--dist "\$RUNNER_TEMP\/npm-qualified"/u);
   assert.match(publishNpm, /brokkai-dsh-plugin-bifrost-/u);
-  assert.match(publishNpm, /test "\$\{#files\[@\]\}" -eq 8/u);
+  // The root package, one package per platform, and the DSH bundle.
+  assert.match(
+    publishNpm,
+    new RegExp(`test "\\$\\{#files\\[@\\]\\}" -eq ${NPM_PLATFORMS.length + 2}\\n`, "u"),
+  );
   assert.doesNotMatch(publishNpm, /^\s*npm\s+pack\b/mu);
 });
 
