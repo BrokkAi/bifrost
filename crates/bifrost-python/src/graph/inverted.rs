@@ -837,6 +837,42 @@ fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[FunctionSco
     {
         return;
     }
+    let cutoff = if python_reference_is_deferred_function_body(node) {
+        usize::MAX
+    } else {
+        node.start_byte()
+    };
+    let selected = ctx.module_bindings.get(text).and_then(|events| {
+        let mut visible = crate::usage_index::visible_module_binding_suffix(events, cutoff);
+        let event = visible.next()?;
+        (visible.next().is_none() && !event.conditional).then_some(event)
+    });
+    if let Some(binding) = selected
+        && ctx.edges.record_missing_relative_import_site(
+            ctx.input,
+            text,
+            binding,
+            node,
+            |binding| {
+                let ModuleBindingEventKind::FromImport { module, .. } = &binding.kind else {
+                    return None;
+                };
+                (module.starts_with('.')
+                    && module != "."
+                    && usage_resolve_module_files(ctx.python, ctx.file, module).is_empty())
+                .then(|| brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportGap {
+                    target: module.clone(),
+                    kind: if ctx.python.usage_index().relative_module_leaves_workspace(ctx.file, module) {
+                        brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportGapKind::OutsideWorkspace
+                    } else {
+                        brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportGapKind::Absent
+                    },
+                })
+            },
+        )
+    {
+        return;
+    }
     if let Some(callee) = ctx.bare_callee(text, node) {
         ctx.record(callee, node);
     }

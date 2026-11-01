@@ -26,6 +26,23 @@ AND NOT EXISTS (SELECT 1 FROM main.resolution_package_route_segments e
  WHERE e.blob_id=r.blob_id AND e.package_scope_node_key=r.package_scope_node_key
  AND e.ordinal>=json_array_length(:segments))
 "#;
+// Every declared namespace segment contributes a Type lookup to the semantic
+// catalog. Seek by the requested last segment, then verify the complete route.
+pub const NAMESPACE_CANDIDATES: &str = r#"
+SELECT DISTINCT m.mount_ordinal
+FROM main.resolution_semantic_catalog l INDEXED BY resolution_semantic_catalog_shared_identity
+CROSS JOIN main.resolution_package_routes r ON r.blob_id=l.blob_id
+CROSS JOIN temp.selected_resolution_mounts m INDEXED BY selected_resolution_mounts_blob_ordinal ON m.blob_id=r.blob_id
+CROSS JOIN temp.selected_resolution_scope_mounts a ON a.mount_ordinal=m.mount_ordinal
+WHERE l.shared_identity=:lookup AND m.storage_language='csharp'
+AND NOT EXISTS (SELECT 1 FROM json_each(:segments) w WHERE NOT EXISTS (
+ SELECT 1 FROM main.resolution_package_route_segments s
+ WHERE s.blob_id=r.blob_id AND s.package_scope_node_key=r.package_scope_node_key
+ AND s.ordinal=CAST(w.key AS INTEGER) AND s.spelling=w.value))
+AND NOT EXISTS (SELECT 1 FROM main.resolution_package_route_segments e
+ WHERE e.blob_id=r.blob_id AND e.package_scope_node_key=r.package_scope_node_key
+ AND e.ordinal>=json_array_length(:segments))
+"#;
 pub const STAGED_CANDIDATES: &str = r#"
 SELECT m.mount_ordinal,m.blob_id,p.token_key,p.domain_shared,p.definition_key,p.source_site,p.root_scope_key,p.namespace,p.lookup_shared
 FROM temp.selected_resolution_stage_package_members candidate
@@ -70,20 +87,32 @@ impl PackagePlanRules for CSharpNamespaceRules<'_, '_, '_, '_> {
         references: &[LoweredPackageReference],
         cancellation: &CancellationToken,
     ) -> Result<SelectedPackageRows<Self::Index>> {
+        self.read_lookups(
+            source,
+            &references.iter().map(|r| r.lookup).collect::<Vec<_>>(),
+            cancellation,
+        )
+    }
+}
+
+impl CSharpNamespaceRules<'_, '_, '_, '_> {
+    fn read_lookups(
+        &self,
+        source: &CSharpNamespaceLevel,
+        lookups: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedPackageRows<Vec<NamespaceMember>>> {
         let ready = self.ready;
         let conn = ready.inventory.connection();
         let names = ready.shared_names();
         let segments = serde_json::to_string(&source.path).expect("namespace segments serialize");
         let mut result = Vec::new();
         let mut seen = HashSet::default();
-        for reference in references {
+        for &lookup in lookups {
             if cancellation.is_cancelled() {
                 return Ok(SelectedPackageRows::Cancelled);
             }
-            let shared = reference
-                .lookup
-                .shared_name_id()
-                .expect("package lookup is shared");
+            let shared = lookup.shared_name_id().expect("package lookup is shared");
             let mut mounts = HashSet::default();
             if let Some(stored) = names.to_persisted(shared) {
                 let mut statement = conn.prepare_cached(ORDINARY_CANDIDATES)?;
@@ -109,12 +138,12 @@ impl PackagePlanRules for CSharpNamespaceRules<'_, '_, '_, '_> {
             let mut mounts = mounts.into_iter().collect::<Vec<_>>();
             mounts.sort_unstable();
             for mount in mounts {
-                if !seen.insert((mount, reference.lookup)) {
+                if !seen.insert((mount, lookup)) {
                     continue;
                 }
                 let SelectedPackageRows::Ready(members) = self
                     .ready
-                    .selected_package_members_for_lookup(mount, reference.lookup, cancellation)?
+                    .selected_package_members_for_lookup(mount, lookup, cancellation)?
                 else {
                     return Ok(SelectedPackageRows::Cancelled);
                 };
@@ -166,6 +195,7 @@ impl PackagePairingRules for CSharpNamespaceRules<'_, '_, '_, '_> {
             })
     }
 }
+
 impl PackageBridgeRules for CSharpNamespaceRules<'_, '_, '_, '_> {
     type Extra = CSharpUnitPlacement;
     type Admission = PackageBridgeAdmission<BindingFragmentId>;
@@ -207,6 +237,45 @@ pub(super) struct AdmittedNamespaceMember {
     pub mount: SelectedResolutionMountOrdinal,
     pub member: LoweredPackageMember,
     pub completion: ResolutionCompletion,
+}
+
+pub(super) fn namespace_types_for_lookup<'unit, 'store, 'input>(
+    ready: &'unit ReadySelectedResolution<'store, 'input>,
+    units: &RefCell<CSharpUnitReader<'unit, 'store>>,
+    source: BindingFragmentId,
+    level: &CSharpNamespaceLevel,
+    lookup: SemanticId,
+    cancellation: &CancellationToken,
+) -> Result<SelectedPackageRows<Vec<AdmittedNamespaceMember>>> {
+    let rules = CSharpNamespaceRules {
+        ready,
+        units,
+        source,
+    };
+    let SelectedPackageRows::Ready(rows) = rules.read_lookups(level, &[lookup], cancellation)?
+    else {
+        return Ok(SelectedPackageRows::Cancelled);
+    };
+    let mut targets = Vec::new();
+    for row in rows {
+        let mount = ready.inventory.mount_record_by_ordinal(row.mount)?;
+        let mut units = units.borrow_mut();
+        let placements = units.placements(mount.persisted_relative_path())?;
+        if let Some(completion) = units
+            .read_access(
+                Some(std::slice::from_ref(&level.caller)),
+                placements.as_deref(),
+            )?
+            .completion(&ResolutionCompletion::Complete)
+        {
+            targets.push(AdmittedNamespaceMember {
+                mount: row.mount,
+                member: row.member,
+                completion,
+            });
+        }
+    }
+    Ok(SelectedPackageRows::Ready(targets))
 }
 
 /// C# has no set admission: retain targets from the shared ordered pair join.

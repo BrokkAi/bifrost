@@ -310,6 +310,7 @@ impl brokk_bifrost_ruby::graph_support::RubySource for RubyAnalyzer {
                     Language::Ruby,
                     brokk_bifrost_core::path_utils::rel_path_string(file),
                     snapshot.oid(),
+                    brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 )),
                 Err(error) => {
                     self.record_query_failure(

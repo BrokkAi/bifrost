@@ -770,6 +770,10 @@ mod value_domain {
         "always_none",
         "explicit_none",
         "may_return_value",
+        "same_constant",
+        "varying",
+        "no_value",
+        "no_normal_return",
         "unknown",
     ];
     pub(super) const PYTHON_RESULT_USE: &[&str] = &["consumed", "discarded", "unknown"];
@@ -3211,6 +3215,8 @@ detailed_row_domains! {
             CodeQueryRowField::optional("explicit_return_statements", Scalar::Integer),
             CodeQueryRowField::optional("fallthrough_none_returns", Scalar::Integer),
             CodeQueryRowField::optional("mixed_returns", Scalar::Boolean),
+            CodeQueryRowField::optional("normal_returns", Scalar::Integer),
+            CodeQueryRowField::optional("return_constant", Scalar::String),
             CodeQueryRowField::optional("is_async", Scalar::Boolean),
             CodeQueryRowField::optional("is_generator", Scalar::Boolean),
             CodeQueryRowField::optional_enum("test_scope", value_domain::PYTHON_TRI_STATE),
@@ -6588,6 +6594,12 @@ fn project_code_query_row_field<'a>(
             .map(|count| Scalar::Integer(count as u64)),
         (CodeQueryResultValue::PythonRuleFact { value }, "mixed_returns") => {
             value.mixed_returns.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "normal_returns") => value
+            .normal_returns
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "return_constant") => {
+            value.return_constant.as_deref().map(Scalar::String)
         }
         (CodeQueryResultValue::PythonRuleFact { value }, "is_async") => {
             value.is_async.map(Scalar::Boolean)

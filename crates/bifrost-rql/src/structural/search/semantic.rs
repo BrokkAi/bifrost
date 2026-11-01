@@ -1,3 +1,4 @@
+use super::dispatch::DispatchBoundaryClass;
 use super::{DerivationExecutionCause, Incompleteness};
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use std::mem::{align_of, size_of};
@@ -1230,7 +1231,7 @@ impl<'a> SemanticQueryContext<'a> {
                     .boundaries()
                     .iter()
                     .filter(|boundary| boundary.kind.target_locator().is_none())
-                    .map(|boundary| boundary.kind.label())
+                    .map(|boundary| DispatchBoundaryClass::from_kind(&boundary.kind))
                     .collect(),
             });
             for candidate in observation.dispatch().candidates() {
@@ -1282,7 +1283,7 @@ impl<'a> SemanticQueryContext<'a> {
                 // counted, though: a consumer reasoning over the arm set has no
                 // other way to learn the set is not the whole answer.
                 let Some(locator) = boundary.kind.target_locator() else {
-                    unnamed_boundaries.push(boundary.kind.label());
+                    unnamed_boundaries.push(DispatchBoundaryClass::from_kind(&boundary.kind));
                     continue;
                 };
                 let fingerprint = boundary
@@ -1309,7 +1310,7 @@ impl<'a> SemanticQueryContext<'a> {
                     unmaterialized_target: boundary.unmaterialized_external_target().cloned(),
                     proof: boundary.proof.label(),
                     completeness: boundary.completeness.label(),
-                    boundary_kind: Some(boundary.kind.label()),
+                    boundary_kind: Some(DispatchBoundaryClass::from_kind(&boundary.kind)),
                 });
             }
         }
@@ -2209,6 +2210,10 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         identity: ContentIdentity,
     ) -> bool {
+        let Some(variant) = self.workspace.analyzer().selected_parse_variant(file) else {
+            self.push_source_generation_changed(file);
+            return false;
+        };
         let current = self.indexed_source_identities.read_mut(
             &memo_attribution(self.workspace.analyzer()),
             |identities| {
@@ -2216,7 +2221,13 @@ impl<'a> SemanticQueryContext<'a> {
                     self.workspace
                         .analyzer()
                         .indexed_source(file)
-                        .map(|source| ContentIdentity::hash_bytes(source.as_bytes()))
+                        .map(|source| {
+                            ContentIdentity::from_source_bytes(
+                                source.as_bytes(),
+                                file.language(),
+                                variant,
+                            )
+                        })
                 })
             },
         );
@@ -2286,7 +2297,13 @@ impl<'a> SemanticQueryContext<'a> {
         let Some(source) = self.workspace.analyzer().indexed_source(file) else {
             return Vec::new();
         };
-        if ContentIdentity::hash_bytes(source.as_bytes()) != key.revision().content() {
+        let Some(variant) = self.workspace.analyzer().selected_parse_variant(file) else {
+            self.push_source_generation_changed(file);
+            return Vec::new();
+        };
+        if ContentIdentity::from_source_bytes(source.as_bytes(), file.language(), variant)
+            != key.revision().content()
+        {
             self.push_source_generation_changed(file);
             return Vec::new();
         }
@@ -4366,7 +4383,11 @@ impl<'a> SemanticQueryContext<'a> {
         artifact: &SemanticArtifact,
         source: SemanticSourceSnapshot,
     ) -> Option<SemanticSourceSnapshot> {
-        if ContentIdentity::hash_bytes(source.source.as_bytes())
+        let Some(variant) = self.workspace.analyzer().selected_parse_variant(file) else {
+            self.push_source_generation_changed(file);
+            return None;
+        };
+        if ContentIdentity::from_source_bytes(source.source.as_bytes(), file.language(), variant)
             != artifact.key().revision().content()
         {
             self.workspace.analyzer().mark_execution_dependent();
@@ -4381,7 +4402,7 @@ impl<'a> SemanticQueryContext<'a> {
         Some(source)
     }
 
-    fn push_source_generation_changed(&mut self, file: &ProjectFile) {
+    pub(super) fn push_source_generation_changed(&mut self, file: &ProjectFile) {
         brokk_bifrost_core::profiling::note_with(|| {
             format!(
                 "policy.units unbounded origin={}:{} cause=snapshot",

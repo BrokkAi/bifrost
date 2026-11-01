@@ -20,6 +20,19 @@ use brokk_bifrost_cpp::hierarchy::{build_cpp_visible_type_units, cpp_resolve_dir
 const ALWAYS: &dyn Fn() -> bool = &|| true;
 
 impl CppAnalyzer {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_descendant_memo_for_test<T>(
+        &self,
+        read: impl FnOnce(&brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo) -> T,
+    ) -> T {
+        self.direct_descendant_index.read(
+            &memo_attribution(self),
+            |memo| read(memo),
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+        )
+    }
+
     pub(crate) fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>> {
         self.cached_complete_read(&self.visible_type_units_by_file, file, || {
             #[cfg(any(test, feature = "test-support"))]
@@ -60,21 +73,33 @@ impl CppAnalyzer {
                 .is_empty()
                 .then(|| Arc::clone(&cached.value));
         }
-        #[cfg(any(test, feature = "test-support"))]
-        self.record_visible_type_units_build_for_test();
-        let scope = AnalyzerQueryScope::new(self);
-        let (built, reads) = capture_query_reads(self, || {
-            build_cpp_visible_type_units(self, scope.token(), file, keep_going)
-        });
-        let built = Arc::new(built?);
-        if scope.read_completion().is_err() {
-            return None;
-        }
-        self.visible_type_units_by_file.insert(
-            file.clone(),
-            CachedFileRead::complete(Arc::clone(&built), &reads),
-        );
-        Some(built)
+        let fill =
+            brokk_bifrost_analysis::analyzer::common::replayable_query_cache_fill(self, || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.record_visible_type_units_build_for_test();
+                let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
+                let (built, reads) = capture_query_reads(self, || {
+                    build_cpp_visible_type_units(self, scope.token(), file, keep_going)
+                });
+                let built = built
+                    .or_else(|| (!scope.captured_read_incompleteness().is_empty()).then(Vec::new));
+                built.map(|built| {
+                    Arc::new(CachedFileRead {
+                        value: Arc::new(built),
+                        reads: reads.keys().into(),
+                        unattributed_reads: reads.unattributed_reads(),
+                        execution_dependences: reads.execution_dependences(),
+                        incompleteness: scope.captured_read_incompleteness().into_boxed_slice(),
+                    })
+                })
+            });
+        let entry = match fill {
+            Ok(Some(entry)) => entry,
+            _ => return None,
+        };
+        self.visible_type_units_by_file
+            .insert(file.clone(), Arc::clone(&entry));
+        entry.incompleteness.is_empty().then(|| entry.replay(self))
     }
 
     /// [`TypeHierarchyProvider::get_direct_ancestors`] under a deadline, sharing
@@ -92,22 +117,34 @@ impl CppAnalyzer {
                 .is_empty()
                 .then(|| (*cached.value).clone());
         }
-        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
-        let scope = AnalyzerQueryScope::new(self);
-        let (resolved, reads) = capture_query_reads(self, || {
-            cpp_resolve_direct_ancestors(self, scope.token(), code_unit, keep_going)
-        });
-        let resolved = resolved?;
-        if scope.read_completion().is_err() {
-            return None;
-        }
-        if cache_fill.is_complete() {
-            self.direct_ancestors.insert(
-                code_unit.clone(),
-                CachedFileRead::complete(Arc::new(resolved.clone()), &reads),
-            );
-        }
-        Some(resolved)
+        let fill =
+            brokk_bifrost_analysis::analyzer::common::replayable_query_cache_fill(self, || {
+                let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
+                let (resolved, reads) = capture_query_reads(self, || {
+                    cpp_resolve_direct_ancestors(self, scope.token(), code_unit, keep_going)
+                });
+                let resolved = resolved
+                    .or_else(|| (!scope.captured_read_incompleteness().is_empty()).then(Vec::new));
+                resolved.map(|resolved| {
+                    Arc::new(CachedFileRead {
+                        value: Arc::new(resolved),
+                        reads: reads.keys().into(),
+                        unattributed_reads: reads.unattributed_reads(),
+                        execution_dependences: reads.execution_dependences(),
+                        incompleteness: scope.captured_read_incompleteness().into_boxed_slice(),
+                    })
+                })
+            });
+        let entry = match fill {
+            Ok(Some(entry)) => entry,
+            _ => return None,
+        };
+        self.direct_ancestors
+            .insert(code_unit.clone(), Arc::clone(&entry));
+        entry
+            .incompleteness
+            .is_empty()
+            .then(|| (*entry.replay(self)).clone())
     }
 }
 

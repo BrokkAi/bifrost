@@ -1115,7 +1115,10 @@ fn workspace_read<T>(
         Ok(value) => Some(value),
         Err(error) => {
             eprintln!("reading Rust workspace implementation evidence: {error:?}");
-            super::std_types::incomplete_proof("workspace_impl_inventory_unavailable");
+            super::std_types::operational_proof_stop(
+                "workspace_impl_inventory_unavailable",
+                super::std_types::cargo_route_execution_cause(&error),
+            );
             None
         }
     }

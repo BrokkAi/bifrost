@@ -425,6 +425,7 @@ fn diagnostic(
         code,
         message: message.into(),
         context: context.into(),
+        semantic_count: None,
         reason_kind: Some(reason_kind.to_owned()),
     }
 }

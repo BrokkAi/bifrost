@@ -41,30 +41,11 @@ use brokk_bifrost_analysis::analyzer::usages::native_incoming::{
     finish_incoming_sites, project_selected_incoming,
 };
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult;
-
-#[cfg(test)]
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallSite;
-
-#[cfg(test)]
-use brokk_bifrost_analysis::analyzer::usages::call_relations::is_call_relation_unit;
-
-#[cfg(test)]
-use brokk_bifrost_analysis::analyzer::usages::call_relations::raw_call_site;
-
-#[cfg(test)]
-use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSiteSyntax;
-
-#[cfg(test)]
-use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::call_site_syntax_for_reference;
-
-#[cfg(test)]
-use brokk_bifrost_core::analyzer::usages::model::UsageProof;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationResult, CallerInventoryCoverage,
+};
 
 use brokk_bifrost_core::analyzer::usages::model::UsageProofAuthority;
-
-#[cfg(test)]
-use brokk_bifrost_analysis::analyzer::usages::proof_rank;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
@@ -75,8 +56,6 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
 use brokk_bifrost_core::hash::HashMap;
-#[cfg(test)]
-use std::sync::Arc;
 
 pub(crate) struct RustNativeCallRelations;
 
@@ -98,6 +77,7 @@ impl CallRelationProvider for RustNativeCallRelations {
         let cancellation = cancellation.unwrap_or(&fallback);
         if cancellation.is_cancelled() {
             return CallRelationResult {
+                caller_inventory: CallerInventoryCoverage::Incomplete,
                 cancelled: true,
                 ..CallRelationResult::default()
             };
@@ -136,6 +116,7 @@ impl CallRelationProvider for RustNativeCallRelations {
                 unavailable("native_store_error", reason, target)
             }
             RustSelectedReverseOutcome::Cancelled => CallRelationResult {
+                caller_inventory: CallerInventoryCoverage::Incomplete,
                 cancelled: true,
                 ..CallRelationResult::default()
             },
@@ -143,6 +124,7 @@ impl CallRelationProvider for RustNativeCallRelations {
         if cancellation.is_cancelled() {
             result.sites.clear();
             result.cancelled = true;
+            result.caller_inventory = CallerInventoryCoverage::Incomplete;
         }
         result
     }
@@ -182,6 +164,7 @@ impl CallRelationProvider for RustNativeCallRelations {
 
 fn unavailable(kind: &str, message: impl Into<String>, subject: &CodeUnit) -> CallRelationResult {
     CallRelationResult {
+        caller_inventory: CallerInventoryCoverage::Incomplete,
         diagnostics: vec![diagnostic(kind, message.into(), subject.fq_name())],
         ..CallRelationResult::default()
     }
@@ -204,11 +187,17 @@ pub(crate) fn project_rust_rich_call_relation(
 
     assert_eq!(selected.edges.len(), references.len());
     let mut result = CallRelationResult {
+        caller_inventory: if matches!(selected.completeness, EdgeCompleteness::Complete) {
+            CallerInventoryCoverage::Complete
+        } else {
+            CallerInventoryCoverage::Incomplete
+        },
         diagnostics: incomplete_diagnostics(selected, target),
         ..CallRelationResult::default()
     };
+    let mut dispatch = |target: &CodeUnit| queries.unenumerable_member_dispatch(target);
     let Some(sites) = project_selected_incoming(
-        &mut RustIncomingProjection(rust),
+        &mut RustIncomingProjection(rust, &mut dispatch),
         target,
         selected.edges.iter().zip(references.iter().copied()),
         limits,
@@ -266,6 +255,7 @@ pub(crate) fn project_rust_rich_call_relation(
                             answer.binding().targets()
                         ),
                         context: reference.to_string(),
+                        semantic_count: Some(answer.binding().targets().len()),
                         reason_kind: None,
                     });
                 }
@@ -283,6 +273,7 @@ pub(crate) fn project_rust_rich_call_relation(
             code: CallRelationDiagnosticCode::BudgetExhausted,
             message: format!("{omitted} incoming call sites kept unproven because the {lane} budget stopped their binding recheck"),
             context: target.fq_name().to_string(),
+            semantic_count: Some(omitted),
             reason_kind: None,
         });
     }
@@ -294,6 +285,7 @@ pub(crate) fn project_rust_rich_call_relation(
             code: CallRelationDiagnosticCode::BudgetExhausted,
             message: format!("selected Rust incoming call projection exceeded limits {limits:?}"),
             context: target.fq_name().to_string(),
+            semantic_count: None,
             reason_kind: None,
         });
     }
@@ -302,13 +294,34 @@ pub(crate) fn project_rust_rich_call_relation(
     if cancellation.is_cancelled() {
         return Ok(None);
     }
+    if result.truncated {
+        result.caller_inventory = CallerInventoryCoverage::Incomplete;
+    }
     Ok(Some(result))
 }
 
-struct RustIncomingProjection<'a>(&'a RustAnalyzer);
+struct RustIncomingProjection<'a>(
+    &'a RustAnalyzer,
+    &'a mut dyn FnMut(&CodeUnit) -> brokk_bifrost_analysis::analyzer::store::Result<Option<bool>>,
+);
 
 impl IncomingCallProjection for RustIncomingProjection<'_> {
     type Error = brokk_bifrost_analysis::analyzer::store::StoreError;
+
+    fn unenumerable_dispatch(&mut self, target: &CodeUnit) -> Result<bool, Self::Error> {
+        // The answer reads the target blob's contract and owner rows.
+        // Rust has one parse variant, independent of project configuration.
+        match self.0.indexed_blob_oid(target.source()) {
+            Some(oid) => self.0.record_read(self.0.inner.file_read_key(
+                target.source(),
+                oid,
+                brokk_bifrost_core::gitblob::ParseVariant::Empty,
+            )),
+            None => self.0.record_unattributed_read(),
+        }
+        // Cancellation (None) leaves the inventory open.
+        Ok(self.1(target)?.unwrap_or(true))
+    }
 
     fn load_file(
         &mut self,
@@ -375,168 +388,38 @@ impl IncomingCallProjection for RustIncomingProjection<'_> {
 #[cfg(test)]
 pub(crate) fn project_rust_call_relation(
     rust: &RustAnalyzer,
+    queries: &mut dyn crate::analyzer::rust::selected_reverse::RustSelectedReverseQueries,
     target: &CodeUnit,
     selected: &EdgeDerivationResult,
     cancellation: &CancellationToken,
 ) -> CallRelationResult {
-    let mut diagnostics = incomplete_diagnostics(selected, target);
-    let mut facts_by_file: HashMap<
-        ProjectFile,
-        Option<Arc<brokk_bifrost_analysis::analyzer::structural::facts::FileFacts>>,
-    > = HashMap::default();
-    let mut sites = Vec::with_capacity(selected.edges.len());
-
-    if cancellation.is_cancelled() {
-        return CallRelationResult {
-            cancelled: true,
-            diagnostics,
-            ..CallRelationResult::default()
-        };
-    }
-
-    for edge in &selected.edges {
-        if cancellation.is_cancelled() {
-            sites.clear();
-            return CallRelationResult {
-                cancelled: true,
-                diagnostics,
-                ..CallRelationResult::default()
-            };
-        }
-        if edge.target != *target {
-            diagnostics.push(diagnostic(
-                "native_reverse_target_mismatch",
-                format!(
-                    "selected Rust reverse row targets {}, expected {}",
-                    edge.target.fq_name(),
-                    target.fq_name()
-                ),
-                target.fq_name().to_string(),
-            ));
-            continue;
-        }
-
-        let facts = facts_by_file
-            .entry(edge.site.file.clone())
-            .or_insert_with(|| {
-                rust.structural_fact_providers()
-                    .into_iter()
-                    .find_map(|provider| provider.structural_facts(&edge.site.file))
-            });
-        if cancellation.is_cancelled() {
-            sites.clear();
-            return CallRelationResult {
-                cancelled: true,
-                diagnostics,
-                ..CallRelationResult::default()
-            };
-        }
-        let Some(facts) = facts.as_ref() else {
-            diagnostics.push(diagnostic(
-                "structural_facts_unavailable",
-                format!(
-                    "structured Rust facts are unavailable for selected call row in {}",
-                    edge.site.file
-                ),
-                edge.site.file.to_string(),
-            ));
-            continue;
-        };
-        // A reference row can point at a value, import, or other non-call
-        // occurrence in the same declaration. Only the structured call
-        // helper can admit it as an incoming call; a missing call shape is a
-        // normal non-call omission, not an authoritative empty result.
-        let Some(syntax) = call_site_syntax_for_reference(
-            facts,
-            edge.site.range.start_byte,
-            edge.site.range.end_byte,
-        ) else {
-            continue;
-        };
-
-        let Some(caller) = edge.site.enclosing.as_ref() else {
-            diagnostics.push(diagnostic(
-                "enclosing_caller_unavailable",
-                format!(
-                    "selected Rust call row at {}:[{}, {}) has no enclosing caller",
-                    edge.site.file, edge.site.range.start_byte, edge.site.range.end_byte
-                ),
-                edge.site.file.to_string(),
-            ));
-            continue;
-        };
-        if !is_call_relation_unit(caller) {
-            diagnostics.push(diagnostic(
-                "enclosing_caller_not_callable",
-                format!(
-                    "selected Rust call row at {}:[{}, {}) has non-callable owner {}",
-                    edge.site.file,
-                    edge.site.range.start_byte,
-                    edge.site.range.end_byte,
-                    caller.fq_name()
-                ),
-                caller.fq_name().to_string(),
-            ));
-            continue;
-        }
-
-        sites.push(call_site(
-            edge.site.file.clone(),
-            caller.clone(),
-            target,
-            syntax,
-            edge.proof,
-        ));
-    }
-
-    sites.sort_by(|left, right| {
-        left.file
-            .cmp(&right.file)
-            .then_with(|| {
-                (
-                    left.range.start_byte,
-                    left.range.end_byte,
-                    left.range.start_line,
-                    left.range.end_line,
-                )
-                    .cmp(&(
-                        right.range.start_byte,
-                        right.range.end_byte,
-                        right.range.start_line,
-                        right.range.end_line,
-                    ))
-            })
-            .then_with(|| left.caller.cmp(&right.caller))
-            .then_with(|| left.callee.cmp(&right.callee))
-            .then_with(|| proof_rank(left.proof).cmp(&proof_rank(right.proof)))
-    });
-    sites.dedup();
-    diagnostics.sort();
-    diagnostics.dedup();
-    if cancellation.is_cancelled() {
-        sites.clear();
-        return CallRelationResult {
-            cancelled: true,
-            diagnostics,
-            ..CallRelationResult::default()
-        };
-    }
-    CallRelationResult {
-        sites,
-        diagnostics,
+    let mut result = CallRelationResult {
+        caller_inventory: if selected.completeness.is_complete() {
+            CallerInventoryCoverage::Complete
+        } else {
+            CallerInventoryCoverage::Incomplete
+        },
+        diagnostics: incomplete_diagnostics(selected, target),
         ..CallRelationResult::default()
+    };
+    let mut dispatch = |target: &CodeUnit| queries.unenumerable_member_dispatch(target);
+    if let Some(sites) = project_selected_incoming(
+        &mut RustIncomingProjection(rust, &mut dispatch),
+        target,
+        selected.edges.iter().map(|edge| (edge, ())),
+        CallRelationLimits {
+            max_files: usize::MAX,
+            max_source_bytes: usize::MAX,
+            max_candidates: usize::MAX,
+        },
+        cancellation,
+        &mut result,
+    )
+    .expect("selected source authority is unchanged")
+    {
+        finish_incoming_sites(sites, &mut result);
     }
-}
-
-#[cfg(test)]
-fn call_site(
-    file: ProjectFile,
-    caller: CodeUnit,
-    target: &CodeUnit,
-    syntax: CallSiteSyntax,
-    proof: UsageProof,
-) -> CallSite {
-    raw_call_site(file, caller, target.clone(), syntax, proof)
+    result
 }
 
 fn incomplete_diagnostics(
@@ -848,6 +731,62 @@ mod tests {
     }
 
     #[test]
+    fn caller_inventory_empty_cancelled_and_truncated() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"inventory\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn unused() {} pub fn target() {} pub fn caller() { target(); }",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let declarations = rust.declarations(&fixture.file("src/lib.rs"));
+        let unused = declarations
+            .iter()
+            .find(|u| u.identifier() == "unused")
+            .unwrap();
+        let target = declarations
+            .iter()
+            .find(|u| u.identifier() == "target")
+            .unwrap();
+        let query = |target, limits, token: &CancellationToken| {
+            RustNativeCallRelations.incoming(&rust, target, limits, Some(token))
+        };
+        let empty = query(unused, rich_limits(), &CancellationToken::default());
+        assert!(empty.sites.is_empty(), "{empty:?}");
+        assert_eq!(
+            empty.caller_inventory,
+            CallerInventoryCoverage::Complete,
+            "{empty:?}"
+        );
+        let uncovered = CodeUnit::new(
+            fixture.file("src/missing.rs"),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+            "",
+            "removed",
+        );
+        assert_eq!(
+            query(&uncovered, rich_limits(), &CancellationToken::default()).caller_inventory,
+            CallerInventoryCoverage::Incomplete
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            query(target, rich_limits(), &cancelled).caller_inventory,
+            CallerInventoryCoverage::Incomplete
+        );
+        let mut limits = rich_limits();
+        limits.max_candidates = 0;
+        assert_eq!(
+            query(target, limits, &CancellationToken::default()).caller_inventory,
+            CallerInventoryCoverage::Incomplete
+        );
+    }
+
+    #[test]
     fn rust_incoming_work_is_bounded_to_target_candidates_and_matches_selected_result() {
         let mut project = InlineTestProject::with_language(Language::Rust)
             .file(
@@ -918,6 +857,141 @@ mod tests {
         );
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8388: composed taint trusted a native Rust reverse inventory that missed callers through a function value"
+    )]
+    fn caller_inventory_function_value_escape() {
+        // Every way Rust names a fn item or associated fn as a value. Each
+        // escaping target can be called through that value from sites the
+        // selected inverse never enumerates; the direct-call control cannot.
+        let (fixture, rust) = inline_source_project(
+            "escaped_callers",
+            concat!(
+                "pub fn target() {}\n",
+                "pub fn mapped(value: u8) -> u8 { value }\n",
+                "pub fn pointer() {}\n",
+                "pub fn shorthand() {}\n",
+                "pub fn field_value() {}\n",
+                "pub fn generic<T>() {}\n",
+                "pub fn captured() {}\n",
+                "pub fn direct() {}\n",
+                "pub struct Holder { pub shorthand: fn(), pub handler: fn() }\n",
+                "pub struct Service;\n",
+                "impl Service { pub fn associated() {} }\n",
+                "pub trait Hook { fn hooked(); }\n",
+                "impl Hook for Service { fn hooked() {} }\n",
+                "pub fn invoke(f: fn()) { f(); }\n",
+                "pub fn caller() -> impl Fn() -> fn() {\n",
+                "    let f = target; f(); invoke(target);\n",
+                "    let _ = [1u8].iter().copied().map(mapped).count();\n",
+                "    let p: fn() = pointer; p();\n",
+                "    let _ = Holder { shorthand, handler: field_value };\n",
+                "    let a: fn() = Service::associated; a();\n",
+                "    let h: fn() = <Service as Hook>::hooked; h();\n",
+                "    let g: fn() = generic::<u8>; g();\n",
+                "    direct();\n",
+                "    move || captured\n",
+                "}\n",
+            ),
+        );
+        let declarations = rust.declarations(&fixture.file("src/lib.rs"));
+        let mut actual = Vec::new();
+        for name in [
+            "target",
+            "mapped",
+            "pointer",
+            "shorthand",
+            "field_value",
+            "associated",
+            "hooked",
+            "generic",
+            "captured",
+            "direct",
+        ] {
+            let target = declarations
+                .iter()
+                .find(|unit| unit.identifier() == name && !unit.is_field())
+                .unwrap_or_else(|| panic!("{name} declaration: {declarations:?}"));
+            let result = RustNativeCallRelations.incoming(&rust, target, rich_limits(), None);
+            actual.push((name, result.caller_inventory));
+        }
+        let expected = actual
+            .iter()
+            .map(|(name, _)| {
+                let coverage = if *name == "direct" {
+                    CallerInventoryCoverage::Complete
+                } else {
+                    CallerInventoryCoverage::Incomplete
+                };
+                (*name, coverage)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8457: a Rust trait-impl member kept a Complete caller inventory while std, operators and loops call it"
+    )]
+    fn caller_inventory_trait_implementation_dispatch() {
+        let (fixture, rust) = inline_source_project(
+            "trait_dispatch_callers",
+            concat!(
+                "use std::fmt;\n",
+                "pub struct X;\n",
+                "impl fmt::Display for X { fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) } }\n",
+                "pub fn show(x: &X) -> String { format!(\"{x}\") }\n",
+                "pub struct Y;\n",
+                "impl Iterator for Y { type Item = (); fn next(&mut self) -> Option<()> { None } }\n",
+                "pub fn walk(y: Y) { for _ in y {} }\n",
+                "pub struct Z;\n",
+                "impl Drop for Z { fn drop(&mut self) {} }\n",
+                "pub fn scope() { let _z = Z; }\n",
+                "pub trait T { fn m(&self); }\n",
+                "pub struct W;\n",
+                "impl T for W { fn m(&self) {} }\n",
+                "pub fn via_dyn(w: &W) { let d: &dyn T = w; d.m(); }\n",
+                // A trait impl produced by a macro has no selected definition,
+                // so its inventory is already incomplete before the hook runs.
+                "pub struct M;\n",
+                "macro_rules! make_display { ($item:item) => { $item }; }\n",
+                "make_display! { impl fmt::Display for M { fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) } } }\n",
+                "pub struct Service;\n",
+                "impl Service { pub fn inherent(&self) {} }\n",
+                "pub fn direct(s: &Service) { s.inherent(); }\n",
+            ),
+        );
+        let declarations = rust.declarations(&fixture.file("src/lib.rs"));
+        let mut actual = Vec::new();
+        for (name, owner) in [
+            ("fmt", "X"),
+            ("next", "Y"),
+            ("drop", "Z"),
+            ("m", "W"),
+            ("fmt", "M"),
+            ("inherent", "Service"),
+        ] {
+            let target = declarations
+                .iter()
+                .find(|unit| unit.identifier() == name && unit.owner_identifier() == Some(owner))
+                .unwrap_or_else(|| panic!("{owner}::{name} declaration: {declarations:?}"));
+            let result = RustNativeCallRelations.incoming(&rust, target, rich_limits(), None);
+            actual.push((owner, result.caller_inventory));
+        }
+        assert_eq!(
+            actual,
+            vec![
+                ("X", CallerInventoryCoverage::Incomplete),
+                ("Y", CallerInventoryCoverage::Incomplete),
+                ("Z", CallerInventoryCoverage::Incomplete),
+                ("W", CallerInventoryCoverage::Incomplete),
+                ("M", CallerInventoryCoverage::Incomplete),
+                ("Service", CallerInventoryCoverage::Complete),
+            ]
+        );
+    }
+
     fn source() -> &'static str {
         concat!(
             "mod left { pub fn target(value: usize) {} }\n",
@@ -966,6 +1040,7 @@ mod tests {
                 };
                 let projected = project_rust_call_relation(
                     &rust,
+                    queries,
                     &method,
                     &incomplete,
                     &CancellationToken::default(),
@@ -975,21 +1050,31 @@ mod tests {
                 missing_owner.edges[0].site.enclosing = None;
                 let missing_owner_projected = project_rust_call_relation(
                     &rust,
+                    queries,
                     &method,
                     &missing_owner,
                     &CancellationToken::default(),
                 );
 
-                let cancelled = CancellationToken::cancel_after_checks_for_test(5);
-                let cancelled_projected =
-                    project_rust_call_relation(&rust, &method, &incomplete, &cancelled);
-                Ok((projected, missing_owner_projected, cancelled_projected))
+                // Cancel at every check in turn, so the test does not depend on
+                // how often the projector polls: entry, mid-prefix and late.
+                let mut cancelled_runs = Vec::new();
+                let mut completed = None;
+                for checks in 1..=256 {
+                    let token = CancellationToken::cancel_after_checks_for_test(checks);
+                    let result =
+                        project_rust_call_relation(&rust, queries, &method, &incomplete, &token);
+                    if !result.cancelled {
+                        completed = Some(checks);
+                        break;
+                    }
+                    cancelled_runs.push((checks, result));
+                }
+                assert!(completed.is_some(), "projection never completed");
+                Ok((projected, missing_owner_projected, cancelled_runs))
             });
-        let RustSelectedReverseOutcome::Ready((
-            projected,
-            missing_owner_projected,
-            cancelled_projected,
-        )) = selected
+        let RustSelectedReverseOutcome::Ready((projected, missing_owner_projected, cancelled_runs)) =
+            selected
         else {
             panic!("selected reverse rows must be ready: {selected:?}");
         };
@@ -997,6 +1082,10 @@ mod tests {
             projected.sites.len(),
             2,
             "known rows remain visible: {projected:?}"
+        );
+        assert_eq!(
+            projected.caller_inventory,
+            CallerInventoryCoverage::Incomplete
         );
         assert!(!projected.truncated);
         assert!(projected.diagnostics.iter().any(|diagnostic| {
@@ -1012,12 +1101,25 @@ mod tests {
                 })
         );
 
-        assert!(cancelled_projected.cancelled);
+        // The edge loop checks once per row, so with two rows at least one
+        // run cancels after a projected prefix.
         assert!(
-            cancelled_projected.sites.is_empty(),
-            "cancelled projection published a prefix: {cancelled_projected:?}"
+            cancelled_runs.len() >= 2,
+            "no cancellation after a projected prefix: {cancelled_runs:?}"
         );
-        assert!(!cancelled_projected.truncated);
+        for (checks, cancelled) in &cancelled_runs {
+            assert!(cancelled.cancelled, "after {checks} checks: {cancelled:?}");
+            assert!(
+                cancelled.sites.is_empty(),
+                "cancelled projection published a prefix after {checks} checks: {cancelled:?}"
+            );
+            assert_eq!(
+                cancelled.caller_inventory,
+                CallerInventoryCoverage::Incomplete,
+                "after {checks} checks"
+            );
+            assert!(!cancelled.truncated, "after {checks} checks");
+        }
     }
 
     #[test]
@@ -1067,20 +1169,25 @@ mod tests {
                 };
                 let free_result = project_rust_call_relation(
                     &rust,
+                    queries,
                     &free,
                     row_for(&free),
                     &CancellationToken::default(),
                 );
                 let method_result = project_rust_call_relation(
                     &rust,
+                    queries,
                     &method,
                     row_for(&method),
                     &CancellationToken::default(),
                 );
+                let mut exhaustive_ambiguous = row_for(&left_target).clone();
+                exhaustive_ambiguous.completeness = EdgeCompleteness::Complete;
                 let ambiguous_result = project_rust_call_relation(
                     &rust,
+                    queries,
                     &left_target,
-                    row_for(&left_target),
+                    &exhaustive_ambiguous,
                     &CancellationToken::default(),
                 );
                 let mut non_call = row_for(&free).clone();
@@ -1096,6 +1203,7 @@ mod tests {
                 edge.site.enclosing = None;
                 let non_call_result = project_rust_call_relation(
                     &rust,
+                    queries,
                     &free,
                     &non_call,
                     &CancellationToken::default(),
@@ -1148,9 +1256,25 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            ambiguous_result.caller_inventory,
+            CallerInventoryCoverage::Complete
+        );
         assert_eq!(ambiguous_result.sites.len(), 1, "{ambiguous_result:?}");
         assert_eq!(ambiguous_result.sites[0].proof, UsageProof::Unproven);
         assert_eq!(ambiguous_result.sites[0].caller, caller);
+        assert_eq!(
+            free_result.caller_inventory,
+            CallerInventoryCoverage::Incomplete
+        );
+        assert_eq!(
+            non_call_result.caller_inventory,
+            CallerInventoryCoverage::Incomplete
+        );
+        assert_eq!(
+            method_result.caller_inventory,
+            CallerInventoryCoverage::Complete
+        );
         assert_eq!(non_call_result.sites, free_result.sites);
         assert!(!non_call_result.diagnostics.iter().any(|diagnostic| {
             diagnostic.reason_kind.as_deref() == Some("enclosing_caller_unavailable")

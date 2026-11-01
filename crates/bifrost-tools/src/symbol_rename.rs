@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tree_sitter::{Node, Tree};
 
 use brokk_bifrost_analysis::analyzer::common::is_valid_rename_identifier;
 
 use brokk_bifrost_core::analyzer::common::language_for_file;
 
 use brokk_bifrost_analysis::analyzer::common::source_identifier_for_target;
+use brokk_bifrost_analysis::analyzer::declaration_range::{
+    DeclarationNameRangeContext, code_unit_declaration_name_range,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome;
 
@@ -47,11 +51,7 @@ use brokk_bifrost_core::analyzer::project::Project;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
-use brokk_bifrost_core::analyzer::model::Range as ByteRange;
-
 use brokk_bifrost_core::text_utils::compute_line_starts;
-
-use brokk_bifrost_core::text_utils::find_word;
 
 use brokk_bifrost_core::text_utils::identifier_span_at_offset;
 
@@ -60,8 +60,6 @@ use brokk_bifrost_core::text_utils::line_column_for_offset;
 const RENAME_CONFIDENCE_THRESHOLD: f64 = 1.0;
 
 pub use brokk_bifrost_analysis::analyzer::rename::MAX_RENAME_IDENTIFIER_BYTES;
-
-pub use brokk_bifrost_analysis::analyzer::rename::PreparedRename;
 
 pub use brokk_bifrost_analysis::analyzer::rename::RenameEdit;
 
@@ -119,14 +117,6 @@ fn rename_usage_hits(query: QueryResult) -> Result<Vec<UsageHit>, RenameFailure>
                 .filter(UsageHit::is_lsp_reference_site)
                 .collect::<Vec<_>>()
         }
-        result @ FuzzyResult::Ambiguous { .. } => {
-            return Err(RenameFailure {
-                kind: "ambiguous",
-                message: format!(
-                    "rename target resolved to ambiguous usage candidates: {result:?}"
-                ),
-            });
-        }
         result @ FuzzyResult::Incomplete { .. } => {
             return Err(RenameFailure {
                 kind: "incomplete_analysis",
@@ -158,30 +148,6 @@ fn rename_usage_hits(query: QueryResult) -> Result<Vec<UsageHit>, RenameFailure>
         });
     }
     Ok(hits)
-}
-
-pub fn prepare_rename(
-    analyzer: &dyn IAnalyzer,
-    project: &dyn Project,
-    file: ProjectFile,
-    selection: RenameSelection,
-) -> Result<PreparedRename, RenameFailure> {
-    let source = read_source(project, &file)?;
-    let line_starts = compute_line_starts(&source);
-    let cursor = rename_cursor_for_selection(file, source, line_starts, selection)?;
-    let target = resolve_rename_target(analyzer, cursor.as_ref())?;
-    if !can_rename_target(&target) {
-        return Err(RenameFailure {
-            kind: "unsupported",
-            message: unsupported_target_message(&target),
-        });
-    }
-
-    Ok(PreparedRename {
-        start_byte: cursor.start,
-        end_byte: cursor.end,
-        placeholder: cursor.identifier.to_string(),
-    })
 }
 
 pub fn rename_symbol(
@@ -241,27 +207,23 @@ pub fn rename_symbol(
     let mut edits_by_file: HashMap<ProjectFile, Vec<EditCandidate>> = HashMap::new();
 
     for hit in hits {
-        let entry = cache.ensure(project, &hit.file)?;
-        let (start_byte, end_byte) =
+        let (start, end) = {
+            let entry = cache.ensure(project, &hit.file)?;
             if entry.body.get(hit.start_offset..hit.end_offset) == Some(old_name.as_str()) {
                 (hit.start_offset, hit.end_offset)
             } else {
-                let slice = entry
-                    .body
-                    .get(hit.start_offset..hit.end_offset)
-                    .ok_or_else(|| RenameFailure {
-                        kind: "stale_location",
-                        message: "usage range no longer exists in source".to_string(),
-                    })?;
-                let offset = find_word(slice, &old_name).ok_or_else(|| RenameFailure {
-                    kind: "stale_location",
-                    message: format!("expected `{old_name}` inside resolved usage range"),
-                })?;
-                let start = hit.start_offset + offset;
-                (start, start + old_name.len())
-            };
+                identifier_in_hit(
+                    entry,
+                    &hit.file,
+                    hit.start_offset,
+                    hit.end_offset,
+                    &old_name,
+                )
+                .unwrap_or((hit.start_offset, hit.end_offset))
+            }
+        };
         let edit = edit_for_byte_range(
-            project, &mut cache, &hit.file, start_byte, end_byte, &old_name, new_name,
+            project, &mut cache, &hit.file, start, end, &old_name, new_name,
         )?;
         edits_by_file.entry(hit.file).or_default().push(edit);
     }
@@ -488,18 +450,18 @@ fn declaration_target_at_span(
     analyzer: &dyn IAnalyzer,
     cursor: &RenameCursorRef<'_>,
 ) -> Option<CodeUnit> {
+    let context = DeclarationNameRangeContext::new(cursor.file, cursor.content.to_string());
     let mut matches = analyzer
         .declarations(cursor.file)
         .into_iter()
         .filter(|code_unit| source_identifier_for_target(code_unit) == cursor.identifier)
         .filter(|code_unit| {
-            analyzer.ranges(code_unit).iter().any(|range| {
-                identifier_selection_byte_range(code_unit, cursor.content, range)
-                    .map(|selection| {
-                        selection.start_byte == cursor.start && selection.end_byte == cursor.end
-                    })
-                    .unwrap_or(false)
-            })
+            context
+                .name_ranges(analyzer, code_unit)
+                .iter()
+                .any(|selection| {
+                    selection.start_byte == cursor.start && selection.end_byte == cursor.end
+                })
         })
         .collect::<Vec<_>>();
     if matches.len() == 1 {
@@ -577,24 +539,13 @@ fn declaration_edit(
 ) -> Result<EditCandidate, RenameFailure> {
     let file = code_unit.source();
     let entry = cache.ensure(project, file)?;
-    let range = analyzer
-        .ranges(code_unit)
-        .iter()
-        .min()
-        .copied()
+    let selection = code_unit_declaration_name_range(analyzer, file, &entry.body, code_unit)
         .ok_or_else(|| RenameFailure {
             kind: "not_found",
-            message: format!("`{}` has no declaration range", code_unit.fq_name()),
-        })?;
-    let selection =
-        identifier_selection_byte_range(code_unit, &entry.body, &range).ok_or_else(|| {
-            RenameFailure {
-                kind: "not_found",
-                message: format!(
-                    "could not find identifier `{}` inside declaration range",
-                    code_unit.identifier()
-                ),
-            }
+            message: format!(
+                "could not find identifier `{}` inside declaration range",
+                code_unit.identifier()
+            ),
         })?;
     edit_for_byte_range(
         project,
@@ -632,27 +583,6 @@ fn edit_for_byte_range(
         start_byte,
         end_byte,
         new_text: new_name.to_string(),
-    })
-}
-
-fn identifier_selection_byte_range(
-    code_unit: &CodeUnit,
-    content: &str,
-    fallback: &ByteRange,
-) -> Option<ByteRange> {
-    let slice = content.get(fallback.start_byte..fallback.end_byte)?;
-    let name = source_identifier_for_target(code_unit);
-    if name.is_empty() {
-        return None;
-    }
-    let offset = find_word(slice, name)?;
-    let abs_start = fallback.start_byte + offset;
-    let abs_end = abs_start + name.len();
-    Some(ByteRange {
-        start_byte: abs_start,
-        end_byte: abs_end,
-        start_line: 0,
-        end_line: 0,
     })
 }
 
@@ -700,8 +630,14 @@ impl FileContentCache {
                 message: format!("failed to read `{}`: {err}", file.rel_path().display()),
             })?;
             let line_starts = compute_line_starts(&body);
-            self.by_path
-                .insert(abs_path.clone(), FileContent { body, line_starts });
+            self.by_path.insert(
+                abs_path.clone(),
+                FileContent {
+                    body,
+                    line_starts,
+                    tree: OnceLock::new(),
+                },
+            );
         }
         self.by_path.get(&abs_path).ok_or_else(|| RenameFailure {
             kind: "read_failed",
@@ -713,6 +649,50 @@ impl FileContentCache {
 struct FileContent {
     body: String,
     line_starts: Vec<usize>,
+    tree: OnceLock<Option<Tree>>,
+}
+
+fn identifier_in_hit(
+    entry: &FileContent,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+    old_name: &str,
+) -> Option<(usize, usize)> {
+    let root = entry
+        .tree
+        .get_or_init(|| {
+            brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language(
+                file,
+                language_for_file(file),
+                &entry.body,
+            )
+        })
+        .as_ref()?
+        .root_node();
+    let mut stack: Vec<Node<'_>> = vec![root];
+    let mut found = None;
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= start || node.start_byte() >= end {
+            continue;
+        }
+        if node.start_byte() >= start
+            && node.end_byte() <= end
+            && node.kind().contains("identifier")
+            && entry.body.get(node.byte_range()) == Some(old_name)
+        {
+            let range = (node.start_byte(), node.end_byte());
+            if found.is_some_and(|previous| previous != range) {
+                return None;
+            }
+            found = Some(range);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    found
 }
 
 #[derive(Debug)]

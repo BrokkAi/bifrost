@@ -1466,6 +1466,7 @@ fn dispatch_boundary_label(boundary: &DispatchBoundaryKind) -> &'static str {
         },
         DispatchBoundaryKind::Unresolved => "unresolved",
         DispatchBoundaryKind::Truncated => "truncated",
+        DispatchBoundaryKind::HierarchyUnenumerated => "hierarchy_unenumerated",
     }
 }
 

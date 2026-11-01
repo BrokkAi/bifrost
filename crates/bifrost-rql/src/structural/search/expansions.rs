@@ -525,38 +525,6 @@ pub(super) fn inbound_reference_expansions(
                     }
                 }
             }
-            FuzzyResult::Ambiguous {
-                hits_by_overload, ..
-            } => {
-                hits.extend(hits_by_overload.into_values().flatten().map(|hit| {
-                    reference_hit_for_target(
-                        analyzer,
-                        hit,
-                        declaration.unit.clone(),
-                        UsageProof::Unproven,
-                    )
-                }));
-                if report {
-                    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
-                        related: Vec::new(),
-                        source: None,
-                        code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
-                        impact: CodeQueryDiagnosticImpact::Advisory,
-                        branch: Vec::new(),
-                        language: crate::analyzer::common::language_for_file(
-                            declaration.unit.source(),
-                        )
-                        .config_label(),
-                        message: format!(
-                            "references_of emitted ambiguous candidates for {} as unproven",
-                            declaration.unit.fq_name()
-                        ),
-                        exhausted_roots: Vec::new(),
-                        withheld_rows_path: None,
-                    }));
-                }
-            }
             FuzzyResult::TooManyCallsites {
                 total_callsites,
                 limit,
@@ -708,9 +676,6 @@ fn fuzzy_result_examination_count(result: &FuzzyResult) -> usize {
             hits_by_overload.values().map(BTreeSet::len).sum::<usize>()
                 + unproven_total_by_overload.values().sum::<usize>()
         }
-        FuzzyResult::Ambiguous {
-            hits_by_overload, ..
-        } => hits_by_overload.values().map(BTreeSet::len).sum(),
         FuzzyResult::TooManyCallsites {
             total_callsites, ..
         } => *total_callsites,

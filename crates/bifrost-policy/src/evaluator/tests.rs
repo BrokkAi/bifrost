@@ -20,6 +20,9 @@ use brokk_bifrost_rql::structural::search::{
 use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryCallSite, CodeQueryDeclaration};
 use serde_json::json;
 
+mod activated_flow_assertion;
+mod visible_policy_run;
+
 fn risk(rating: &str, refs: &[&str]) -> OrganizationalRiskAssessment {
     OrganizationalRiskAssessment::try_new(
         "test-risk".to_string(),

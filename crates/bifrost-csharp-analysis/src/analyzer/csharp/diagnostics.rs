@@ -82,8 +82,68 @@ pub(crate) fn collect_csharp_semantic_diagnostics(
         forward_sources_complete: OnceLock::new(),
         evidence: analyzer.dependency_discovery_evidence(Language::CSharp),
     };
-    let report = brokk_bifrost_csharp::diagnostics::collect_csharp_semantic_diagnostics(
-        csharp, token, &external, file, source,
+    let limit = brokk_bifrost_csharp::diagnostics::MAX_CSHARP_SEMANTIC_DIAGNOSTIC_BYTES;
+    if source.len() > limit {
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
+        return report;
+    }
+    // Diagnostics have a bounded syntax-only contract. Index admission can
+    // decline this source independently, so use the same configured scan with
+    // the diagnostic parser rather than requiring a published file state.
+    let snapshot = csharp
+        .inner
+        .source_snapshot_limited(file, limit)
+        .ok()
+        .flatten();
+    if snapshot
+        .as_ref()
+        .is_none_or(|(_, snapshot)| snapshot.source() != source)
+    {
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "diagnostic source differs from the selected source snapshot".to_owned(),
+            }],
+        );
+        return report;
+    }
+    let parse = match csharp.inner.path_parse_for_source(file, source) {
+        Ok(parse) => parse,
+        Err(error) => {
+            let mut report = SemanticDiagnosticReport::new();
+            report.push_incomplete(
+                None,
+                vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: format!("configured source reading failed: {error}"),
+                }],
+            );
+            csharp.inner.record_store_error(error);
+            return report;
+        }
+    };
+    let scan = parse
+        .preprocessor
+        .as_ref()
+        .expect("configured source has preprocessing evidence")
+        .as_any()
+        .downcast_ref::<brokk_bifrost_csharp::preprocessor::PreprocessorScan>()
+        .expect("C# source has a C# scan");
+    let Some(tree) =
+        brokk_bifrost_csharp::preprocessor::parse_csharp_scan_with_cancellation(source, scan, None)
+    else {
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "C# source did not parse".to_owned(),
+            }],
+        );
+        return report;
+    };
+    let report = brokk_bifrost_csharp::diagnostics::collect_csharp_semantic_diagnostics_with_scan(
+        csharp, token, &external, file, source, &tree, scan,
     );
     brokk_bifrost_analysis::analyzer::semantic_model::runtime::degrade_pack_gap_absences(
         analyzer, report,

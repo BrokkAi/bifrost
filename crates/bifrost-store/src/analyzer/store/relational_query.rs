@@ -2084,6 +2084,77 @@ pub mod tests {
             );
         }
 
+        for (view, predicate, file_first) in [
+            (
+                "live_stable_definition_parent_names",
+                "exact_parent_tail='Owner' AND identifier='Thing'",
+                false,
+            ),
+            (
+                "live_anchored_definition_parent_names",
+                "prefix='Proj' AND exact_parent_tail='Owner' AND identifier='Thing'",
+                true,
+            ),
+            (
+                "live_stable_definition_normalized_names",
+                "tail='Owner.Thing'",
+                false,
+            ),
+            (
+                "live_anchored_definition_normalized_names",
+                "prefix='Proj' AND tail='Owner.Thing'",
+                true,
+            ),
+            (
+                "live_stable_definition_identifiers",
+                "identifier='Thing'",
+                false,
+            ),
+            (
+                "live_anchored_definition_identifiers",
+                "identifier='Thing'",
+                false,
+            ),
+            (
+                "live_anchored_package_types",
+                "prefix='Proj' AND package_tail='' AND simple_type_name='Thing'",
+                true,
+            ),
+        ] {
+            let sql = format!("SELECT blob_id FROM {view} WHERE lang='csharp' AND {predicate}");
+            let plan = explain_query_plan(&connection, view, &sql, &[]);
+            let decision = plan
+                .iter()
+                .position(|step| step.starts_with("SEARCH decisions "))
+                .unwrap_or_else(|| {
+                    panic!("{view} must probe the file decision {state}: {plan:#?}")
+                });
+            assert!(
+                !plan.iter().any(|step| step.contains("TEMP B-TREE")
+                    || step.contains("SCAN decisions")
+                    || step.contains("SCAN files")
+                    || step.contains("SCAN units")),
+                "{view} {state}: {plan:#?}"
+            );
+            if file_first {
+                let blob = plan
+                    .iter()
+                    .position(|step| {
+                        step.starts_with("SEARCH selected_blob ")
+                            && step.contains("blob_oid=?")
+                            && step.contains("lang=?")
+                            && step.contains("parse_variant=?")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{view} must seek the full blob key {state}: {plan:#?}")
+                    });
+                assert!(
+                    decision < blob,
+                    "{view} must probe decisions before blobs {state}: {plan:#?}"
+                );
+            }
+        }
+
         let scanned_plans = [
             (
                 "stable parent",
@@ -2158,11 +2229,21 @@ pub mod tests {
     #[cfg(test)]
     #[test]
     fn callable_candidate_preflight_seeks_stable_and_anchored_name_indexes() {
+        for state in PlannerStatisticsState::BOTH {
+            callable_candidate_preflight_seeks_stable_and_anchored_name_indexes_in(state);
+        }
+    }
+
+    #[cfg(test)]
+    fn callable_candidate_preflight_seeks_stable_and_anchored_name_indexes_in(
+        state: PlannerStatisticsState,
+    ) {
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
         let connection = store.conn.lock().expect("store mutex");
         connection
             .execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)
             .expect("install revisioned candidate views");
+        state.install(&connection);
         let mut statement = connection
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {CALLABLE_CANDIDATE_AVAILABILITY_SQL}"
@@ -2179,22 +2260,50 @@ pub mod tests {
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("idx_code_units_stable_parent_identifier")),
-            "stable callable candidates must seek the stable name index: {plan:#?}"
+            "stable callable candidates must seek the stable name index {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("idx_code_units_anchored_parent_identifier")),
-            "anchored callable candidates must seek the anchored name index: {plan:#?}"
+            "anchored callable candidates must seek the anchored name index {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("idx_workspace_file_anchor_rows_package")),
-            "anchored callable candidates must seek the package anchor index: {plan:#?}"
+            "anchored callable candidates must seek the package anchor index {state}: {plan:#?}"
         );
         assert!(
-            plan.iter()
-                .all(|detail| !detail.contains("SCAN units") && !detail.contains("SCAN anchors")),
-            "callable candidate preflight must not scan name or anchor rows: {plan:#?}"
+            plan.iter().all(|detail| !detail.contains("SCAN units")
+                && !detail.contains("SCAN anchors")
+                && !detail.contains("TEMP B-TREE")),
+            "callable candidate preflight must not scan names or anchors or sort {state}: {plan:#?}"
+        );
+        // Readiness is materialized separately before each UNION arm and its
+        // lookup may scan that result. Check the anchored join chain before
+        // readiness and the outer scan of the UNION result.
+        let anchored = plan
+            .iter()
+            .skip_while(|detail| !detail.starts_with("SEARCH anchors "))
+            .take_while(|detail| {
+                !detail.starts_with("SCAN names") && !detail.contains("visibility")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            anchored.iter().all(|detail| !detail.contains("SCAN ")),
+            "anchored join chain must not scan tables {state}: {plan:#?}"
+        );
+        let decision = anchored
+            .iter()
+            .position(|detail| detail.starts_with("SEARCH decisions "));
+        let blob = anchored.iter().position(|detail| {
+            detail.contains("SEARCH blobs")
+                && detail.contains("blob_oid=?")
+                && detail.contains("lang=?")
+                && detail.contains("parse_variant=?")
+        });
+        assert!(
+            matches!((decision, blob), (Some(decision), Some(blob)) if decision < blob),
+            "anchored callable candidates must probe decisions before seeking the full blob key {state}: {plan:#?}"
         );
     }
 }
@@ -2258,6 +2367,12 @@ mod batched_query_tests {
     }
 
     impl StoreLanguageAdapter for FixtureAdapter {
+        // Test adapter.
+        fn parse_time_semantic_lowerer(
+            &self,
+        ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+            None
+        }
         fn language(&self) -> Language {
             Language::Java
         }
@@ -2625,6 +2740,7 @@ mod batched_query_tests {
                 .iter()
                 .filter(|blob| blob.lang == lang && blob.in_workspace)
                 .map(|blob| WorkspaceFileRow {
+                    decision: None,
                     rel_path: blob.rel_path.to_string(),
                     blob_oid: blob.oid,
                 })
@@ -2918,6 +3034,119 @@ mod batched_query_tests {
                 vec![pad.clone()],
             )
         });
+        // Two projects read identical source bytes under different symbols.
+        // Exercise every optimized declaration view, including the anchored
+        // shapes, without introducing another fixture tree.
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oid = test_blob_oid(b"same conditional source");
+        let adapter = FixtureAdapter {
+            path_units: Vec::new(),
+        };
+        let mut files = Vec::new();
+        let mut anchors = Vec::new();
+        let mut configuration = Vec::new();
+        {
+            let conn = store.conn.lock().unwrap();
+            for (branch, byte) in [("DEBUG", 1_u8), ("RELEASE", 2_u8)] {
+                let path = format!("anchored/{branch}/Shared.cs");
+                configuration.push(crate::analyzer::store::WorkspaceConfigurationInput::new(
+                    format!("anchored/{branch}/{branch}.csproj"),
+                    format!("<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework><DefineConstants>{branch}</DefineConstants></PropertyGroup></Project>").into_bytes().into_boxed_slice(),
+                ));
+                let blob = Blob {
+                    oid,
+                    lang: "csharp",
+                    rel_path: "Shared.cs",
+                    rows: vec![
+                        row(
+                            &unit(
+                                "stable/Shared.cs",
+                                CodeUnitType::Class,
+                                &[("project", P), ("Owner", T), (branch, N)],
+                                1,
+                            ),
+                            &[1],
+                        ),
+                        row(
+                            &unit(
+                                &path,
+                                CodeUnitType::Class,
+                                &[("project", P), ("Owner", T), (branch, N)],
+                                1,
+                            ),
+                            &[2],
+                        ),
+                    ],
+                    parsed: true,
+                    in_workspace: true,
+                };
+                insert_blob(&conn, &adapter, &blob);
+                conn.execute("UPDATE blobs SET parse_variant=?1 WHERE blob_oid=?2 AND lang='csharp' AND parse_variant=x''",
+                    params![vec![byte; 32], oid.to_string()]).unwrap();
+                files.push(WorkspaceFileRow {
+                    rel_path: path.clone(),
+                    blob_oid: oid,
+                    decision: Some(crate::analyzer::store::FileVersionDecision {
+                        decision_digest: [byte; 32],
+                        assignment_digest: [byte; 32],
+                    }),
+                });
+                anchors.push(WorkspaceAnchorRow {
+                    rel_path: path,
+                    anchor: PackageAnchor::OwnModule { pop: 0 },
+                    package_name: branch.into(),
+                });
+            }
+        }
+        let workspace = crate::analyzer::store::WorkspaceId("a".repeat(64));
+        let snapshot = store
+            .sync_workspace_inputs_for_workspace(
+                &workspace,
+                "csharp",
+                GenerationId::BOOTSTRAP,
+                &files,
+                &[],
+                &[],
+                &[],
+                &[],
+                &anchors,
+                &configuration,
+                &[],
+                &[],
+            )
+            .unwrap();
+        let snapshots = [("csharp".into(), snapshot)].into_iter().collect();
+        let conn = store.read_conn_for_workspace(&snapshots).unwrap();
+        for view in [
+            "live_stable_definition_parent_names",
+            "live_anchored_definition_parent_names",
+            "live_stable_definition_normalized_names",
+            "live_anchored_definition_normalized_names",
+            "live_stable_definition_identifiers",
+            "live_anchored_definition_identifiers",
+            "live_stable_package_types",
+            "live_anchored_package_types",
+        ] {
+            let rows = conn
+                .prepare(&format!(
+                    "SELECT rel_path, identifier FROM {view} WHERE lang='csharp' ORDER BY rel_path"
+                ))
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("anchored/DEBUG/Shared.cs".into(), "DEBUG".into()),
+                    ("anchored/RELEASE/Shared.cs".into(), "RELEASE".into())
+                ],
+                "{view}"
+            );
+        }
     }
 
     #[test]

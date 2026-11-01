@@ -16,8 +16,11 @@ pub(crate) mod java_artifact;
 pub(crate) mod jdk_artifact;
 pub(crate) mod jmod_artifact;
 pub(crate) mod kotlin_artifact;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod native_hierarchy;
 #[doc(hidden)]
 pub mod native_points;
+pub(crate) mod producer_codes;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
 pub(crate) mod scala_collection_contracts;
@@ -195,10 +198,16 @@ fn source_archive_entries(
 
     use crate::analyzer::jvm::java_artifact::MAX_TOTAL_ARCHIVE_BYTES;
     use std::io::{Cursor, Read};
+    let fallback_invalid_code = format!("{diagnostic_prefix}.archive.invalid");
+    let invalid_code = if diagnostic_prefix == "scala" {
+        producer_codes::SCALA_ARCHIVE_INVALID.code
+    } else {
+        fallback_invalid_code.as_str()
+    };
     let mut archive = zip::ZipArchive::new(Cursor::new(artifact.bytes()))
         .map_err(|_| {
             brokk_bifrost_semantic::analyzer::semantic_model::producer::failed_artifact_production(
-                &format!("{diagnostic_prefix}.archive.invalid"),
+                invalid_code,
                 "artifact is not a readable ZIP/JAR archive",
                 limits,
             )
@@ -208,7 +217,7 @@ fn source_archive_entries(
     let mut total_bytes = 0u64;
     if archive.len() > MAX_ARCHIVE_ENTRIES {
         diagnostics.warning(
-            "limit.archive_entries",
+            producer_codes::LIMIT_ARCHIVE_ENTRIES.code,
             None,
             format!("producer inspected at most {MAX_ARCHIVE_ENTRIES} archive entries"),
         );
@@ -225,7 +234,11 @@ fn source_archive_entries(
         }
         let Ok(mut entry) = archive.by_index(index) else {
             diagnostics.warning(
-                format!("{diagnostic_prefix}.archive.entry"),
+                if diagnostic_prefix == "scala" {
+                    producer_codes::SCALA_ARCHIVE_ENTRY.code.to_owned()
+                } else {
+                    format!("{diagnostic_prefix}.archive.entry")
+                },
                 None,
                 format!("could not read archive entry at index {index}"),
             );
@@ -235,7 +248,11 @@ fn source_archive_entries(
             Ok(name) => name.into_owned(),
             Err(error) => {
                 diagnostics.warning(
-                    format!("{diagnostic_prefix}.archive.entry_name"),
+                    if diagnostic_prefix == "scala" {
+                        producer_codes::SCALA_ARCHIVE_ENTRY_NAME.code.to_owned()
+                    } else {
+                        format!("{diagnostic_prefix}.archive.entry_name")
+                    },
                     None,
                     format!("could not decode archive entry name at index {index}: {error}"),
                 );
@@ -250,7 +267,7 @@ fn source_archive_entries(
         }
         if name.len() > max_locator_path_bytes {
             diagnostics.warning(
-                "limit.locator_path",
+                producer_codes::LIMIT_LOCATOR_PATH.code,
                 None,
                 "source entry path exceeded the locator length limit",
             );
@@ -275,7 +292,11 @@ fn source_archive_entries(
             || bytes.len() as u64 > MAX_SOURCE_ENTRY_BYTES
         {
             diagnostics.warning(
-                format!("{diagnostic_prefix}.archive.entry_read"),
+                if diagnostic_prefix == "scala" {
+                    producer_codes::SCALA_ARCHIVE_ENTRY_READ.code.to_owned()
+                } else {
+                    format!("{diagnostic_prefix}.archive.entry_read")
+                },
                 Some(name),
                 "could not read bounded archive entry bytes",
             );
@@ -284,7 +305,11 @@ fn source_archive_entries(
         match String::from_utf8(bytes) {
             Ok(source) => entries.push((name, source)),
             Err(_) => diagnostics.warning(
-                format!("{diagnostic_prefix}.source.encoding"),
+                if diagnostic_prefix == "scala" {
+                    producer_codes::SCALA_SOURCE_ENCODING.code.to_owned()
+                } else {
+                    format!("{diagnostic_prefix}.source.encoding")
+                },
                 Some(name),
                 "source entry is not valid UTF-8",
             ),

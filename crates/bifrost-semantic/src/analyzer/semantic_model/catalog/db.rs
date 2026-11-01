@@ -12,7 +12,7 @@ use crate::analyzer::semantic_model::catalog::CatalogOpenMode;
 use brokk_bifrost_core::sqlite_template;
 
 pub(in crate::analyzer::semantic_model::catalog) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 28;
+pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 29;
 const PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 10;
 const NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 11;
 const UNKNOWN_TYPES_CATALOG_VERSION: i64 = 12;
@@ -96,6 +96,9 @@ const PACK_MANIFEST_OBJECTS_SQL: &str =
 pub(in crate::analyzer::semantic_model::catalog) const ASSEMBLY_TYPE_FORWARDS_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0028-assembly-type-forwards.sql");
 
+const OPEN_SCHEMA_VERSION_BOUND_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0029-open-schema-version-bound.sql");
+
 /// This build's empty-catalog template. The migrations are the schema inputs:
 /// on an empty catalog their Rust steps have no rows to change, so the SQL
 /// alone decides the bytes.
@@ -132,6 +135,7 @@ static CATALOG_TEMPLATE: LazyLock<sqlite_template::Template> = LazyLock::new(|| 
             SEMANTIC_PAYLOAD_FAMILIES_SQL.as_bytes(),
             PACK_MANIFEST_OBJECTS_SQL.as_bytes(),
             ASSEMBLY_TYPE_FORWARDS_SQL.as_bytes(),
+            OPEN_SCHEMA_VERSION_BOUND_SQL.as_bytes(),
         ],
     )
 });
@@ -333,7 +337,8 @@ fn migrate(
     }
     migrate_catalog_through_payload_families(connection)?;
     migrate_pack_manifest_objects(connection, root)?;
-    migrate_manifest_schema(connection, 28, ASSEMBLY_TYPE_FORWARDS_SQL)
+    migrate_manifest_schema(connection, 28, ASSEMBLY_TYPE_FORWARDS_SQL)?;
+    migrate_manifest_schema(connection, 29, OPEN_SCHEMA_VERSION_BOUND_SQL)
 }
 
 fn migrate_catalog_through_payload_families(
@@ -2714,6 +2719,68 @@ mod tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn migration_29_opens_the_schema_version_bound_and_preserves_rows() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("staging")).unwrap();
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_schema_10(&mut connection);
+        insert_legacy_pack(&connection);
+        migrate_catalog_through_payload_families(&mut connection).unwrap();
+        migrate_pack_manifest_objects(&mut connection, root.path()).unwrap();
+        migrate_manifest_schema(&mut connection, 28, ASSEMBLY_TYPE_FORWARDS_SQL).unwrap();
+        let manifest: String = connection
+            .query_row(
+                "SELECT manifest_digest FROM catalog_packs LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute("INSERT INTO catalog_pack_shards(manifest_digest,ordinal,shard_id,payload_kind,stored_digest,content_digest,semantic_digest,record_count,descriptor_json) SELECT manifest_digest,0,'s','declaration_facts',manifest_object_digest,manifest_digest,manifest_digest,0,X'7B7D' FROM catalog_packs WHERE manifest_digest=?1",[&manifest]).unwrap();
+        let schema_21 = "UPDATE catalog_packs SET schema_version=21, bifrost_compatibility=NULL WHERE manifest_digest=?1";
+        assert!(
+            connection.execute(schema_21, [&manifest]).is_err(),
+            "version 28 bounds the schema version at 20"
+        );
+        let tables: Vec<String>=connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
+            .query_map([],|row|row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let before: Vec<_> = tables
+            .iter()
+            .map(|table| (table.clone(), table_rows(&connection, table)))
+            .collect();
+        migrate_manifest_schema(&mut connection, 29, OPEN_SCHEMA_VERSION_BOUND_SQL).unwrap();
+        for (table, rows) in before {
+            assert_eq!(table_rows(&connection, &table), rows, "{table}");
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        // Any version from 8 on is admitted; the compatibility shape still
+        // partitions at 8.
+        connection.execute(schema_21, [&manifest]).unwrap();
+        connection
+            .execute(
+                "UPDATE catalog_packs SET schema_version=40 WHERE manifest_digest=?1",
+                [&manifest],
+            )
+            .unwrap();
+        assert!(connection.execute("UPDATE catalog_packs SET schema_version=8, bifrost_compatibility='>=0.1.0' WHERE manifest_digest=?1",[&manifest]).is_err());
+        assert!(connection.execute("UPDATE catalog_packs SET schema_version=7, bifrost_compatibility=NULL WHERE manifest_digest=?1",[&manifest]).is_err());
+        assert!(
+            connection
+                .execute(
+                    "UPDATE catalog_packs SET schema_version=1 WHERE manifest_digest=?1",
+                    [&manifest]
+                )
+                .is_err()
         );
     }
 

@@ -1,3 +1,4 @@
+// Go-only context rows use the empty parse variant.
 //! Demand-local Go dot-import composition over immutable package publications.
 //!
 //! This is one caller's query. Package membership stays in SQLite; the source
@@ -263,6 +264,44 @@ pub(crate) struct GoContextSelection {
     global_gap_count: i64,
 }
 
+/// Whether the operation's Go mounts cover the active context's source files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoHierarchySelectionCoverage {
+    Workspace,
+    Partial,
+}
+
+impl GoHierarchySelectionCoverage {
+    pub const fn incomplete_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Workspace => None,
+            Self::Partial => Some("selection does not cover workspace"),
+        }
+    }
+}
+
+pub(crate) const GO_HIERARCHY_SELECTION_COVERAGE_SQL: &str = r#"
+-- Coverage compares the request with the whole non-ignored context inventory.
+-- go_same_package's source_role IN ('go', ?3) rule filters visible peers for
+-- the consumer; it does not restrict the inventory tested here.
+WITH active(file_version_id) AS (
+  SELECT source.file_version_id
+  FROM temp.selected_go_context_source_files AS source
+  WHERE source.context_id=?1 AND source.source_role<>'ignored'
+), requested(file_version_id) AS (
+  -- A keyed read per transient mount; a LEFT JOIN would materialize the view.
+  SELECT COALESCE(mounted.file_version_id,
+                  (SELECT placed.file_version_id
+                   FROM temp.selected_go_transient_placements AS placed
+                   WHERE placed.mount_ordinal=mounted.mount_ordinal))
+  FROM temp.selected_resolution_scope_mounts AS scope
+  JOIN temp.selected_resolution_mounts AS mounted ON mounted.mount_ordinal=scope.mount_ordinal
+  WHERE mounted.storage_language='go'
+)
+SELECT NOT EXISTS(SELECT file_version_id FROM active EXCEPT SELECT file_version_id FROM requested)
+   AND NOT EXISTS(SELECT file_version_id FROM requested EXCEPT SELECT file_version_id FROM active)
+"#;
+
 // A transient return value: the ready payload is moved out immediately, so
 // boxing it would add an allocation to every context read.
 #[allow(clippy::large_enum_variant)]
@@ -456,6 +495,28 @@ impl SelectedResolutionOperation<'_, '_> {
             .borrow_mut()
             .insert(memo_key, selection.clone());
         Ok(selection)
+    }
+
+    /// The context helper fixes the same generation and revision used by the
+    /// selected source-file view; this adds no second context inventory read.
+    pub fn go_hierarchy_selection_coverage(
+        &self,
+        context_id: i64,
+        source_role: &str,
+    ) -> Result<GoHierarchySelectionCoverage> {
+        let Some(_selection) = self.go_context_selection(context_id, source_role)? else {
+            return Ok(GoHierarchySelectionCoverage::Partial);
+        };
+        let complete: bool = self.ready.inventory.connection().query_row(
+            GO_HIERARCHY_SELECTION_COVERAGE_SQL,
+            rusqlite::params![context_id],
+            |row| row.get(0),
+        )?;
+        Ok(if complete {
+            GoHierarchySelectionCoverage::Workspace
+        } else {
+            GoHierarchySelectionCoverage::Partial
+        })
     }
 
     fn read_go_context_selection(

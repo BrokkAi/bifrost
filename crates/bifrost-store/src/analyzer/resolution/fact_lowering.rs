@@ -2864,11 +2864,16 @@ fn lower_root_import_paths(
             root_symbols.extend(route);
             root_symbols.push(token);
             root_symbols.push(lookup);
-            let choice = identities.semantic(match import.fact.position {
-                Some(position) => {
+            let choice = identities.semantic(match (language, import.fact.position) {
+                // SLS chapter 2: an import binds in its enclosing body's scope.
+                // Its checkpoint still controls when the import becomes visible.
+                (Language::Scala, _) => {
+                    scope_choice_identity(import.fact.root_scope, demand.namespace)
+                }
+                (_, Some(position)) => {
                     checkpoint_choice_identity(import.fact.root_scope, position, demand.namespace)
                 }
-                None => scope_choice_identity(import.fact.root_scope, demand.namespace),
+                (_, None) => scope_choice_identity(import.fact.root_scope, demand.namespace),
             });
             // The producer's byte position orders positional imports within
             // their blob. Other languages supply none, so their rows store NULL.

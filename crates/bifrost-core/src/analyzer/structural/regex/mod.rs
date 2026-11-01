@@ -62,6 +62,17 @@ struct BranchFrame {
     group_start: Option<usize>,
     last_atom: Option<usize>,
     restore_flags: Option<RegexFlags>,
+    /// The group number when this frame is a capturing group.
+    capture: Option<usize>,
+}
+
+/// Capturing groups opened before an escape, numbered from 1 in opening order.
+/// Dialects whose numeric escapes depend on the groups read this.
+#[derive(Debug, Default)]
+pub struct CaptureGroups {
+    pub opened: usize,
+    /// Groups whose closing parenthesis has not been reached yet.
+    pub open: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,6 +175,7 @@ pub trait RegexSyntax {
         start: usize,
         in_class: bool,
         flags: RegexFlags,
+        groups: &CaptureGroups,
     ) -> Option<EscapeValue>;
     fn class_atom(&self, chars: &[char], start: usize, flags: RegexFlags) -> Option<ClassAtom>;
     fn wildcard(&self, flags: RegexFlags) -> CharacterSet;
@@ -172,6 +184,9 @@ pub trait RegexSyntax {
     fn verbose_whitespace(&self, character: char) -> bool;
     fn verbose_comment_terminator(&self, character: char) -> bool;
     fn supports_possessive_quantifiers(&self) -> bool;
+    /// The line terminators that `$` without MULTILINE may leave unconsumed at
+    /// the end of the input.
+    fn final_line_terminators(&self, flags: RegexFlags) -> &'static [&'static str];
     /// Producer-owned analysis run before ReDoS classifiers; may mark incomplete.
     fn analyze(&self, context: &mut RegexAnalysis<'_>);
 }

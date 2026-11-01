@@ -14,11 +14,12 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
     fn claims_included_files(&self) -> bool {
         false
     }
+    /// Native engines publish their file-local lowerer at parse time. None is for
+    /// legacy engines or lowerers that read models, overlays, or dependencies
+    /// outside the file, which the file-only producer epoch cannot key.
     fn parse_time_semantic_lowerer(
         &self,
-    ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer> {
-        None
-    }
+    ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer>;
     fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
         if self.claims_included_files() && file.has_unclaimed_extension() {
             return self.language().config_label();

@@ -157,21 +157,21 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
             "alias",
             "namespace A { class X {} namespace B { using X = Other.Y; class C { X f; } } }",
             "namespace Other { class Y {} }",
-            None,
+            Some(("App/Other.cs", "Other.Y")),
             false,
         ),
         (
             "namespace",
             "namespace A { class X {} namespace B { using Other; class C { X f; } } }",
             "namespace Other { class X {} }",
-            None,
+            Some(("App/Other.cs", "Other.X")),
             false,
         ),
         (
             "static",
             "namespace A { class X {} namespace B { using static Other.Y; class C { X f; } } }",
             "namespace Other { class Y { public class X {} } }",
-            None,
+            Some(("App/Other.cs", "Other.Y$X")),
             false,
         ),
         (
@@ -192,7 +192,7 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
             "global_only",
             "namespace A { namespace B { class C { X f; } } }",
             "global using X = Other.Y; namespace Other { class Y {} }",
-            None,
+            Some(("App/Other.cs", "Other.Y")),
             true,
         ),
         (
@@ -251,11 +251,22 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
             .unwrap();
         if let Some((file, name)) = expected {
             assert_eq!(result.targets, vec![(file.to_owned(), name.to_owned())]);
-            assert!(
-                result.using_gaps.is_empty(),
-                "{case}: {:?}",
-                result.using_gaps
-            );
+            if case == "namespace" || case == "static" {
+                assert!(
+                    result
+                        .named_reasons
+                        .iter()
+                        .any(|(name, _)| *name == "csharp_external_unindexed"),
+                    "{case}: {:?}",
+                    result.named_reasons
+                );
+            } else {
+                assert!(
+                    result.using_gaps.is_empty(),
+                    "{case}: {:?}",
+                    result.using_gaps
+                );
+            }
             if case == "global" {
                 assert_eq!(
                     result
@@ -283,7 +294,7 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
                 result
                     .named_reasons
                     .iter()
-                    .any(|(name, _)| *name == "csharp_using_tier_unmodeled"),
+                    .any(|(name, _)| *name == "csharp_compilation_usings_incomplete"),
                 "{case}: visits={:?}, gaps={:?}, reasons={:?}",
                 result.visited,
                 result.using_gaps,
@@ -320,7 +331,12 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
         }
         assert!(
             result.visited.contains(&Some(vec!["A".to_owned()]))
-                == (case == "extern_outer" || case == "global" || case == "global_only"),
+                == (case == "alias"
+                    || case == "namespace"
+                    || case == "static"
+                    || case == "extern_outer"
+                    || case == "global"
+                    || case == "global_only"),
             "{case}: {:?}",
             result.visited
         );

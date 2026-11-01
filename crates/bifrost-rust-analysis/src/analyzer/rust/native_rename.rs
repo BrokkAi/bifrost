@@ -647,6 +647,7 @@ fn rust_rename_overlay_inputs(
             SelectedResolutionContentMountRequest::new(
                 witness,
                 WorkspaceFileRow {
+                    decision: None,
                     rel_path: path,
                     blob_oid: oid,
                 },

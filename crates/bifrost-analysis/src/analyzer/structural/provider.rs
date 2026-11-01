@@ -672,6 +672,10 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
         file: &ProjectFile,
         source: &str,
     ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
+        let Some(variant) = crate::analyzer::IAnalyzer::selected_parse_variant(self, file) else {
+            return (None, StructuralFactsCacheOutcome::Unavailable);
+        };
+
         let snapshot_key = self.structural_snapshot_key(file, source);
         if let Some(key) = snapshot_key.as_ref()
             && let Some(facts) = self.structural_cache().get(key)
@@ -702,7 +706,9 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
             match read {
                 Some(crate::analyzer::store::StructuralFactRowsRead::Ready(rows)) => {
                     let facts = match FileFacts::from_persisted_rows(source.to_owned(), rows) {
-                        Ok(facts) => Arc::new(facts),
+                        Ok(facts) => {
+                            Arc::new(facts.with_parse_identity(self.adapter().language(), variant))
+                        }
                         Err(error) => {
                             self.record_store_error(StoreError::new(format!(
                                 "invalid canonical structural facts: {error}"
@@ -724,11 +730,14 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
 
             if let Some(state) = self.cached_canonical_source_state(file, source) {
                 let source_facts = state.source_facts.as_ref().expect("canonical source state");
-                let facts = Arc::new(FileFacts::from_source_and_rows(
-                    source.to_owned(),
-                    source_facts.occurrences.clone(),
-                    source_facts.structural.clone(),
-                ));
+                let facts = Arc::new(
+                    FileFacts::from_source_and_rows(
+                        source.to_owned(),
+                        source_facts.occurrences.clone(),
+                        source_facts.structural.clone(),
+                    )
+                    .with_parse_identity(self.adapter().language(), variant),
+                );
                 return Ok((facts, StructuralFactsCacheOutcome::MemoryHit));
             }
 
@@ -789,7 +798,7 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
                     source_facts.structural,
                 ),
             };
-            let facts = Arc::new(facts);
+            let facts = Arc::new(facts.with_parse_identity(self.adapter().language(), variant));
             if retainable {
                 Ok((facts, StructuralFactsCacheOutcome::Extracted))
             } else {
@@ -813,6 +822,8 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
         source: &str,
         max_fact_nodes: usize,
     ) -> Option<StructuralFactsLimitedOutcome> {
+        let variant = crate::analyzer::IAnalyzer::selected_parse_variant(self, file)?;
+
         let state = self.cached_canonical_source_state(file, source)?;
         let source_facts = state
             .source_facts
@@ -824,11 +835,14 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
                 minimum_fact_nodes: work_items,
             });
         }
-        let facts = Arc::new(FileFacts::from_source_and_rows(
-            source.to_owned(),
-            source_facts.occurrences.clone(),
-            source_facts.structural.clone(),
-        ));
+        let facts = Arc::new(
+            FileFacts::from_source_and_rows(
+                source.to_owned(),
+                source_facts.occurrences.clone(),
+                source_facts.structural.clone(),
+            )
+            .with_parse_identity(self.adapter().language(), variant),
+        );
         Some(StructuralFactsLimitedOutcome::Available {
             facts,
             cache_outcome: StructuralFactsCacheOutcome::MemoryHit,
@@ -940,7 +954,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
                 // check. Keep its raw blob identity for read-ledger
                 // invalidation, including when fact materialization hits a
                 // persisted or in-memory canonical result.
-                self.record_reads(|sink| sink.push(self.file_read_key(file, snapshot.0)));
+                self.record_reads(|sink| self.record_selected_file_key(sink, file, snapshot.0));
             }
             StructuralSourceLimitedOutcome::Available(snapshot.1.into_source())
         }
@@ -989,6 +1003,10 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         &self,
         file: &ProjectFile,
     ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
+        let Some(variant) = crate::analyzer::IAnalyzer::selected_parse_variant(self, file) else {
+            return (None, StructuralFactsCacheOutcome::Unavailable);
+        };
+
         let Some(spec) = self.adapter().structural_spec() else {
             return (None, StructuralFactsCacheOutcome::Unavailable);
         };
@@ -1011,7 +1029,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         if let Some((oid, key)) = probed.clone()
             && let Some(facts) = self.structural_cache().get(&key)
         {
-            self.record_reads(|sink| sink.push(self.file_read_key(file, oid)));
+            self.record_reads(|sink| self.record_selected_file_key(sink, file, oid));
             return (Some(facts), StructuralFactsCacheOutcome::MemoryHit);
         }
         if self.adapter().produces_canonical_source_facts() {
@@ -1025,7 +1043,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
                 // that case, so preserve the unavailable result.
                 return (None, StructuralFactsCacheOutcome::Unavailable);
             };
-            self.record_reads(|sink| sink.push(self.file_read_key(file, content_oid)));
+            self.record_reads(|sink| self.record_selected_file_key(sink, file, content_oid));
             return self.canonical_structural_facts_with_outcome(file, &source);
         }
         let Some(source) = self.file_source(file) else {
@@ -1042,7 +1060,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         // The structural facts of one file are a per-file read of exactly these
         // bytes, recorded whether the cache, the store, or a fresh extraction
         // answers: all three are the same input.
-        self.record_reads(|sink| sink.push(self.file_read_key(file, content_oid)));
+        self.record_reads(|sink| self.record_selected_file_key(sink, file, content_oid));
         let key = match probed.clone() {
             // The probe and source read are separate observations. An overlay
             // or file replacement between them may change the content; only
@@ -1057,7 +1075,9 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
                     self.structural_cache().record_extraction();
                     return match extract_file_facts(spec, &grammar, &source) {
                         Some(facts) => (
-                            Some(Arc::new(facts)),
+                            Some(Arc::new(
+                                facts.with_parse_identity(self.adapter().language(), variant),
+                            )),
                             StructuralFactsCacheOutcome::Extracted,
                         ),
                         None => (None, StructuralFactsCacheOutcome::Unavailable),
@@ -1075,7 +1095,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
             || {
                 let grammar = self.adapter().parser_language_for_file(file);
                 let facts = extract_file_facts(spec, &grammar, &source)?;
-                Some(facts)
+                Some(facts.with_parse_identity(self.adapter().language(), variant))
             },
         )
     }
@@ -1095,6 +1115,10 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         max_fact_nodes: usize,
         cancellation: Option<&CancellationToken>,
     ) -> StructuralFactsLimitedOutcome {
+        let Some(variant) = crate::analyzer::IAnalyzer::selected_parse_variant(self, file) else {
+            return StructuralFactsLimitedOutcome::Unavailable;
+        };
+
         let Some(spec) = self.adapter().structural_spec() else {
             return StructuralFactsLimitedOutcome::Unavailable;
         };
@@ -1180,7 +1204,9 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
                     return StructuralFactsLimitedOutcome::Cancelled;
                 }
                 let facts = match FileFacts::from_persisted_rows(source.to_owned(), rows) {
-                    Ok(facts) => Arc::new(facts),
+                    Ok(facts) => {
+                        Arc::new(facts.with_parse_identity(self.adapter().language(), variant))
+                    }
                     Err(error) => {
                         self.record_store_error(StoreError::new(format!(
                             "invalid canonical structural facts: {error}"
@@ -1220,7 +1246,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
                 return StructuralFactsLimitedOutcome::Cancelled;
             }
 
-            let facts = Arc::new(facts);
+            let facts = Arc::new(facts.with_parse_identity(self.adapter().language(), variant));
             // The bounded query path must remain promptly cancellable. Durable row conversion
             // clones every normalized node and role edge before insertion, so leave that optional
             // optimization to the ordinary materialization path rather than performing an
@@ -1364,7 +1390,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
 
     fn structural_file_read_key(&self, file: &ProjectFile) -> Option<crate::analyzer::ReadKey> {
         Some(match self.resolve_live_oid_for_file(file) {
-            Some(oid) => self.file_read_key(file, oid),
+            Some(oid) => self.file_read_key(file, oid, self.selected_parse_variant(file)?),
             None => crate::analyzer::ReadKey::path_absent(
                 self.adapter().language(),
                 crate::path_utils::rel_path_string(file),

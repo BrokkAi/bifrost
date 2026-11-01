@@ -13,6 +13,23 @@ pub(in crate::analyzer::store) const EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL: &s
 pub(in crate::analyzer::store) const INTRINSIC_MEMBER_OWNER_INDEXED_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn=?2)";
 
+pub(in crate::analyzer::store) fn intrinsic_member_inventory_for_owner(
+    connection: &rusqlite::Connection,
+    owner: &ExternalOwnerIdentity,
+) -> StoreResult<Option<&'static [crate::analyzer::resolution::universe::IntrinsicMember]>> {
+    let Some(inventory) =
+        crate::analyzer::resolution::universe::intrinsic_member_inventory(&owner.owner_fqn)
+    else {
+        return Ok(None);
+    };
+    let indexed: bool = connection.query_row(
+        jvm_external_owner_relations().owner_indexed,
+        rusqlite::params![owner.provider_id.as_ref(), owner.owner_fqn.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok((!indexed).then_some(inventory))
+}
+
 struct ExternalOwnerScopes {
     callables_complete: bool,
     values_complete: bool,
@@ -39,25 +56,6 @@ fn decode_external_owner_scopes(
 fn decode_external_member_visibility(label: &str) -> StoreResult<DeclaredVisibility> {
     DeclaredVisibility::from_label(label)
         .ok_or_else(|| invalid_fact(format!("invalid external member visibility {label:?}")))
-}
-
-pub(in crate::analyzer::store) fn intrinsic_member_inventory_for_owner(
-    connection: &rusqlite::Connection,
-    owner: &ExternalOwnerIdentity,
-) -> StoreResult<Option<&'static [crate::analyzer::resolution::universe::IntrinsicMember]>> {
-    let Some(inventory) =
-        crate::analyzer::resolution::universe::intrinsic_member_inventory(&owner.owner_fqn)
-    else {
-        return Ok(None);
-    };
-    // Indexed artifacts own their ordinals. Never overlay intrinsic ordinals
-    // onto an existing provider's rows; the fixed table fills an unindexed root.
-    let indexed: bool = connection.query_row(
-        jvm_external_owner_relations().owner_indexed,
-        rusqlite::params![owner.provider_id.as_ref(), owner.owner_fqn.as_ref()],
-        |row| row.get(0),
-    )?;
-    Ok((!indexed).then_some(inventory))
 }
 
 impl SelectedResolutionTypedSource<'_, '_> {
@@ -149,9 +147,23 @@ impl SelectedResolutionTypedSource<'_, '_> {
         Option<Option<&'static [crate::analyzer::resolution::universe::IntrinsicMember]>>,
     > {
         self.read_statement(cancellation, |connection| {
-            Ok(Some(intrinsic_member_inventory_for_owner(
-                connection, owner,
-            )?))
+            let Some(inventory) =
+                crate::analyzer::resolution::universe::intrinsic_member_inventory(&owner.owner_fqn)
+            else {
+                return Ok(Some(None));
+            };
+            // Preserve the inventory read's own publication check, and make
+            // its exact answer available to the root shadow check.
+            let indexed: bool = connection.query_row(
+                jvm_external_owner_relations().owner_indexed,
+                rusqlite::params![owner.provider_id.as_ref(), owner.owner_fqn.as_ref()],
+                |row| row.get(0),
+            )?;
+            self.intrinsic_owner_indexed.borrow_mut().insert_bounded(
+                (owner.provider_id.to_string(), owner.owner_fqn.to_string()),
+                indexed,
+            );
+            Ok(Some((!indexed).then_some(inventory)))
         })
     }
 
@@ -655,10 +667,12 @@ pub(super) struct ExternalSignatureMemo {
     >,
     declarations:
         crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
-    seeds: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredIntrinsicSeed>>,
+    pub(super) seeds: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredIntrinsicSeed>>,
     parameter_slots: crate::hash::HashSet<SemanticId>,
-    components: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredTypeComponent>>,
-    descriptors: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredIntrinsicTypeDescriptor>>,
+    pub(super) components:
+        crate::hash::HashMap<SemanticId, Vec<SelectedTypedRow<LoweredTypeComponent>>>,
+    pub(super) descriptors:
+        crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredIntrinsicTypeDescriptor>>,
     owners: crate::hash::HashMap<String, Option<ExternalOwnerIdentity>>,
 }
 
@@ -1108,7 +1122,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
         self.external_signature_rows(
             containers
                 .iter()
-                .filter_map(|slot| memo.components.get(slot).cloned())
+                .filter_map(|slot| memo.components.get(slot))
+                .flat_map(|rows| rows.iter().cloned())
                 .collect(),
             cancellation,
             visitor,
@@ -1261,6 +1276,12 @@ pub(super) trait TypeTermHooks {
     fn sequence_element<'a>(&self, _term: &'a TypeRef) -> Option<&'a TypeRef> {
         None
     }
+    fn slice_element<'a>(&self, _term: &'a TypeRef) -> Option<&'a TypeRef> {
+        None
+    }
+    fn map_elements<'a>(&self, _term: &'a TypeRef) -> Option<(&'a TypeRef, &'a TypeRef)> {
+        None
+    }
     fn pointer_element<'a>(&self, _term: &'a TypeRef) -> Option<&'a TypeRef> {
         None
     }
@@ -1359,13 +1380,19 @@ pub(super) fn lower_type_term(
         ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
     };
     let root = hooks.allocate();
+    enum Children {
+        Pointer(SemanticId),
+        Sequence(SemanticId),
+        Slice(SemanticId),
+        Map(SemanticId, SemanticId),
+    }
     let mut pending = vec![(term, root, None)];
     while let Some((term, (slot, digest), component)) = pending.pop() {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        if let Some((element, pointer)) = component {
-            if pointer {
+        if let Some(component) = component {
+            if let Children::Pointer(element) = component {
                 let child = memo
                     .seeds
                     .get(&element)
@@ -1394,20 +1421,43 @@ pub(super) fn lower_type_term(
                 );
                 continue;
             }
-            let child = memo
-                .seeds
-                .get(&element)
-                .expect("external array component was lowered first");
-            let completion = child.row().frontier().completion().clone();
-            memo.components.insert(
-                slot,
-                hooks.wrap(LoweredTypeComponent::new(
-                    slot,
+            let (constructor, children) = match component {
+                Children::Sequence(element) => (
                     ResolutionTypeConstructorKind::Sequence,
-                    ResolutionTypeComponentKind::Element,
-                    element,
-                )),
-            );
+                    vec![(ResolutionTypeComponentKind::Element, element)],
+                ),
+                Children::Slice(element) => (
+                    ResolutionTypeConstructorKind::Slice,
+                    vec![(ResolutionTypeComponentKind::Element, element)],
+                ),
+                Children::Map(key, value) => (
+                    ResolutionTypeConstructorKind::Map,
+                    vec![
+                        (ResolutionTypeComponentKind::Key, key),
+                        (ResolutionTypeComponentKind::Value, value),
+                    ],
+                ),
+                Children::Pointer(_) => unreachable!(),
+            };
+            let completion =
+                children
+                    .iter()
+                    .fold(ResolutionCompletion::Complete, |completion, (_, child)| {
+                        completion.combine(
+                            memo.seeds
+                                .get(child)
+                                .expect("constructor operand was lowered first")
+                                .row()
+                                .frontier()
+                                .completion(),
+                        )
+                    });
+            for (kind, child) in children {
+                memo.components
+                    .entry(slot)
+                    .or_default()
+                    .push(hooks.wrap(LoweredTypeComponent::new(slot, constructor, kind, child)));
+            }
             memo.seeds.insert(
                 slot,
                 hooks.wrap(LoweredIntrinsicSeed::new(
@@ -1426,14 +1476,32 @@ pub(super) fn lower_type_term(
         }
         if let Some(element) = hooks.pointer_element(term) {
             let child = hooks.allocate();
-            pending.push((term, (slot, digest), Some((child.0, true))));
+            pending.push((term, (slot, digest), Some(Children::Pointer(child.0))));
             pending.push((element, child, None));
             continue;
         }
         if let Some(element) = hooks.sequence_element(term) {
             let child = hooks.allocate();
-            pending.push((term, (slot, digest), Some((child.0, false))));
+            pending.push((term, (slot, digest), Some(Children::Sequence(child.0))));
             pending.push((element, child, None));
+            continue;
+        }
+        if let Some(element) = hooks.slice_element(term) {
+            let child = hooks.allocate();
+            pending.push((term, (slot, digest), Some(Children::Slice(child.0))));
+            pending.push((element, child, None));
+            continue;
+        }
+        if let Some((key, value)) = hooks.map_elements(term) {
+            let key_child = hooks.allocate();
+            let value_child = hooks.allocate();
+            pending.push((
+                term,
+                (slot, digest),
+                Some(Children::Map(key_child.0, value_child.0)),
+            ));
+            pending.push((value, value_child, None));
+            pending.push((key, key_child, None));
             continue;
         }
         let known = hooks.nominal(term, &memo.owners)?;

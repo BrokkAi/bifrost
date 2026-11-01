@@ -1,4 +1,5 @@
 //! Language-defined JVM parents use ordinary absolute references and hierarchy edges.
+use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::resolution_facts::*;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
@@ -6,12 +7,30 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 /// The shared publication preserves written parent order after this first edge.
 pub(crate) fn publish_implicit_supertype(
     facts: &mut FileResolutionFacts,
+    language: Language,
     subtype: ResolutionSiteId,
     reference: ResolutionSiteId,
     name: ResolutionNameId,
     prefix: &[ResolutionNameId],
     kind: ResolutionSupertypeKind,
 ) {
+    if kind == ResolutionSupertypeKind::ImplicitSuperclass {
+        let route = prefix
+            .iter()
+            .copied()
+            .chain(std::iter::once(name))
+            .map(|part| facts.names[part.index()].spelling.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                (language, route.as_slice()),
+                (Language::Scala, ["scala", "AnyRef"])
+                    | (Language::Java, ["java", "lang", "Object"])
+                    | (Language::Kotlin, ["kotlin", "Any"])
+            ),
+            "invalid implicit superclass route for {language:?}: {route:?}"
+        );
+    }
     assert_eq!(
         facts.sites[reference.index()].kind,
         ResolutionSiteKind::SyntheticReference

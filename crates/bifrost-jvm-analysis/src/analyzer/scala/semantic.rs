@@ -118,7 +118,8 @@ use crate::analyzer::scala::semantic_adaptation::type_identity as scala_type_ide
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v25";
+// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v26";
 
 /// Procedure syntax roles used by source-backed assignment relations. The
 /// Scala lowering already publishes exact assignment effects; these roles

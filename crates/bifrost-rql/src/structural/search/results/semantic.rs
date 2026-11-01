@@ -1058,6 +1058,13 @@ pub struct CodeQueryPythonRuleFact {
     pub fallthrough_none_returns: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mixed_returns: Option<bool>,
+    /// Reachable normal returns of a non-Python procedure return profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal_returns: Option<usize>,
+    /// The constant every normal return yields, when `return_contract` is
+    /// `same_constant`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_constant: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_async: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

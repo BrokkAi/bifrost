@@ -1022,3 +1022,9 @@ mod tests {
         );
     }
 }
+
+/// Whether a function type declares Kotlin context parameters.
+pub fn kotlin_function_type_has_context_parameters(node: Node<'_>) -> bool {
+    assert_eq!(node.kind(), "function_type");
+    first_named_child_of_kind(node, "context_parameters").is_some()
+}

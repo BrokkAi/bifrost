@@ -1155,7 +1155,8 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             let value = match option.field() {
                 QueryStepField::FormalName => Value::String(symbol_or_string(&items[2])?),
                 QueryStepField::FormalIndex => number_value(&items[2], head)?,
-                _ => unreachable!("call-argument registry contains only its two options"),
+                QueryStepField::FormalAnnotationType => Value::String(symbol_or_string(&items[2])?),
+                _ => unreachable!("call-argument registry contains only its three options"),
             };
             let mut step = Map::new();
             step.insert(
@@ -4409,6 +4410,28 @@ mod tests {
             })
         );
 
+        assert_eq!(
+            canonical(
+                r#"(call-argument :formal-annotation-type "Refit.HeaderAttribute"
+                      (call-bindings (call-shape (call))))"#,
+            ),
+            json!({
+                "match": { "kind": "call" },
+                "steps": [
+                    { "op": "call_shape" },
+                    { "op": "call_bindings" },
+                    {
+                        "op": "call_argument",
+                        "formal_annotation_type": "Refit.HeaderAttribute",
+                    },
+                ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
+
         let source = r#"(resolved-call :resolves-to "Widget.create" :proof exact
                           (call-bindings (call-shape (call :callee "create"))))"#;
         let query = CodeQuery::from_sexp(source).unwrap();
@@ -4570,6 +4593,10 @@ mod tests {
             r#"(call-argument :formal-name "sql" :formal-index 0
                   (call-bindings (call-shape (call))))"#,
             r#"(call-argument :formal-index 0 (call-shape (call)))"#,
+            r#"(call-argument :formal-annotation-type ""
+                  (call-bindings (call-shape (call))))"#,
+            r#"(call-argument :formal-name "user" :formal-annotation-type "Refit.HeaderAttribute"
+                  (call-bindings (call-shape (call))))"#,
         ] {
             assert!(CodeQuery::from_sexp(invalid).is_err(), "{invalid}");
         }

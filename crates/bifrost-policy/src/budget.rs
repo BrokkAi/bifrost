@@ -54,14 +54,14 @@ const MAX_PIPELINE_ROWS_HARD_CAP: usize = 16 * MAX_PIPELINE_ROWS;
 // owns variable-sized values, traces and projection columns, so retained bytes
 // cannot be inferred from row count alone.
 const SOURCE_BYTES_PER_SCALED_FACT_NODE: u64 = 6;
-const SCALED_SCAN_HEADROOM: u64 = 2;
+pub(crate) const SCALED_SCAN_HEADROOM: u64 = 2;
 // Semantic lanes cap resident admissions only. Source scans and traversal of
 // existing rows are non-refusing work telemetry, including on cache replay.
 // Cumulative = admitted plus worked per lane: held-and-scanned bytes can count
 // twice. It is telemetry, not a bound; root-work peaks are also telemetry.
 // The numerical resident grants retain their historical mixed-work calibration;
 // removing work refusal does not widen any resident grant.
-const SCALED_SEMANTIC_SOURCE_BYTES_PER_SOURCE_BYTE: u64 = 64;
+pub(crate) const SCALED_SEMANTIC_SOURCE_BYTES_PER_SOURCE_BYTE: u64 = 64;
 const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
 const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
@@ -145,7 +145,7 @@ const MAX_FINDINGS_HARD_CAP: usize = 16 * MAX_FINDINGS;
 // second one invented: one request may report up to two findings per audited
 // file.  On OWASP BenchmarkJava's 2770 analyzed files that is 5540, which the
 // 16000 hard cap admits; a workspace above 8000 files clamps.
-const SCALED_FINDINGS_PER_FILE: usize = SCALED_SCAN_HEADROOM as usize;
+pub(crate) const SCALED_FINDINGS_PER_FILE: usize = SCALED_SCAN_HEADROOM as usize;
 
 const MAX_DIAGNOSTICS: usize = 256;
 const MAX_RELATED_LOCATIONS_PER_FINDING: usize = 64;
@@ -513,6 +513,16 @@ impl Default for PolicyBatchBudget {
 impl PolicyBatchBudget {
     pub fn builder() -> PolicyBatchBudgetBuilder {
         PolicyBatchBudgetBuilder::default()
+    }
+
+    pub(crate) fn with_scaled_per_policy(mut self, mut budget: PolicyBudget) -> Self {
+        // Batch retention is an absolute cap even when workspace scaling widens
+        // the policy's allowance.
+        budget.max_retained_report_bytes = budget
+            .max_retained_report_bytes
+            .min(self.max_retained_report_bytes);
+        self.per_policy = budget;
+        self
     }
 
     pub const fn max_policies(&self) -> usize {

@@ -478,6 +478,7 @@ fn typed_relation_answers(
         TypedFactRelation::EmbeddedTypeLookup
         | TypedFactRelation::InterfaceMethodLookup
         | TypedFactRelation::SupertypeNameLookup => false,
+        TypedFactRelation::AliasTargetLookup => false,
         TypedFactRelation::RustReferenceContext => {
             answered!(visit_rust_reference_context_pages, semantic)
         }

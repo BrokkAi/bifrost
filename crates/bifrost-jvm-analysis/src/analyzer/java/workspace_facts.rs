@@ -44,6 +44,10 @@ impl JavaAnalyzer {
                     self,
                     cell,
                     || {
+                        // This source-only inventory is incomplete while externals
+                        // are unavailable. Reading the index makes that dependency
+                        // part of the retained fill's own receipt.
+                        self.external_declaration_index();
                         // Complete enumeration precedes the digest. Retain only the
                         // scalar, not another workspace-sized declaration inventory.
                         let classes = self
@@ -192,6 +196,266 @@ mod tests {
             .file("app/Target.java", "package app; class Target {}\n")
             .file("lib/Base.java", "package lib; public class Base {}\n")
             .build()
+    }
+
+    #[test]
+    #[hardwon(
+        "#8184: a retained replayable fill replayed the enclosing query's unrelated gap to later queries"
+    )]
+    fn replayable_cell_does_not_replay_enclosing_query_gap() {
+        use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+        use brokk_bifrost_analysis::analyzer::common::{
+            QueryCacheCell, replayable_query_cache_cell,
+        };
+
+        let project = fixture();
+        let java = JavaAnalyzer::new(project.project_arc());
+        let cell = QueryCacheCell::new();
+
+        {
+            let _scope = AnalyzerQueryScope::capturing_read_incompleteness(&java);
+            java.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                "unrelated".into(),
+            ));
+            assert_eq!(replayable_query_cache_cell(&java, &cell, || 7), 7);
+        }
+
+        let clean = AnalyzerQueryScope::capturing_read_incompleteness(&java);
+        assert_eq!(
+            replayable_query_cache_cell(&java, &cell, || panic!("must hit")),
+            7
+        );
+        assert!(clean.captured_read_incompleteness().is_empty());
+    }
+
+    #[test]
+    fn replayable_cell_preserves_closed_query_obligations_on_warm_reads() {
+        use brokk_bifrost_analysis::analyzer::common::{
+            QueryCacheCell, ReplayableQueryCacheValue, replayable_query_cache_cell,
+        };
+        use brokk_bifrost_analysis::analyzer::resolution::{FactResolutionAnswer, QueryObligation, QueryObligations};
+        use brokk_bifrost_analysis::analyzer::resolution::query_obligations::replay_observations::{
+            answer_for_cache_test, read_closed_answer_for_cache_test,
+        };
+        let project = fixture();
+        let java = JavaAnalyzer::new(project.project_arc());
+        let cell: QueryCacheCell<ReplayableQueryCacheValue<FactResolutionAnswer>> =
+            QueryCacheCell::new();
+        let mut expected = QueryObligations::empty();
+        expected.insert(QueryObligation::new(
+            "jvm-default-import-package-open",
+            "java.lang",
+            "unacquired",
+        ));
+        let cold_answer;
+        let mut cold_consumer = QueryObligations::empty();
+        {
+            let clean = AnalyzerQueryScope::new(&java);
+            cold_answer = read_closed_answer_for_cache_test(
+                replayable_query_cache_cell(&java, &cell, || {
+                    answer_for_cache_test(expected.clone())
+                }),
+                &mut cold_consumer,
+            );
+            assert!(clean.read_completion().is_ok());
+        }
+        assert_eq!(cold_consumer, expected);
+        let clean = AnalyzerQueryScope::new(&java);
+        let mut warm_consumer = QueryObligations::empty();
+        let warm_answer = read_closed_answer_for_cache_test(
+            replayable_query_cache_cell(&java, &cell, || panic!("same environment must hit")),
+            &mut warm_consumer,
+        );
+        assert_eq!(warm_answer, cold_answer);
+        assert_eq!(warm_consumer, cold_consumer);
+        assert!(
+            clean.read_completion().is_ok(),
+            "obligations are independent of typed read incompleteness"
+        );
+    }
+
+    #[test]
+    fn replayable_answer_cache_misses_on_selected_environment_change() {
+        use brokk_bifrost_analysis::analyzer::common::{
+            build_replayable_query_cache, read_replayable_query_cache, replayable_query_cache_value,
+        };
+        use brokk_bifrost_analysis::analyzer::resolution::{FactResolutionAnswer, QueryObligation, QueryObligations};
+        use brokk_bifrost_analysis::analyzer::resolution::query_obligations::replay_observations::{
+            answer_for_cache_test, read_closed_answer_for_cache_test,
+        };
+        use brokk_bifrost_core::analyzer::config::JvmSourceToolchainBinding;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        let project = fixture();
+        let file = project.file("app/Target.java");
+        let selected = ["unacquired-jdk-a", "unacquired-jdk-b"].map(|name| {
+            let home = project.root().join(name);
+            assert!(!home.exists());
+            let mut config = brokk_bifrost_analysis::test_support::hermetic_jvm_config();
+            config.jvm.standard_library_discovery.source_toolchains =
+                vec![JvmSourceToolchainBinding::new(PathBuf::new(), home)];
+            JavaAnalyzer::new_with_config(project.project_dyn(), config)
+        });
+        let keys = selected.each_ref().map(|java| {
+            java.selected_jdk_home_for_file(&file)
+                .unwrap()
+                .to_path_buf()
+        });
+        assert_ne!(keys[0], keys[1]);
+        // A cell owner fixes an environment. A cache shared across selections
+        // must key it explicitly, even if the two unacquired answers coincide.
+        let cache = build_replayable_query_cache(|_: &Arc<FactResolutionAnswer>| {
+            std::mem::size_of::<FactResolutionAnswer>()
+        });
+        let builds = std::cell::Cell::new(0);
+        let mut expected = QueryObligations::empty();
+        expected.insert(QueryObligation::new(
+            "jvm-default-import-package-open",
+            "java.lang",
+            "unacquired",
+        ));
+        for (selection, expected_builds) in [(0, 1), (0, 1), (1, 2), (1, 2)] {
+            let java = &selected[selection];
+            let clean = AnalyzerQueryScope::new(java);
+            let answer = read_replayable_query_cache(&cache, &keys[selection], || {
+                builds.set(builds.get() + 1);
+                replayable_query_cache_value(java, || {
+                    Arc::new(answer_for_cache_test(expected.clone()))
+                })
+            });
+            let mut consumer = QueryObligations::empty();
+            let value =
+                read_closed_answer_for_cache_test(answer.replay().as_ref().clone(), &mut consumer);
+            assert_eq!(value.query_obligations, expected);
+            assert_eq!(consumer, expected);
+            assert_eq!(builds.get(), expected_builds, "selection={selection}");
+            assert!(clean.read_completion().is_ok());
+        }
+    }
+
+    #[test]
+    fn replayable_cell_clean_first_stays_clean() {
+        use brokk_bifrost_analysis::analyzer::common::{
+            QueryCacheCell, replayable_query_cache_cell,
+        };
+
+        let project = fixture();
+        let java = JavaAnalyzer::new(project.project_arc());
+        let cell = QueryCacheCell::new();
+        let builds = std::cell::Cell::new(0);
+
+        let first = AnalyzerQueryScope::capturing_read_incompleteness(&java);
+        assert_eq!(
+            replayable_query_cache_cell(&java, &cell, || {
+                builds.set(builds.get() + 1);
+                7
+            }),
+            7
+        );
+        assert!(first.captured_read_incompleteness().is_empty());
+        drop(first);
+
+        let second = AnalyzerQueryScope::capturing_read_incompleteness(&java);
+        assert_eq!(
+            replayable_query_cache_cell(&java, &cell, || panic!("must hit")),
+            7
+        );
+        assert!(second.captured_read_incompleteness().is_empty());
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    #[hardwon(
+        "#8184: retained fills must replay every own reason and read channel without caller gaps"
+    )]
+    fn replayable_cell_replays_all_own_reasons_and_unattributed_reads() {
+        use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+        use brokk_bifrost_analysis::analyzer::common::{
+            QueryCacheCell, replayable_query_cache_cell,
+        };
+        let project = fixture();
+        let java = JavaAnalyzer::new(project.project_arc());
+        let cell = QueryCacheCell::new();
+        let reasons = vec![
+            QueryReadIncomplete::ArtifactUnavailable("artifact".into()),
+            QueryReadIncomplete::SemanticEvidenceGap("own".into()),
+        ];
+        {
+            let _outer = AnalyzerQueryScope::capturing_read_incompleteness(&java);
+            java.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                "unrelated".into(),
+            ));
+            let (_, cold) = capture_query_reads(&java, || {
+                replayable_query_cache_cell(&java, &cell, || {
+                    for reason in &reasons {
+                        java.record_query_incomplete(reason.clone());
+                    }
+                    java.record_unattributed_read();
+                    7
+                })
+            });
+            assert_eq!(cold.unattributed_reads(), 1);
+        }
+        let clean = AnalyzerQueryScope::capturing_read_incompleteness(&java);
+        let (value, warm) = capture_query_reads(&java, || {
+            replayable_query_cache_cell(&java, &cell, || panic!("must hit"))
+        });
+        assert_eq!(value, 7);
+        assert_eq!(clean.captured_read_incompleteness(), reasons);
+        assert_eq!(warm.unattributed_reads(), 1);
+    }
+
+    #[test]
+    fn retained_fill_request_domain_is_transported_and_released() {
+        use brokk_bifrost_analysis::analyzer::common::{
+            QueryCacheCell, replayable_query_cache_cell,
+        };
+        use brokk_bifrost_core::analyzer::carried_context::CarriedContext;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let project = fixture();
+        let java = JavaAnalyzer::new(project.project_arc());
+        let _outer = AnalyzerQueryScope::new(&java);
+        let outer_memo = java
+            .inner
+            .active_query_request_memo::<AtomicUsize>()
+            .unwrap();
+        outer_memo.store(19, Ordering::Relaxed);
+        let cell = QueryCacheCell::new();
+        replayable_query_cache_cell(&java, &cell, || {
+            let inner_memo = java
+                .inner
+                .active_query_request_memo::<AtomicUsize>()
+                .unwrap();
+            assert_eq!(inner_memo.load(Ordering::Relaxed), 0);
+            assert!(!Arc::ptr_eq(&outer_memo, &inner_memo));
+            inner_memo.store(7, Ordering::Relaxed);
+            let carried = CarriedContext::current();
+            std::thread::scope(|threads| {
+                threads
+                    .spawn(|| {
+                        carried.run(|| {
+                            let _nested = AnalyzerQueryScope::new(&java);
+                            let transported = java
+                                .inner
+                                .active_query_request_memo::<AtomicUsize>()
+                                .unwrap();
+                            assert!(Arc::ptr_eq(&inner_memo, &transported));
+                            assert_eq!(transported.load(Ordering::Relaxed), 7);
+                        })
+                    })
+                    .join()
+                    .expect("transported fill worker");
+            });
+        });
+        assert!(Arc::ptr_eq(
+            &outer_memo,
+            &java
+                .inner
+                .active_query_request_memo::<AtomicUsize>()
+                .unwrap()
+        ));
+        assert_eq!(outer_memo.load(Ordering::Relaxed), 19);
     }
 
     #[test]
@@ -432,6 +696,33 @@ mod tests {
                 )),
                 "each file-only hit retains its own selected content: {reads:?}"
             );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#8618: JavaFileClassIndexMemo kept an index built after StructureUnavailable and its hits did not replay the gap"
+    )]
+    fn file_class_index_replays_structure_gap_in_later_retained_fill() {
+        use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, QueryReadIncomplete};
+        let project = fixture();
+        project
+            .file("lib/Base.java")
+            .write("package lib;\0class Base {}")
+            .unwrap();
+        let java = JavaAnalyzer::new(project.project_arc());
+        let file = project.file("lib/Base.java");
+        let _request = AnalyzerQueryScope::new(&java);
+        for _ in 0..2 {
+            let fill = AnalyzerQueryScope::for_retained_fill(&java);
+            assert!(matches!(
+                java.unique_class_by_fqn_in_file("lib.Base", &file),
+                brokk_bifrost_jvm::java::graph_support::UniqueClassInFile::None
+            ));
+            assert!(matches!(
+                fill.read_completion(),
+                Err(QueryReadIncomplete::StructureUnavailable(_))
+            ));
         }
     }
 }

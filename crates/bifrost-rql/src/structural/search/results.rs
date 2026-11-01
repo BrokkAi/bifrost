@@ -793,6 +793,11 @@ pub struct CodeQueryMatch {
     pub enclosing_symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub python_import: Option<Box<CodeQueryPythonImportSite>>,
+    /// Present when the language relation that selected this match is a
+    /// heuristic, such as an edit-distance typo guess: why the match may not
+    /// hold. A policy finding from it is only possible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heuristic: Option<&'static str>,
 }
 
 /// Parser-derived Python import facts attached by the opt-in

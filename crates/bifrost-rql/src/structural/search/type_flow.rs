@@ -1331,6 +1331,7 @@ impl TypeFlowQueryState {
             // This only projects already retained evidence. Do not charge old
             // reconstruction work again or spend an evidence-expansion budget.
             let (public, reads) = capture_query_reads(workspace.analyzer(), || {
+                let variant = workspace.analyzer().selected_parse_variant(&finding.file)?;
                 // Coordinate and indexed-source caches may both be warm.
                 // Name the exact snapshot source even when neither loads it.
                 if let Some(blob) = workspace.analyzer().indexed_blob_oid(&finding.file) {
@@ -1338,11 +1339,12 @@ impl TypeFlowQueryState {
                         language_for_file(&finding.file),
                         crate::path_utils::rel_path_string(&finding.file),
                         blob,
+                        variant,
                     ));
                 } else {
                     workspace.analyzer().record_unattributed_read();
                 }
-                super::witness_projection::public_absent_member_witness(
+                Some(super::witness_projection::public_absent_member_witness(
                     workspace,
                     finding,
                     root,
@@ -1350,8 +1352,19 @@ impl TypeFlowQueryState {
                     max_steps.min(remaining_steps),
                     max_bytes.min(remaining_bytes),
                     &mut self.witness_render_cache,
-                )
+                ))
             });
+            let Some(public) = public else {
+                workspace.analyzer().mark_execution_dependent();
+                push_deduplicated_diagnostic(
+                    &mut self.diagnostics,
+                    CodeQueryDiagnosticCode::TypeFlowWitnessUnavailable,
+                    Incompleteness::Operational(DerivationExecutionCause::Snapshot),
+                    "absent-member witness unavailable: selected parse identity unreadable"
+                        .to_owned(),
+                );
+                continue;
+            };
             if let Err(error) = &root.witness {
                 self.record_witness_unavailable(error);
             }
@@ -3576,10 +3589,7 @@ mod tests {
                 ReadKey::Lookup { question, .. } => match question {
                     LookupQuestion::Declaration { rel_path, .. }
                     | LookupQuestion::File { rel_path }
-                    | LookupQuestion::CallSite { rel_path, .. }
-                    | LookupQuestion::ProcedureCallSite { rel_path, .. } => {
-                        rel_path.as_ref() == path
-                    }
+                    | LookupQuestion::CallSite { rel_path, .. } => rel_path.as_ref() == path,
                     LookupQuestion::Name { .. }
                     | LookupQuestion::Summary { .. }
                     | LookupQuestion::WorkspaceFact { .. } => false,

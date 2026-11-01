@@ -156,7 +156,7 @@ Every ordered-list role reads the same way: each listed pattern must match a dis
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-The response contains a `results` array. Every item has a `result_type`, which names the output domain of the last step, or the source domain when there are no steps. The reference lists [all 75 result types](/reference/code-query/#result-types). `bifrost --list-row-schemas` prints every domain's fields, scalar types, nullability, and enum labels. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
+The response contains a `results` array. Every item has a `result_type`, which names the output domain of the last step, or the source domain when there are no steps. The reference lists [all 75 result types](/reference/code-query/#result-types). `bifrost --list-row-schemas` prints every domain's fields, scalar types, nullability, and enum labels. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`. A match selected by a heuristic language relation, such as `js/misspelled-identifier`, also carries `heuristic`, the reason the match may not hold; a policy finding from it has `possible` certainty with that reason.
 
 With `result_detail: "full"`, results additionally include:
 

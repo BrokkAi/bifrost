@@ -212,6 +212,13 @@ impl LanguageAdapter for PythonAdapter {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PythonAdapter {
+    // #8580: Python lowering reads inputs outside the file, so parse-time publication is unavailable.
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        None
+    }
+
     fn source_fact_storage(
         &self,
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>

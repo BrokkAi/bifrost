@@ -24,11 +24,10 @@ pub(super) struct EndpointSetCacheEntry {
 #[derive(Debug, Default)]
 pub(super) struct EndpointSetClosure {
     pub(super) cache: Vec<EndpointSetCacheEntry>,
-    pub(super) retained_bytes: usize,
+    pub(super) retained_bytes: i128,
     pub(super) dependencies: Vec<ResolvedEndpointSetDependency>,
     pub(super) parsed_documents: usize,
     pub(super) cache_hits: usize,
-    pub(super) released_cache_bytes: usize,
     /// Workspace-authored imports deferred at the built-in catalog boundary:
     /// the references stay in the authored plan and close after activation.
     pub(super) deferred: bool,
@@ -148,7 +147,7 @@ impl PolicyRegistry {
         parsed: &ParsedRqlpDocument,
         path: PolicySelectorPath,
         authored: &PolicySelector,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
         locators: LocatorResolution<'_>,
         imports: &EndpointSetClosure,
     ) -> Result<ResolvedPolicySelector, PolicyRegistryError> {
@@ -165,11 +164,10 @@ impl PolicyRegistry {
         source_bytes: usize,
         locators: LocatorResolution<'_>,
     ) -> Result<EndpointSetClosure, PolicyRegistryError> {
-        self.ensure_local_retained_bytes(source_bytes)?;
         let locators = locators.endpoints();
         let mut closure = EndpointSetClosure {
             cache: self.endpoint_set_cache.clone(),
-            retained_bytes: source_bytes,
+            retained_bytes: source_bytes as i128,
             ..Default::default()
         };
         let flow = matches!(definition.analysis, PolicyAnalysis::Flow { .. });
@@ -569,6 +567,18 @@ impl PolicyRegistry {
                     ),
                 ));
             }
+            let source = PolicySourceIdentity::new(path.as_str());
+            let context = frame.referrer.selector_context().clone();
+            let cached_index = closure
+                .cache
+                .iter()
+                .position(|cached| cached.source == source && cached.context.same_scope(&context));
+            let cached = cached_index.map(|index| closure.cache.remove(index));
+            if let Some(cached) = &cached {
+                // Local reservations are deltas: replacement can release more
+                // bytes than this registration adds.
+                closure.retained_bytes -= cached.source_bytes as i128;
+            }
             let available = self
                 .available_local_bytes(closure.retained_bytes)?
                 .min(MAX_RQLP_SOURCE_BYTES);
@@ -582,7 +592,6 @@ impl PolicyRegistry {
                     import_error(&frame, code, error.to_string())
                 })?;
             self.charge_local(&mut closure.retained_bytes, loaded.source().len())?;
-            let source = PolicySourceIdentity::new(path.as_str());
             closure.import_ranges.insert(
                 source.clone(),
                 (
@@ -591,15 +600,18 @@ impl PolicyRegistry {
                 ),
             );
             let content = PolicySourceHash::from_source_bytes(loaded.source().as_bytes());
-            let context = frame.referrer.selector_context().clone();
-            let document = if let Some(cached) = closure.cache.iter().find(|cached| {
-                cached.source == source
-                    && cached.content == content
-                    && cached.context.same_scope(&context)
-            }) {
+            let document = if let Some(cached) = cached.filter(|cached| cached.content == content) {
+                self.charge_local(&mut closure.retained_bytes, cached.source_bytes)?;
                 closure.cache_hits += 1;
-                Arc::clone(&cached.parsed)
+                let parsed = Arc::clone(&cached.parsed);
+                closure
+                    .cache
+                    .insert(cached_index.expect("cache hit has an index"), cached);
+                parsed
             } else {
+                if closure.cache.len() == self.limits.max_endpoint_set_files {
+                    closure.retained_bytes -= closure.cache.remove(0).source_bytes as i128;
+                }
                 // Retain the parser cache independently of this policy's typed
                 // entry copy. Reserve its source budget before parsing/mutation.
                 self.charge_local(&mut closure.retained_bytes, loaded.source().len())?;
@@ -616,13 +628,6 @@ impl PolicyRegistry {
                         }
                     })?,
                 );
-                closure.cache.retain(|cached| {
-                    let keep = cached.source != source || !cached.context.same_scope(&context);
-                    if !keep {
-                        closure.released_cache_bytes += cached.source_bytes;
-                    }
-                    keep
-                });
                 closure.cache.push(EndpointSetCacheEntry {
                     source,
                     content,
@@ -630,9 +635,6 @@ impl PolicyRegistry {
                     parsed: Arc::clone(&document),
                     source_bytes: loaded.source().len(),
                 });
-                if closure.cache.len() > self.limits.max_endpoint_set_files {
-                    closure.released_cache_bytes += closure.cache.remove(0).source_bytes;
-                }
                 closure.parsed_documents += 1;
                 document
             };

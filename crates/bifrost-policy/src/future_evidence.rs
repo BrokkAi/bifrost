@@ -1283,6 +1283,9 @@ impl RetainedSize for ResolvedTypestateTerminal {
     }
 }
 
+#[cfg(test)]
+mod typestate_budget_contract_tests;
+
 /// Complete pre-retention #824 typestate projection input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[must_use = "projection facts must be normalized and validated before policy reduction"]
@@ -3024,7 +3027,11 @@ fn endpoint_phase_label(value: EndpointObservationPhase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[path = "identity_boundary_tests.rs"]
+    mod identity_boundary_tests;
     use super::*;
+
+    mod retained_contract_tests;
     use crate::finding_identity::{FindingIdentityStability, PolicyFindingId};
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
     use brokk_bifrost_test_macros::hardwon;
@@ -3826,5 +3833,8 @@ mod tests {
             serde_json::to_value(weak).unwrap(),
             json!({"type": "weak", "typed_key": "taint:snapshot-finding"})
         );
+    }
+    mod finding_scenario_budget_tests {
+        include!("finding_scenario_budget_tests.rs");
     }
 }

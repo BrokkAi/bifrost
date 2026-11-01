@@ -3,6 +3,10 @@
 //! Public callers can provide typed authoring and overlay inputs, but only the
 //! crate-owned reducer can seal evidence, scores, and coherent variant IDs.
 
+#[cfg(test)]
+mod assessment_contract_tests;
+#[cfg(test)]
+mod evidence_contract_tests;
 mod identity;
 mod policy_evidence;
 mod reduction;

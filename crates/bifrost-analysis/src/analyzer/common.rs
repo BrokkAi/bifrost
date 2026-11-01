@@ -145,6 +145,35 @@ pub struct ReplayableQueryCacheValue<T> {
 }
 
 impl<T> ReplayableQueryCacheValue<T> {
+    pub fn retained_receipt_bytes(&self) -> usize {
+        let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::default();
+        heap.slice(&self.receipt.keys);
+        for key in self.receipt.keys.iter() {
+            crate::analyzer::store::cache_budget::retained_read_key(&mut heap, key);
+        }
+        std::mem::size_of::<QueryCacheBuildReceipt>()
+            + heap.total()
+            + self
+                .receipt
+                .reasons
+                .iter()
+                .map(|reason| {
+                    std::mem::size_of_val(reason)
+                        + match reason {
+                            crate::analyzer::QueryReadIncomplete::ArtifactUnavailable(text)
+                            | crate::analyzer::QueryReadIncomplete::SemanticEvidenceGap(text)
+                            | crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                                text,
+                            ) => text.len(),
+                            crate::analyzer::QueryReadIncomplete::StructureUnavailable(file) => {
+                                file.to_string().len()
+                            }
+                            _ => 0,
+                        }
+                })
+                .sum::<usize>()
+    }
+
     pub fn replay(&self) -> &T {
         self.receipt.replay();
         &self.value
@@ -171,7 +200,10 @@ pub fn replayable_query_cache_cell<T: Clone + Send + Sync + 'static>(
     if let Some(value) = cell.get() {
         return value.replay().clone();
     }
+    let built_here = std::cell::Cell::new(false);
     let result = cell.attempts.get_or_try_build_wave_inline(|| {
+        built_here.set(true);
+        let _fill = crate::analyzer::AnalyzerQueryScope::for_retained_fill(analyzer);
         let (attempt, mut receipt) =
             capture_query_cache_build(analyzer, || replayable_query_cache_fill(analyzer, build));
         let attempt = attempt.inspect(|_| receipt.keys = Arc::default());
@@ -182,14 +214,16 @@ pub fn replayable_query_cache_cell<T: Clone + Send + Sync + 'static>(
         };
         attempt.map(entry).map_err(entry)
     });
-    match result {
-        Ok(value) => cell
-            .value
-            .get_or_init(|| value.as_ref().clone())
-            .replay()
-            .clone(),
-        Err(failure) => failure.replay().clone(),
+    let value = match result {
+        Ok(value) => cell.value.get_or_init(|| value.as_ref().clone()).clone(),
+        Err(failure) => failure.as_ref().clone(),
+    };
+    // A cold builder already forwarded its reads and reasons. Only another
+    // consumer replays counts, or the cold query would count each read twice.
+    if !built_here.get() {
+        value.receipt.replay();
     }
+    value.value
 }
 
 /// Typed completion and read evidence of one cache build. Transient failures
@@ -204,6 +238,18 @@ pub struct QueryCacheBuildReceipt {
 }
 
 impl QueryCacheBuildReceipt {
+    pub fn stable_reasons(&self) -> &[crate::analyzer::QueryReadIncomplete] {
+        debug_assert!(!self.has_execution_dependences());
+        &self.reasons
+    }
+
+    pub fn has_execution_dependences(&self) -> bool {
+        self.execution_dependences > 0
+            || self
+                .reasons
+                .iter()
+                .any(|reason| reason.is_execution_dependent())
+    }
     pub fn is_complete(&self) -> bool {
         self.reasons.is_empty() && self.execution_dependences == 0
     }
@@ -213,23 +259,25 @@ impl QueryCacheBuildReceipt {
     }
 
     pub fn replay(&self) {
-        for reason in &self.reasons {
-            match reason {
-                crate::analyzer::QueryReadIncomplete::StoreFailure(error) => {
-                    crate::analyzer::i_analyzer::record_store_error_on_current_contexts(
-                        error.clone(),
-                    );
-                }
-                reason => crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
-                    reason.clone(),
-                ),
-            }
-        }
+        replay_query_cache_stable_reasons(&self.reasons);
         crate::analyzer::i_analyzer::replay_query_read_receipt_on_current_contexts(
             &self.keys,
             self.unattributed_reads,
             self.execution_dependences,
         );
+    }
+}
+
+pub fn replay_query_cache_stable_reasons(reasons: &[crate::analyzer::QueryReadIncomplete]) {
+    for reason in reasons {
+        match reason {
+            crate::analyzer::QueryReadIncomplete::StoreFailure(error) => {
+                crate::analyzer::i_analyzer::record_store_error_on_current_contexts(error.clone());
+            }
+            reason => crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
+                reason.clone(),
+            ),
+        }
     }
 }
 
@@ -370,6 +418,7 @@ pub fn replayable_query_cache_fill<T>(
     analyzer: &dyn IAnalyzer,
     build: impl FnOnce() -> T,
 ) -> Result<T, T> {
+    let _fill = crate::analyzer::AnalyzerQueryScope::for_retained_fill(analyzer);
     let generation_before = analyzer.project().analysis_generation();
     let ((value, incompleteness), reads) =
         crate::analyzer::i_analyzer::capture_query_reads(analyzer, || {
@@ -405,16 +454,151 @@ pub fn replayable_query_cache_fill<T>(
     }
 }
 
-/// Read a complete descendant memo, preserving refused-fill causes and receipts.
+/// Capture the value and all stable failure evidence as one retained entry.
+#[doc(hidden)]
+pub fn replayable_query_cache_value<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> T,
+) -> Result<ReplayableQueryCacheValue<T>, ReplayableQueryCacheValue<T>> {
+    let _fill = crate::analyzer::AnalyzerQueryScope::for_retained_fill(analyzer);
+    let (attempt, receipt) =
+        capture_query_cache_build(analyzer, || replayable_query_cache_fill(analyzer, build));
+    let receipt = Arc::new(receipt);
+    let entry = |value| ReplayableQueryCacheValue {
+        value,
+        receipt: Arc::clone(&receipt),
+    };
+    attempt.map(entry).map_err(entry)
+}
+
+/// Preserve the complete-only answer while retaining a stable failed outcome.
+#[doc(hidden)]
+pub fn replayable_optional_query_cache_value<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> Option<T>,
+) -> Result<ReplayableQueryCacheValue<Option<T>>, ReplayableQueryCacheValue<Option<T>>> {
+    let complete_outcome = |mut entry: ReplayableQueryCacheValue<Option<T>>| {
+        if !entry.receipt.is_complete() {
+            entry.value = None;
+        }
+        entry
+    };
+    match replayable_query_cache_value(analyzer, build) {
+        // A refusal must record why. A None with a clean receipt is a producer
+        // that refused without a reason; never retain it, so a release build
+        // fails closed where the debug build reports the producer.
+        Ok(entry) if entry.value.is_none() && entry.receipt.is_complete() => {
+            debug_assert!(
+                false,
+                "optional memo fill returned None without incomplete evidence"
+            );
+            Err(entry)
+        }
+        Ok(entry) => Ok(complete_outcome(entry)),
+        Err(entry) => Err(complete_outcome(entry)),
+    }
+}
+
+/// Whole-workspace projections use the same 64 MiB ceiling as the field-slot
+/// cache: bound both the answer and its complete invalidation evidence.
+const REPLAYABLE_QUERY_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[doc(hidden)]
+pub type ReplayableQueryCache<K, T> = moka::sync::Cache<K, Arc<ReplayableQueryCacheValue<T>>>;
+
+#[doc(hidden)]
+pub fn build_replayable_query_cache<K, T>(
+    weigh: impl Fn(&T) -> usize + Send + Sync + 'static,
+) -> ReplayableQueryCache<K, T>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache(
+        REPLAYABLE_QUERY_CACHE_BYTES,
+        move |_: &K, entry: &Arc<ReplayableQueryCacheValue<T>>| {
+            let bytes = std::mem::size_of::<K>()
+                + std::mem::size_of::<ReplayableQueryCacheValue<T>>()
+                + entry.retained_receipt_bytes()
+                + weigh(&entry.value);
+            u32::try_from(bytes).unwrap_or(u32::MAX)
+        },
+    )
+}
+
+/// Deadline-sensitive readers never wait behind another request's build.
+/// A duplicate cold build is preferable to inheriting another reader's stop.
+#[doc(hidden)]
+pub fn read_replayable_query_cache<K, T>(
+    cache: &ReplayableQueryCache<K, T>,
+    key: &K,
+    build: impl FnOnce() -> Result<ReplayableQueryCacheValue<T>, ReplayableQueryCacheValue<T>>,
+) -> Arc<ReplayableQueryCacheValue<T>>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    if let Some(entry) = cache.get(key) {
+        return entry;
+    }
+    match build() {
+        Ok(entry) => {
+            let entry = Arc::new(entry);
+            cache.insert(key.clone(), Arc::clone(&entry));
+            entry
+        }
+        Err(entry) => Arc::new(entry),
+    }
+}
+
+#[doc(hidden)]
+pub type ReplayableDescendantMemo = ReplayableQueryCache<
+    brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant,
+    Option<brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex>,
+>;
+
+#[doc(hidden)]
+pub fn new_replayable_descendant_memo() -> ReplayableDescendantMemo {
+    build_replayable_query_cache(
+        |value: &Option<brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex>| {
+            value
+                .as_ref()
+                .map_or(0, |index| index.estimated_retained_bytes())
+        },
+    )
+}
+
+/// Fill an optional descendant index, recording a scope cancellation inside the
+/// fill.
+///
+/// Descendant builders poll the scope's own token, which need not be the
+/// analyzer's active cancellation, and return None when it fires without
+/// recording a reason. Recording it here gives the receipt an
+/// execution-dependent cause, so the refusal is never retained.
+#[doc(hidden)]
+pub fn replayable_descendant_fill<T>(
+    analyzer: &dyn IAnalyzer,
+    scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
+    build: impl FnOnce() -> Option<T>,
+) -> Result<ReplayableQueryCacheValue<Option<T>>, ReplayableQueryCacheValue<Option<T>>> {
+    replayable_optional_query_cache_value(analyzer, || {
+        let value = build();
+        if scope.cancellation().is_cancelled() {
+            analyzer.record_query_incomplete(
+                crate::analyzer::i_analyzer::QueryReadIncomplete::Cancelled,
+            );
+        }
+        value
+    })
+}
+
+/// Read a descendant memo, replaying stable refused-fill causes and receipts.
 #[doc(hidden)]
 pub fn complete_descendant_query(
     analyzer: &dyn IAnalyzer,
     scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
     code_unit: &brokk_bifrost_core::analyzer::CodeUnit,
-    memo: &brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo<
-        brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant,
-        brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex,
-    >,
+    memo: &ReplayableDescendantMemo,
     build: impl Fn() -> Option<brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex>,
     record_complete: impl FnOnce(&crate::hash::HashSet<brokk_bifrost_core::analyzer::CodeUnit>),
 ) -> Result<
@@ -422,11 +606,33 @@ pub fn complete_descendant_query(
     brokk_bifrost_core::analyzer::capabilities::Cancelled,
 > {
     use brokk_bifrost_core::analyzer::capabilities::{
-        Cancelled, HierarchyAnswer, HierarchyOpenReason, descendants_from_variant_index,
+        Cancelled, HierarchyAnswer, HierarchyOpenReason,
     };
-    let descendants = descendants_from_variant_index(memo, scope, code_unit, || {
-        complete_query_cache_fill(analyzer, &build).ok().flatten()
-    });
+    let descendants = if scope.cancellation().is_cancelled() {
+        None
+    } else {
+        let entry = if let Some(entry) = memo.get(&scope.variant()) {
+            entry.receipt.replay();
+            entry
+        } else {
+            match replayable_descendant_fill(analyzer, scope, &build) {
+                Ok(entry) => {
+                    let entry = Arc::new(entry);
+                    memo.insert(scope.variant(), Arc::clone(&entry));
+                    entry
+                }
+                Err(entry) => Arc::new(entry),
+            }
+        };
+        if !entry.receipt.is_complete() || analyzer.current_query_read_completion().is_err() {
+            None
+        } else {
+            entry
+                .value
+                .as_ref()
+                .map(|index| index.descendants(code_unit))
+        }
+    };
     if scope.cancellation().is_cancelled() {
         analyzer
             .record_query_incomplete(crate::analyzer::i_analyzer::QueryReadIncomplete::Cancelled);
@@ -1289,12 +1495,7 @@ pub fn external_index_incompleteness(
         | "artifact.count"
         | "csharp.metadata.invalid"
         | "csharp.assembly_identity"
-        | "csharp.metadata.export_omitted"
-        | "java.archive.invalid"
-        | "java.class.invalid"
-        | "java.source_binary_conflict"
-        | "jvm.dependency_unresolved"
-        | "jdk.home.unavailable" => QueryReadIncomplete::ArtifactUnavailable(detail),
+        | "csharp.metadata.export_omitted" => QueryReadIncomplete::ArtifactUnavailable(detail),
         "artifact.cancelled" => QueryReadIncomplete::Cancelled,
         _ => QueryReadIncomplete::SemanticEvidenceUnavailable(detail),
     }

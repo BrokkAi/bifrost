@@ -5239,6 +5239,7 @@ func main() { api.Public() }
                             SelectedResolutionContentMountRequest::new(
                                 content.into_parts().0,
                                 WorkspaceFileRow {
+                                    decision: None,
                                     rel_path: GO_ROOT_CONSUMER_PATH.to_owned(),
                                     blob_oid: oid,
                                 },
@@ -6491,9 +6492,13 @@ type Item struct{ Decoy bool }
                 } else {
                     (270, 238)
                 };
+                // #8166: the batch candidate-path memo serves repeated
+                // RESOLUTION_PATHS_BY_KEY_SQL hydration within one point
+                // operation; only that statement moves: cold search -5
+                // executions/-13 rows, warm search -3/-3, for both kinds.
                 let (cold_search, warm_open, warm_search) = match kind {
-                    ProductionGoPointKind::Definition => ((160, 156), (5, 4), (125, 96)),
-                    ProductionGoPointKind::Type => ((178, 153), (5, 4), (144, 94)),
+                    ProductionGoPointKind::Definition => ((155, 143), (5, 4), (122, 93)),
+                    ProductionGoPointKind::Type => ((173, 140), (5, 4), (141, 91)),
                 };
                 let production_schema = cold
                     .open
@@ -7297,6 +7302,7 @@ type Item struct{ Decoy bool }
                 (GO_ROOT_DECOY_PATH, GO_ROOT_DECOY_SOURCE),
             ]
             .map(|(path, source)| WorkspaceFileRow {
+                decision: None,
                 rel_path: path.into(),
                 blob_oid: Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap(),
             });

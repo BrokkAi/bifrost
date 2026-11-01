@@ -264,6 +264,10 @@ impl fmt::Display for PolicyBaselineSourceError {
 
 crate::impl_policy_source_error!(PolicyBaselineSourceError);
 
+#[cfg(test)]
+#[path = "baseline/contract_tests.rs"]
+mod contract_tests;
+
 pub(crate) fn load_policy_baseline_from_root(
     root: &WorkspaceRoot,
     options: &PolicyBaselineOptions,

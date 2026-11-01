@@ -117,6 +117,7 @@ fn signature_storage_is_charged_before_admitting_a_unit_slice() {
 fn file_cache_evicts_untouched_oldest_entries() {
     use brokk_bifrost_analysis::analyzer::source_admission::SourceAdmissionPolicy;
     let key = |name: &str| FileStateCacheKey {
+        variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
         oid: git2::Oid::zero(),
         rel_path: name.into(),
         admission_policy: SourceAdmissionPolicy::current(),

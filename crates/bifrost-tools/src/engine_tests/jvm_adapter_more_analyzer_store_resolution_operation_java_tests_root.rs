@@ -2445,6 +2445,7 @@ pub mod jvm_extraction_tests {
                     .unwrap(),
                 );
                 source_rows.push(WorkspaceFileRow {
+                    decision: None,
                     rel_path: path.to_owned(),
                     blob_oid: oid,
                 });

@@ -11,10 +11,7 @@ pub mod model_context;
 pub mod relevance;
 pub mod searchtools;
 pub mod searchtools_render;
-pub mod summary;
 pub mod symbol_rename;
-
-pub use summary::{RenderedSummary, SummaryInput, summarize_inputs};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod native_resolution_test_support {

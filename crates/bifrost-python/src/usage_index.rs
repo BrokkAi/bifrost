@@ -544,6 +544,21 @@ impl PythonUsageIndex {
             module_specifier,
         )
     }
+
+    pub(crate) fn relative_module_leaves_workspace(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> bool {
+        self.module_spellings.project().is_some_and(|project| {
+            crate::imports::resolve_python_relative_module(
+                project,
+                importing_file,
+                module_specifier,
+            )
+            .is_none()
+        })
+    }
 }
 
 fn canonical_module_replacement(

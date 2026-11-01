@@ -104,7 +104,7 @@ impl<'source> GoSourcePropertyCollector<'source> {
             let ty = self.type_ids[&node.id()];
             self.add_type_declaration(
                 declaration,
-                &format!("$anon${}", node.start_byte()),
+                &crate::declarations::go_synthetic_name(node),
                 ty,
                 false,
             );

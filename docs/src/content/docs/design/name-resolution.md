@@ -243,6 +243,11 @@ separate in-memory path.
 
 ## Workspace context
 
+C# membership comes from the MSBuild configuration declared in the workspace,
+including in-tree assignments and SDK defaults. Unacquired package imports
+remain inventory obligations. Build-invocation overrides, such as command-line
+`/p:` changes to SDK-defaulted base paths, are not modeled.
+
 Stack graphs are purely syntactic. They need no build configuration, which
 suits a code host that cannot run each project's build. Bifrost runs inside the
 user's workspace, and in several languages the meaning of a route between

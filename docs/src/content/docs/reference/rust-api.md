@@ -59,7 +59,7 @@ These are the public modules of `brokk_bifrost`.
 | --- | --- |
 | `extension` | Stable extension API with a negotiated version. See [Extension API](#extension-api). |
 | `rql`, `sexp` | CodeQuery and RQL: the `brokk-bifrost-rql` crate, and its S-expression parser and formatter. |
-| `analyzer`, `searchtools`, `searchtools_render`, `navigation`, `usages`, `summary`, `symbol_rename`, `relevance`, `diff_analysis`, `cyclomatic_complexity_diff`, `code_quality`, `file_tools`, `compact_graph`, `model_context`, `workspace_document` | Analysis modules from `brokk-bifrost-analysis`. |
+| `analyzer`, `searchtools`, `searchtools_render`, `navigation`, `usages`, `symbol_rename`, `relevance`, `diff_analysis`, `cyclomatic_complexity_diff`, `code_quality`, `file_tools`, `compact_graph`, `model_context`, `workspace_document` | Analysis modules from `brokk-bifrost-analysis`. |
 | `cancellation`, `cache_db`, `cache_gc`, `git_file`, `gitblob`, `hash`, `panic_report`, `path_normalization`, `path_utils`, `process`, `profiling`, `schema_version`, `seam_profile`, `text_utils`, `util` | Support modules from `brokk-bifrost-analysis`. |
 | `flow` | The `brokk-bifrost-flow` crate. |
 | `policy` | The `brokk-bifrost-policy` crate. |
@@ -116,7 +116,6 @@ These items are re-exported at `brokk_bifrost::<name>`.
 | `ParseError`, `ParseErrorKind` | struct, enum | A tree-sitter parse error and its kind. |
 | `Range` | struct | A source range. |
 | `CodeBaseMetrics` | struct | Workspace size metrics. |
-| `SummaryInput`, `RenderedSummary`, `summarize_inputs` | struct, struct, function | Render summaries for a set of inputs. |
 | `CloneSmell`, `CloneSmellWeights`, `TestAssertionSmell`, `TestAssertionWeights` | structs | Code-quality findings and their scoring weights. |
 
 ### Dependency Evidence and Semantic Packs

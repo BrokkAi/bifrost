@@ -1,3 +1,9 @@
+# Check out every text file with LF on every host. Fixtures, goldens and
+# embedded sources are compared byte for byte, and pinning them one path at a
+# time kept missing new files on Windows. Git still detects binary files and
+# leaves them alone; the rules below refine this default.
+* text=auto eol=lf
+
 # SQL resources are included as source text; planner-statistics needles split on LF.
 *.sql text eol=lf
 crates/bifrost-core/migrations/cache/0225-blob-parse-variant.sql text eol=lf
@@ -20,6 +26,9 @@ tests/fixtures/python-native-callee-internal/probe.py text eol=lf
 # Typestate canonical contracts are compared byte for byte.
 tests/fixtures/typestate/*.canonical*.json text eol=lf
 
+# This upstream Node notice is copied verbatim, including its mixed line endings.
+semantic-packs/node/runtime-values/notices/node-v22.11.0.txt -text
+
 # Semantic-model source, schema, and text goldens are exact cross-platform contracts.
 schemas/semantic-model-pack-v2.schema.json text eol=lf
 schemas/semantic-model-pack-v3.schema.json text eol=lf
@@ -28,8 +37,11 @@ schemas/semantic-model-pack-v5.schema.json text eol=lf
 schemas/semantic-model-pack-v18.schema.json text eol=lf
 schemas/semantic-model-pack-v19.schema.json text eol=lf
 schemas/semantic-model-pack-v20.schema.json text eol=lf
+schemas/semantic-model-pack-v21.schema.json text eol=lf
 schemas/semantic-model-compiled-manifest-v19.schema.json text eol=lf
 schemas/semantic-model-compiled-manifest-v20.schema.json text eol=lf
+schemas/semantic-model-compiled-manifest-v21.schema.json text eol=lf
+crates/bifrost-jvm-analysis/src/analyzer/jvm/fixtures/enclosing-signature/enclosing/*.class binary
 crates/bifrost-semantic/tests/fixtures/extraction-contract.json text eol=lf
 crates/bifrost-semantic/src/analyzer/semantic_model/csmi/profiles/runtime-values.fixture.json text eol=lf
 tests/fixtures/semantic-model-packs/*.json text eol=lf
@@ -106,6 +118,7 @@ tests/fixtures/golden/**/*.java text eol=lf
 tests/fixtures/golden/**/*.js text eol=lf
 tests/fixtures/golden/**/*.jsx text eol=lf
 tests/fixtures/golden/**/*.json text eol=lf
+tests/fixtures/golden/kotlin-package-members/expected.txt text eol=lf
 tests/fixtures/golden/**/*.kt text eol=lf
 tests/fixtures/golden/**/*.kts text eol=lf
 tests/fixtures/golden/**/*.lock text eol=lf
@@ -158,7 +171,8 @@ crates/bifrost-jvm/src/intrinsic_inventory_data.rs text eol=lf
 docs/src/content/docs/code-query-tutorials/*.md text eol=lf
 
 # Archived license CRLF is fixture data.
-tests/fixtures/policy-oracle/boltons-loop-invariant-sort/LICENSE.upstream whitespace=cr-at-eol
+tests/fixtures/policy-oracle/boltons-loop-invariant-sort/LICENSE.upstream -text whitespace=cr-at-eol
+tests/fixtures/policy-oracle/boltons-mixed-returns/LICENSE.upstream -text
 # Oracle patch context lines reproduce pinned upstream bytes, including their
 # trailing spaces and tab indentation, so no whitespace check applies to them.
 tests/fixtures/policy-oracle/*/*.patch -whitespace
@@ -195,3 +209,19 @@ tests/suite_cross_language/workspace_authority_classification.tsv text eol=lf
 crates/bifrost-store/src/analyzer/store/mod.rs text eol=lf
 
 crates/bifrost-core/migrations/cache/0224-csharp-compilation-symbols.sql text eol=lf
+
+# Policy-flow evidence goldens render source coordinates measured against LF
+# bytes on every host.
+tests/fixtures/golden/policy-flow-evidence/** text eol=lf
+crates/bifrost-core/migrations/cache/0228-csharp-file-version-decisions.sql text eol=lf
+
+# The loaded policy identity contract tests read these canonical projections
+# with fs::read_to_string and compare them exactly with serde_json pretty
+# output, so a CRLF checkout must not change their bytes.
+crates/bifrost-policy/tests/fixtures/loaded-canonical/*.json text eol=lf
+
+# The JVM import-context equality ledger is read with fs::read_to_string and
+# compared exactly with output joined by "\n".
+tests/fixtures/golden/jvm-import-context/equality/expected.txt text eol=lf
+
+crates/bifrost-core/migrations/cache/0229-csharp-undecided-chains.sql text eol=lf

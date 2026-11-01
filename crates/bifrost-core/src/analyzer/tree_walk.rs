@@ -16,6 +16,55 @@ use crate::cancellation::CancellationToken;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tree_sitter::Node;
 
+/// Structured identity of one synthetic declaration within its named owner.
+#[derive(Debug, Clone, Copy)]
+pub struct SyntheticName {
+    pub kind: &'static str,
+    pub rank: usize,
+}
+
+impl std::fmt::Display for SyntheticName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "${}${}", self.kind, self.rank)
+    }
+}
+
+/// Name a synthetic node by its source-order rank within its nearest named owner.
+/// Language hooks classify nodes; the walk never interprets source text. Nested
+/// anonymous scopes remain in the owner's rank space, so they cannot collide.
+/// #8387: producer epochs rotate when these structured identities change.
+pub fn synthetic_name(
+    node: Node<'_>,
+    kind: impl Fn(Node<'_>) -> Option<&'static str>,
+    named_owner: impl Fn(Node<'_>) -> bool,
+) -> SyntheticName {
+    let label = kind(node).expect("synthetic node has a kind");
+    let mut owner = node;
+    while let Some(parent) = owner.parent() {
+        owner = parent;
+        if named_owner(owner) {
+            break;
+        }
+    }
+    let mut rank = 0;
+    let mut found = false;
+    walk_tree_preorder(owner, false, |candidate| {
+        if candidate == node {
+            found = true;
+            return WalkControl::Break;
+        }
+        if kind(candidate) == Some(label) {
+            rank += 1;
+        }
+        if named_owner(candidate) {
+            return WalkControl::SkipChildren;
+        }
+        WalkControl::Continue
+    });
+    assert!(found, "synthetic node belongs to its named owner");
+    SyntheticName { kind: label, rank }
+}
+
 /// Whether a tree-sitter node kind represents a comment in one of Bifrost's
 /// supported grammars.
 pub fn is_comment_kind(kind: &str) -> bool {

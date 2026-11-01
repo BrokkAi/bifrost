@@ -51,7 +51,7 @@ fn ranges() -> Vec<ScalarFloatRange> {
     ranges
 }
 
-fn facts() -> Vec<ScalarFact> {
+pub(super) fn facts() -> Vec<ScalarFact> {
     let mut facts = vec![
         ScalarFact::Unreachable,
         ScalarFact::Nil,
@@ -186,6 +186,7 @@ proptest! {
         a in proptest::sample::select(facts()), b in proptest::sample::select(facts())
     ) {
         prop_assert_eq!(a.join(a), a);
+        prop_assert_eq!(a.widen(a), a);
         let joined = a.join(b);
         prop_assert_eq!(joined, b.join(a));
         prop_assert_eq!(a.join(joined), joined);

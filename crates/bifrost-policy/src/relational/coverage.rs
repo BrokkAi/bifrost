@@ -124,17 +124,13 @@ impl CoveragePartition {
     /// operator orders names the same partition.
     pub fn union(mut self, other: Self) -> Self {
         self.truncated |= other.truncated;
-        for root in other.roots {
-            if self.roots.len() >= MAX_COVERAGE_PARTITION_ROOTS {
-                self.truncated = true;
-                break;
-            }
-            if !self.roots.contains(&root) {
-                self.roots.push(root);
-            }
-        }
+        self.roots.extend(other.roots);
         self.roots.sort();
         self.roots.dedup();
+        if self.roots.len() > MAX_COVERAGE_PARTITION_ROOTS {
+            self.truncated = true;
+            self.roots.truncate(MAX_COVERAGE_PARTITION_ROOTS);
+        }
         self
     }
 }
@@ -225,11 +221,10 @@ impl RelationCoverage {
             // meet provably returns the accumulator unchanged is not projected
             // at all. An exhaustive row cannot weaken an already weaker
             // accumulator, and cannot rename the partition that weaker input
-            // named; once the bounded partition fold is full it cannot add a
-            // name to an exhaustive one either.
+            // named; once an exhaustive partition has reported an omitted
+            // name, additional exhaustive rows cannot change that report.
             if matches!(row_coverage.extent, CodeQueryRowCoverageExtent::Exhaustive)
-                && (!coverage.is_exhaustive()
-                    || coverage.partition.roots().len() >= MAX_COVERAGE_PARTITION_ROOTS)
+                && (!coverage.is_exhaustive() || coverage.partition.truncated())
             {
                 continue;
             }

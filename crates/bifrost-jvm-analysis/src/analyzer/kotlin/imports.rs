@@ -426,6 +426,103 @@ mod tests {
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_test_macros::hardwon;
 
+    #[test]
+    fn retained_kotlin_imports_isolate_and_retire_java_overlay_domains() {
+        use crate::analyzer::JavaAnalyzer;
+        use brokk_bifrost_core::analyzer::CodeUnitIndex;
+        use brokk_bifrost_core::analyzer::project::{OverlayProject, Project};
+        use brokk_bifrost_jvm::realm::JvmSourceRealm;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let fixture = InlineTestProject::with_language(Language::Kotlin)
+            .file("Service.java", "package api; public class Service {}")
+            .file(
+                "Consumer.kt",
+                "package app\nimport api.Service\nclass Consumer\n",
+            )
+            .build();
+        let disk = JavaAnalyzer::new(fixture.project_dyn());
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(overlay.set(
+            fixture.file("Service.java").abs_path(),
+            "package api; public class Service { public void overlayOnly() {} }".into()
+        ));
+        let project: Arc<dyn Project> = overlay;
+        let java = disk.clone_with_project(Arc::clone(&project));
+        let kotlin = KotlinAnalyzer::new(project);
+        let realm = JvmSourceRealm::new(vec![(Language::Java, &java), (Language::Kotlin, &kotlin)]);
+        let outer_scope = AnalyzerQueryScope::new(&java);
+        let outer = java
+            .inner()
+            .active_query_request_memo::<AtomicUsize>()
+            .unwrap();
+        outer.store(19, Ordering::Relaxed);
+        for iteration in 0..4 {
+            {
+                let fill = AnalyzerQueryScope::for_retained_fill(&kotlin);
+                let imported = kotlin.imported_code_units_in_realm(
+                    fill.token(),
+                    &fixture.file("Consumer.kt"),
+                    Some(&realm),
+                );
+                assert!(
+                    imported.iter().any(|unit| unit.fq_name() == "api.Service"),
+                    "{imported:?}"
+                );
+                assert!(
+                    java.declarations(&fixture.file("Service.java"))
+                        .iter()
+                        .any(|unit| unit.identifier() == "overlayOnly")
+                );
+                let own = java
+                    .inner()
+                    .active_query_request_memo::<AtomicUsize>()
+                    .unwrap();
+                // Fills started in one request share one retained domain,
+                // apart from the request's ordinary domain (#8191).
+                assert_eq!(
+                    own.load(Ordering::Relaxed),
+                    if iteration == 0 { 0 } else { 7 }
+                );
+                assert!(!Arc::ptr_eq(&outer, &own));
+                own.store(7, Ordering::Relaxed);
+                assert_eq!(java.inner().retained_fill_domain_count_for_test(), 1);
+                // An execution-dependent reason, because fills inherit only that
+                // class (#8618); stable content gaps stay with their own answer.
+                kotlin.record_query_incomplete(
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                        "own fill".into(),
+                    ),
+                );
+                let nested = AnalyzerQueryScope::capturing_read_incompleteness(&java);
+                assert!(
+                    !nested.captured_read_incompleteness().is_empty(),
+                    "a lazily accessed peer must inherit its actual same-domain parent"
+                );
+            }
+            // The shared domain lives as long as its request.
+            assert_eq!(java.inner().retained_fill_domain_count_for_test(), 1);
+            assert_eq!(outer.load(Ordering::Relaxed), 19);
+        }
+        // A caller may hold a cache guard after its fill scope closes. Closing
+        // the fill does not wait for the guard, because the shared domain stays
+        // registered until its request ends.
+        let held;
+        {
+            let _fill = AnalyzerQueryScope::for_retained_fill(&kotlin);
+            held = java.inner().query_read_cache_lock();
+        }
+        assert_eq!(java.inner().retained_fill_domain_count_for_test(), 1);
+        drop(held);
+        assert_eq!(java.inner().retained_fill_domain_count_for_test(), 1);
+        // The domain retires with its request.
+        drop(outer_scope);
+        assert_eq!(java.inner().retained_fill_domain_count_for_test(), 0);
+        assert_eq!(kotlin.inner.retained_fill_domain_count_for_test(), 0);
+    }
+
     /// Cost pin for the scan-path milestone: after `prefetch_import_targets`,
     /// resolving the import paths the candidate walk will ask about costs no
     /// further store reads, and the memoized answers are the point path's.

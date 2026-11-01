@@ -344,6 +344,12 @@ pub struct SymbolAncestorsResult {
 pub struct SymbolAncestors {
     pub symbol: String,
     pub ancestors: Vec<String>,
+    #[serde(skip_serializing_if = "definition_lookup_complete")]
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -476,7 +482,23 @@ pub(crate) fn search_symbols_with_cap(
         .into_iter()
         .filter(|pattern| !pattern.trim().is_empty())
         .collect();
-    let pattern_batch = SearchSymbolPatternBatch::compile(patterns.clone(), false, cancellation);
+    let matcher_patterns = patterns
+        .iter()
+        .map(|pattern| {
+            if pattern.contains('+')
+                && classify_search_pattern(pattern) == SearchPatternKind::LiteralQualified
+            {
+                format!(
+                    "(?:{}|{})",
+                    regex::escape(&pattern.replace('+', ".")),
+                    pattern
+                )
+            } else {
+                pattern.clone()
+            }
+        })
+        .collect();
+    let pattern_batch = SearchSymbolPatternBatch::compile(matcher_patterns, false, cancellation);
     let invalid_patterns = pattern_batch.invalid_patterns().to_vec();
 
     let definitions = {
@@ -2428,18 +2450,32 @@ pub fn get_symbol_ancestors(
                         rejected_kind.get_or_insert(code_unit_kind_name(code_unit.kind()));
                         continue;
                     }
-                    // S2b: SymbolAncestors has no hierarchy incompleteness channel.
-                    let mut ancestor_names = provider
-                        .get_ancestors(&code_unit)
-                        .definite()
-                        .to_vec()
-                        .into_iter()
-                        .map(|ancestor| display_symbol_for_target(analyzer, &ancestor))
+                    let answer = provider.get_ancestors(&code_unit);
+                    let mut ancestor_names = answer
+                        .edges
+                        .iter()
+                        .map(|ancestor| display_symbol_for_target(analyzer, ancestor))
                         .collect::<Vec<_>>();
                     append_active_universal_root(analyzer, &code_unit, &mut ancestor_names);
                     resolved.push(SymbolAncestors {
                         symbol: display_symbol_for_target(analyzer, &code_unit),
                         ancestors: ancestor_names,
+                        complete: answer.is_complete(),
+                        incomplete_reasons: answer
+                            .open
+                            .iter()
+                            .map(|reason| reason.description())
+                            .collect(),
+                        alternatives: answer
+                            .ambiguous
+                            .iter()
+                            .map(|group| {
+                                group
+                                    .iter()
+                                    .map(|unit| display_symbol_for_target(analyzer, unit))
+                                    .collect()
+                            })
+                            .collect(),
                     });
                 }
                 if resolved.is_empty() {
@@ -2544,9 +2580,29 @@ fn model_symbol_ancestors(analyzer: &dyn IAnalyzer, target: &str) -> Option<Symb
         .cloned();
     let mut found = false;
     let mut names = Vec::new();
+    let mut alternatives = Vec::new();
+    let mut incomplete_reasons = Vec::new();
     for model_symbol in model_targets {
         found = true;
-        let model_ancestors = overlay.ancestors_of(&model_symbol);
+        if model_symbol.provenance.ambiguous {
+            incomplete_reasons.push(format!(
+                "hierarchy_ambiguous: {}",
+                model_symbol.qualified_name
+            ));
+        }
+        let model_ancestors = overlay.ancestry_answer(&model_symbol);
+        alternatives.extend(model_ancestors.alternatives.into_iter().map(|group| {
+            group
+                .into_iter()
+                .map(|record| record.qualified_name.clone())
+                .collect()
+        }));
+        incomplete_reasons.extend(
+            model_ancestors
+                .missing
+                .into_iter()
+                .map(|name| format!("unread_ancestor: {name}")),
+        );
         names.extend(
             model_ancestors
                 .records
@@ -2562,6 +2618,9 @@ fn model_symbol_ancestors(analyzer: &dyn IAnalyzer, target: &str) -> Option<Symb
     Some(SymbolAncestors {
         symbol: target.to_string(),
         ancestors: names,
+        complete: incomplete_reasons.is_empty() && alternatives.is_empty(),
+        incomplete_reasons,
+        alternatives,
     })
 }
 
@@ -2649,6 +2708,7 @@ pub(crate) fn score_symbol_match(pattern: &str, code_unit: &CodeUnit) -> SymbolM
 
     let pattern_kind = classify_search_pattern(normalized);
     let query = normalized.to_ascii_lowercase();
+    let qualified_query = normalize_symbol_name_for_search(normalized);
     let identifier_raw = code_unit.identifier();
     let short_name_raw = code_unit.short_name();
     let fq_name_raw = code_unit.fq_name();
@@ -2683,11 +2743,15 @@ pub(crate) fn score_symbol_match(pattern: &str, code_unit: &CodeUnit) -> SymbolM
             }
         }
         SearchPatternKind::LiteralQualified => {
-            if query == normalized_short || query == normalized_fq {
+            if qualified_query == normalized_short || qualified_query == normalized_fq {
                 9
-            } else if normalized_short.starts_with(&query) || normalized_fq.starts_with(&query) {
+            } else if normalized_short.starts_with(&qualified_query)
+                || normalized_fq.starts_with(&qualified_query)
+            {
                 7
-            } else if normalized_short.contains(&query) || normalized_fq.contains(&query) {
+            } else if normalized_short.contains(&qualified_query)
+                || normalized_fq.contains(&qualified_query)
+            {
                 5
             } else if query == identifier {
                 3
@@ -2716,7 +2780,7 @@ pub(crate) fn score_symbol_match(pattern: &str, code_unit: &CodeUnit) -> SymbolM
         exact_patterns: usize::from(
             (pattern_kind == SearchPatternKind::LiteralIdentifier && query == identifier)
                 || (pattern_kind == SearchPatternKind::LiteralQualified
-                    && (query == normalized_short || query == normalized_fq)),
+                    && (qualified_query == normalized_short || qualified_query == normalized_fq)),
         ),
     }
 }

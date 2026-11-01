@@ -50,6 +50,10 @@ fn normalized_report_identifier(value: impl Into<String>) -> Result<String, Repo
     Ok(value)
 }
 
+#[cfg(test)]
+#[path = "finding/identifier_contract_tests.rs"]
+mod identifier_contract_tests;
+
 fn has_canonical_typed_reasons<T: Ord>(reasons: &[T]) -> bool {
     !reasons.is_empty()
         && reasons.len() <= MAX_TYPED_REASONS
@@ -2500,14 +2504,13 @@ impl PolicyQueryResultRef {
                 coverage,
             } => {
                 require_span_bearing(location)?;
-                for id in [
-                    assignment_ast_id,
-                    rhs_ast_id,
-                    receiver_identity_id,
-                    member_target_id,
-                ] {
-                    validate_report_identifier(id)?;
-                }
+                validate_report_identifier(assignment_ast_id)?;
+                validate_report_identifier(rhs_ast_id)?;
+                // Receiver and member identities are opaque analyzer ids, not
+                // report identifiers: a source declaration id is
+                // `decl:v1:<hex>`, a modeled member is its dotted name.
+                validate_report_prose(receiver_identity_id)?;
+                validate_report_prose(member_target_id)?;
                 validate_report_identifier(proof)?;
                 validate_report_identifier(completeness)?;
                 validate_report_identifier(coverage)?;
@@ -3852,16 +3855,7 @@ impl PolicyDiagnostic {
         impact: PolicyDiagnosticImpact,
         message: impl Into<String>,
     ) -> Self {
-        const TRUNCATION_MARKER: &str = " [truncated]";
-        let mut message = message.into();
-        if message.len() > MAX_REPORT_PROSE_BYTES {
-            let mut boundary = MAX_REPORT_PROSE_BYTES - TRUNCATION_MARKER.len();
-            while boundary > 0 && !message.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            message.truncate(boundary);
-            message.push_str(TRUNCATION_MARKER);
-        }
+        let message = bounded_report_prose(message);
         Self::try_new(code, severity, impact, message, None, Vec::new())
             .expect("a bounded location-free diagnostic must construct")
     }
@@ -6214,6 +6208,21 @@ pub(crate) fn validate_report_identifier(value: &str) -> Result<(), ReportValueE
     Ok(())
 }
 
+/// Keep an explanation within the report prose cap without losing its diagnostic.
+pub(crate) fn bounded_report_prose(message: impl Into<String>) -> String {
+    const TRUNCATION_MARKER: &str = " [truncated]";
+    let mut message = message.into();
+    if message.len() > MAX_REPORT_PROSE_BYTES {
+        let mut boundary = MAX_REPORT_PROSE_BYTES - TRUNCATION_MARKER.len();
+        while boundary > 0 && !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
+        message.push_str(TRUNCATION_MARKER);
+    }
+    message
+}
+
 pub(crate) fn validate_report_prose(value: &str) -> Result<(), ReportValueError> {
     if value.len() > MAX_REPORT_PROSE_BYTES {
         return Err(ReportValueError::ProseTooLong {
@@ -7027,6 +7036,8 @@ impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
 
 #[cfg(test)]
 mod tests {
+    mod completion_contract_tests;
+    mod finding_contract_tests;
     use super::*;
     use crate::cvss::{
         CvssAssessment, CvssAssessmentProvenance, CvssAssessmentSet, CvssAssessmentVariant,
@@ -8043,6 +8054,9 @@ mod tests {
         assert_eq!(round_trip(&finding, &budget), finding);
     }
 
+    mod identity_contract_tests;
+    mod wire_and_byte_admission_tests;
+
     #[test]
     fn a_finding_that_exceeds_the_readers_budget_is_a_load_error() {
         let writer = PolicyBudget::default();
@@ -8597,4 +8611,16 @@ mod tests {
             "a label diverged from its serde tag"
         );
     }
+    mod finding_report_contract_tests {
+        include!("finding_report_contract_tests.rs");
+    }
+    mod run_contract_tests;
 }
+
+#[cfg(test)]
+#[path = "finding_ancestry_byte_contract_tests.rs"]
+mod finding_ancestry_byte_contract_tests;
+
+#[cfg(test)]
+#[path = "finding_closure_budget_tests.rs"]
+mod finding_closure_budget_tests;

@@ -9,6 +9,7 @@ pub struct RegexParser<'a> {
     pub(super) index: usize,
     pub(super) facts: Vec<Fact>,
     pub(super) frames: Vec<BranchFrame>,
+    pub(super) captures_opened: usize,
     pub(super) pending_risks: Vec<(NormalizedKind, usize, usize, usize, String)>,
     pub(super) incomplete: Option<(usize, usize, String)>,
     pub(super) exceeded: bool,
@@ -30,6 +31,7 @@ impl<'a> RegexParser<'a> {
             index: 0,
             facts: Vec::new(),
             frames: Vec::new(),
+            captures_opened: 0,
             pending_risks: Vec::new(),
             incomplete: None,
             exceeded: false,
@@ -63,6 +65,7 @@ impl<'a> RegexParser<'a> {
             group_start: None,
             last_atom: None,
             restore_flags: None,
+            capture: None,
         });
 
         while self.index < length {
@@ -350,6 +353,10 @@ impl<'a> RegexParser<'a> {
             self.exceeded = true;
             return;
         }
+        let capture = matches!(group_type, "capturing" | "named-capturing").then(|| {
+            self.captures_opened += 1;
+            self.captures_opened
+        });
         let owner = self.current_sequence();
         let group = self.add_fact(
             NormalizedKind::RegexGroup,
@@ -382,6 +389,7 @@ impl<'a> RegexParser<'a> {
             group_start: Some(start),
             last_atom: None,
             restore_flags,
+            capture,
         });
         self.index = content_start;
     }
@@ -634,7 +642,18 @@ impl<'a> RegexParser<'a> {
 
     fn escape(&mut self, in_class: bool) {
         let start = self.index;
-        let Some(escape) = self.syntax.escape(&self.chars, start, in_class, self.flags) else {
+        let groups = CaptureGroups {
+            opened: self.captures_opened,
+            open: self
+                .frames
+                .iter()
+                .filter_map(|frame| frame.capture)
+                .collect(),
+        };
+        let Some(escape) = self
+            .syntax
+            .escape(&self.chars, start, in_class, self.flags, &groups)
+        else {
             self.mark_incomplete(
                 start,
                 (start + 2).min(self.chars.len()),

@@ -470,6 +470,23 @@ pub(super) fn read_and_decode(
 /// Decode one head's outcome columns.
 /// One procedure's partial flows, or `None` when the procedure has no head
 /// row. The locators and texts the ports name are rebuilt under `scope`.
+/// The stored head of one procedure's partial flows: outcome, detail text id,
+/// open, relations complete, port count, flow count and discharged gaps.
+type PartialFlowHead = (i64, Option<i64>, i64, i64, i64, i64, String);
+
+/// The head columns of `semantic_ir_partial_flow_heads` starting at `first`.
+fn partial_flow_head(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<PartialFlowHead> {
+    Ok((
+        row.get(first)?,
+        row.get(first + 1)?,
+        row.get(first + 2)?,
+        row.get(first + 3)?,
+        row.get(first + 4)?,
+        row.get(first + 5)?,
+        row.get(first + 6)?,
+    ))
+}
+
 pub(super) fn read_partial_flows(
     tx: &Transaction<'_>,
     blob_id: i64,
@@ -484,21 +501,55 @@ pub(super) fn read_partial_flows(
              FROM semantic_ir_partial_flow_heads WHERE blob_id = ?1 AND procedure = ?2",
         )?
         .query_row(rusqlite::params![blob_id, procedure], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-            ))
+            partial_flow_head(row, 0)
         })
         .optional()?;
-    let Some((outcome, detail, open, relations_complete, port_count, flow_count, gaps)) = head
-    else {
+    let Some(head) = head else {
         return Ok(None);
     };
+    let mut decoder = Decoder::new(blob_id, scope);
+    decoder.read_identities(tx)?;
+    decode_partial_flows(tx, &decoder, procedure, head).map(Some)
+}
+
+/// Every procedure's partial flows in procedure order. The blob's identities
+/// are decoded once, not once per procedure as [`read_partial_flows`] must.
+pub(super) fn read_blob_partial_flows(
+    tx: &Transaction<'_>,
+    blob_id: i64,
+    scope: &SemanticIrMountScope,
+) -> Result<Vec<(u32, ProcedurePartialFlows)>> {
+    let heads = tx
+        .prepare_cached(
+            "SELECT procedure, outcome, detail, open, relations_complete, port_count,
+                    flow_count, json(discharged_gaps)
+             FROM semantic_ir_partial_flow_heads WHERE blob_id = ?1 ORDER BY procedure",
+        )?
+        .query_map([blob_id], |row| {
+            Ok((row.get(0)?, partial_flow_head(row, 1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(u32, PartialFlowHead)>>>()?;
+    let mut decoder = Decoder::new(blob_id, scope);
+    decoder.read_identities(tx)?;
+    heads
+        .into_iter()
+        .map(|(procedure, head)| {
+            Ok((
+                procedure,
+                decode_partial_flows(tx, &decoder, procedure, head)?,
+            ))
+        })
+        .collect()
+}
+
+fn decode_partial_flows(
+    tx: &Transaction<'_>,
+    decoder: &Decoder<'_>,
+    procedure: u32,
+    head: PartialFlowHead,
+) -> Result<ProcedurePartialFlows> {
+    let blob_id = decoder.blob_id;
+    let (outcome, detail, open, relations_complete, port_count, flow_count, gaps) = head;
     let outcome = PartialFlowOutcome::try_from_code(outcome).unwrap_or_else(|| {
         panic!(
             "semantic IR partial-flow head of blob {blob_id} procedure {procedure} has outcome {outcome}"
@@ -516,8 +567,6 @@ pub(super) fn read_partial_flows(
             panic!("semantic IR partial-flow head of blob {blob_id} has relations_complete {other}")
         }
     };
-    let mut decoder = Decoder::new(blob_id, scope);
-    decoder.read_identities(tx)?;
     let detail = detail.map(|id| {
         usize::try_from(id)
             .ok()
@@ -601,7 +650,7 @@ pub(super) fn read_partial_flows(
                 };
                 PartialFlowPort::Heap {
                     root: Box::new(ports[root].clone()),
-                    selectors: heap_selectors(cells, &decoder, &text),
+                    selectors: heap_selectors(cells, decoder, &text),
                     tail,
                 }
             }
@@ -649,7 +698,7 @@ pub(super) fn read_partial_flows(
     let gaps: Vec<u32> = serde_json::from_str(&gaps).unwrap_or_else(|error| {
         panic!("semantic IR partial-flow head of blob {blob_id}: discharged_gaps: {error}")
     });
-    Ok(Some(ProcedurePartialFlows {
+    Ok(ProcedurePartialFlows {
         outcome,
         detail,
         ports,
@@ -657,7 +706,7 @@ pub(super) fn read_partial_flows(
         open,
         relations_complete,
         discharged_gaps: gaps.into_iter().map(SemanticGapId::new).collect(),
-    }))
+    })
 }
 
 fn required_u32(cells: &Cells<'_, '_>, value: Option<i64>, name: &str) -> u32 {

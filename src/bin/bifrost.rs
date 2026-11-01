@@ -750,6 +750,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--no-incremental"
                 | "--policy-timings"
                 | "--policy-cost-hints"
+                | "--policy-deadlines-ms"
                 | "--output"
                 | "--color"
                 | "--verbose"
@@ -796,6 +797,8 @@ fn option_requires_value(argument: &str) -> bool {
             | "--baseline-file"
             | "--evaluation-date"
             | "--diff-base"
+            | "--policy-cost-hints"
+            | "--policy-deadlines-ms"
             | "--output"
             | "--color"
             | "--explain-finding"
@@ -882,6 +885,7 @@ fn run_inner(
     let mut policy_diff_scoped = false;
     let mut policy_timings = false;
     let mut policy_cost_hints = None;
+    let mut policy_deadlines = None;
     let mut policy_output: Option<PathBuf> = None;
     let mut policy_verbose = false;
     let mut policy_verbose_seen = false;
@@ -1183,6 +1187,23 @@ fn run_inner(
                         .map_err(|error| format!("Invalid --policy-cost-hints {path}: {error}"))?,
                 );
             }
+            "--policy-deadlines-ms" => {
+                if policy_deadlines.is_some() {
+                    return Err("--policy-deadlines-ms may only be provided once".to_string());
+                }
+                let path = args
+                    .next()
+                    .ok_or_else(|| "--policy-deadlines-ms requires a path".to_string())?;
+                let bytes = std::fs::read(Path::new(&path)).map_err(|error| {
+                    format!("failed to read --policy-deadlines-ms {path}: {error}")
+                })?;
+                policy_deadlines = Some(
+                    serde_json::from_slice::<brokk_bifrost::policy::PolicyDeadlines>(&bytes)
+                        .map_err(|error| {
+                            format!("Invalid --policy-deadlines-ms {path}: {error}")
+                        })?,
+                );
+            }
             "--policy-timings" => {
                 if policy_timings {
                     return Err("--policy-timings may only be provided once".to_string());
@@ -1331,6 +1352,7 @@ fn run_inner(
                 || !policy_incremental
                 || policy_timings
                 || policy_cost_hints.is_some()
+                || policy_deadlines.is_some()
                 || policy_output.is_some()
                 || policy_verbose_seen
                 || policy_color_seen
@@ -1417,12 +1439,13 @@ fn run_inner(
                 || policy_diff_base.is_some()
                 || policy_timings
                 || policy_cost_hints.is_some()
+                || policy_deadlines.is_some()
                 || policy_verbose_seen
                 || policy_color_seen
                 || !tool_sources.is_empty()
             {
                 return Err(
-                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --on-inconclusive, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --policy-timings, --policy-cost-hints, --verbose, --color, or --sources"
+                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --on-inconclusive, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --policy-timings, --policy-cost-hints, --policy-deadlines-ms, --verbose, --color, or --sources"
                         .to_string(),
                 );
             }
@@ -1527,6 +1550,7 @@ fn run_inner(
                 incremental: policy_incremental,
                 policy_timings,
                 policy_cost_hints: policy_cost_hints.unwrap_or_default(),
+                policy_deadlines: policy_deadlines.unwrap_or_default(),
                 output: policy_output,
                 verbose: policy_verbose,
                 color: policy_color,
@@ -1892,6 +1916,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
             incremental,
             policy_timings: false,
             policy_cost_hints: Default::default(),
+            policy_deadlines: Default::default(),
             output,
             verbose,
             color,
@@ -2290,6 +2315,7 @@ struct PolicyModeRequest {
     incremental: bool,
     policy_timings: bool,
     policy_cost_hints: brokk_bifrost::policy::PolicyCostHints,
+    policy_deadlines: brokk_bifrost::policy::PolicyDeadlines,
     output: Option<PathBuf>,
     verbose: bool,
     color: PolicyColorMode,
@@ -2324,7 +2350,8 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
             .with_on_inconclusive(request.on_inconclusive)
             .with_incremental(request.incremental)
             .with_policy_timings(request.policy_timings)
-            .with_policy_cost_hints(request.policy_cost_hints.clone());
+            .with_policy_cost_hints(request.policy_cost_hints.clone())
+            .with_policy_deadlines(request.policy_deadlines.clone());
     if let Some(revision) = request.diff_base.clone() {
         options = options.with_diff_base(revision);
     }
@@ -2894,6 +2921,11 @@ OPTIONS:
                            Read a JSON object of policy id to expected milliseconds and start
                            the longest policies first; policies without a hint start before
                            them. Only the start order changes, never the report
+    --policy-deadlines-ms PATH
+                           Read a JSON object of policy id to milliseconds (at least 1) and stop
+                           each listed policy at its own deadline, counted from when it starts.
+                           A policy that reaches it ends inconclusive with reason
+                           rule_deadline_exceeded while the other policies keep running
     --policy-timings       Include each policy's evaluation elapsed time in its report work metrics
     --require-explicit-schema-versions
                            Reject inferred policy and RQL schema versions
@@ -2930,7 +2962,8 @@ OPTIONS:
                            exclude each other, and none can be combined with --format,
                            --fail-on, --suppressions-file, --scope-file, --baseline-file,
                            --accept-current, --evaluation-date, --diff-base, --policy-timings,
-                           --policy-cost-hints, --verbose, --color, or --sources
+                           --policy-cost-hints, --policy-deadlines-ms, --verbose, --color, or
+                           --sources
     --output PATH          Atomically write policy output to PATH instead of stdout
     --no-line-numbers      Render source output without leading line numbers
     -h, --help [TOOL]      Show this help, or a single tool's description and parameters

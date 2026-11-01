@@ -4,9 +4,8 @@
 //! closed [`ResolvedTaintPolicySpec`] boundary and lowers only structured,
 //! source-backed selector results into the diagnostic-neutral taint engine.
 
-use brokk_bifrost_rust_analysis::{
-    RustStdBuiltinCall, RustStdBuiltinTransfer, rust_std_builtin_call,
-};
+use brokk_bifrost_analysis::analyzer::languages::language_support;
+use brokk_bifrost_analysis::analyzer::semantic::{IntrinsicCall, IntrinsicTransfer};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
@@ -1787,7 +1786,7 @@ struct DiscoveredValueFlow {
     /// Query-local Rust formatting macro calls whose exact standard identity
     /// was proved by ordinary dispatch. They receive the language intrinsic
     /// result-transfer model below, independent of active semantic packs.
-    rust_format_result_calls: Vec<(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)>,
+    intrinsic_format_result_calls: Vec<(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)>,
     /// Region membership, by durable procedure identity rather than by handle.
     /// A selected source or sink is tested against this set, and its handle can
     /// come from a different materialization than the walk's, so handle
@@ -2016,7 +2015,9 @@ fn value_flow_cause_text(
     let rust_call_site = match cause {
         ValueFlowIncompleteCause::CallResolution { call, .. }
         | ValueFlowIncompleteCause::CallBinding { call, .. }
-        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => is_rust_taint_call(call),
+        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => {
+            uses_call_site_taint_evidence(call)
+        }
         _ => false,
     };
     let family =
@@ -2172,12 +2173,12 @@ fn composition_first_cause(
         PolicyDiagnosticSeverity::Warning,
         PolicyDiagnosticImpact::RunIncomplete,
         family,
-        message,
+        super::finding::bounded_report_prose(message),
         primary,
         Vec::new(),
     )
-    .ok();
-    let mut diagnostics: Vec<PolicyDiagnostic> = diagnostic.into_iter().collect();
+    .expect("a static cause family, bounded message and empty related locations are valid");
+    let mut diagnostics: Vec<PolicyDiagnostic> = vec![diagnostic];
     // The ICFG engine gives each analysis root its own first cause, so a run
     // whose roots fail for different reasons names both families. The
     // composition has one root; a source whose evidence is incomplete is
@@ -2188,17 +2189,17 @@ fn composition_first_cause(
             .find(|reason| matches!(reason, Incompleteness::SourceEvidence { .. }))
     {
         let (family, message) = source_evidence_text(point);
-        diagnostics.extend(
+        diagnostics.push(
             PolicyDiagnostic::try_new_in_family(
                 PolicyDiagnosticCode::EvaluationFailure,
                 PolicyDiagnosticSeverity::Warning,
                 PolicyDiagnosticImpact::RunIncomplete,
                 family,
-                message,
+                super::finding::bounded_report_prose(message),
                 None,
                 Vec::new(),
             )
-            .ok(),
+            .expect("a static cause family, bounded message and empty related locations are valid"),
         );
     }
     Ok((diagnostics, first_status))
@@ -2333,7 +2334,7 @@ fn call_site_cause(
     let (handle, _, _) = provider
         .dispatched_call(call)
         .expect("the composition records every call a reason names");
-    if !is_rust_taint_call(&handle) {
+    if !uses_call_site_taint_evidence(&handle) {
         return Ok(None);
     }
     let evidence = taint_call_resolution_evidence(
@@ -2410,8 +2411,9 @@ fn composition_reason_message(reason: &Incompleteness) -> String {
     }
 }
 
-fn is_rust_taint_call(call: &CallSiteHandle) -> bool {
-    call.procedure().artifact().key().language() == SemanticLanguage::Standard(Language::Rust)
+fn uses_call_site_taint_evidence(call: &CallSiteHandle) -> bool {
+    language_support(call.procedure().artifact().key().language().language())
+        .is_some_and(|support| support.taint_uses_call_site_evidence())
 }
 
 /// The family of a Rust call whose dispatch keeps the run incomplete. Both
@@ -3209,7 +3211,8 @@ pub(crate) struct PolicyDiscoveryProvider<'a, 'cache> {
     /// published, in the order the walk saw it. The walk drains this once at
     /// the end, so the vector is scoped to one root's discovery.
     returned_callables: RefCell<Vec<ReturnedCallableProvenance>>,
-    rust_format_result_calls: RefCell<Vec<(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)>>,
+    intrinsic_format_result_calls:
+        RefCell<Vec<(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)>>,
 }
 
 impl<'a, 'cache> PolicyDiscoveryProvider<'a, 'cache> {
@@ -3227,7 +3230,7 @@ impl<'a, 'cache> PolicyDiscoveryProvider<'a, 'cache> {
             cache,
             poison: RefCell::new(None),
             returned_callables: RefCell::new(Vec::new()),
-            rust_format_result_calls: RefCell::new(Vec::new()),
+            intrinsic_format_result_calls: RefCell::new(Vec::new()),
         }
     }
 
@@ -3305,12 +3308,12 @@ impl<'a, 'cache> PolicyDiscoveryProvider<'a, 'cache> {
 
     /// Take standard `format!`/`format_args!` identities observed during this
     /// query's dispatch walk, deduplicated by the call's durable identity.
-    fn take_rust_format_result_calls(
+    fn take_intrinsic_format_result_calls(
         &self,
     ) -> Vec<(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)> {
         let mut seen = HashSet::new();
         let mut rows = Vec::new();
-        for row in self.rust_format_result_calls.take() {
+        for row in self.intrinsic_format_result_calls.take() {
             if seen.insert((row.0.durable_key(), row.1.clone())) {
                 rows.push(row);
             }
@@ -3359,14 +3362,14 @@ impl<'a, 'cache> PolicyDiscoveryProvider<'a, 'cache> {
     }
 
     /// Record the call's standard format identity when its dispatch proves
-    /// one ([`rust_format_result_identity`]).
-    fn record_rust_format_result_call(
+    /// one ([`intrinsic_format_result_identity`]).
+    fn record_intrinsic_format_result_call(
         &self,
         call: &CallSiteHandle,
         outcome: &SemanticOutcome<DispatchResult>,
     ) {
-        if let Some(identity) = rust_format_result_identity(outcome) {
-            self.rust_format_result_calls
+        if let Some(identity) = intrinsic_format_result_identity(outcome) {
+            self.intrinsic_format_result_calls
                 .borrow_mut()
                 .push((call.clone(), identity.clone()));
         }
@@ -3387,10 +3390,15 @@ impl<'a, 'cache> PolicyDiscoveryProvider<'a, 'cache> {
 /// if any. Only a complete, exact query-time macro dispatch answer proves it:
 /// the spelling-derived lowerer candidate and a user macro that shadows the
 /// prelude cannot satisfy this identity test.
-pub(crate) fn rust_format_result_identity(
+pub(crate) fn intrinsic_format_result_identity(
     outcome: &SemanticOutcome<DispatchResult>,
 ) -> Option<&ResolverOwnedExternalCalleeIdentity> {
-    let dispatch = outcome.available_value()?;
+    let SemanticOutcome::Complete {
+        value: dispatch, ..
+    } = outcome
+    else {
+        return None;
+    };
     if dispatch.coverage() != CandidateCoverage::Exhaustive
         || !dispatch.candidates().is_empty()
         || dispatch.boundaries().len() != 1
@@ -3404,12 +3412,9 @@ pub(crate) fn rust_format_result_identity(
         return None;
     }
     let identity = boundary.external_callee_identity()?;
-    (identity.language() == brokk_bifrost_analysis::analyzer::Language::Rust
-        && matches!(
-            (identity.owner_fqn(), identity.member()),
-            ("std" | "core" | "alloc", "format" | "format_args") | ("alloc.fmt", "format")
-        ))
-    .then_some(identity)
+    language_support(identity.language())
+        .is_some_and(|support| support.intrinsic_format_result(identity))
+        .then_some(identity)
 }
 
 impl PolicyDiscoveryProvider<'_, '_> {
@@ -3536,7 +3541,7 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
             let outcome = cached.replay();
             record_dispatch_read(self.oracle.workspace(), call, &outcome);
             self.record_returned_callables(&outcome);
-            self.record_rust_format_result_call(call, &outcome);
+            self.record_intrinsic_format_result_call(call, &outcome);
             return Ok(outcome);
         }
         let mut staged = request.staged_with_execution_budget(&self.execution_budget);
@@ -3558,7 +3563,7 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
         record_dispatch_read(self.oracle.workspace(), call, &outcome);
         self.require_outcome(&outcome, "taint call dispatch")?;
         self.record_returned_callables(&outcome);
-        self.record_rust_format_result_call(call, &outcome);
+        self.record_intrinsic_format_result_call(call, &outcome);
         self.cache
             .dispatch
             .borrow_mut()
@@ -4605,7 +4610,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 sinks.len(),
             )?;
             sink_specs.extend(write_specs.iter().cloned());
-            let rust_format_result_calls = discovery.rust_format_result_calls.clone();
+            let intrinsic_format_result_calls = discovery.intrinsic_format_result_calls.clone();
             let (value_flow, call_resolution_discovery, sanitizer_declines) = self
                 .build_value_flow_plan(
                     discovery,
@@ -4619,7 +4624,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 value_flow,
                 &models,
                 &universe,
-                &rust_format_result_calls,
+                &intrinsic_format_result_calls,
             )?;
             // A store declaration models its selected call outright: nothing
             // flows through the call directly, taint crosses only via the
@@ -4649,7 +4654,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     )
                     .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?
             };
-            let value_flow = self.install_rust_std_builtin_models(value_flow)?;
+            let value_flow = self.install_intrinsic_call_models(value_flow)?;
             let local_rules = transforms
                 .iter()
                 .map(|transform| {
@@ -5366,6 +5371,21 @@ impl<'a> TaintPolicyCompiler<'a> {
                 self.authored_selector_summary = true;
             }
             return (self.matched_values)(self, selection);
+        }
+        // A field-write row's span is the assigned value, not a call. A call
+        // port would bind whatever call sits at that span, such as the
+        // right-hand call itself, and refuse the site only as advisory, so a
+        // setter-only workspace would answer complete and clean (#8305).
+        if selector.as_query().is_some_and(|(_, query)| {
+            query
+                .validate_row_kinds()
+                .expect("a compiled selector has a valid plan")
+                .contains(&brokk_bifrost_rql::structural::QueryValueKind::FieldWriteValue)
+        }) {
+            return Err(TaintPolicyCompileError::UnsupportedBinding(format!(
+                "selector `{}` selects field-write values, which have no call port: bind the assigned value with matched-value",
+                selector.path
+            )));
         }
         let calls = self.selected_semantic_calls(&selection)?;
         if matches!(calls, SelectedCallSites::Missing) && matches!(binding, PolicyPort::ReturnValue)
@@ -7138,7 +7158,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 )
             })
             .collect();
-        let rust_format_result_calls = provider.take_rust_format_result_calls();
+        let intrinsic_format_result_calls = provider.take_intrinsic_format_result_calls();
 
         let mut seen_external_targets = HashSet::new();
         let mut seen_unmaterialized_targets = HashSet::new();
@@ -7171,7 +7191,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             snapshots: discovered.snapshots,
             bindings,
             returned_callables,
-            rust_format_result_calls,
+            intrinsic_format_result_calls,
             procedures,
             external_targets,
             unmaterialized_external_targets,
@@ -7227,7 +7247,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             &dispatch_boundaries,
             external_summaries.as_ref(),
         );
-        resolved_external_calls.extend(exact_rust_builtin_macro_resolution_calls(
+        resolved_external_calls.extend(exact_intrinsic_resolution_calls(
             &call_coverage,
             &dispatch_boundaries,
         ));
@@ -7663,7 +7683,7 @@ pub(crate) fn exact_python_external_resolution_calls(
         .collect()
 }
 
-pub(crate) fn exact_rust_builtin_macro_resolution_calls(
+pub(crate) fn exact_intrinsic_resolution_calls(
     coverage: &HashMap<DurableCallSiteKey, CallSiteCoverage>,
     boundaries: &[DispatchBoundary],
 ) -> Vec<CallSiteHandle> {
@@ -7674,28 +7694,9 @@ pub(crate) fn exact_rust_builtin_macro_resolution_calls(
         let Some(target) = boundary.unmaterialized_external_target() else {
             return false;
         };
-        let known_identity = identity.language() == Language::Rust
-            && matches!(
-                (identity.owner_fqn(), identity.member()),
-                (
-                    "std" | "core" | "alloc",
-                    "format"
-                        | "format_args"
-                        | "print"
-                        | "println"
-                        | "eprint"
-                        | "eprintln"
-                        | "write"
-                        | "writeln"
-                        | "panic"
-                ) | ("alloc.fmt", "format")
-                    | ("core.panicking", "panic_fmt" | "assert_failed")
-                    | ("std.io.stdio", "_print" | "_eprint")
-                    | ("core", "matches")
-                    | ("alloc", "vec")
-            );
-        known_identity
-            && target.language() == SemanticLanguage::Standard(Language::Rust)
+        language_support(identity.language())
+            .is_some_and(|support| support.intrinsic_complete_target(identity))
+            && target.language() == SemanticLanguage::Standard(identity.language())
             && target.owner_fqn() == identity.owner_fqn()
             && target.member() == identity.member()
             && matches!(&boundary.kind, DispatchBoundaryKind::External(Some(locator)) if locator == target.locator())
@@ -9093,17 +9094,17 @@ fn compose_batch(
     if outcome.report.is_complete() || outcome.report.is_proven_by_authored_summaries() {
         for cause in &outcome.finding_incompleteness {
             let (family, message, primary) = composition_cause_text(workspace, &provider, cause)?;
-            if let Ok(diagnostic) = PolicyDiagnostic::try_new_in_family(
+            let diagnostic = PolicyDiagnostic::try_new_in_family(
                 PolicyDiagnosticCode::EvaluationFailure,
                 PolicyDiagnosticSeverity::Warning,
                 PolicyDiagnosticImpact::FindingPartial,
                 family,
-                message,
+                super::finding::bounded_report_prose(message),
                 primary,
                 Vec::new(),
-            ) {
-                composition_finding_diagnostics.push(diagnostic);
-            }
+            )
+            .expect("a static cause family, bounded message and empty related locations are valid");
+            composition_finding_diagnostics.push(diagnostic);
         }
     }
     if let Some(lane) = first_exhausted_taint_lane(execution_budget) {
@@ -9855,6 +9856,7 @@ fn boundary_kind_detail(kind: &SummaryBoundaryKind) -> String {
             DispatchBoundaryKind::External(_)
             | DispatchBoundaryKind::Unmaterialized(_)
             | DispatchBoundaryKind::Unresolved
+            | DispatchBoundaryKind::HierarchyUnenumerated
             | DispatchBoundaryKind::Truncated => format!("dispatch:{}", dispatch.label()),
         },
         SummaryBoundaryKind::Limit(limit) => format!("limit:{}", limit.label()),
@@ -10842,7 +10844,7 @@ fn policy_authored_arm_closures_from(
 fn project_taint_report(
     workspace: &WorkspaceAnalyzer,
     group: &ProjectedSourceGroup<'_>,
-    store_crossings: Vec<&StoreCrossingProvenance>,
+    store_crossings: Vec<(&ValueFlowEventKey, &StoreCrossingProvenance)>,
     finding_key: &str,
     primary: &crate::finding::PolicySourceLocation,
     proven: bool,
@@ -11008,7 +11010,7 @@ struct EffectiveWitnessLimits {
 fn project_taint_witnesses(
     workspace: &WorkspaceAnalyzer,
     group: &ProjectedSourceGroup<'_>,
-    store_crossings: Vec<&StoreCrossingProvenance>,
+    store_crossings: Vec<(&ValueFlowEventKey, &StoreCrossingProvenance)>,
     finding_key: &str,
     finding_incomplete: bool,
     witness_limit: usize,
@@ -11054,10 +11056,10 @@ fn project_taint_witnesses(
             omitted = omitted.saturating_add(1);
             continue;
         };
-        if let Some(crossing) = store_crossings
-            .iter()
-            .find(|crossing| crossing.source_endpoint == group.source.identity)
-        {
+        if let Some((_, crossing)) = store_crossings.iter().find(|(event, crossing)| {
+            **event == *origin.origin().value_flow_key()
+                && crossing.source_endpoint == group.source.identity
+        }) {
             projected =
                 project_store_crossing_witness(workspace, projected, crossing, witness_limits)?;
         }
@@ -11086,7 +11088,7 @@ fn project_taint_witnesses(
 fn store_crossings_for_group<'a>(
     seeds: &'a [StoreReadSeed],
     group: &ProjectedSourceGroup<'_>,
-) -> Vec<&'a StoreCrossingProvenance> {
+) -> Vec<(&'a ValueFlowEventKey, &'a StoreCrossingProvenance)> {
     let origin_events = group
         .origins
         .iter()
@@ -11095,8 +11097,12 @@ fn store_crossings_for_group<'a>(
     seeds
         .iter()
         .filter(|seed| origin_events.contains(&seed.event))
-        .flat_map(|seed| seed.crossings.iter())
-        .filter(|crossing| crossing.source_endpoint == group.source.identity)
+        .flat_map(|seed| {
+            seed.crossings
+                .iter()
+                .map(move |crossing| (&seed.event, crossing))
+        })
+        .filter(|(_, crossing)| crossing.source_endpoint == group.source.identity)
         .collect()
 }
 
@@ -11882,7 +11888,7 @@ impl<'a> TaintPolicyCompiler<'a> {
     /// literal receiver's structure, proves the std identity, so they model
     /// the call at the derived tier. A call another model already owns keeps
     /// that model.
-    fn install_rust_std_builtin_models(
+    fn install_intrinsic_call_models(
         &mut self,
         plan: ValueFlowPlan,
     ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
@@ -11897,14 +11903,14 @@ impl<'a> TaintPolicyCompiler<'a> {
                 if plan.has_curated_call_model(&call) || !modeled.insert(call.clone()) {
                     continue;
                 }
-                let Some(builtin) = rust_std_builtin_call(workspace, &call)
+                let Some(builtin) = language_intrinsic_call(workspace, &call)
                     .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?
                 else {
                     continue;
                 };
                 models.push(ValueFlowCuratedCallModel::new(
                     call,
-                    rust_std_builtin_model(&builtin)?,
+                    intrinsic_call_model(&builtin)?,
                 ));
             }
         }
@@ -11922,9 +11928,9 @@ impl<'a> TaintPolicyCompiler<'a> {
         plan: ValueFlowPlan,
         models: &[BoundExternalModel],
         universe: &TaintUniverse,
-        rust_format_result_calls: &[(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)],
+        intrinsic_format_result_calls: &[(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)],
     ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
-        if models.is_empty() && rust_format_result_calls.is_empty() {
+        if models.is_empty() && intrinsic_format_result_calls.is_empty() {
             return Ok(plan);
         }
         // `models` is sorted by call identity, so equal calls are adjacent.
@@ -11941,7 +11947,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 _ => grouped.push((model.call.clone(), vec![model], None)),
             }
         }
-        for (call, identity) in rust_format_result_calls {
+        for (call, identity) in intrinsic_format_result_calls {
             if let Some((_, _, recorded_identity)) = grouped
                 .iter_mut()
                 .find(|(candidate, _, _)| candidate.durable_key() == call.durable_key())
@@ -11965,9 +11971,9 @@ impl<'a> TaintPolicyCompiler<'a> {
         });
         let mut curated = Vec::with_capacity(grouped.len());
         let mut location_bindings = Vec::new();
-        for (call, group, rust_format_identity) in grouped {
+        for (call, group, format_identity) in grouped {
             let mut seams =
-                ExternalCallSeams::new(&call, &group, rust_format_identity.as_ref(), universe);
+                ExternalCallSeams::new(&call, &group, format_identity.as_ref(), universe);
             // Decide every field destination against the plan's closed
             // carrier set before the model is built, so an unobservable write
             // drops out of the model entirely and the rest stays complete.
@@ -12046,18 +12052,30 @@ impl<'a> TaintPolicyCompiler<'a> {
     }
 }
 
-/// The curated model of one reviewed Rust std operation (#3757).
-pub(crate) fn rust_std_builtin_model(
-    builtin: &RustStdBuiltinCall,
+/// The calling language's proven intrinsic for `call`, if it has one.
+pub(crate) fn language_intrinsic_call(
+    workspace: &WorkspaceAnalyzer,
+    call: &CallSiteHandle,
+) -> Result<Option<IntrinsicCall>, brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError>
+{
+    match language_support(call.procedure().artifact().key().language().language()) {
+        Some(support) => support.intrinsic_call(workspace, call),
+        None => Ok(None),
+    }
+}
+
+/// The curated model of one proven language intrinsic (Rust std operations since #3757).
+pub(crate) fn intrinsic_call_model(
+    builtin: &IntrinsicCall,
 ) -> Result<CuratedCallModel, TaintPolicyCompileError> {
     let plan_error = |error: &dyn fmt::Display| TaintPolicyCompileError::Plan(error.to_string());
     let evidence =
         SummaryEvidence::from_semantic(&ProofStatus::Proven, &EvidenceCompleteness::Complete)
             .map_err(|e| plan_error(&e))?;
     let input = match builtin.transfer {
-        RustStdBuiltinTransfer::ReceiverToResult => Some(SummaryPort::Receiver),
-        RustStdBuiltinTransfer::ArgumentToResult => Some(SummaryPort::Parameter(0)),
-        RustStdBuiltinTransfer::FreshResult => None,
+        IntrinsicTransfer::ReceiverToResult => Some(SummaryPort::Receiver),
+        IntrinsicTransfer::ArgumentToResult => Some(SummaryPort::Parameter(0)),
+        IntrinsicTransfer::FreshResult => None,
     };
     let transfers = input
         .map(|input| {
@@ -12072,11 +12090,11 @@ pub(crate) fn rust_std_builtin_model(
         .transpose()?
         .into_iter()
         .collect();
-    let mut content = b"bifrost-rust-std-builtin/v1\0".to_vec();
+    let mut content = builtin.content_domain.to_vec();
     content.extend_from_slice(builtin.operation.as_bytes());
     content.extend_from_slice(format!("\0{:?}", builtin.transfer).as_bytes());
     CuratedCallModel::try_new(
-        ExternalSummaryModelId::new(format!("bifrost.rust-std#{}", builtin.operation))
+        ExternalSummaryModelId::new(format!("{}#{}", builtin.model_namespace, builtin.operation))
             .map_err(|e| plan_error(&e))?,
         ExternalSummaryContentHash::hash_bytes(&content),
         transfers,
@@ -12110,13 +12128,12 @@ impl<'model> ExternalCallSeams<'model> {
     pub(crate) fn new(
         call: &CallSiteHandle,
         group: &[&'model BoundExternalModel],
-        rust_format_identity: Option<&ResolverOwnedExternalCalleeIdentity>,
+        format_identity: Option<&ResolverOwnedExternalCalleeIdentity>,
         universe: &'model TaintUniverse,
     ) -> Self {
         let mut proof = ProofStatus::Proven;
         let mut completeness = EvidenceCompleteness::Complete;
-        let mut names =
-            Vec::with_capacity(group.len() + usize::from(rust_format_identity.is_some()));
+        let mut names = Vec::with_capacity(group.len() + usize::from(format_identity.is_some()));
         let mut moved: BTreeMap<(SummaryPort, SummaryPort), ExternalSeam<'model>> = BTreeMap::new();
         for model in group {
             proof = conjoin_proof(&proof, &model.proof);
@@ -12136,16 +12153,12 @@ impl<'model> ExternalCallSeams<'model> {
                 }
             }
         }
-        if let Some(identity) = rust_format_identity {
-            assert_eq!(
-                identity.language(),
-                brokk_bifrost_analysis::analyzer::Language::Rust
+        if let Some(identity) = format_identity {
+            assert!(
+                language_support(identity.language())
+                    .is_some_and(|support| support.intrinsic_format_result(identity)),
+                "a format seam needs its language's format-result identity: {identity:?}"
             );
-            assert!(matches!(
-                identity.owner_fqn(),
-                "std" | "core" | "alloc" | "alloc.fmt"
-            ));
-            assert!(matches!(identity.member(), "format" | "format_args"));
             names.push(format!(
                 "bifrost.intrinsic.rust-format.{}.{}",
                 identity.owner_fqn(),
@@ -12971,6 +12984,9 @@ fn taint_selector_error(
 mod tests {
     use std::sync::Arc;
 
+    #[path = "display_anchor_contract.rs"]
+    mod display_anchor_contract;
+
     use brokk_bifrost_test_macros::hardwon;
 
     use super::{
@@ -13010,6 +13026,141 @@ mod tests {
     };
     use brokk_bifrost_flow::dataflow::{SolverWork, SummaryBoundaryKind};
     use brokk_bifrost_rql::structural::{CodeQueryExecutionLimits, CodeQuerySemanticLimits};
+
+    #[test]
+    fn intrinsic_hook_preserves_rust_std_and_format_models() {
+        use brokk_bifrost_analysis::analyzer::semantic::oracle::DispatchOracle;
+        use brokk_bifrost_flow::dataflow::{
+            CuratedCallModel, ExternalSummaryContentHash, ExternalSummaryModelId, SummaryEvidence,
+            SummaryExit, SummaryExitKind, SummaryPort, SummaryTransfer,
+        };
+        use brokk_bifrost_rust_analysis::{RustStdBuiltinTransfer, rust_std_builtin_call};
+        let (_project, workspace) = workspace_with_sources(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"intrinsic_boundary\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "src/lib.rs",
+                r#"pub fn run() {
+                let _ = "hello".to_owned();
+                let _ = "hello".len();
+                let _ = Some("hello");
+                let _: Result<&str, &str> = Ok("hello");
+                let _: Result<&str, &str> = Err("hello");
+                let _ = String::new();
+                let _ = format!("{}", "hello");
+                let _ = format_args!("{}", "hello");
+            }"#,
+            ),
+        ]);
+        let file = workspace
+            .analyzer()
+            .get_analyzed_files()
+            .into_iter()
+            .find(|file| file.rel_path().ends_with("lib.rs"))
+            .unwrap();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let mut std_count = 0;
+        let mut format_count = 0;
+        for row in artifact.procedures() {
+            let procedure = artifact.procedure_handle(row.id()).unwrap();
+            for row in procedure.semantics().call_sites() {
+                let call = procedure.call_site_handle(row.id).unwrap();
+                let old = rust_std_builtin_call(&workspace, &call).unwrap();
+                let descriptor = super::language_intrinsic_call(&workspace, &call).unwrap();
+                assert_eq!(old.is_some(), descriptor.is_some());
+                if let Some(old) = old {
+                    std_count += 1;
+                    let input = match old.transfer {
+                        RustStdBuiltinTransfer::ReceiverToResult => Some(SummaryPort::Receiver),
+                        RustStdBuiltinTransfer::ArgumentToResult => Some(SummaryPort::Parameter(0)),
+                        RustStdBuiltinTransfer::FreshResult => None,
+                    };
+                    let evidence = SummaryEvidence::from_semantic(
+                        &ProofStatus::Proven,
+                        &EvidenceCompleteness::Complete,
+                    )
+                    .unwrap();
+                    let transfers = input
+                        .map(|input| {
+                            SummaryTransfer::try_new(
+                                input,
+                                SummaryExit::try_new(
+                                    SummaryExitKind::Normal,
+                                    SummaryPort::NormalReturn,
+                                )
+                                .unwrap(),
+                                evidence,
+                            )
+                            .unwrap()
+                        })
+                        .into_iter()
+                        .collect();
+                    let mut content = b"bifrost-rust-std-builtin/v1\0".to_vec();
+                    content.extend_from_slice(old.operation.as_bytes());
+                    content.extend_from_slice(format!("\0{:?}", old.transfer).as_bytes());
+                    let expected = CuratedCallModel::try_new(
+                        ExternalSummaryModelId::new(format!("bifrost.rust-std#{}", old.operation))
+                            .unwrap(),
+                        ExternalSummaryContentHash::hash_bytes(&content),
+                        transfers,
+                    )
+                    .unwrap();
+                    let actual = super::intrinsic_call_model(&descriptor.unwrap()).unwrap();
+                    assert_eq!(expected, actual);
+                }
+                let answer = workspace
+                    .semantic_oracle_provider()
+                    .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+                    .unwrap();
+                let old_format = answer.available_value().and_then(|dispatch| {
+                    if dispatch.coverage() != super::CandidateCoverage::Exhaustive
+                        || !dispatch.candidates().is_empty()
+                        || dispatch.boundaries().len() != 1
+                    {
+                        return None;
+                    }
+                    let boundary = &dispatch.boundaries()[0];
+                    if boundary.proof != ProofStatus::Proven
+                        || boundary.completeness != EvidenceCompleteness::Complete
+                    {
+                        return None;
+                    }
+                    let identity = boundary.external_callee_identity()?;
+                    (identity.language() == Language::Rust
+                        && matches!(
+                            (identity.owner_fqn(), identity.member()),
+                            ("std" | "core" | "alloc", "format" | "format_args")
+                                | ("alloc.fmt", "format")
+                        ))
+                    .then_some(identity)
+                });
+                assert_eq!(old_format, super::intrinsic_format_result_identity(&answer));
+                if old_format.is_some() {
+                    format_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            std_count, 6,
+            "every std fixture call must exercise the translator"
+        );
+        assert_eq!(
+            format_count, 2,
+            "both format fixture calls must exercise the hook"
+        );
+    }
 
     #[test]
     fn semantic_string_labels_do_not_satisfy_literal_requirements() {

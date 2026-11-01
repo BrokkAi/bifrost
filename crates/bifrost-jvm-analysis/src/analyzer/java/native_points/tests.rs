@@ -1815,7 +1815,7 @@ fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
             &analyzer.inner,
             argument_query,
             ordinal,
-            prepare_context,
+            |operation, path, cancellation| prepare_context(&analyzer, &analyzer, operation, path, cancellation),
             || {},
         );
         if let BoundedResolution::Complete { value, .. } = &stored {
@@ -2221,7 +2221,7 @@ fn java_native_binary_actuals_promote_together_and_string_decides_unknown_operan
                 &analyzer.inner,
                 query,
                 0,
-                prepare_context,
+                |operation, path, cancellation| prepare_context(&analyzer, &analyzer, operation, path, cancellation),
                 || {},
             );
             let BoundedResolution::Complete { value, .. } = answer else {
@@ -2336,7 +2336,7 @@ fn java_native_carrier_frontier_preserves_type_variables_and_arrays() {
             &analyzer.inner,
             BoundedReceiverQuery { analyzer: &analyzer, file: &file, source, tree: None,
                 site: &site, budget: ReceiverAnalysisBudget::default(), cancellation: None },
-            prepare_context,
+            |operation, path, cancellation| prepare_context(&analyzer, &analyzer, operation, path, cancellation),
             |answer| { evidence = Some(answer.answer.clone()); java_observed_value_type(answer) },
         );
         let BoundedResolution::Complete { value, .. } = result else {
@@ -2461,13 +2461,8 @@ fn java_native_batch_reuses_nested_points_and_keeps_sibling_contexts_separate() 
             expected_operations,
             "{expression}"
         );
-        // Context reuse is deliberately deferred: every actual point keeps
-        // its own context identity registry and builds its file context once.
-        assert_eq!(
-            jvm_context_build_count_for_test(),
-            expected_operations,
-            "{expression}"
-        );
+        // Each point keeps its own identities but restores this request's base context.
+        assert_eq!(jvm_context_build_count_for_test(), 1, "{expression}");
     }
 }
 
@@ -2513,9 +2508,15 @@ fn java_native_nested_argument_budget_stop_keeps_outer_point_incomplete() {
         budget: Default::default(),
         cancellation: None,
     };
-    let BoundedResolution::Complete { work, .. } =
-        resolve_native_definition_bounded(&analyzer.inner, query, None, prepare_context, || {})
-    else {
+    let BoundedResolution::Complete { work, .. } = resolve_native_definition_bounded(
+        &analyzer.inner,
+        query,
+        None,
+        |operation, path, cancellation| {
+            prepare_context(&analyzer, &analyzer, operation, path, cancellation)
+        },
+        || {},
+    ) else {
         panic!("the unconstrained outer definition must finish")
     };
     // The argument-value root requires more work than the binding root. Derive
@@ -2532,7 +2533,13 @@ fn java_native_nested_argument_budget_stop_keeps_outer_point_incomplete() {
             &analyzer.inner,
             constrained,
             None,
-            prepare_context,
+            |operation, path, cancellation| prepare_context(
+                &analyzer,
+                &analyzer,
+                operation,
+                path,
+                cancellation
+            ),
             || {}
         ),
         BoundedResolution::Complete { .. }
@@ -2718,9 +2725,9 @@ fn native_batch_hit_replays_fill_query_obligations() {
     use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution;
     use brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest;
 
-    // Scala's intrinsic owner fixes this member identity while the unacquired
-    // default-import environment remains an independent query obligation.
-    let source = "class ScalaProbe extends AnyRef { def inherited() = getClass() }";
+    // A test-only declaration fixes Enumeration's hierarchy but does not
+    // acquire scala. Its independent library obligation must survive the hit.
+    let source = "class ScalaProbe extends Enumeration { def inherited() = getClass() }";
     let path = "Probe.scala";
     let fixture = InlineTestProject::with_language(Language::Scala)
         .file(path, source)
@@ -2740,6 +2747,8 @@ fn native_batch_hit_replays_fill_query_obligations() {
     assert!(
         brokk_bifrost_analysis::analyzer::IAnalyzer::semantic_model_overlay(&analyzer).is_none()
     );
+    let (_library_fixture, _provider) =
+        crate::native_resolution_test_support::scala_library_scope_fixture(&analyzer);
     let _inventory = analyzer.external_declaration_index();
     let inner = analyzer.tree_sitter_analyzer();
     let file = fixture.file(path);
@@ -2910,5 +2919,476 @@ fn kotlin_unbound_call_keeps_default_gap_with_unindexed_supertype() {
                     == "jvm-default-import-package-open:kotlin.collections:unacquired"
         }),
         "an unbound call cannot lift its default-import gap: {outcome:#?}"
+    );
+}
+
+#[test]
+fn java_import_context_snapshot_certificate() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+    let source = "package use; import dep.Target; import ext.External; class Use { Target first; Target second; Peer peer; External external; }";
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(CALLER_PATH, source)
+        .file(PROVIDER_PATH, "package dep; public class Target {}")
+        .file("src/main/java/use/Peer.java", "package use; class Peer {}")
+        .build();
+    use crate::analyzer::jvm::external::{TestClassFile, write_test_class_jar};
+    use brokk_bifrost_core::analyzer::config::{
+        JvmAnalyzerConfig, JvmExternalArtifact, JvmExternalDependencies,
+    };
+    let jar_dir = tempfile::tempdir().unwrap();
+    let jar_path = jar_dir.path().join("snapshot.jar");
+    write_test_class_jar(
+        &jar_path,
+        &[TestClassFile {
+            internal_name: "ext/External",
+            super_internal_name: "java/lang/Object",
+            methods: &[],
+            private_nested: false,
+        }],
+    );
+    let analyzer = JavaAnalyzer::new_with_config(
+        project.project_dyn(),
+        AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    artifact_paths: vec![JvmExternalArtifact {
+                        artifact_path: jar_path,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let file = project.file(CALLER_PATH);
+    let points = [
+        source.find("Target first").unwrap(),
+        source.find("Target second").unwrap(),
+        source.find("Peer peer").unwrap(),
+        source.find("External external").unwrap(),
+    ];
+    let resolve = |offset: usize| {
+        capture_query_reads(&analyzer, || {
+            native_evidence_at(
+                &analyzer,
+                &file,
+                source,
+                offset,
+                if source[offset..].starts_with("Peer") {
+                    4
+                } else if source[offset..].starts_with("External") {
+                    8
+                } else {
+                    6
+                },
+            )
+        })
+    };
+    let cold: Vec<_> = points
+        .iter()
+        .map(|&offset| {
+            let _scope = AnalyzerQueryScope::new(&analyzer);
+            resolve(offset)
+        })
+        .collect();
+    let _scope = AnalyzerQueryScope::new(&analyzer);
+    let memo = analyzer
+        .inner
+        .active_query_request_memo::<JavaImportContextSnapshots>()
+        .unwrap();
+    for (index, &offset) in points.iter().enumerate() {
+        let (warm, reads) = resolve(offset);
+        assert_eq!(warm.outcome.status, cold[index].0.outcome.status);
+        assert_eq!(
+            format!("{:?}", warm.outcome),
+            format!("{:?}", cold[index].0.outcome)
+        );
+        assert_eq!(reads.keys(), cold[index].1.keys(), "point {index}");
+        assert_eq!(
+            reads.unattributed_reads(),
+            cold[index].1.unattributed_reads(),
+            "point {index}"
+        );
+        assert_eq!(
+            reads.execution_dependences(),
+            cold[index].1.execution_dependences(),
+            "point {index}"
+        );
+        memo.entries.run_pending_tasks();
+        assert_eq!(memo.entries.entry_count(), 1);
+        assert_eq!(
+            memo.restores.load(std::sync::atomic::Ordering::Relaxed),
+            index
+        );
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8404: the snapshot key omitted the native rejection-trace flag that root compilation reads"
+)]
+fn java_import_context_snapshot_keeps_traced_and_untraced_contexts_apart() {
+    // Keep the native trial hook isolated from other tests in this process.
+    const CHILD: &str = "BIFROST_TEST_IMPORT_SNAPSHOT_TRACE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "analyzer::java::native_points::tests::java_import_context_snapshot_keeps_traced_and_untraced_contexts_apart", "--nocapture"])
+            .env(CHILD, "1")
+            .env("BIFROST_TRIAL_NATIVE_JAVA", "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, trace::resolve_definition_batch_with_trace,
+    };
+    let source = "package use; import dep.Target; import dep.Second; class Use { Target first; Second second; }";
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(CALLER_PATH, source)
+        .file(PROVIDER_PATH, "package dep; public class Target {}")
+        .file(
+            "src/main/java/dep/Second.java",
+            "package dep; public class Second {}",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::new(project.project_dyn());
+    let file = project.file(CALLER_PATH);
+    let points = [
+        source.find("Target first").unwrap(),
+        source.find("Second second").unwrap(),
+    ];
+    let traced = |offsets: &[usize]| {
+        resolve_definition_batch_with_trace(
+            &analyzer,
+            offsets
+                .iter()
+                .map(|&offset| DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(offset),
+                    end_byte: Some(offset + 6),
+                })
+                .collect(),
+            file.clone(),
+            Arc::from(source),
+            &CancellationToken::new(),
+        )
+    };
+    let cold: Vec<_> = points
+        .iter()
+        .map(|&offset| {
+            let _scope = AnalyzerQueryScope::new(&analyzer);
+            traced(&[offset]).remove(0)
+        })
+        .collect();
+    let _scope = AnalyzerQueryScope::new(&analyzer);
+    let memo = analyzer
+        .inner
+        .active_query_request_memo::<JavaImportContextSnapshots>()
+        .unwrap();
+    let untraced_site = site(source);
+    let untraced = resolve_java_type_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &untraced_site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    );
+    assert!(
+        matches!(untraced, BoundedResolution::Complete { .. }),
+        "{untraced:?}"
+    );
+    memo.entries.run_pending_tasks();
+    assert_eq!(memo.entries.entry_count(), 1);
+    assert_eq!(memo.restores.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let warm = traced(&points);
+    for (index, ((outcome, trace), (cold_outcome, cold_trace))) in
+        warm.iter().zip(&cold).enumerate()
+    {
+        assert_eq!(
+            format!("{trace:?}"),
+            format!("{cold_trace:?}"),
+            "rejection metadata at point {index}"
+        );
+        assert_eq!(
+            format!("{outcome:?}"),
+            format!("{cold_outcome:?}"),
+            "answer at point {index}"
+        );
+    }
+    assert_eq!(
+        memo.restores.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the second traced point restores the traced snapshot"
+    );
+}
+
+#[test]
+fn java_import_context_snapshot_operation_ordering() {
+    use brokk_bifrost_analysis::analyzer::native_points::open_native_point_operation;
+    use brokk_bifrost_analysis::analyzer::resolution::SharedNameInterner;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionOperationOpenOutcome,
+        jvm_context::{JvmContextReadProfile, JvmImportContextSnapshotRefusal},
+    };
+    let (_project, analyzer) = fixture();
+    let cancellation = CancellationToken::new();
+    let open = || {
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) =
+            open_native_point_operation(&analyzer.inner, &cancellation).unwrap()
+        else {
+            panic!("selected operation unavailable")
+        };
+        operation
+    };
+    let publish = || {
+        let operation = open();
+        let key = operation.jvm_import_context_snapshot_key(Language::Java, CALLER_PATH);
+        let (JavaImportContext::Ready { context, .. }, snapshot) = operation
+            .jvm_import_context_with_snapshot(Language::Java, CALLER_PATH, &cancellation)
+            .unwrap()
+        else {
+            panic!("fixture context is Ready")
+        };
+        // The publisher's cold build, before anything else touches the operation.
+        let cold = (
+            context.describe_for_test(),
+            format!("{:?}", operation.ready().context_identities),
+        );
+        let snapshot = snapshot.unwrap();
+        assert!(matches!(
+            operation
+                .jvm_import_context_with_snapshot(Language::Java, CALLER_PATH, &cancellation)
+                .unwrap()
+                .1,
+            Err(JvmImportContextSnapshotRefusal::UsedOperation)
+        ));
+        (key, snapshot, cold)
+    };
+    {
+        let operation = open();
+        operation.ready().inventory.note_stage_content_commit();
+        assert!(matches!(
+            operation
+                .jvm_import_context_with_snapshot(Language::Java, CALLER_PATH, &cancellation)
+                .unwrap()
+                .1,
+            Err(JvmImportContextSnapshotRefusal::UsedOperation)
+        ));
+    }
+    let (first_key, first, first_cold) = publish();
+    let (second_key, second, second_cold) = publish();
+    assert_eq!(first_key, second_key);
+    assert_eq!(first_cold, second_cold, "two cold builds of one key agree");
+    let restore = |snapshot: &brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContextSnapshot| {
+        let operation = open();
+        *operation.ready().jvm_context_profile.borrow_mut() = Some(JvmContextReadProfile::default());
+        let JavaImportContext::Ready { context, .. } = operation.restore_jvm_import_context_snapshot(snapshot).unwrap().unwrap() else { panic!("published context is Ready") };
+        let restored = (context.describe_for_test(), format!("{:?}", operation.ready().context_identities));
+        let before = operation.ready().jvm_context_profile.borrow().as_ref().unwrap().calls("derive_file_context");
+        assert!(matches!(operation.jvm_import_context_for_name(Language::Java, CALLER_PATH, "Target", &cancellation).unwrap(), JavaImportContext::Ready { .. }));
+        assert_eq!(operation.ready().jvm_context_profile.borrow().as_ref().unwrap().calls("derive_file_context"), before);
+        restored
+    };
+    // A restore reproduces the cold build that published it, field by field.
+    assert_eq!(restore(&first), first_cold);
+    assert_eq!(restore(&second), second_cold);
+    let operation = open();
+    operation.ready().shared_names().intern([42; 32]);
+    assert!(matches!(
+        operation
+            .restore_jvm_import_context_snapshot(&first)
+            .unwrap(),
+        Err(JvmImportContextSnapshotRefusal::MintedNames)
+    ));
+}
+
+#[test]
+fn java_import_context_snapshot_refuses_persistently_interned_name() {
+    use brokk_bifrost_analysis::analyzer::native_points::open_native_point_operation;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionOperationOpenOutcome, jvm_context::JvmImportContextSnapshotRefusal,
+    };
+    let (_project, analyzer) = fixture();
+    let cancellation = CancellationToken::new();
+    let open = || {
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) =
+            open_native_point_operation(&analyzer.inner, &cancellation).unwrap()
+        else {
+            panic!("selected operation unavailable")
+        };
+        operation
+    };
+    let (published, snapshot) = {
+        let operation = open();
+        let (JavaImportContext::Ready { context, .. }, snapshot) = operation
+            .jvm_import_context_with_snapshot(Language::Java, CALLER_PATH, &cancellation)
+            .unwrap()
+        else {
+            panic!("fixture context is Ready")
+        };
+        (format!("{:?}", context.mounts), snapshot.unwrap())
+    };
+    let digest = snapshot.minted_digest_for_test();
+    analyzer
+        .inner
+        .analyzer_store()
+        .conn
+        .execute(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO resolution_identities(identity_digest) VALUES (?1)",
+                    [digest.as_slice()],
+                )
+                .unwrap();
+        });
+    let operation = open();
+    assert!(matches!(
+        operation
+            .restore_jvm_import_context_snapshot(&snapshot)
+            .unwrap(),
+        Err(JvmImportContextSnapshotRefusal::StoreInternedSincePublish)
+    ));
+    let JavaImportContext::Ready { context, .. } = operation
+        .java_import_context(CALLER_PATH, &cancellation)
+        .unwrap()
+    else {
+        panic!("cold context is Ready")
+    };
+    assert_eq!(published, format!("{:?}", context.mounts));
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8166: candidate path hydration re-read the same persisted path rows; 94.5% of key reads repeated within one point operation"
+)]
+fn java_native_batch_candidate_paths_keep_operation_ledgers() {
+    use brokk_bifrost_analysis::analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::native_points::{
+        native_point_operation_open_count_for_test,
+        reset_native_point_operation_open_count_for_test,
+    };
+
+    const CALLER: &str = "package use; import dep.*; class Use { Target field; }";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(CALLER_PATH, CALLER)
+        .file(PROVIDER_PATH, "package dep; public class Target {}")
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let _inventory = analyzer.external_declaration_index();
+    let file = fixture.file(CALLER_PATH);
+    let site = site(CALLER);
+    let tree = brokk_bifrost_jvm::java::declarations::parse_tree(CALLER).unwrap();
+    let query = BoundedReceiverQuery {
+        analyzer: &analyzer,
+        file: &file,
+        source: CALLER,
+        tree: Some(&tree),
+        site: &site,
+        budget: Default::default(),
+        cancellation: None,
+    };
+    let batch = NativePointBatch::new(
+        &analyzer.inner,
+        &analyzer,
+        file.clone(),
+        CALLER.into(),
+        None,
+    )
+    .unwrap()
+    .expect("selected batch inputs are ready");
+    batch
+        .persisted_reads_for_test()
+        .observe_candidate_paths_for_test();
+    reset_native_point_operation_open_count_for_test();
+    let (first, reads) = capture_query_reads(&analyzer, || {
+        resolve_java_definition_with_evidence_uncached(query, Some(&batch), || {})
+    });
+    let BoundedResolution::Complete {
+        value: first,
+        work: cold_work,
+    } = first
+    else {
+        panic!("cold point must complete")
+    };
+    assert_eq!(first.outcome.status, DefinitionLookupStatus::Resolved);
+    let operations = native_point_operation_open_count_for_test();
+    assert!(operations > 0, "the cold point opens an operation");
+    assert!(!reads.keys().is_empty(), "the fill must record real reads");
+    let cold_paths = batch
+        .persisted_reads_for_test()
+        .take_candidate_paths_for_test();
+    assert!(!cold_paths.is_empty());
+    assert!(cold_paths.iter().any(|paths| !paths.is_empty()));
+    let cold_path_counts = batch
+        .persisted_reads_for_test()
+        .candidate_path_counts_for_test();
+    assert!(cold_path_counts.0 > 0);
+    eprintln!(
+        "candidate path SQL/fills/refusals/bytes: {cold_path_counts:?}; average charged bytes {}",
+        cold_path_counts.3 / cold_path_counts.1
+    );
+    let cold_counts = batch.persisted_read_counts_for_test();
+    assert!(
+        cold_counts.0 > 0 && cold_counts.1 > 0,
+        "both SQL families ran: {cold_counts:?}"
+    );
+    let (second, later_reads) = capture_query_reads(&analyzer, || {
+        resolve_java_definition_with_evidence_uncached(query, Some(&batch), || {})
+    });
+    let BoundedResolution::Complete {
+        value: second,
+        work: warm_work,
+    } = second
+    else {
+        panic!("warm point must complete")
+    };
+    assert_eq!(
+        cold_work, warm_work,
+        "all scope, candidate, and receiver work counters are unchanged at the same budget"
+    );
+    let warm_paths = batch
+        .persisted_reads_for_test()
+        .take_candidate_paths_for_test();
+    assert_eq!(cold_paths, warm_paths);
+    let warm_path_counts = batch
+        .persisted_reads_for_test()
+        .candidate_path_counts_for_test();
+    assert!(
+        warm_path_counts.0 - cold_path_counts.0 < cold_path_counts.0,
+        "warm point must run fewer hydration statements: {cold_path_counts:?} -> {warm_path_counts:?}"
+    );
+    // Hydration records no ledger keys itself. Its consumers must still record
+    // all three read channels in each operation, including when rows are memo hits.
+    assert_eq!(
+        later_reads.execution_dependences(),
+        reads.execution_dependences()
+    );
+    assert_eq!(
+        batch.persisted_read_counts_for_test(),
+        cold_counts,
+        "warm point executes neither persisted SQL family"
+    );
+    assert_eq!(cold_counts.2, 0);
+    assert_eq!(second.outcome.status, first.outcome.status);
+    assert_eq!(later_reads.keys(), reads.keys());
+    assert_eq!(later_reads.unattributed_reads(), reads.unattributed_reads());
+    assert_eq!(
+        native_point_operation_open_count_for_test(),
+        operations * 2,
+        "each point keeps its own operation"
     );
 }

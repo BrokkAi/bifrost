@@ -2210,10 +2210,18 @@ impl<'source> JavaResolutionBuilder<'source> {
                 );
             }
             TypeFlavor::Interface | TypeFlavor::Class => {}
-            TypeFlavor::Record | TypeFlavor::Annotation => {
-                self.add_gap(
+            TypeFlavor::Record => {
+                self.add_implicit_supertype(
                     context.declaration,
-                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                    "Record",
+                    ResolutionSupertypeKind::Superclass,
+                );
+            }
+            TypeFlavor::Annotation => {
+                self.add_implicit_supertype(
+                    context.declaration,
+                    "Annotation",
+                    ResolutionSupertypeKind::Interface,
                 );
             }
         }
@@ -4298,9 +4306,13 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.site(subtype).scope,
         );
         let name = self.intern_name(parent_name);
-        let prefix = [self.intern_name("java"), self.intern_name("lang")];
+        let mut prefix = vec![self.intern_name("java"), self.intern_name("lang")];
+        if parent_name == "Annotation" {
+            prefix.push(self.intern_name("annotation"));
+        }
         crate::implicit_supertype::publish_implicit_supertype(
             &mut self.facts,
+            Language::Java,
             subtype,
             reference,
             name,
@@ -8329,8 +8341,8 @@ mod tests {
             ("package java.lang; class Outer { class Object {} }", 2),
             (
                 "interface I {} enum E { A } record R() {} @interface A {}",
-                // #6291: I gets an Object member root and E an Enum parent.
-                2,
+                // Every flavor has its language-defined parent.
+                4,
             ),
         ] {
             let facts = parse(source);
@@ -8561,7 +8573,7 @@ mod tests {
     )]
     fn implicit_parent_edges_follow_java_type_flavor() {
         let facts = parse(
-            "interface Parent {} interface Child extends Parent {} class C {} enum E implements Child { VALUE }",
+            "interface Parent {} interface Child extends Parent {} class C {} enum E implements Child { VALUE } record R(int value) {}",
         );
         for (spelling, parent, kind) in [
             ("C", "Object", ResolutionSupertypeKind::ImplicitSuperclass),
@@ -8571,6 +8583,7 @@ mod tests {
                 ResolutionSupertypeKind::ImplicitInterfaceMembers,
             ),
             ("E", "Enum", ResolutionSupertypeKind::Superclass),
+            ("R", "Record", ResolutionSupertypeKind::Superclass),
         ] {
             let owner = identifier(
                 &facts,
@@ -9401,9 +9414,12 @@ mod tests {
                     implicit_superclass_reference(&facts, enumeration),
                     ResolutionGapKind::UnsupportedHierarchyTraversal
                 ),
-                ResolutionGapFact::new(record, ResolutionGapKind::UnsupportedHierarchyTraversal),
                 ResolutionGapFact::new(
-                    annotation,
+                    implicit_superclass_reference(&facts, record),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
+                ResolutionGapFact::new(
+                    implicit_superclass_reference(&facts, annotation),
                     ResolutionGapKind::UnsupportedHierarchyTraversal
                 ),
                 ResolutionGapFact::new(

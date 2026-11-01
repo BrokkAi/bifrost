@@ -68,6 +68,8 @@ pub(crate) mod tests {
 
     use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticBudget;
 
+    use brokk_bifrost_analysis::analyzer::semantic::ir::model::AsyncResumeKind;
+
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticEffect;
 
     use brokk_bifrost_analysis::analyzer::semantic::ids::SemanticLocator;
@@ -622,12 +624,19 @@ pub(crate) mod tests {
         let ProcedureLoweringStart {
             mut builder,
             mut session,
+            entry,
             ..
         } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
             .expect("lowering start");
+        let awaited = session
+            .add_value(&mut builder, entry, SemanticValueKind::Temporary)
+            .expect("awaited value");
+        let result = session
+            .add_value(&mut builder, entry, SemanticValueKind::AwaitResult)
+            .expect("await result");
         let mut occurrence = 0;
         let scaffold = session
-            .add_await_scaffold(&mut builder, |session, builder| {
+            .add_await_scaffold(&mut builder, Some(awaited), result, |session, builder| {
                 let current = occurrence;
                 occurrence += 1;
                 session.add_mapping(
@@ -642,8 +651,28 @@ pub(crate) mod tests {
         assert_eq!(scaffold.suspend.index(), 3);
         assert_eq!(scaffold.normal_resume.index(), 4);
         assert_eq!(scaffold.exceptional_resume.index(), 5);
-        assert_eq!(scaffold.awaited.index(), 0);
-        assert_eq!(scaffold.result.index(), 1);
+        let resume_events = parts.points[scaffold.normal_resume.index()]
+            .events
+            .iter()
+            .map(|event| event.effect.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resume_events,
+            vec![SemanticEffect::AsyncResume {
+                suspend: scaffold.suspend,
+                kind: AsyncResumeKind::Normal,
+                result: Some(result),
+            }]
+        );
+        assert!(
+            parts.points[scaffold.suspend.index()]
+                .events
+                .iter()
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::AsyncSuspend { awaited: Some(value), .. } if value == awaited
+                ))
+        );
         let resume_edges = parts
             .control_edges
             .iter()
@@ -671,13 +700,17 @@ pub(crate) mod tests {
         let ProcedureLoweringStart {
             mut builder,
             mut session,
+            entry,
             ..
         } = ProcedureLoweringSession::start(parts(), &budget, &cancellation)
             .expect("lowering start");
+        let result = session
+            .add_value(&mut builder, entry, SemanticValueKind::AwaitResult)
+            .expect("await result");
         let mut occurrence = 0;
 
         let error = session
-            .add_await_scaffold(&mut builder, |session, builder| {
+            .add_await_scaffold(&mut builder, None, result, |session, builder| {
                 let current = occurrence;
                 occurrence += 1;
                 session.add_mapping(

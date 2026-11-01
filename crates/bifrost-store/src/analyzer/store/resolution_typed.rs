@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 
 use std::rc::Rc;
 
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use rusqlite::types::Value;
 
 use rusqlite::Connection;
@@ -104,6 +105,12 @@ use super::resolution_selection::SelectedResolutionReadStamp;
 
 use super::Result as StoreResult;
 use super::StoreError;
+
+/// Hydrated candidate round, owned only by its hierarchy request.
+pub struct JvmHierarchyCandidateRows {
+    pub parents: Vec<LoweredSupertypeProperty>,
+    pub aliases: Vec<(SemanticId, SemanticId)>,
+}
 
 /// Indexed impl Target read shared by execution and planner pins.
 pub(in crate::analyzer::store) const RUST_RECEIVER_IMPL_TARGETS_SQL: &str = "SELECT DISTINCT target_mount.mount_ordinal, target.semantic_key
@@ -238,11 +245,36 @@ pub struct SelectedResolutionTypedSource<'selection, 'store> {
     go_context_binder: Option<&'selection dyn GoDefinitionContextBinder>,
     go_owner_proofs: std::cell::RefCell<go_members::OwnerProofMemo>,
     external_signatures: std::cell::RefCell<external_owners::ExternalSignatureMemo>,
+    // Dropped with this operation. Completed scalar owner-index reads are cached
+    // under a bounded admission cap; cancellation produces no cached value.
+    intrinsic_owner_indexed:
+        std::cell::RefCell<super::selected_read_memo::ExactReadMemo<(String, String), bool>>,
     // One classifier per opted-in storage language, not per mount or definition.
     namespace_classifiers: Vec<(
         String,
         Box<dyn super::language_support::NamespaceDefinitionClassifier>,
     )>,
+}
+
+/// A name-index nomination. The owning site is intentionally absent: the
+/// selected Go facts in this blob must confirm it before an answer is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoLookupCandidate {
+    pub blob_id: i64,
+    pub mount: SelectedResolutionMountOrdinal,
+    pub identity_id: i64,
+}
+
+impl TypedRowEvidence for GoLookupCandidate {}
+
+/// One name's negative-read key. The selection fingerprint covers every
+/// selected mount's content, so adding, removing or changing a blob rotates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GoLookupReadKey {
+    pub relation: TypedFactRelation,
+    pub name: SemanticId,
+    pub identity_id: Option<i64>,
+    pub selection_fingerprint: [u8; 32],
 }
 
 impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
@@ -270,6 +302,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             go_context_binder: None,
             go_owner_proofs: Default::default(),
             external_signatures: Default::default(),
+            intrinsic_owner_indexed: Default::default(),
             namespace_classifiers: selection
                 .namespace_definition_providers()
                 .iter()
@@ -618,6 +651,165 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         )
     }
 
+    /// Reverse membership selects every selected mount with relation-43
+    /// membership, including dependents outside the forward dependency scope.
+    /// Callers supply all queued shared type names for one language together.
+    pub fn jvm_supertype_candidate_mounts(
+        &self,
+        names: &[SemanticId],
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> StoreResult<Option<Vec<SelectedResolutionMountOrdinal>>> {
+        assert!(names.iter().all(|name| name.shared_name_id().is_some()));
+        if !self.validate_selected_interiors(cancellation)? {
+            return Ok(None);
+        }
+        let Some(coordinates) = self.semantic_coordinates_in_session(
+            names,
+            TypedFactRelation::SupertypeNameLookup,
+            cancellation,
+            Some(session),
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut mounts = coordinates
+            .into_iter()
+            .map(|coordinate| coordinate.mount)
+            .collect::<Vec<_>>();
+        mounts.sort_unstable();
+        mounts.dedup();
+        Ok(Some(mounts))
+    }
+
+    /// Hydrate one nominated round using structured terminal identities and
+    /// blob-local named import selectors. Complete selected interiors certify
+    /// selector absence as well as presence. A reference without a readable
+    /// terminal stays conservative and is resolved by the hierarchy operation.
+    /// No source text is inspected and no candidate point reads are added.
+    pub fn jvm_candidate_hierarchy_rows(
+        &self,
+        mounts: &[SelectedResolutionMountOrdinal],
+        storage_language: &str,
+        names: &[String],
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> StoreResult<Option<JvmHierarchyCandidateRows>> {
+        if mounts.is_empty() {
+            return Ok(Some(JvmHierarchyCandidateRows {
+                parents: Vec::new(),
+                aliases: Vec::new(),
+            }));
+        }
+        let mounts = json_array(mounts.iter().map(|mount| mount.get()));
+        self.read_statement(cancellation, |connection| {
+            let mut statement = connection.prepare_cached(
+                "WITH RECURSIVE spellings(blob_id, name) AS (
+                   SELECT m.blob_id, n.value FROM json_each(?1) requested
+                   JOIN temp.selected_resolution_mounts m ON m.mount_ordinal=requested.value
+                   CROSS JOIN json_each(?5) n
+                   UNION
+                   SELECT s.blob_id, s.local_name FROM spellings known
+                   JOIN main.resolution_import_selectors s
+                     ON s.blob_id=known.blob_id AND s.source_name=known.name
+                   WHERE ?2 IN ('scala', 'kotlin') AND s.kind='named' AND s.local_name IS NOT NULL
+                 ), candidates AS (
+                 SELECT m.mount_ordinal, parent.definition, parent.reference,
+                        parent.frontier, parent.kind, parent.parent_ordinal
+                 FROM json_each(?1) AS requested
+                 CROSS JOIN temp.selected_resolution_mounts AS m
+                   ON m.mount_ordinal=requested.value
+                 CROSS JOIN main.resolution_supertypes AS parent
+                   INDEXED BY resolution_supertypes_reference
+                   ON parent.blob_id=m.blob_id
+                 WHERE m.storage_language=?2
+                 UNION ALL
+                 SELECT m.mount_ordinal, declaration.definition, projection.reference,
+                        transfer.source_slot, -1, 0
+                 FROM json_each(?1) AS requested
+                 CROSS JOIN temp.selected_resolution_mounts AS m
+                   ON m.mount_ordinal=requested.value
+                 CROSS JOIN main.resolution_declaration_types AS declaration
+                   ON declaration.blob_id=m.blob_id
+                 CROSS JOIN main.resolution_type_transfers AS transfer
+                   INDEXED BY resolution_type_transfers_target
+                   ON transfer.blob_id=m.blob_id AND transfer.target_slot=declaration.slot
+                  AND transfer.kind=?3
+                 CROSS JOIN main.resolution_binding_projections AS projection
+                   INDEXED BY resolution_binding_projections_output
+                   ON projection.blob_id=m.blob_id AND projection.output_slot=transfer.source_slot
+                 WHERE m.storage_language=?2)
+                 SELECT candidate.* FROM candidates candidate
+                 JOIN temp.selected_resolution_mounts m ON m.mount_ordinal=candidate.mount_ordinal
+                 WHERE (NOT EXISTS (
+                   SELECT 1 FROM main.resolution_paths p
+                   WHERE p.blob_id=m.blob_id AND p.start_node=candidate.reference
+                     AND p.end_lead_identity IS NOT NULL
+                 ) AND NOT EXISTS (
+                   SELECT 1 FROM main.resolution_reference_lookup_identities p
+                   WHERE p.blob_id=m.blob_id AND p.semantic_key=candidate.reference
+                 ) AND NOT EXISTS (
+                   SELECT 1 FROM main.resolution_paths p
+                   JOIN main.resolution_root_route_segments route
+                     ON route.blob_id=p.blob_id AND route.path_key=p.path
+                   WHERE p.blob_id=m.blob_id AND p.start_node=candidate.reference
+                     AND route.terminal_spelling IS NOT NULL
+                 )) OR EXISTS (
+                   SELECT 1 FROM main.resolution_paths p
+                   JOIN main.resolution_identities i ON i.id=p.end_lead_identity
+                   JOIN spellings known ON known.blob_id=m.blob_id AND known.name=i.spelling
+                   WHERE p.blob_id=m.blob_id AND p.start_node=candidate.reference
+                 ) OR EXISTS (
+                   SELECT 1 FROM main.resolution_reference_lookup_identities p
+                   JOIN main.resolution_identities i ON i.id=p.identity_id
+                   JOIN spellings known ON known.blob_id=m.blob_id AND known.name=i.spelling
+                   WHERE p.blob_id=m.blob_id AND p.semantic_key=candidate.reference
+                 ) OR EXISTS (
+                   SELECT 1 FROM main.resolution_paths p
+                   JOIN main.resolution_root_route_segments route
+                     ON route.blob_id=p.blob_id AND route.path_key=p.path
+                   JOIN spellings known
+                     ON known.blob_id=m.blob_id AND known.name=route.terminal_spelling
+                   WHERE p.blob_id=m.blob_id AND p.start_node=candidate.reference
+                 ) LIMIT ?4",
+            )?;
+            let alias_kind = brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_TYPE_TRANSFER_KINDS.iter()
+                .position(|kind| *kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind::TypeAlias)
+                .expect("the transfer vocabulary contains aliases") as i64;
+            let mut rows = statement.query(rusqlite::params![mounts, storage_language, alias_kind, i64::try_from(session.scope_lookahead_limit()).unwrap_or(i64::MAX), serde_json::to_string(names).expect("hierarchy names serialize")])?;
+            let mut parents = Vec::new();
+            let mut aliases = Vec::new();
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                if !session.scope_step() { return Ok(None); }
+                let mount = mount_ordinal(row, 0, "candidate supertype mount")?;
+                let semantic = |column| -> StoreResult<SemanticId> {
+                    let key =
+                        u32::try_from(nonnegative_i64(row, column, "candidate supertype key")?)
+                            .map_err(|_| invalid_fact("candidate supertype key exceeds u32"))?;
+                    Ok(SemanticId::local(mount.get(), key))
+                };
+                if row.get::<_, i64>(4)? == -1 {
+                    aliases.push((semantic(1)?, semantic(2)?));
+                    continue;
+                }
+                parents.push(
+                    typed_rows::decode_supertype_fields(
+                        semantic(1)?,
+                        semantic(2)?,
+                        semantic(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    )
+                    .into(),
+                );
+            }
+            Ok(Some(JvmHierarchyCandidateRows { parents, aliases }))
+        })
+    }
+
     fn read_statement<T>(
         &self,
         cancellation: &CancellationToken,
@@ -717,6 +909,16 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         relation: TypedFactRelation,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<RequestCoordinate>>> {
+        self.semantic_coordinates_in_session(identities, relation, cancellation, None)
+    }
+
+    fn semantic_coordinates_in_session(
+        &self,
+        identities: &[SemanticId],
+        relation: TypedFactRelation,
+        cancellation: &CancellationToken,
+        session: Option<&ResolutionSession>,
+    ) -> StoreResult<Option<Vec<RequestCoordinate>>> {
         if identities.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -801,7 +1003,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
                 "{relation:?} has no membership writer in prepare_typed_fact_lookups, \
                  so a shared key for it would name no mount and answer nothing silently"
             );
-            let sql = shared_membership_sql(shared.len(), relation);
+            let mut sql = shared_membership_sql(shared.len(), relation);
             let mut parameters = Vec::with_capacity(shared.len() * 2);
             for (ordinal, name) in &shared {
                 parameters.push(Value::Integer(
@@ -809,12 +1011,21 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
                 ));
                 parameters.push(Value::Integer(i64::from(name.get())));
             }
+            if let Some(session) = session {
+                sql.push_str(&format!(" LIMIT ?{}", parameters.len() + 1));
+                parameters.push(Value::Integer(
+                    i64::try_from(session.scope_lookahead_limit()).unwrap_or(i64::MAX),
+                ));
+            }
             let Some(rows) = self.read_statement(cancellation, |conn| {
                 let mut statement = conn.prepare_cached(&sql)?;
                 let mut rows = statement.query(params_from_iter(parameters.iter()))?;
                 let mut decoded = Vec::new();
                 while let Some(row) = rows.next()? {
                     if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
+                    if !ResolutionSession::scope_step_with_optional_session(session) {
                         return Ok(None);
                     }
                     decoded.push(RequestCoordinate::shared(
@@ -979,7 +1190,9 @@ impl RequestCoordinate {
 /// without the scope join it names every selected blob that holds the relation
 /// under that name, dependents of the staged crate included. A reference in
 /// crate A can bind only inside A's dependency closure, so those mounts cannot
-/// contribute an answer and only cost unnecessary authority reads.
+/// contribute a forward answer and only cost unnecessary authority reads.
+/// Relation 43 is reverse discovery and deliberately omits that scope join:
+/// the dependents are precisely the mounts that can contain children.
 ///
 /// The mount is found by its blob. Without `INDEXED BY` the planner reached
 /// it through the unique `(storage_language, persisted_relative_path)` index
@@ -991,6 +1204,17 @@ impl RequestCoordinate {
 /// here rather than left to statistics.
 pub(super) fn shared_membership_sql(requests: usize, relation: TypedFactRelation) -> String {
     let values = values_sql(requests, 2);
+    // Supertype-name membership is reverse discovery: a dependent mount can
+    // contain a child even when it is outside the root's dependency closure.
+    let scope = if matches!(
+        relation,
+        TypedFactRelation::SupertypeNameLookup | TypedFactRelation::AliasTargetLookup
+    ) {
+        ""
+    } else {
+        "CROSS JOIN temp.selected_resolution_scope_mounts AS scope
+             ON scope.mount_ordinal = m.mount_ordinal"
+    };
     format!(
         r#"WITH requested(request_ordinal, identity_id) AS (VALUES {values})
            SELECT r.request_ordinal, m.mount_ordinal, membership.identity_id
@@ -1001,8 +1225,7 @@ pub(super) fn shared_membership_sql(requests: usize, relation: TypedFactRelation
            CROSS JOIN temp.selected_resolution_mounts AS m
                 INDEXED BY selected_resolution_mounts_blob_ordinal
              ON m.blob_id = membership.blob_id
-           CROSS JOIN temp.selected_resolution_scope_mounts AS scope
-             ON scope.mount_ordinal = m.mount_ordinal
+           {scope}
            CROSS JOIN main.resolution_fragment_interiors AS interior
              ON interior.blob_id = m.blob_id
             AND interior.lang = m.storage_language
@@ -1137,6 +1360,30 @@ fn rust_fragment_coordinate(
     )))
 }
 
+impl SelectedResolutionTypedSource<'_, '_> {
+    fn intrinsic_owner_is_indexed(
+        &self,
+        connection: &rusqlite::Connection,
+        provider_id: &str,
+        owner_fqn: &str,
+    ) -> StoreResult<bool> {
+        let key = (provider_id.to_owned(), owner_fqn.to_owned());
+        if let Some(&indexed) = self.intrinsic_owner_indexed.borrow().get(&key) {
+            return Ok(indexed);
+        }
+        let indexed = connection.query_row(
+            super::resolution_operation::nominal_rules::jvm_external_owner_relations()
+                .owner_indexed,
+            rusqlite::params![provider_id, owner_fqn],
+            |row| row.get::<_, bool>(0),
+        )?;
+        self.intrinsic_owner_indexed
+            .borrow_mut()
+            .insert_bounded(key, indexed);
+        Ok(indexed)
+    }
+}
+
 impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
     fn supports_conditional_type_seeds(&self) -> bool {
         self.selection.has_conditional_type_seeds()
@@ -1247,20 +1494,29 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         owner_fqn: &str,
         cancellation: &CancellationToken,
     ) -> StoreResult<bool> {
-        Ok(self
-            .read_statement(cancellation, |connection| {
-                Ok(Some(
-                    super::resolution_operation::selected_jvm_declaration_owner(
-                        super::resolution_operation::nominal_rules::jvm_external_owner_relations(),
-                        connection,
-                        self.model_authority.as_deref(),
-                        &self.external_providers,
-                        owner_fqn,
-                    )?
-                    .is_none(),
-                ))
-            })?
-            .unwrap_or(false))
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let unshadowed = self.read_statement(cancellation, |connection| {
+            let unshadowed = super::resolution_operation::selected_jvm_declaration_owner(
+                super::resolution_operation::nominal_rules::jvm_external_owner_relations(),
+                connection,
+                self.model_authority.as_deref(),
+                &self.external_providers,
+                owner_fqn,
+            )?
+            .is_none();
+            let unindexed =
+                if brokk_bifrost_jvm::intrinsics::source_language_root_member_inventory(owner_fqn)
+                    .is_some()
+                {
+                    !self.intrinsic_owner_is_indexed(connection, "jvm-intrinsic", owner_fqn)?
+                } else {
+                    true
+                };
+            Ok(Some(unshadowed && unindexed))
+        })?;
+        Ok(unshadowed.unwrap_or(false))
     }
 
     fn generated_items_cannot_shadow_bindings(
@@ -4430,6 +4686,144 @@ fn decode_call_obligation(
 type MountKeys = (SelectedResolutionMountOrdinal, Vec<i64>);
 
 impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
+    /// Nominate blobs containing an embedded Go type with a shared name.
+    /// Each returned row is charged by the typed page visitor.
+    pub fn visit_go_embedded_type_candidate_pages(
+        &self,
+        names: &[SemanticId],
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, GoLookupCandidate>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        self.visit_go_lookup_candidate_pages(
+            names,
+            TypedFactRelation::EmbeddedTypeLookup,
+            cancellation,
+            visitor,
+        )
+    }
+
+    /// Nominate blobs declaring aliases with this spelled target terminal.
+    pub fn visit_go_alias_target_candidate_pages(
+        &self,
+        names: &[SemanticId],
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, GoLookupCandidate>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        self.visit_go_lookup_candidate_pages(
+            names,
+            TypedFactRelation::AliasTargetLookup,
+            cancellation,
+            visitor,
+        )
+    }
+
+    /// Nominate blobs containing an interface method with a shared name.
+    pub fn visit_go_interface_method_candidate_pages(
+        &self,
+        names: &[SemanticId],
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, GoLookupCandidate>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        self.visit_go_lookup_candidate_pages(
+            names,
+            TypedFactRelation::InterfaceMethodLookup,
+            cancellation,
+            visitor,
+        )
+    }
+
+    fn visit_go_lookup_candidate_pages(
+        &self,
+        names: &[SemanticId],
+        relation: TypedFactRelation,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, GoLookupCandidate>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        assert!(names.iter().all(|name| name.shared_name_id().is_some()));
+        let Some(coordinates) = self.semantic_coordinates(names, relation, cancellation)? else {
+            return cancelled();
+        };
+        for chunk in coordinates.chunks(visitor.maximum_rows()) {
+            let mut page = Vec::with_capacity(chunk.len());
+            for coordinate in chunk {
+                if cancellation.is_cancelled() {
+                    return Ok(TypedFactReadOutcome::cancelled(
+                        ResolutionCompletion::Complete,
+                    ));
+                }
+                debug_assert_eq!(coordinate.space, RequestKeySpace::Shared);
+                let mount = self.mount(coordinate.mount)?;
+                page.push(GoLookupCandidate {
+                    blob_id: mount.blob_id(),
+                    mount: coordinate.mount,
+                    identity_id: coordinate.keys[0],
+                });
+            }
+            match Self::page_out(&page, cancellation, visitor)? {
+                PageOutcome::Exhausted => {}
+                PageOutcome::Stopped => {
+                    return Ok(TypedFactReadOutcome::stopped(
+                        ResolutionCompletion::Complete,
+                    ));
+                }
+                PageOutcome::Cancelled => {
+                    return Ok(TypedFactReadOutcome::cancelled(
+                        ResolutionCompletion::Complete,
+                    ));
+                }
+            }
+        }
+        Ok(if cancellation.is_cancelled() {
+            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+        } else {
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+        })
+    }
+
+    /// Produce one read key per name, including names with no matching row.
+    pub fn go_lookup_read_keys(
+        &self,
+        names: &[SemanticId],
+        relation: TypedFactRelation,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<GoLookupReadKey>>> {
+        assert!(matches!(
+            relation,
+            TypedFactRelation::EmbeddedTypeLookup
+                | TypedFactRelation::InterfaceMethodLookup
+                | TypedFactRelation::AliasTargetLookup
+        ));
+        let names_table = self
+            .selection
+            .shared_name_table()
+            .interner(self.selection.connection());
+        let identities = names.iter().copied().map(|name| {
+            let shared = name
+                .shared_name_id()
+                .expect("Go lookup name must be shared");
+            (
+                name,
+                names_table
+                    .to_persisted(shared)
+                    .map(|stored| i64::from(stored.get())),
+            )
+        });
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let fingerprint = self.selection.fingerprint();
+        Ok(Some(
+            identities
+                .map(|(name, identity_id)| GoLookupReadKey {
+                    relation,
+                    name,
+                    identity_id,
+                    selection_fingerprint: fingerprint,
+                })
+                .collect(),
+        ))
+    }
+
     /// Group one request's resolved coordinates by the blob that answers them.
     ///
     /// `semantic_coordinates` is unchanged: it is what turns a runtime

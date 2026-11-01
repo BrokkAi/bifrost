@@ -4833,6 +4833,115 @@ mod tests {
     }
 
     #[test]
+    fn unenumerated_hierarchy_cannot_exclude_workspace_procedures() {
+        use crate::analyzer::semantic::{
+            CandidateCoverage, DispatchBoundary, DispatchBoundaryKind, DispatchResult,
+            OracleLimits, SemanticRequest,
+        };
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::Python,
+        )
+        .file("app.py", "def caller(holder):\n    return holder.foo()\n")
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("materialize fixture")
+            .available_value()
+            .cloned()
+            .expect("fixture artifact");
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| !procedure.call_sites().is_empty())
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller with a call");
+        let call = root
+            .call_site_handle(root.semantics().call_sites()[0].id)
+            .expect("call handle");
+        let provider = WorkspaceValueFlowProvider::new(
+            &workspace,
+            crate::value_flow::ValueFlowCache::default(),
+        );
+        let mut discovery = TypeFlowDiscovery::new(
+            &root,
+            &provider,
+            ClosureLimits { max_procedures: 16 },
+            &mut budget,
+            &cancellation,
+        )
+        .expect("discover fixture");
+        assert!(discovery.closure.root_snapshot.is_some());
+        discovery.closure.coverage.clear();
+        // Ordinary unresolved calls do not claim that a workspace hierarchy
+        // enumeration was attempted and left procedures out.
+        for (kind, status) in [
+            (
+                DispatchBoundaryKind::Unresolved,
+                SemanticInputStatus::Unproven,
+            ),
+            (
+                DispatchBoundaryKind::HierarchyUnenumerated,
+                SemanticInputStatus::Unproven,
+            ),
+            (
+                DispatchBoundaryKind::HierarchyUnenumerated,
+                SemanticInputStatus::Cancelled,
+            ),
+        ] {
+            let hierarchy_unenumerated = kind == DispatchBoundaryKind::HierarchyUnenumerated;
+            let boundary = DispatchBoundary {
+                kind,
+                external_callee_identity: None,
+                exact_external_target: None,
+                unmaterialized_external_target: None,
+                proof: ProofStatus::Unproven("reason text is not a soundness discriminator".into()),
+                completeness: EvidenceCompleteness::Partial("unsupported external family".into()),
+                provenance: Box::new([]),
+            };
+            let mut candidates = Vec::new();
+            let mut boundaries = vec![boundary];
+            crate::analyzer::semantic::workspace_oracle::dispatch::attach_dispatch_provenance(
+                &call,
+                &mut candidates,
+                &mut boundaries,
+                None,
+                None,
+                OracleLimits::default(),
+            )
+            .expect("dispatch provenance");
+            let dispatch = DispatchResult::new(
+                &call,
+                candidates,
+                boundaries,
+                CandidateCoverage::Open,
+                OracleLimits::default(),
+            )
+            .expect("open dispatch");
+            let coverage = CallSiteCoverage::from_dispatch(status, &dispatch);
+            assert!(coverage.has_uncovered_boundary);
+            assert_eq!(coverage.truncated, hierarchy_unenumerated);
+            discovery
+                .closure
+                .coverage
+                .insert((root.durable_key(), call.id()), coverage);
+            assert_eq!(
+                discovery.excludes_procedures(std::iter::empty()),
+                !hierarchy_unenumerated
+            );
+            assert_eq!(
+                discovery.discovery_boundary(),
+                hierarchy_unenumerated.then_some(UnknownReason::Truncated)
+            );
+        }
+    }
+
+    #[test]
     fn discovery_budget_status_has_precedence_over_an_unresolved_call() {
         let dispatch_budget = coverage(
             DispatchStatus::Unavailable {

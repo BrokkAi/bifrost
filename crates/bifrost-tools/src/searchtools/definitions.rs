@@ -216,10 +216,11 @@ pub(crate) fn resolve_definition_context_query(
         Vec<brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest>,
     )> = Vec::new();
     for unit in units {
-        let Some(range) = primary_range(analyzer, &unit) else {
+        let ranges = analyzer.ranges(&unit);
+        if ranges.is_empty() {
             continue;
-        };
-        // `range` above is derived from the analyzer's own declaration data,
+        }
+        // These ranges are derived from the analyzer's own declaration data,
         // so the analyzed snapshot (not a fresh disk read) is the source
         // whose byte offsets it actually corresponds to.
         let source: Arc<str> = match analyzer.indexed_source(unit.source()) {
@@ -239,30 +240,34 @@ pub(crate) fn resolve_definition_context_query(
                 };
             }
         };
-        let Some(symbol_source) = source.get(range.start_byte..range.end_byte) else {
-            continue;
-        };
         let language = language_for_file(unit.source());
-        for (context_offset, context) in symbol_source.match_indices(&query.context) {
-            for target_offset in reference_target_match_offsets(context, &query.target, language) {
-                let start_byte = range.start_byte + context_offset + target_offset;
-                let request = brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest {
-                    file: unit.source().clone(),
-                    line: None,
-                    column: None,
-                    start_byte: Some(start_byte),
-                    end_byte: Some(start_byte + query.target.len()),
-                };
-                match requests_by_source
-                    .iter_mut()
-                    .find(|(file, _, _)| file == unit.source())
+        for range in ranges {
+            let Some(symbol_source) = source.get(range.start_byte..range.end_byte) else {
+                continue;
+            };
+            for (context_offset, context) in symbol_source.match_indices(&query.context) {
+                for target_offset in
+                    reference_target_match_offsets(context, &query.target, language)
                 {
-                    Some((_, _, requests)) => requests.push(request),
-                    None => requests_by_source.push((
-                        unit.source().clone(),
-                        Arc::clone(&source),
-                        vec![request],
-                    )),
+                    let start_byte = range.start_byte + context_offset + target_offset;
+                    let request = brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest {
+                        file: unit.source().clone(),
+                        line: None,
+                        column: None,
+                        start_byte: Some(start_byte),
+                        end_byte: Some(start_byte + query.target.len()),
+                    };
+                    match requests_by_source
+                        .iter_mut()
+                        .find(|(file, _, _)| file == unit.source())
+                    {
+                        Some((_, _, requests)) => requests.push(request),
+                        None => requests_by_source.push((
+                            unit.source().clone(),
+                            Arc::clone(&source),
+                            vec![request],
+                        )),
+                    }
                 }
             }
         }

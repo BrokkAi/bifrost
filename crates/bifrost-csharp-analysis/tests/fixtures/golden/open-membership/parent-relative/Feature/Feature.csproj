@@ -1,0 +1,1 @@
+<Project><PropertyGroup><BaseIntermediateOutputPath>../obj/</BaseIntermediateOutputPath></PropertyGroup><ItemGroup><Compile Include="../Shared.cs" Condition="'$(Feature)' == 'true'" /></ItemGroup></Project>

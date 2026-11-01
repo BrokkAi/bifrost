@@ -2172,8 +2172,8 @@ fn native_model_argument_applicability(
     };
     let kind = match java_external_conversion_in(&actual_type, &formal_type, Some(&surface)) {
         JavaExternalConversion::Inapplicable => return ModelArgumentApplicability::Inapplicable,
-        JavaExternalConversion::Unknown => {
-            return ModelArgumentApplicability::Unknown(ConversionUnknown::IncompleteHierarchy);
+        JavaExternalConversion::Unknown(cause) => {
+            return ModelArgumentApplicability::Unknown(cause);
         }
         JavaExternalConversion::Strict
             if java_external_same_static_type(&actual_type, &formal_type) =>

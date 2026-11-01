@@ -3,7 +3,7 @@
 //! Rules are static. Each lowering works on one file and retains no inventory.
 
 use super::local_identity::ResolutionIdentityCatalogBuilder;
-use super::model::{BindingOrigin, PrecedenceStep, SemanticId};
+use super::model::{BindingNodeId, BindingOrigin, PrecedenceStep, SemanticId};
 use crate::analyzer::structural::PrecedenceTier;
 #[cfg(test)]
 use brokk_bifrost_core::analyzer::Language;
@@ -29,8 +29,77 @@ pub(super) const EFFECTIVE_NAMESPACES: [ResolutionNamespace; 5] = [
     ResolutionNamespace::Macro,
 ];
 
+/// The source endpoint where a binding becomes visible, followed by its
+/// outward checkpoint and scope-head chain. These values belong to one query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingScopeCoordinate {
+    pub endpoint: BindingNodeId,
+    pub outward: Vec<BindingNodeId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shadowing {
+    Shadows,
+    Shadowed,
+    Incomparable,
+}
+
+/// The source scope of the left binding relative to the right binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingScopeRelation {
+    Inner,
+    Same,
+    Outer,
+    Unrelated,
+}
+
+impl BindingScopeCoordinate {
+    pub fn relative_to(&self, other: &Self) -> BindingScopeRelation {
+        if self.endpoint == other.endpoint {
+            BindingScopeRelation::Same
+        } else if self.outward.contains(&other.endpoint) {
+            BindingScopeRelation::Inner
+        } else if other.outward.contains(&self.endpoint) {
+            BindingScopeRelation::Outer
+        } else {
+            BindingScopeRelation::Unrelated
+        }
+    }
+}
+
 /// Static language policy for precedence data and root-import lowering.
 pub trait PrecedenceRules: Sync {
+    /// Compare competing binding origins. The default JVM rule retains the
+    /// historical rank-first order; equal ranks leave the semantic choice to
+    /// the shared path comparator.
+    fn shadows(
+        &self,
+        left_rank: u32,
+        right_rank: u32,
+        relation: BindingScopeRelation,
+    ) -> Shadowing {
+        let _ = relation;
+        match left_rank.cmp(&right_rank) {
+            std::cmp::Ordering::Less => Shadowing::Shadows,
+            std::cmp::Ordering::Greater => Shadowing::Shadowed,
+            std::cmp::Ordering::Equal => Shadowing::Incomparable,
+        }
+    }
+
+    fn shared_choice_shadowing(
+        &self,
+        _ranks: Option<(u32, u32)>,
+        _relation: Option<BindingScopeRelation>,
+        left: &PrecedenceStep,
+        right: &PrecedenceStep,
+    ) -> Option<Shadowing> {
+        match (left.tier, left.ordinal).cmp(&(right.tier, right.ordinal)) {
+            std::cmp::Ordering::Less => Some(Shadowing::Shadows),
+            std::cmp::Ordering::Greater => Some(Shadowing::Shadowed),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+
     /// Lower is stronger; path comparison remains shared.
     fn origin_rank(&self, _origin: BindingOrigin) -> Option<u32> {
         None
@@ -104,6 +173,65 @@ struct JvmPrecedenceRules {
 impl PrecedenceRules for JvmPrecedenceRules {
     fn origin_rank(&self, origin: BindingOrigin) -> Option<u32> {
         (self.origin_rank)(origin)
+    }
+    fn root_import_tier(&self, kind: ResolutionRootImportKind) -> PrecedenceTier {
+        match kind {
+            ResolutionRootImportKind::Named => PrecedenceTier::ExplicitImport,
+            ResolutionRootImportKind::Glob => PrecedenceTier::WildcardImport,
+        }
+    }
+}
+
+struct ScalaPrecedenceRules;
+impl PrecedenceRules for ScalaPrecedenceRules {
+    fn shared_choice_shadowing(
+        &self,
+        ranks: Option<(u32, u32)>,
+        relation: Option<BindingScopeRelation>,
+        left: &PrecedenceStep,
+        right: &PrecedenceStep,
+    ) -> Option<Shadowing> {
+        // A shared reference or outward step says nothing about the binding
+        // scopes. Continue to the first choice where the paths diverge.
+        if left == right {
+            return None;
+        }
+        if let Some((left_rank, right_rank)) = ranks {
+            if let Some(relation) = relation {
+                return Some(self.shadows(left_rank, right_rank, relation));
+            }
+            if (left.tier, left.ordinal) != (right.tier, right.ordinal) {
+                return Some(Shadowing::Incomparable);
+            }
+            return None;
+        }
+        match (left.tier, left.ordinal).cmp(&(right.tier, right.ordinal)) {
+            std::cmp::Ordering::Less => Some(Shadowing::Shadows),
+            std::cmp::Ordering::Greater => Some(Shadowing::Shadowed),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+
+    fn shadows(
+        &self,
+        left_rank: u32,
+        right_rank: u32,
+        relation: BindingScopeRelation,
+    ) -> Shadowing {
+        match relation {
+            BindingScopeRelation::Same => match left_rank.cmp(&right_rank) {
+                std::cmp::Ordering::Less => Shadowing::Shadows,
+                std::cmp::Ordering::Greater => Shadowing::Shadowed,
+                std::cmp::Ordering::Equal => Shadowing::Incomparable,
+            },
+            BindingScopeRelation::Inner if left_rank <= right_rank => Shadowing::Shadows,
+            BindingScopeRelation::Outer if right_rank <= left_rank => Shadowing::Shadowed,
+            _ => Shadowing::Incomparable,
+        }
+    }
+
+    fn origin_rank(&self, origin: BindingOrigin) -> Option<u32> {
+        scala_binding_origin_rank(origin)
     }
     fn root_import_tier(&self, kind: ResolutionRootImportKind) -> PrecedenceTier {
         match kind {
@@ -209,9 +337,16 @@ pub static JAVA_PRECEDENCE_RULES: &dyn PrecedenceRules = &JvmPrecedenceRules {
 pub static KOTLIN_PRECEDENCE_RULES: &dyn PrecedenceRules = &JvmPrecedenceRules {
     origin_rank: kotlin_binding_origin_rank,
 };
-pub static SCALA_PRECEDENCE_RULES: &dyn PrecedenceRules = &JvmPrecedenceRules {
-    origin_rank: scala_binding_origin_rank,
-};
+pub static SCALA_PRECEDENCE_RULES: &dyn PrecedenceRules = &ScalaPrecedenceRules;
+
+pub(crate) fn rules_for_language(
+    language: brokk_bifrost_core::analyzer::Language,
+) -> &'static dyn PrecedenceRules {
+    crate::analyzer::store::store_language_support_for_hook(language, "precedence_rules")
+        .map_or(&DefaultPrecedenceRules as &dyn PrecedenceRules, |support| {
+            support.precedence_rules()
+        })
+}
 
 /// The ordinal at one scope level's import choice: member or alias is 0,
 /// use or import is 1, and outward continuation is 2. Languages classify
@@ -267,6 +402,59 @@ mod tests {
     use brokk_bifrost_core::analyzer::resolution_facts::{
         ResolutionImportRouteKind, ResolutionImportSelectorKind,
     };
+
+    #[test]
+    fn scala_shadowing_is_a_partial_scope_order() {
+        let outer = BindingScopeCoordinate {
+            endpoint: BindingNodeId::local(1, 1),
+            outward: vec![],
+        };
+        let inner = BindingScopeCoordinate {
+            endpoint: BindingNodeId::local(1, 2),
+            outward: vec![outer.endpoint],
+        };
+        let unrelated = BindingScopeCoordinate {
+            endpoint: BindingNodeId::local(2, 2),
+            outward: vec![],
+        };
+        let scala = SCALA_PRECEDENCE_RULES;
+        assert_eq!(
+            scala.shadows(1, 0, inner.relative_to(&outer)),
+            Shadowing::Incomparable
+        );
+        assert_eq!(
+            scala.shadows(0, 1, outer.relative_to(&inner)),
+            Shadowing::Incomparable
+        );
+        assert_eq!(
+            scala.shadows(1, 1, inner.relative_to(&outer)),
+            Shadowing::Shadows
+        );
+        assert_eq!(
+            scala.shadows(0, 1, inner.relative_to(&outer)),
+            Shadowing::Shadows
+        );
+        assert_eq!(
+            scala.shadows(0, 1, inner.relative_to(&inner)),
+            Shadowing::Shadows
+        );
+        assert_eq!(
+            scala.shadows(0, 0, inner.relative_to(&inner)),
+            Shadowing::Incomparable
+        );
+        assert_eq!(
+            scala.shadows(0, 1, inner.relative_to(&unrelated)),
+            Shadowing::Incomparable
+        );
+        assert_eq!(
+            JAVA_PRECEDENCE_RULES.shadows(0, 1, BindingScopeRelation::Unrelated),
+            Shadowing::Shadows
+        );
+        assert_eq!(
+            KOTLIN_PRECEDENCE_RULES.shadows(1, 0, BindingScopeRelation::Unrelated),
+            Shadowing::Shadowed
+        );
+    }
     // #7314: the pre-extraction JVM values are the contract for the rules seam.
     #[test]
     fn jvm_rank_table_matches_base_contract() {

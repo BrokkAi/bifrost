@@ -31,6 +31,157 @@ mod rust_departing_tests_tests {
     use brokk_bifrost_core::cancellation::CancellationToken;
 
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_core::analyzer::model::Language;
+    use brokk_bifrost_core::analyzer::project::OverlayProject;
+    use std::sync::Arc;
+
+    use brokk_bifrost_semantic::analyzer::semantic::service::SERVE_COUNTS;
+    use std::sync::atomic::Ordering;
+
+    const COMPLETION_SOURCE: &str = "pub fn answer() -> i32 { 42 }\n";
+
+    fn assert_completion_origins(limits: SemanticWork, complete: bool) {
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", COMPLETION_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let cancellation = CancellationToken::default();
+        let rows_before = SERVE_COUNTS.rows_hits.load(Ordering::Relaxed);
+        let lowerings_before = SERVE_COUNTS.lowerings.load(Ordering::Relaxed);
+        let mut rows_budget = SemanticBudget::new(limits).expect("positive limits");
+        let rows = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut rows_budget, &cancellation),
+            )
+            .expect("stored semantic IR rows");
+        assert!(
+            SERVE_COUNTS.rows_hits.load(Ordering::Relaxed) > rows_before,
+            "the first disk touch must serve stored semantic IR rows"
+        );
+        assert!(
+            if complete {
+                matches!(rows, SemanticOutcome::Complete { .. })
+            } else {
+                matches!(rows, SemanticOutcome::ExceededBudget { .. })
+            },
+            "stored rows: {rows:?}"
+        );
+        assert_eq!(
+            SERVE_COUNTS.lowerings.load(Ordering::Relaxed),
+            lowerings_before
+        );
+        // A refused row admission does not populate the complete cache.
+        // Fill it with an unrestricted request before testing its refusal.
+        if !complete {
+            let mut warm_budget = SemanticBudget::default();
+            let warm = fixture
+                .analyzer
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut warm_budget, &cancellation),
+                )
+                .expect("warm complete cache");
+            assert!(matches!(warm, SemanticOutcome::Complete { .. }));
+        }
+        let rows_after = SERVE_COUNTS.rows_hits.load(Ordering::Relaxed);
+
+        // The complete case repeats against the same bounded source budget.
+        let mut cached_budget = if complete {
+            rows_budget
+        } else {
+            SemanticBudget::new(limits).expect("positive limits")
+        };
+        let cached = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut cached_budget, &cancellation),
+            )
+            .expect("complete-artifact cache");
+        assert!(
+            if complete {
+                matches!(cached, SemanticOutcome::Complete { .. })
+            } else {
+                matches!(cached, SemanticOutcome::ExceededBudget { .. })
+            },
+            "cache: {cached:?}"
+        );
+        assert_eq!(
+            SERVE_COUNTS.rows_hits.load(Ordering::Relaxed),
+            rows_after,
+            "second touch must use the complete-artifact cache, not rows"
+        );
+        assert_eq!(
+            SERVE_COUNTS.lowerings.load(Ordering::Relaxed),
+            lowerings_before,
+            "second touch must not lower"
+        );
+
+        let overlay_fixture =
+            AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", COMPLETION_SOURCE)]);
+        let overlay_file = ProjectFile::new(overlay_fixture.project_root(), "src/lib.rs");
+        let overlay = OverlayProject::new(Arc::new(overlay_fixture.test_project().clone()));
+        assert!(overlay.set(overlay_file.abs_path(), COMPLETION_SOURCE.to_owned()));
+        let overlaid = overlay_fixture
+            .analyzer
+            .clone_with_project(Arc::new(overlay.snapshot()));
+        let mut overlay_budget = SemanticBudget::new(limits).expect("positive limits");
+        let lowered = overlaid
+            .materialize_program_semantics(
+                &overlay_file,
+                &mut SemanticRequest::new(&mut overlay_budget, &cancellation),
+            )
+            .expect("on-demand overlay lowering");
+        assert!(
+            if complete {
+                matches!(lowered, SemanticOutcome::Complete { .. })
+            } else {
+                matches!(lowered, SemanticOutcome::ExceededBudget { .. })
+            },
+            "lowering: {lowered:?}"
+        );
+        assert!(
+            SERVE_COUNTS.lowerings.load(Ordering::Relaxed) > lowerings_before,
+            "overlay must lower on demand"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8586: an overlay with the disk file's bytes exceeded a source budget the cached disk artifact passed"
+    )]
+    fn identical_rust_overlay_and_disk_have_equal_semantic_completion() {
+        let mut limits = SemanticBudget::default().limits();
+        limits.source_bytes = 1;
+        assert_completion_origins(limits, true);
+    }
+
+    #[test]
+    fn rust_semantic_census_limit_exceeds_on_every_origin() {
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", COMPLETION_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("complete census")
+            .available_value()
+            .cloned()
+            .expect("complete artifact");
+        let mut limits = SemanticBudget::default().limits();
+        assert!(
+            artifact.work().program_points > 1,
+            "fixture needs multiple program points"
+        );
+        limits.program_points = artifact.work().program_points - 1;
+        assert_completion_origins(limits, false);
+    }
     #[test]
     fn procedure_deferred_scheduling_does_not_weaken_a_nested_call_transfer() {
         let fixture = AnalyzerFixture::new_for_language(

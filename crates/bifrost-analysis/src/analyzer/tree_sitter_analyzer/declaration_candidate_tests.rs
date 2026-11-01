@@ -9,6 +9,12 @@ use crate::hash::HashSet;
 struct TestAdapter;
 
 impl StoreLanguageAdapter for TestAdapter {
+    // Test adapter.
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        None
+    }
     fn language(&self) -> Language {
         Language::Python
     }

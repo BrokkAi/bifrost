@@ -421,6 +421,15 @@ Output: `nodes` (`id`, `fqn`, `kind`, `language`, `path`, `start_line`),
 `edges` (`from`, `from_id`, `to`, `to_id`, `language`, `weight`, and `sites`
 with one `{path, line}` per reference), and `session_subset` when relevant.
 
+Selected configurations: when the workspace has Go files,
+`build_configurations` lists the Go build configuration that the analysis
+selected (`language`, `goos`, `goarch`, `cgo_enabled`, `tags`). When the
+workspace has C# files, `csharp_compilations` lists each selected C#
+compilation: `project_path` (null for files that no project owns),
+`configuration`, `target_framework` (null when no restore recorded one),
+`defined_symbols`, `closed`, and `open_reason` when the symbol set is open.
+Each list is omitted when it is empty.
+
 `paths` chooses declaration roots, and `depth` expands outbound
 caller-to-callee hops from those roots. The graph still resolves referenced
 files as needed, so a narrow path or depth does not make resolution cost
@@ -429,7 +438,9 @@ query; use `scan_usages_by_location` for caller questions.
 
 Completeness: `complete` is false when any part of the graph is missing.
 `incomplete_reasons` lists each gap as `{code, message}`, including
-`unmatched_paths` for a selector that matched nothing. `truncated_symbols`
+`unmatched_paths` for a selector that matched nothing, and
+`csharp_selected_configuration_unavailable` when the workspace has C# files
+but their selected configurations cannot be read. `truncated_symbols`
 lists symbols with more than 1,000 call sites (`fqn`, `total_callsites`,
 `limit`); their inbound edges are omitted.
 
@@ -696,7 +707,7 @@ workspace snapshot.
 | `diff_base` | string | No | - | 1 to 256 bytes | `--diff-base` | Git revision. Bifrost also evaluates that revision, labels each finding new or persisting, and only new findings count toward `fail_on`. |
 | `incremental` | boolean | No | `true` | - | `--no-incremental` sets false | Reuse verified policy units from the analyzer cache. Findings and status are the same either way. |
 | `policy_cost_hints` | object | No | Empty | At most 256 entries; non-empty keys, non-negative integer milliseconds | `--policy-cost-hints <path>` (JSON file) | Parallel batches start unknown policies first, then hinted policies from longest to shortest; hints never change the report. |
-| `policy_deadlines_ms` | object | No | Empty | At most 256 entries; non-empty keys, integer milliseconds of at least 1 | - | The most time each listed policy's evaluation may take, counted from when it starts. A policy that reaches its limit ends `inconclusive` with reason `rule_deadline_exceeded`, the exit status is 2, and `execution.timed_out_policy_ids` lists it; the other policies continue. The request budget still bounds the whole call. |
+| `policy_deadlines_ms` | object | No | Empty | At most 256 entries; non-empty keys, integer milliseconds of at least 1 | `--policy-deadlines-ms <path>` (JSON file) | The most time each listed policy's evaluation may take, counted from when it starts. A policy that reaches its limit ends `inconclusive` with reason `rule_deadline_exceeded`, the exit status is 2, and `execution.timed_out_policy_ids` lists it; the other policies continue. The request budget still bounds the whole call. |
 | `stream_runs` | boolean | No | `false` | Needs a `progressToken` | - | Send each policy's run when that policy finishes, before the result, as a `notifications/progress` whose `_meta["io.bifrost/policy-run"]` is `{policy_id, progress, run}`. `progress` is `completed`, `interrupted`, `timed_out` or `pending`. A streamed run is not yet reviewed: suppressions, the scope file, the baseline and the `diff_base` classification appear only in the final report, which stays authoritative. Delivery is best effort. A call run as an MCP task streams nothing. |
 | `include_stage_timings` | boolean | No | `false` | - | `--policy-timings` (CLI reports per-policy time instead) | Add a `stage_timings` field with wall-clock time per stage. |
 
@@ -746,6 +757,11 @@ Output: `locations` (`symbol`, `path`, `start_line`, `end_line`, `loc`) and
 `not_found`.
 
 ### get_symbol_ancestors
+
+Partial hierarchy answers retain definite ancestors and add `complete: false`,
+`incomplete_reasons` with stable reason labels and endpoint names when known,
+and `alternatives` with one
+list per ambiguous edge. Complete answers omit these fields.
 
 Return ancestor classes of known classes, nearest parent first. Arguments are
 the same as for `get_symbol_locations`.

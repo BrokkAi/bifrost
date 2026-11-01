@@ -443,3 +443,85 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2))]
+
+    /// Capped import unions return correct subsets with reported truncation.
+    #[test]
+    fn capped_import_union_merge_returns_a_correct_subset(
+        generated in generated_project(),
+        eighths in proptest::array::uniform4(1usize..=24),
+    ) {
+        let project = generated.build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let mut files = workspace.analyzer().analyzed_files();
+        files.sort_by(seed_file_order);
+        let scan = json!({"match": {"kind": "function"}});
+        let absent = json!({"languages": ["python"], "match": {"kind": "function"}});
+        let mut exercised_imports = false;
+        for op in ["imports_of", "importers_of"] {
+            let importing = json!({"match": {"kind": "function"},
+                "steps": [{"op": "file_of"}, {"op": op}]});
+            for branches in [
+                vec![importing.clone(), scan.clone()],
+                vec![scan.clone(), importing.clone()],
+                vec![absent.clone(), importing.clone(), scan.clone()],
+            ] {
+                let query = CodeQuery::from_json(&json!({
+                    "schema_version": 1, "union": branches,
+                    "limit": 500, "result_detail": "full",
+                })).expect("import union parses");
+                prop_assert!(crate::PlanPartitioning::classify(&query.plan).is_seed_union(),
+                    "{}", op);
+                let units: Vec<_> = files.iter().map(|file| execute_code_query_unit(
+                    workspace.analyzer(), &flow, None, &query,
+                    CodeQueryExecutionLimits::default(), None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+                )).collect();
+                let merged = merge_unit_rows(&query, units);
+                exercised_imports |= merged.budgeted_work.import_files_resolved > 0
+                    || merged.budgeted_work.import_edges_resolved > 0;
+                let whole = execute_code_query_detailed_eager_index(
+                    workspace.analyzer(), &flow, &query, CodeQueryExecutionLimits::default(), None,
+                );
+                prop_assert!(!whole.result.truncated);
+                let complete = whole.result.results.iter().map(UnitRowItem::project).collect::<Vec<_>>();
+                let totals = [
+                    merged.work.scanned_files + merged.budgeted_work.import_files_resolved,
+                    merged.work.scanned_source_bytes,
+                    merged.work.fact_nodes + merged.work.examined_references,
+                    merged.work.pipeline_rows + merged.budgeted_work.provenance_steps
+                        + merged.budgeted_work.import_edges_resolved,
+                ];
+                for (lane, total) in totals.into_iter().enumerate() {
+                    let cap = (total as usize * eighths[lane] / 8).max(1);
+                    let mut limits = CodeQueryExecutionLimits::default();
+                    match lane {
+                        0 => limits.max_scanned_files = cap,
+                        1 => limits.max_scanned_source_bytes = cap,
+                        2 => limits.max_fact_nodes = cap,
+                        3 => limits.max_pipeline_rows = cap,
+                        _ => unreachable!(),
+                    }
+                    let capped_units = files.iter().map(|file| execute_code_query_unit(
+                        workspace.analyzer(), &flow, None, &query, limits, None,
+                        CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+                    ));
+                    let mut capped = merge_unit_rows(&query, capped_units);
+                    capped.apply_result_limit(query.limit);
+                    prop_assert!(capped.items.iter().all(|row| complete.iter().any(|candidate| { let mut row = row.clone(); let mut candidate = candidate.clone(); row.provenance.clear(); candidate.provenance.clear(); row == candidate })), "{}: lane {}, cap {}", op, lane, cap);
+                    if !capped.truncated {
+                        prop_assert_eq!(comparable_rendering(&capped.items), comparable_rendering(&complete));
+                    } else {
+                        prop_assert!(!capped.diagnostics.is_empty());
+                    }
+                }
+            }
+        }
+        // Resolving the import graph charges work even when a generated file
+        // has no outgoing imports; keep the property from becoming vacuous.
+        prop_assert!(exercised_imports, "import resolution must be exercised");
+    }
+}

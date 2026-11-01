@@ -952,7 +952,7 @@ impl<A: LanguageAdapter> CanonicalCppSourceFacts for TreeSitterAnalyzer<A> {
     ) -> Option<Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>> {
         let generation = self.language_generation(lang)?;
         let oid = self.resolve_live_oid_for_file(file)?;
-        let key = self.file_read_key(file, oid);
+        let key = self.file_read_key(file, oid, brokk_bifrost_core::gitblob::ParseVariant::Empty);
         debug_assert!(matches!(&key, ReadKey::File { .. }));
         self.record_read_key(key);
         if self.record_structure_unavailable_if_unparseable(file, oid) {
@@ -1026,7 +1026,13 @@ impl<A: LanguageAdapter> CanonicalCppSourceFacts for TreeSitterAnalyzer<A> {
             return Some(facts);
         }
         let facts = self.store_query_or_record(
-            |sink| sink.push(self.file_read_key(file, oid)),
+            |sink| {
+                sink.push(self.file_read_key(
+                    file,
+                    oid,
+                    brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                ))
+            },
             self.store_context.store.cpp_source_facts(
                 oid,
                 generation,
@@ -1043,7 +1049,13 @@ impl<A: LanguageAdapter> CanonicalCppSourceFacts for TreeSitterAnalyzer<A> {
                     return None;
                 }
             } else if !self.store_query_or_record(
-                |sink| sink.push(self.file_read_key(file, oid)),
+                |sink| {
+                    sink.push(self.file_read_key(
+                        file,
+                        oid,
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                    ))
+                },
                 self.store_context
                     .store
                     .contains_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, lang)),

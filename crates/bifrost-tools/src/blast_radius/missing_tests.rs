@@ -645,8 +645,8 @@ fn exact_node_outcome(analyzer: &dyn IAnalyzer, entry: ScanUsagesEntry) -> Exact
                 outcome.reaches_test_context = true;
                 continue;
             }
-            let start_line = hit.line.saturating_sub(1);
-            let end_line = hit.end_line.unwrap_or(hit.line).saturating_sub(1);
+            let start_line = hit.line;
+            let end_line = hit.end_line.unwrap_or(hit.line);
             let Some(caller) = analyzer.enclosing_code_unit_for_lines(&file, start_line, end_line)
             else {
                 outcome
@@ -776,7 +776,7 @@ fn render_function_section(
     lines.push(String::new());
     for function in functions {
         let location = if options.render_line_numbers {
-            format!("{}:{}", function.after.path, function.after.start_line + 1)
+            format!("{}:{}", function.after.path, function.after.start_line)
         } else {
             function.after.path.clone()
         };
@@ -800,8 +800,57 @@ mod tests {
     use crate::blast_radius::missing_tests::*;
 
     use brokk_bifrost_core::test_support::write_file as write;
+    use brokk_bifrost_test_macros::hardwon;
     use git2::Repository;
     use std::fs;
+
+    #[test]
+    #[hardwon(
+        "#8643: missing-tests text printed a changed function one line below its declaration"
+    )]
+    fn missing_tests_text_uses_declaration_line() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let root = temp.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        write(
+            root,
+            "src/lib.rs",
+            "// Header.\n\npub fn uncovered() -> i32 { 1 }\n",
+        );
+        let repo = Repository::init(root).expect("initialize repository");
+        commit_all(&repo, "base");
+        write(
+            root,
+            "src/lib.rs",
+            "// Header.\n\npub fn uncovered() -> i32 { 2 }\n",
+        );
+        let target = commit_all(&repo, "target");
+
+        let result = missing_tests_at_root(
+            root,
+            None,
+            MissingTestsParams {
+                base: None,
+                target: Some(target.to_string()),
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
+        )
+        .expect("missing tests");
+        let candidate = result
+            .missing_functions
+            .iter()
+            .chain(&result.indeterminate_functions)
+            .find(|function| function.after.name == "uncovered")
+            .expect("changed function appears in the report");
+        assert_eq!(candidate.after.start_line, 3);
+        let rendered = result.render_text(RenderOptions::default());
+        assert!(rendered.contains(" at `src/lib.rs:3`"), "{rendered}");
+    }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]

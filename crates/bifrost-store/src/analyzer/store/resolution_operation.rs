@@ -12,6 +12,8 @@ pub use services::{SelectedAnalyzerServices, SelectedModelAuthority};
 
 #[doc(hidden)]
 pub mod go_context;
+#[doc(hidden)]
+pub mod go_hierarchy;
 pub use go_context::GO_IMPORT_INCOMPLETE;
 #[doc(hidden)]
 pub mod go_named;
@@ -39,6 +41,8 @@ pub(crate) use java_access::JvmAccessPolicy;
 pub mod jvm_context;
 #[doc(hidden)]
 pub mod jvm_demand;
+#[doc(hidden)]
+pub mod jvm_direct_supertypes;
 mod jvm_hierarchy_order;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -1061,6 +1065,15 @@ type NativeDemandCallback<'a> = dyn FnMut(
     + 'a;
 
 pub(crate) trait DemandInstall: Send + Sync {
+    fn selected_target_completion(
+        &self,
+        _preparation: &dyn std::any::Any,
+        _ready: &ReadySelectedResolution<'_, '_>,
+        _answer: &crate::analyzer::resolution::FactResolutionAnswer,
+    ) -> Result<ResolutionCompletion> {
+        Ok(ResolutionCompletion::Complete)
+    }
+
     fn prepare_caller(
         &self,
         operation: &SelectedResolutionOperation<'_, '_>,
@@ -1734,10 +1747,40 @@ type ImportReferenceReadMemo = ExactReadMemo<(i64, git2::Oid, Vec<u8>), Vec<u32>
 pub struct SelectedPointReadMemos {
     pub(crate) reference_evidence:
         std::rc::Rc<RefCell<super::resolution_lexical::ReferenceLocalPathReadMemo>>,
+    pub(crate) candidate_paths:
+        std::rc::Rc<RefCell<super::resolution_lexical::CandidatePathReadMemo>>,
     pub(crate) import_references: RefCell<ImportReferenceReadMemo>,
 }
 
 impl SelectedPointReadMemos {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_candidate_paths_for_test(&self) {
+        self.candidate_paths.borrow_mut().observed = Some(Vec::new());
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_candidate_paths_for_test(
+        &self,
+    ) -> Vec<
+        Vec<(
+            crate::analyzer::resolution::CandidatePathIdentity,
+            crate::analyzer::resolution::PartialPath,
+        )>,
+    > {
+        std::mem::take(
+            self.candidate_paths
+                .borrow_mut()
+                .observed
+                .as_mut()
+                .expect("observation enabled"),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn candidate_path_counts_for_test(&self) -> (usize, usize, usize, usize) {
+        self.candidate_paths.borrow().counts_for_test()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn read_counts_for_test(&self) -> (usize, usize, usize) {
         let evidence = self.reference_evidence.borrow().bounded_counts();
@@ -1965,6 +2008,9 @@ impl<'store> ReadySelectedResolution<'store, '_> {
                 std::rc::Rc::clone(cache),
             )
             .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo))
+            .with_candidate_path_read_memo(std::rc::Rc::clone(
+                &self.point_read_memos.candidate_paths,
+            ))
             .with_reference_read_memo(std::rc::Rc::clone(
                 &self.point_read_memos.reference_evidence,
             ));
@@ -1974,6 +2020,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
             std::rc::Rc::clone(&self.operation_candidate_cache),
         )
         .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo))
+        .with_candidate_path_read_memo(std::rc::Rc::clone(&self.point_read_memos.candidate_paths))
         .with_reference_read_memo(std::rc::Rc::clone(
             &self.point_read_memos.reference_evidence,
         ))
@@ -9441,7 +9488,8 @@ impl SelectedResolutionOperation<'_, '_> {
                         >,
                          provider: Option<
                             &mut dyn crate::analyzer::resolution::DemandRootProvider,
-                        >| {
+                        >,
+                         selected: Option<(&dyn DemandInstall, &dyn std::any::Any)>| {
                             if let Some(overlay) = go_receiver_overlay {
                                 operation.set_go_receiver_slot_type_overlay(overlay);
                             }
@@ -9455,7 +9503,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 }
                             }
                             setup(operation, reference)?;
-                            let answer = match provider {
+                            let mut answer = match provider {
                                 Some(provider) => match operation
                                     .resolve_reference_by_demand(reference, provider)?
                                 {
@@ -9469,6 +9517,12 @@ impl SelectedResolutionOperation<'_, '_> {
                                     &mut resolution_metrics,
                                 )?,
                             };
+                            if let Some((installer, prepared)) = selected {
+                                let completion = installer.selected_target_completion(prepared, ready, &answer)?;
+                                if completion != ResolutionCompletion::Complete {
+                                    answer.combine_binding_completion(&completion);
+                                }
+                            }
                             if family.is_some() {
                                 self.profile_jvm_read("native_point_answer", (reference, &answer));
                             }
@@ -9497,7 +9551,9 @@ impl SelectedResolutionOperation<'_, '_> {
                             cancellation,
                             session,
                             selected_import_gap,
-                            |operation| resolve_with_provider(operation, None).map(resolve_plain),
+                            |operation| {
+                                resolve_with_provider(operation, None, None).map(resolve_plain)
+                            },
                         )?
                     } else if let Some(demand) = go_demand.take() {
                         assert_eq!(locator.storage_language(), "go");
@@ -9512,7 +9568,9 @@ impl SelectedResolutionOperation<'_, '_> {
                                 session,
                             },
                             artifacts.take(),
-                            |operation| resolve_with_provider(operation, None).map(resolve_plain),
+                            |operation| {
+                                resolve_with_provider(operation, None, None).map(resolve_plain)
+                            },
                         )?
                     } else if let Some((language, installer)) =
                         match native_demand_installer_for_reference(locator, reference) {
@@ -9556,7 +9614,13 @@ impl SelectedResolutionOperation<'_, '_> {
                                 session,
                                 artifacts: artifacts.take(),
                             },
-                            |operation, provider| resolve_with_provider(operation, Some(provider)),
+                            |operation, provider| {
+                                resolve_with_provider(
+                                    operation,
+                                    Some(provider),
+                                    Some((installer.0, prepared.as_ref())),
+                                )
+                            },
                         )? {
                             std::ops::ControlFlow::Continue(answer) => answer,
                             std::ops::ControlFlow::Break(completion) => {
@@ -9575,7 +9639,9 @@ impl SelectedResolutionOperation<'_, '_> {
                                 session,
                                 artifacts,
                             },
-                            |operation| resolve_with_provider(operation, None).map(resolve_plain),
+                            |operation| {
+                                resolve_with_provider(operation, None, None).map(resolve_plain)
+                            },
                         )?
                     } else {
                         blueprint.with_forward_operation_in_session(
@@ -9584,7 +9650,9 @@ impl SelectedResolutionOperation<'_, '_> {
                             &observed_typed,
                             cancellation,
                             session,
-                            |operation| resolve_with_provider(operation, None).map(resolve_plain),
+                            |operation| {
+                                resolve_with_provider(operation, None, None).map(resolve_plain)
+                            },
                         )?
                     }
                 }

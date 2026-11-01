@@ -2090,6 +2090,7 @@ pub(super) fn execute_seed(
                 .or(custom_source.as_deref())
                 .map(|relation_source| {
                     let result = body_relations::matches_for_file(
+                        analyzer,
                         &file,
                         relation_source,
                         language,
@@ -2466,6 +2467,7 @@ fn language_rule_matches(
                 })
                 .cloned()?;
             fact_match.reported_range = Some(range.report);
+            fact_match.heuristic = range.heuristic;
             Some(fact_match)
         })
         .collect()

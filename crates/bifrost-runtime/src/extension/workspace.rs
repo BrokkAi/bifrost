@@ -9,9 +9,10 @@ use brokk_bifrost_analysis::analyzer::semantic::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CandidateCoverage, EvidenceCompleteness, MoveInvalidation, OracleCallContext,
-    ProcedureSemantics, ProofStatus, SemanticBudget, SemanticLocator, SemanticOutcome,
-    SemanticRequest, SourceMappingId, TransferKind, TransferOperation, ValueFlowEndpoint,
-    ValueFlowOracle, ValueFlowRelationKind, ValuePreservation, WorkspaceSemanticOracle,
+    ProcedureSemantics, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticLocator,
+    SemanticOutcome, SemanticRequest, SemanticWork, SourceMappingId, TransferKind,
+    TransferOperation, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind,
+    ValuePreservation, WorkspaceSemanticOracle,
     cfg_algorithms::derive_procedure_control_dependence,
 };
 use brokk_bifrost_analysis::analyzer::{
@@ -571,6 +572,26 @@ impl ExtensionWorkspace {
         budget_limits.source_bytes = usize::try_from(values.max_source_bytes).unwrap_or(usize::MAX);
         let mut budget = SemanticBudget::new(budget_limits)
             .expect("validated source limit preserves positive semantic budget limits");
+        let source = self
+            .analyzer
+            .analyzer()
+            .project()
+            .read_source_snapshot(&file)
+            .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?;
+        if let Some((completion, work)) = refuse_source_over_budget(&budget, source.source()) {
+            return Ok(with_tiers(
+                make_outcome(
+                    None,
+                    completion,
+                    &self.generation,
+                    &ExtensionLimits::default(),
+                    operation,
+                    stability,
+                    work,
+                ),
+                &scope,
+            ));
+        }
         let mut semantic_request = SemanticRequest::new(&mut budget, cancellation.token());
         let materialized = self
             .analyzer
@@ -639,12 +660,6 @@ impl ExtensionWorkspace {
         // order, before the node budget is applied: an occurrence ordinal must
         // be a property of the procedure's own text, not of how many nodes this
         // particular request happened to be allowed to emit.
-        let source = self
-            .analyzer
-            .analyzer()
-            .project()
-            .read_source_snapshot(&file)
-            .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?;
         let anchors = semantic_node_anchors(procedure, source.source());
         let nodes = procedure
             .points()
@@ -1131,6 +1146,27 @@ impl ExtensionWorkspace {
         budget_limits.source_bytes = usize::try_from(values.max_source_bytes).unwrap_or(usize::MAX);
         let mut budget = SemanticBudget::new(budget_limits)
             .expect("a validated source limit preserves positive semantic budget limits");
+        let source = self
+            .analyzer
+            .analyzer()
+            .project()
+            .read_source_snapshot(&file)
+            .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?;
+        if let Some((completion, work)) = refuse_source_over_budget(&budget, source.source()) {
+            return Ok(with_tiers(
+                make_outcome(
+                    None,
+                    completion,
+                    &self.generation,
+                    &echoed,
+                    operation,
+                    stability,
+                    work,
+                ),
+                &scope,
+            ));
+        }
+        drop(source);
         let materialized = {
             let mut semantic_request = SemanticRequest::new(&mut budget, cancellation.token());
             self.analyzer
@@ -2190,6 +2226,36 @@ fn semantic_owner_key(locator: &SemanticLocator) -> String {
     }
     owner
 }
+
+/// The caller's `max_source_bytes` bounds the file a request materializes. The
+/// semantic service lowers every artifact under its producer budget and serves
+/// stored, cached and freshly lowered artifacts alike, so a request source
+/// limit does not refuse inside it. The request refuses here instead, by the
+/// file's own size, which every origin of its artifact shares (#3008).
+fn refuse_source_over_budget(
+    budget: &SemanticBudget,
+    source: &str,
+) -> Option<(ExtensionCompletion, ExtensionWork)> {
+    let work = SemanticWork {
+        source_bytes: source.len(),
+        ..SemanticWork::default()
+    };
+    let exceeded = budget.check_admission(work).err()?;
+    Some((
+        exceeded_budget_completion(&exceeded),
+        ExtensionWork {
+            source_bytes: source.len() as u64,
+            ..Default::default()
+        },
+    ))
+}
+
+fn exceeded_budget_completion(exceeded: &SemanticBudgetExceeded) -> ExtensionCompletion {
+    ExtensionCompletion::ExceededBudget {
+        dimension: exceeded.dimension().public_lane().label().into(),
+    }
+}
+
 fn semantic_completion<T>(outcome: &SemanticOutcome<T>) -> ExtensionCompletion {
     match outcome {
         SemanticOutcome::Complete { .. } => ExtensionCompletion::Complete,
@@ -2200,9 +2266,7 @@ fn semantic_completion<T>(outcome: &SemanticOutcome<T>) -> ExtensionCompletion {
                 .unwrap(),
         },
         SemanticOutcome::Unproven { .. } => ExtensionCompletion::Unproven,
-        SemanticOutcome::ExceededBudget { exceeded, .. } => ExtensionCompletion::ExceededBudget {
-            dimension: exceeded.dimension().public_lane().label().into(),
-        },
+        SemanticOutcome::ExceededBudget { exceeded, .. } => exceeded_budget_completion(exceeded),
         SemanticOutcome::Cancelled { .. } => ExtensionCompletion::Cancelled,
     }
 }

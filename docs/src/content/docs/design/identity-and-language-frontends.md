@@ -459,6 +459,59 @@ Parser timeout or cancellation leaves the extraction job unfinished, so
 publication is refused under the shared
 [complete-value cache contract](/design/storage-and-cache/).
 
+## Conditional compilation
+
+Some languages let build settings choose the source text that the compiler
+sees. C# `#if` chains are one example. Bifrost does not parse every
+combination of branches, because each would need its own parse identities.
+It analyzes one selected configuration per project, as Go analysis uses one
+set of build tags, and answers name the configuration they assume.
+
+For C#, the selected configuration is `Debug`, the first target framework
+that the restore recorded, the SDK's implicit symbols for that framework, and
+the project's `DefineConstants`, read without running MSBuild. The
+implicit-symbol table is built into Bifrost, and its version is part of the
+compilation derivation, so the result depends only on snapshot inputs, not on
+an installed SDK. The inputs are workspace files only: project files, the props
+and targets files they import from the workspace, and each project's restore
+files. Bifrost does not read build files from the NuGet package cache (#8225).
+When the generated restore files import them, the project's symbol set is
+open. An open set lists no symbols: every symbol is unknown, never assumed
+undefined, because a symbol guessed to be undefined would hide a branch
+without notice.
+
+A chain is decided when every compilation that owns the file selects the same
+branch. A condition can have a known value even when it names an unknown
+symbol, and a literal condition decides even for a file that no project owns.
+An undecided chain keeps one default reading, the earliest branch not proven
+false. Answers that may depend on the skipped text carry the content
+obligation `csharp_conditional_branch_unseen` when that text holds anything
+other than whitespace and comments. A file read records it for that file. A
+read that lists C# declarations across files records it when any file in the
+snapshot has such a chain. When this scope rule was chosen (2026-10-31, #8684),
+it fired in 1 of 434 CodeQL C# query-test workspaces and in 1 of 69 repository
+fixtures that have project files. #8652 tracks measuring real repositories,
+with a rule per name as the replacement if the scope rule fires too often.
+
+Which lines are directives depends on the decisions, because the compiler does
+not tokenize a skipped section. So scanning and deciding are one pass in source
+order. The premise is that, in a configuration that compiles, each owner's
+reading is in a clean lexical state at every directive it recognizes. This
+premise applies to configurations that compile; Bifrost does not run the
+compiler to validate it.
+
+The decisions are part of the parse product's identity. Each configured
+reading is its own row set under `BlobKey(blob_oid, storage language,
+parse_variant)`, with the decision digest as the variant. A path's decision
+belongs to its file version in one revision, not to its content, because
+identical bytes can be compiled under different symbols. A decision change with
+unchanged bytes replaces the file version. The C# file read key carries the
+variant: a configuration edit that leaves a file's decisions unchanged keeps its
+cached units, and an edit that changes them does not.
+
+Usage graphs report the selected configurations: `build_configurations` for Go
+and `csharp_compilations` for C#.
+
 ## Proof, ambiguity, and completeness
 
 Bifrost treats candidate discovery and proof as separate stages. A structural

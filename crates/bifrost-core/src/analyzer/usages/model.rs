@@ -3,9 +3,6 @@ use crate::hash::HashMap;
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
-/// Confidence threshold for filtering hits in [`FuzzyResult::Ambiguous`] outcomes.
-pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
-
 /// Immutable metadata describing a single usage occurrence.
 ///
 /// Equality and hashing intentionally key only on `(file, start_offset, end_offset, enclosing)`;
@@ -395,12 +392,6 @@ pub enum FuzzyResult {
         reason_kind: String,
         reason: String,
     },
-    /// Multiple definitions share the short name; hits are returned but should be filtered.
-    Ambiguous {
-        short_name: String,
-        candidate_targets: BTreeSet<CodeUnit>,
-        hits_by_overload: HashMap<CodeUnit, BTreeSet<UsageHit>>,
-    },
     /// Guardrail tripped — too many call sites for the analyzer to enumerate cheaply.
     TooManyCallsites {
         short_name: String,
@@ -471,21 +462,6 @@ impl FuzzyResult {
         }
     }
 
-    pub fn ambiguous(
-        target: CodeUnit,
-        short_name: String,
-        candidate_targets: BTreeSet<CodeUnit>,
-        hits: BTreeSet<UsageHit>,
-    ) -> Self {
-        let mut map = HashMap::default();
-        map.insert(target, hits);
-        FuzzyResult::Ambiguous {
-            short_name,
-            candidate_targets,
-            hits_by_overload: map,
-        }
-    }
-
     /// Returns every external-usage hit, regardless of overload bucket. Excludes
     /// import/re-export bindings and self/this receiver hits because
     /// call-graph/relevance surfaces want externally meaningful references only.
@@ -514,9 +490,6 @@ impl FuzzyResult {
             }
             | FuzzyResult::Incomplete {
                 hits_by_overload, ..
-            }
-            | FuzzyResult::Ambiguous {
-                hits_by_overload, ..
             } => hits_by_overload
                 .values()
                 .flat_map(|set| set.iter().cloned())
@@ -525,9 +498,8 @@ impl FuzzyResult {
         }
     }
 
-    /// Lossy adapter equivalent to `EitherUsagesOrError`. Returns `Ok(set)` for `Success` and
-    /// `Ambiguous` (the latter filtered by [`CONFIDENCE_THRESHOLD`]) and `Err(message)` for
-    /// `Failure` / `TooManyCallsites` / `Incomplete`.
+    /// Lossy adapter equivalent to `EitherUsagesOrError`. Returns `Ok(set)` for
+    /// `Success` and `Err(message)` for `Failure` / `TooManyCallsites` / `Incomplete`.
     pub fn into_either(self) -> Result<BTreeSet<UsageHit>, String> {
         match self {
             FuzzyResult::Incomplete { diagnostics, .. } => {
@@ -550,16 +522,6 @@ impl FuzzyResult {
                 .into_values()
                 .flat_map(BTreeSet::into_iter)
                 .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-                .collect()),
-            FuzzyResult::Ambiguous {
-                hits_by_overload, ..
-            } => Ok(hits_by_overload
-                .into_values()
-                .flat_map(BTreeSet::into_iter)
-                .filter(|hit| {
-                    hit.kind.included_in(UsageHitSurface::ExternalUsages)
-                        && hit.confidence >= CONFIDENCE_THRESHOLD
-                })
                 .collect()),
         }
     }

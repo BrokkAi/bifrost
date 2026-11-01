@@ -33,8 +33,9 @@ use super::resolver::{is_bare_constant_reference, is_object_creation_type_name, 
 use super::syntax::{
     assignment_value_type_fq_name, captured_local_scope_bindings, declared_instance_callable,
     declared_instance_field, direct_receiver_union_member, instance_receiver_type_fq_name,
-    instanceof_type_node, is_local_scope, object_creation_type, seed_assignment_binding,
-    seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
+    instanceof_type_node, is_local_scope, is_relative_scope_keyword, object_creation_type,
+    seed_assignment_binding, seed_parameter_types, static_member_parts, static_scope_type_fq_name,
+    variable_identifier,
 };
 use crate::aliases::{
     PhpCallableCandidates, PhpFileContextIndex, resolve_php_constant, resolve_php_function,
@@ -214,8 +215,7 @@ fn record_reference(
             if method.is_empty() {
                 return;
             }
-            if let Some(owner) = scope_class_fqn(scope, scan) {
-                scan.record(owner.clone(), scope);
+            if let Some(owner) = scope_class_fqn(scope, scan, bindings) {
                 // `self::m()` / `static::m()` are same-owner own-type static
                 // calls (#1138): the member edge is unproven inbound. `parent::`
                 // and an explicit class name stay external/proven.
@@ -253,8 +253,7 @@ fn record_reference(
             if property.is_empty() {
                 return;
             }
-            if let Some(owner) = scope_class_fqn(scope, scan) {
-                scan.record(owner.clone(), scope);
+            if let Some(owner) = scope_class_fqn(scope, scan, bindings) {
                 // `self::$prop` / `static::$prop` are same-owner own-type static
                 // accesses (#1138): the member edge is unproven inbound.
                 let scope_name = node_text(scope, scan.source);
@@ -272,7 +271,13 @@ fn record_reference(
                             name_node.end_byte(),
                         );
                     },
-                    |scan| scan.record(format!("{owner}.{property}"), name_node),
+                    |scan| {
+                        if let Some(field) =
+                            declared_instance_field(scan.php, scan.analyzer, &owner, property)
+                        {
+                            scan.record(field.fq_name(), name_node);
+                        }
+                    },
                 );
             }
         }
@@ -282,9 +287,7 @@ fn record_reference(
             let Some((scope, _)) = static_member_parts(node) else {
                 return;
             };
-            if let Some(owner) = scope_class_fqn(scope, scan) {
-                scan.record(owner, scope);
-            }
+            scope_class_fqn(scope, scan, bindings);
         }
         // `$obj->method(..)` instance call: type the receiver, giving `Owner.method`.
         "member_call_expression" | "nullsafe_member_call_expression" => {
@@ -402,17 +405,27 @@ fn record_reference(
     }
 }
 
-/// The fqn of the class named by a static call's scope expression: an explicit
-/// type, or `self`/`static`/`parent` → the enclosing class.
-fn scope_class_fqn(scope: Node<'_>, scan: &PhpScan<'_>) -> Option<String> {
-    let text = node_text(scope, scan.source);
-    static_scope_type_fq_name(
+/// The fqn of the class a static access's scope names: an explicit type, or
+/// `self`/`static`/`parent` → the enclosing class, which is also recorded as a
+/// type reference. Any other scope (`$obj::m()`) is an object expression whose
+/// class is its receiver type, and names no type in source.
+fn scope_class_fqn(
+    scope: Node<'_>,
+    scan: &mut PhpScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    if !matches!(scope.kind(), "name" | "qualified_name" | "relative_scope") {
+        return receiver_type_fqn(scope, scan, bindings);
+    }
+    let owner = static_scope_type_fq_name(
         scan.php,
         scan.analyzer,
-        text,
+        node_text(scope, scan.source),
         scan.contexts.context_at(scope.start_byte()),
         scan.enclosing_class(scope.start_byte()),
-    )
+    )?;
+    scan.record(owner.clone(), scope);
+    Some(owner)
 }
 
 /// The fqn of an instance-call receiver's type. `$this` is the enclosing class; a
@@ -443,10 +456,7 @@ fn seed_parameters(
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     seed_parameter_types(node, scan.source, bindings, |_name, raw| {
-        if ["self", "static", "parent"]
-            .iter()
-            .any(|keyword| raw.eq_ignore_ascii_case(keyword))
-        {
+        if is_relative_scope_keyword(raw) {
             static_scope_type_fq_name(
                 scan.php,
                 scan.analyzer,

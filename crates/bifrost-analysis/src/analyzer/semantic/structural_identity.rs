@@ -107,11 +107,17 @@ impl StructuralNodeIndex {
                 ));
             }
         };
+        let facts =
+            facts.with_parse_identity(prepared.dialect().language(), prepared.parse_variant());
         let work_items = facts.work_item_count();
         let content = facts.source_identity();
         assert_eq!(
             content,
-            ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256())),
+            ContentIdentity::from_source_digest(
+                StableDigest::from_array(prepared.source_sha256()),
+                prepared.dialect().language(),
+                prepared.parse_variant()
+            ),
             "structural facts must be extracted from the semantic artifact source"
         );
         Ok(StructuralNodeIndexOutcome::Complete {

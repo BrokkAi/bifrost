@@ -11,18 +11,18 @@
 //! around it, which is this module's.
 //!
 //! The algorithm applied to one policy is: classify, enumerate, key, prefetch,
-//! verify or recompute, check exhaustiveness, publish, merge, and check merged
-//! limits. Every step that can refuse returns a typed [`WidenReason`], which
+//! verify or recompute within the remaining physical budget, publish complete
+//! units, and merge rows with reported incompleteness. Every step that can refuse returns a typed [`WidenReason`], which
 //! the caller reports beside a full evaluation rather than swallowing.
 //!
 //! Reuse follows one contract: publish a unit only with the read ledger that
 //! licenses it, and verify every ledger entry against the head workspace before
 //! reuse. A summary read identity excludes the workspace digest because the
 //! unit's `File` and `Artifact` keys verify the precise workspace inputs. A
-//! result-cache hit records no read set and cannot publish a unit. Shared budget
-//! lanes remain request-wide: reused root products replay their solver,
-//! semantic, execution, artifact-lease, and finding-lane charges, and reaching
-//! a shared limit widens the policy with `MergedLimitReached`. A typestate root
+//! result-cache hit records no read set and cannot publish a unit. Query units
+//! charge only recomputed physical work and return partial rows at budget walls.
+//! Reused typestate root products replay their solver, semantic, execution,
+//! artifact-lease, and finding-lane charges. A typestate root
 //! key includes its compiled protocol and binding-plan hashes, so a product from
 //! one compiled plan is not served under another. Adding an admitted partition
 //! or product kind requires updating the `policy_units` check constraint.
@@ -55,7 +55,7 @@ use brokk_bifrost_flow::type_flow::{FieldSlotIndex, FieldSlotIndexCache};
 use brokk_bifrost_flow::value_flow::ValueFlowCache;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, MergedUnitRows, UnitExecutionResult, execute_code_query_unit,
-    merge_unit_rows, plan_seed_files,
+    merge_unit_rows, plan_seed_files, push_skipped_unit_diagnostic, remaining_unit_limits,
 };
 use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryExecutionLimits};
 use brokk_bifrost_rql::{PlanPartitioning, PlanWidenDetail};
@@ -523,10 +523,35 @@ impl<'a> UnitReuse<'a> {
         product: PolicyUnitProduct,
         reads: Vec<ReadKey>,
     ) {
+        let workspace = self.incremental.workspace();
+        let seed_parse_variant = match &key.partition {
+            UnitPartition::Seed { rel_path, .. }
+            | UnitPartition::Binding { rel_path, .. }
+            | UnitPartition::AssertFile { rel_path, .. }
+            | UnitPartition::Root { rel_path, .. }
+            | UnitPartition::Selector { rel_path, .. } => {
+                let file = brokk_bifrost_analysis::analyzer::ProjectFile::new(
+                    workspace.analyzer().project().root().to_path_buf(),
+                    std::path::Path::new(rel_path.as_ref()),
+                );
+                let Some(variant) = workspace.analyzer().selected_parse_variant(&file) else {
+                    return;
+                };
+                Some(variant)
+            }
+            UnitPartition::Whole => None,
+        };
         let snapshots = self.incremental.publication_snapshots(&reads);
         self.incremental.stage_unit(
             self.policy_id.clone(),
-            PolicyUnit::new(key, product, reads, BudgetMode::Exhaustive, snapshots),
+            PolicyUnit::new(
+                key,
+                seed_parse_variant,
+                product,
+                reads,
+                BudgetMode::Exhaustive,
+                snapshots,
+            ),
         );
     }
 }
@@ -542,6 +567,7 @@ impl<'a> UnitReuse<'a> {
 pub(crate) fn recompute_unit<T>(
     analyzer: &dyn IAnalyzer,
     cancellation: Option<&CancellationToken>,
+    unit_label: impl FnOnce() -> String,
     run: impl FnOnce() -> T,
 ) -> (T, Option<Vec<ReadKey>>, Duration) {
     let ledger = Arc::new(ReadLedger::new());
@@ -570,13 +596,55 @@ pub(crate) fn recompute_unit<T>(
                     _reads.store_error().is_some()
                 )
             });
+            let _refusal = brokk_bifrost_analysis::profiling::read_refusal_scope(
+                brokk_bifrost_analysis::profiling::enabled().then(|| {
+                    brokk_bifrost_analysis::profiling::ReadRefusal {
+                        kind: "execution_dependent",
+                        reason: format!(
+                            "UnitBoundary(cancelled={}, snapshot={}, store={})",
+                            cancellation.is_some_and(CancellationToken::is_cancelled)
+                                || analyzer
+                                    .active_query_cancellation()
+                                    .is_some_and(|token| token.is_cancelled()),
+                            analyzer.project().analysis_generation() != generation_before,
+                            _reads.store_error().is_some()
+                        ),
+                        origin: std::panic::Location::caller(),
+                    }
+                }),
+            );
             ledger.mark_execution_dependent();
         }
         (product, started.elapsed())
     };
     let (product, elapsed) = product;
+    if !ledger.is_bounded() {
+        note_refused_unit(&ledger, unit_label);
+    }
     let reads = ledger.is_bounded().then(|| ledger.keys());
     (product, reads, elapsed)
+}
+
+/// Report one refused unit, after its reads have finished recording.
+/// Labels and provenance are diagnostic only; this does not decide admission.
+pub(crate) fn note_refused_unit(ledger: &ReadLedger, unit_label: impl FnOnce() -> String) {
+    brokk_bifrost_analysis::profiling::note_with(|| {
+        // A missing origin is a diagnostics gap, never a reason to panic.
+        let (kind, reason, origin) = match ledger.first_refusal() {
+            Some(first) => (
+                first.kind,
+                first.reason,
+                format!("{}:{}", first.origin.file(), first.origin.line()),
+            ),
+            None => ("unknown", "unknown".to_string(), "unknown".to_string()),
+        };
+        format!(
+            "policy.units unbounded {} cause=ledger_refused kind={kind} reason={reason} origin={origin} unattributed={} execution={}",
+            unit_label(),
+            ledger.unattributed_reads(),
+            ledger.execution_dependences(),
+        )
+    });
 }
 
 /// The limits a replayed lookup re-runs its funnel under.
@@ -661,6 +729,212 @@ pub(crate) struct SlicedQuery {
     pub(crate) keys: Vec<PolicyUnitKey>,
 }
 
+/// A query-local prefix, merge, and suffix contract. The generic evaluator
+/// owns lookup, read capture, publication, and ordered product collection.
+/// Instances supply only the product and budget rules that differ.
+pub(crate) trait UnitSlice {
+    type Capture<'a>;
+    type Seed;
+    type Prefix;
+    type Error;
+    type BudgetState: Default;
+    type Allowance: Copy;
+    type Merged;
+    type Output;
+
+    fn remaining(&self, state: &Self::BudgetState) -> Option<Self::Allowance>;
+    fn prefix(
+        &self,
+        seed: &Self::Seed,
+        allowance: Self::Allowance,
+    ) -> Result<Self::Prefix, Self::Error>;
+    fn decode(
+        &self,
+        seed: &Self::Seed,
+        product: PolicyUnitProduct,
+    ) -> Result<Self::Prefix, WidenReason>;
+    fn encode(&self, prefix: &Self::Prefix) -> PolicyUnitProduct;
+    fn charge(&self, _state: &mut Self::BudgetState, _prefix: &Self::Prefix) {}
+    fn capture<'a>(&self, _analyzer: &'a dyn IAnalyzer) -> Self::Capture<'a>;
+    fn after_recompute(
+        &self,
+        _prefix: &mut Self::Prefix,
+        _capture: &Self::Capture<'_>,
+        _cancellation: Option<&CancellationToken>,
+    ) {
+    }
+    fn validate(&self, _prefix: &Self::Prefix) -> Result<(), WidenReason> {
+        Ok(())
+    }
+    fn publishable(&self, _prefix: &Self::Prefix) -> bool {
+        true
+    }
+    fn missing_reads(&self, attempt: &mut UnitAttempt) -> Result<(), WidenReason> {
+        attempt.unbounded();
+        Ok(())
+    }
+    fn failure(&self, error: Self::Error, products: Vec<Self::Prefix>) -> Self::Output;
+    fn merge(&self, products: impl IntoIterator<Item = Self::Prefix>) -> Self::Merged;
+    fn suffix(&self, merged: Self::Merged, skipped: usize) -> Self::Output;
+}
+
+/// Reuse or recompute each prefix in seed order, then merge and finish once.
+pub(crate) fn evaluate_reusable_slice<'a, S: UnitSlice>(
+    slice: &S,
+    seeds: impl IntoIterator<Item = (S::Seed, &'a PolicyUnitKey)>,
+    reuse: &mut UnitReuse<'_>,
+    attempt: &mut UnitAttempt,
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+) -> Result<S::Output, WidenReason> {
+    let mut state = S::BudgetState::default();
+    let mut skipped = 0;
+    let mut products = Vec::new();
+    for (seed, key) in seeds {
+        let prefix = match reuse.published(key)? {
+            Some(product) => {
+                attempt.reused();
+                slice.decode(&seed, product)?
+            }
+            None => {
+                let Some(allowance) = slice.remaining(&state) else {
+                    skipped += 1;
+                    continue;
+                };
+                attempt.recomputed();
+                let capture = slice.capture(analyzer);
+                let (mut result, reads, elapsed) = recompute_unit(
+                    analyzer,
+                    cancellation,
+                    || format!("policy={} partition={:?}", reuse.policy_id, key.partition),
+                    || slice.prefix(&seed, allowance),
+                );
+                if let Ok(prefix) = &mut result {
+                    slice.after_recompute(prefix, &capture, cancellation);
+                }
+                reuse.record_recompute(elapsed);
+                let prefix = match result {
+                    Ok(prefix) => prefix,
+                    Err(error) => return Ok(slice.failure(error, products)),
+                };
+                slice.charge(&mut state, &prefix);
+                match reads {
+                    Some(reads) => {
+                        slice.validate(&prefix)?;
+                        if slice.publishable(&prefix) {
+                            reuse.publish(key.clone(), slice.encode(&prefix), reads);
+                        }
+                    }
+                    None => slice.missing_reads(attempt)?,
+                }
+                prefix
+            }
+        };
+        slice.validate(&prefix)?;
+        products.push(prefix);
+    }
+    Ok(slice.suffix(slice.merge(products), skipped))
+}
+
+struct FileQuerySlice<'a, F> {
+    query: &'a CodeQuery,
+    execution: &'a UnitQueryExecution<'a>,
+    execute: F,
+}
+
+impl<'a, F> UnitSlice for FileQuerySlice<'a, F>
+where
+    F: Fn((&'a ProjectFile, CodeQueryExecutionLimits)) -> UnitExecutionResult,
+{
+    type Capture<'b> = AnalyzerQueryScope<'b>;
+    type Seed = &'a ProjectFile;
+    type Prefix = UnitExecutionResult;
+    type Error = std::convert::Infallible;
+    type BudgetState = (
+        brokk_bifrost_rql::structural::search::CodeQueryExecutionWork,
+        brokk_bifrost_rql::structural::CodeQueryBudgetedWork,
+    );
+    type Allowance = CodeQueryExecutionLimits;
+    type Merged = MergedUnitRows;
+    type Output = MergedUnitRows;
+
+    fn remaining(&self, state: &Self::BudgetState) -> Option<Self::Allowance> {
+        remaining_unit_limits(self.execution.limits, &state.0, &state.1)
+    }
+
+    fn prefix(
+        &self,
+        file: &Self::Seed,
+        allowance: Self::Allowance,
+    ) -> Result<Self::Prefix, Self::Error> {
+        Ok((self.execute)((file, allowance)))
+    }
+
+    fn decode(
+        &self,
+        _seed: &Self::Seed,
+        product: PolicyUnitProduct,
+    ) -> Result<Self::Prefix, WidenReason> {
+        product.into_rows().ok_or(WidenReason::ProductLoadFailed)
+    }
+
+    fn encode(&self, prefix: &Self::Prefix) -> PolicyUnitProduct {
+        PolicyUnitProduct::Rows(prefix.clone())
+    }
+
+    fn charge(&self, state: &mut Self::BudgetState, rows: &Self::Prefix) {
+        state.0 = state.0.saturating_add(rows.work);
+        if state.1.step_outputs.is_empty() {
+            state
+                .1
+                .step_outputs
+                .resize(rows.budgeted_work.step_outputs.len(), 0);
+        }
+        state.1 = state.1.saturating_add(&rows.budgeted_work);
+    }
+
+    fn capture<'b>(&self, analyzer: &'b dyn IAnalyzer) -> Self::Capture<'b> {
+        AnalyzerQueryScope::capturing_read_incompleteness(analyzer)
+    }
+
+    fn after_recompute(
+        &self,
+        rows: &mut Self::Prefix,
+        scope: &Self::Capture<'_>,
+        cancellation: Option<&CancellationToken>,
+    ) {
+        let active_cancellation = self.execution.analyzer.active_query_cancellation();
+        fold_unit_execution_state(rows, scope, cancellation.or(active_cancellation.as_ref()));
+    }
+
+    fn publishable(&self, rows: &Self::Prefix) -> bool {
+        check_exhaustive_rows(rows).is_ok()
+            && !rows.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.incompleteness,
+                    brokk_bifrost_rql::Incompleteness::Operational(_)
+                )
+            })
+    }
+
+    fn failure(&self, error: Self::Error, _products: Vec<Self::Prefix>) -> Self::Output {
+        match error {}
+    }
+
+    fn merge(&self, products: impl IntoIterator<Item = Self::Prefix>) -> Self::Merged {
+        merge_unit_rows(self.query, products)
+    }
+
+    fn suffix(&self, mut merged: Self::Merged, skipped: usize) -> Self::Output {
+        merged.apply_result_limit(self.query.limit);
+        if skipped > 0 {
+            merged.truncated = true;
+            push_skipped_unit_diagnostic(&mut merged.diagnostics, skipped);
+        }
+        merged
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QuerySlicingWiden {
     pub(crate) reason: WidenReason,
@@ -712,10 +986,8 @@ pub(crate) fn frontier_slicing_widen_reason(query: &CodeQuery) -> Option<WidenRe
 /// Execute one query as the merge of one execution per seed file.
 ///
 /// `Err` is the demand to evaluate the whole policy instead, with the reason
-/// that demand exists. `Ok` is a row vector equal to the one a whole execution
-/// would have produced: every unit was exhaustive, diagnostic-free and fully
-/// attributed, and the merged counters proved that no cumulative cap the whole
-/// execution enforces was reached.
+/// that demand exists. `Ok` contains correct rows and reports incompleteness
+/// when units truncate, cannot record their reads, or exhaust the budget.
 ///
 /// `partition` spells how one seed file's unit is keyed, because a policy may
 /// run more than one query over the same seeds and two queries of one policy
@@ -744,14 +1016,6 @@ pub(crate) fn sliced_query_units(
 
     let seed_files = plan_seed_files(&query.plan, execution.workspace_files);
     attempt.enumerated(seed_files.len());
-    let shared = execution.subject_batch.and_then(|batch| {
-        batch.query_units(
-            query,
-            execution.analyzer,
-            execution.workspace,
-            execution.limits,
-        )
-    });
     let inputs = incremental.inputs();
 
     let mut keys = Vec::with_capacity(seed_files.len());
@@ -778,70 +1042,103 @@ pub(crate) fn sliced_query_units(
         Some(brokk_bifrost_rql::structural::unit_plan_node_count(query)),
     )?;
 
-    let mut products = Vec::with_capacity(seed_files.len());
-    for (file, key) in seed_files.iter().zip(keys.iter()) {
-        let rows = match reuse.published(key)? {
-            Some(product) => {
-                attempt.reused();
-                let Some(rows) = product.into_rows() else {
-                    // One key names one product shape. A unit published under a
-                    // query key that carries anything else is a store that
-                    // answered a different question.
-                    return Err(WidenReason::ProductLoadFailed);
-                };
-                check_exhaustive_rows(&rows)?;
-                rows
+    let slice = FileQuerySlice {
+        query,
+        execution,
+        execute: |(file, remaining)| {
+            let shared = execution.subject_batch.and_then(|batch| {
+                batch.query_units(query, execution.analyzer, execution.workspace, remaining)
+            });
+            let execute = || {
+                let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+                    format!("policy.query_unit[{}]", rel_path_string(file))
+                });
+                execute_code_query_unit(
+                    execution.analyzer,
+                    execution.flow_state.clone(),
+                    execution.workspace,
+                    query,
+                    remaining,
+                    execution.cancellation,
+                    CodeQueryExecutionScope::for_seed_files(
+                        std::slice::from_ref(file),
+                        execution.workspace_files,
+                    ),
+                )
+            };
+            match &shared {
+                Some(shared) => shared.execute(
+                    Some(file),
+                    execution.analyzer,
+                    execution.cancellation,
+                    execute,
+                ),
+                None => execute(),
             }
-            None => {
-                attempt.recomputed();
-                let (rows, reads, elapsed) =
-                    recompute_unit(execution.analyzer, execution.cancellation, || {
-                        let execute = || {
-                            let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
-                                format!("policy.query_unit[{}]", rel_path_string(file))
-                            });
-                            execute_code_query_unit(
-                                execution.analyzer,
-                                execution.flow_state.clone(),
-                                execution.workspace,
-                                query,
-                                execution.limits,
-                                execution.cancellation,
-                                CodeQueryExecutionScope::for_seed_files(
-                                    std::slice::from_ref(file),
-                                    execution.workspace_files,
-                                ),
-                            )
-                        };
-                        match &shared {
-                            Some(shared) => shared.execute(
-                                Some(file),
-                                execution.analyzer,
-                                execution.cancellation,
-                                execute,
-                            ),
-                            None => execute(),
-                        }
-                    });
-                reuse.record_recompute(elapsed);
-                let Some(reads) = reads else {
-                    attempt.unbounded();
-                    return Err(WidenReason::UnitUnbounded);
-                };
-                check_exhaustive_rows(&rows)?;
-                reuse.publish(key.clone(), PolicyUnitProduct::Rows(rows.clone()), reads);
-                rows
-            }
-        };
-        products.push(rows);
-    }
-
-    let merged = merge_unit_rows(query, products);
-    if let Some(limit) = merged.reached_limit(&execution.limits, query.limit) {
-        attempt.set_widen_detail(Some(PlanWidenDetail::MergedLimit(limit)));
-        return Err(WidenReason::MergedLimitReached);
-    }
+        },
+    };
+    let merged = evaluate_reusable_slice(
+        &slice,
+        seed_files.iter().zip(keys.iter()),
+        reuse,
+        attempt,
+        execution.analyzer,
+        execution.cancellation,
+    )?;
     Ok(SlicedQuery { merged, keys })
+}
+
+/// Preserve operational failures observed inside nested unit scopes, including
+/// failures that arrive after the executor has rendered its rows.
+fn fold_unit_execution_state(
+    rows: &mut UnitExecutionResult,
+    scope: &AnalyzerQueryScope<'_>,
+    cancellation: Option<&CancellationToken>,
+) {
+    use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    use brokk_bifrost_rql::{
+        CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
+        DiagnosticExecutionCause, Incompleteness,
+    };
+    let mut reasons = scope.captured_read_incompleteness();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        reasons.push(QueryReadIncomplete::Cancelled);
+    }
+    for reason in reasons {
+        let (code, cause, message) = match reason {
+            QueryReadIncomplete::StoreFailure(error) => (
+                CodeQueryDiagnosticCode::SemanticProviderFailed,
+                DiagnosticExecutionCause::Provider,
+                error.to_string(),
+            ),
+            QueryReadIncomplete::Cancelled => (
+                CodeQueryDiagnosticCode::Cancelled,
+                DiagnosticExecutionCause::Cancelled,
+                "query_code cancelled; any already-produced results are partial".to_owned(),
+            ),
+            _ => continue,
+        };
+        if !rows.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == code
+                && (code == CodeQueryDiagnosticCode::Cancelled || diagnostic.message == message)
+        }) {
+            rows.diagnostics
+                .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    code,
+                    incompleteness: Incompleteness::Operational(cause),
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message,
+                    exhausted_roots: Vec::new(),
+                    related: Vec::new(),
+                    source: None,
+                    withheld_rows_path: None,
+                }));
+        }
+    }
+    rows.completion =
+        brokk_bifrost_rql::structural::code_query_completion(rows.truncated, &rows.diagnostics);
 }
 
 /// Truncation prevents a partition from representing its complete rows.
@@ -870,6 +1167,176 @@ mod cache_fill_tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#8314: retained unbounded unit rows lost late store failure or cancellation")]
+    fn recomputed_unit_operational_failure_reaches_the_merged_answer() {
+        use brokk_bifrost_analysis::CodeUnitIndex;
+        use brokk_bifrost_rust_analysis::RustAnalyzer;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("app.rs", "pub fn value() -> i32 { 1 }")
+            .build();
+        let analyzer = RustAnalyzer::from_project(fixture.project().clone());
+        let query = CodeQuery::from_json(&serde_json::json!({
+            "languages": ["rust"], "match": {"kind": "function"}, "limit": 10,
+        }))
+        .unwrap();
+        let files = analyzer.analyzed_files();
+        for store_failure in [true, false] {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+            let cancellation = CancellationToken::new();
+            let (mut rows, reads, _) = recompute_unit(
+                &analyzer,
+                Some(&cancellation),
+                || "policy=test.operational partition=seed:app.rs".to_owned(),
+                || {
+                    let rows = execute_code_query_unit(
+                        &analyzer,
+                        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                        None,
+                        &query,
+                        Default::default(),
+                        None,
+                        CodeQueryExecutionScope::for_seed_files(&files, &files),
+                    );
+                    assert_eq!(
+                        rows.rows.len(),
+                        1,
+                        "the unit really executed before failure"
+                    );
+                    if store_failure {
+                        analyzer.record_query_failure(StoreError::new(
+                            "injected late unit store failure",
+                        ));
+                    } else {
+                        cancellation.cancel();
+                    }
+                    rows
+                },
+            );
+            assert!(reads.is_none());
+            fold_unit_execution_state(&mut rows, &scope, Some(&cancellation));
+            let merged = merge_unit_rows(&query, [rows]);
+            assert_eq!(merged.items.len(), 1, "retain the answer already computed");
+            assert_ne!(
+                merged.completion(),
+                brokk_bifrost_rql::CodeQueryCompletion::Complete
+            );
+            assert!(
+                merged
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| if store_failure {
+                        diagnostic.message == "injected late unit store failure"
+                    } else {
+                        diagnostic.code == brokk_bifrost_rql::CodeQueryDiagnosticCode::Cancelled
+                    })
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#8410: refused unit ledgers omitted the first refusing read and its producer")]
+    fn refused_unit_note_names_first_unattributed_read() {
+        const CHILD: &str = "BIFROST_TEST_REFUSAL_NOTE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let fixture = InlineTestProject::with_language(Language::Cpp)
+                .file("app.cpp", "int value = 1;")
+                .build();
+            let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+            let (_, reads, _) = recompute_unit(
+                &analyzer,
+                None,
+                || "policy=test.refusal partition=seed:app.cpp".to_owned(),
+                || {
+                    let ledger = ReadLedger::new();
+                    let _reason = brokk_bifrost_analysis::profiling::read_refusal_scope(Some(
+                        brokk_bifrost_analysis::profiling::ReadRefusal {
+                            kind: "unattributed",
+                            reason: "Unattributed(CallContextUnavailable)".to_owned(),
+                            origin: std::panic::Location::caller(),
+                        },
+                    ));
+                    ledger.record_unattributed();
+                    drop(_reason);
+                    // Exercise nested-capture forwarding, rather than only a direct read.
+                    brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(
+                        &analyzer, &ledger,
+                    );
+                    analyzer.mark_execution_dependent();
+                },
+            );
+            assert!(reads.is_none());
+            let (_, reads, _) = recompute_unit(
+                &analyzer,
+                None,
+                || "policy=test.refusal partition=execution-only".to_owned(),
+                || {
+                    brokk_bifrost_analysis::analyzer::i_analyzer::capture_nested_reads(
+                        &analyzer,
+                        || {
+                            brokk_bifrost_analysis::analyzer::capture_query_reads(
+                                &analyzer,
+                                || {
+                                    analyzer.record_unattributed_read();
+                                    let _execution =
+                                        brokk_bifrost_analysis::profiling::read_refusal_scope(
+                                            Some(brokk_bifrost_analysis::profiling::ReadRefusal {
+                                                kind: "execution_dependent",
+                                                reason: "ExecutionDependent(TestExecutionCause)"
+                                                    .to_owned(),
+                                                origin: std::panic::Location::caller(),
+                                            }),
+                                        );
+                                    analyzer.mark_execution_dependent();
+                                },
+                            );
+                        },
+                    );
+                },
+            );
+            assert!(reads.is_none());
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unit_execution::cache_fill_tests::refused_unit_note_names_first_unattributed_read",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("BIFROST_TIMING", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap().replace('\\', "/");
+        let notes: Vec<_> = stderr
+            .lines()
+            .filter(|line| line.contains("cause=ledger_refused"))
+            .collect();
+        assert_eq!(notes.len(), 2, "{stderr}");
+        assert!(
+            notes[0].contains("policy=test.refusal partition=seed:app.cpp"),
+            "{stderr}"
+        );
+        assert!(
+            notes[0].contains("kind=unattributed reason=Unattributed(CallContextUnavailable)"),
+            "{stderr}"
+        );
+        assert!(
+            notes[0].contains("origin=crates/bifrost-policy/src/unit_execution.rs:"),
+            "{stderr}"
+        );
+        assert!(notes[1].contains("partition=execution-only"), "{stderr}");
+        assert!(
+            notes[1]
+                .contains("kind=execution_dependent reason=ExecutionDependent(TestExecutionCause)"),
+            "{stderr}"
+        );
+        assert!(notes[1].contains("unattributed=0 execution=1"), "{stderr}");
+        eprintln!("{}\n{}", notes[0], notes[1]);
+    }
+
+    #[test]
     #[hardwon(
         "#7876: removing global degraded-fill refusal must keep consuming policy units unbounded"
     )]
@@ -887,19 +1354,24 @@ mod cache_fill_tests {
             ),
         ] {
             let cache = QueryCacheCell::new();
-            let ((value, failure), reads, _) = recompute_unit(&analyzer, None, || {
-                let scope = AnalyzerQueryScope::new(&analyzer);
-                let value = complete_query_cache_cell(&analyzer, &cache, || {
-                    match &reason {
-                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(
-                            error,
-                        ) => analyzer.record_query_failure(error.clone()),
-                        reason => analyzer.record_query_incomplete(reason.clone()),
-                    }
-                    17
-                });
-                (value, scope.read_completion())
-            });
+            let ((value, failure), reads, _) = recompute_unit(
+                &analyzer,
+                None,
+                || "policy=test partition=test".to_owned(),
+                || {
+                    let scope = AnalyzerQueryScope::new(&analyzer);
+                    let value = complete_query_cache_cell(&analyzer, &cache, || {
+                        match &reason {
+                            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(
+                                error,
+                            ) => analyzer.record_query_failure(error.clone()),
+                            reason => analyzer.record_query_incomplete(reason.clone()),
+                        }
+                        17
+                    });
+                    (value, scope.read_completion())
+                },
+            );
             assert_eq!(
                 value, 17,
                 "the degraded build returned its best-effort answer"
@@ -918,9 +1390,12 @@ mod cache_fill_tests {
                 "the consuming policy unit must remain unbounded: {reason:?}"
             );
 
-            let (value, reads, _) = recompute_unit(&analyzer, None, || {
-                complete_query_cache_cell(&analyzer, &cache, || 29)
-            });
+            let (value, reads, _) = recompute_unit(
+                &analyzer,
+                None,
+                || "policy=test partition=test".to_owned(),
+                || complete_query_cache_cell(&analyzer, &cache, || 29),
+            );
             assert_eq!(value, 29, "a later request rebuilt the cache");
             assert_eq!(cache.get(), Some(&29));
             assert!(
@@ -950,6 +1425,107 @@ mod field_slot_verification_tests {
     use brokk_bifrost_flow::type_flow::field_slot_class_identity;
     use brokk_bifrost_test_macros::hardwon;
     use std::sync::Mutex;
+
+    #[test]
+    #[hardwon(
+        "#8287: physical budget walls widened sliced policies instead of reporting partial rows"
+    )]
+    fn sliced_units_stop_at_the_request_budget_without_publishing_partial_units() {
+        let fixture = InlineTestProject::with_language(Language::TypeScript)
+            .with_git()
+            .file("a.ts", "export function a() {}\nexport function aa() {}\n")
+            .file("b.ts", "export function b() {}\n")
+            .file("c.ts", "export function c() {}\n")
+            .build();
+        let workspace = WorkspaceAnalyzer::build_persisted(
+            Arc::new(FilesystemProject::new(fixture.root()).unwrap()),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let registry = crate::test_support::registry_with_policy(
+            "test:budget-units",
+            r#"(policy
+            :id "test.budget-units" :name "Budget units" :message "Matched" :severity warning
+            :analysis (analysis :type match :selector (rql (language typescript (function)))))"#,
+            "policy",
+        );
+        let policy = registry.policies().next().unwrap();
+        let changed = ChangedFacts::between(&workspace, &workspace);
+        assert!(changed.is_complete());
+        let snapshot = workspace_snapshot(&workspace).unwrap();
+        let store = Mutex::new(crate::units::InMemoryPolicyUnitStore::new());
+        let context = PolicyIncrementalContext::new(
+            &store,
+            &workspace,
+            &changed,
+            WorkspaceUnitInputs::of(&workspace, None),
+            IncrementalBaseState::Evaluated,
+            UnitSnapshots {
+                base: snapshot,
+                head: snapshot,
+            },
+        );
+        let limits = CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..Default::default()
+        };
+        let budget = PolicyBudget::builder()
+            .with_query_limits(limits)
+            .unwrap()
+            .build()
+            .unwrap();
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let query = CodeQuery::from_json(&serde_json::json!({
+            "languages": ["typescript"], "match": {"kind": "function"}, "limit": 1,
+        }))
+        .unwrap();
+        let files = workspace.analyzer().analyzed_files();
+        let execution = UnitQueryExecution {
+            analyzer: workspace.analyzer(),
+            flow_state: (&flow).into(),
+            workspace: Some(&workspace),
+            cancellation: None,
+            limits,
+            workspace_files: &files,
+            subject_batch: None,
+        };
+        let mut reuse = UnitReuse::new(policy, &context, &budget, &flow);
+        let mut attempt = UnitAttempt::default();
+        let sliced = sliced_query_units(
+            policy,
+            &query,
+            &mut reuse,
+            &execution,
+            SeedPartition::seed,
+            &mut attempt,
+        )
+        .expect("budget exhaustion must not widen");
+        assert_eq!(attempt.recomputed, 1);
+        assert_eq!(attempt.total, 3);
+        assert_eq!(sliced.merged.items.len(), 1);
+        assert!(sliced.merged.truncated);
+        assert_ne!(
+            sliced.merged.completion(),
+            brokk_bifrost_rql::CodeQueryCompletion::Complete
+        );
+        assert!(
+            sliced
+                .merged
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == brokk_bifrost_rql::CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                    && diagnostic.message.contains("skipped 2 units"))
+        );
+        for key in sliced.keys {
+            assert!(
+                context
+                    .staged_unit(&policy.definition().metadata.id, &key)
+                    .is_none(),
+                "truncated and skipped units must not be published"
+            );
+        }
+    }
 
     #[test]
     #[hardwon(
@@ -1032,26 +1608,31 @@ mod field_slot_verification_tests {
         // Exercise the recorder -> persisted unit -> head verifier boundary.
         // Query build reads are subsumed by these exact Class/Whole receipts,
         // as in the RQL producer; no dispatch question obscures verification.
-        let (product, reads, _) = recompute_unit(base.analyzer(), None, || {
-            for (subject, answer) in subjects.iter().zip(before) {
-                record_workspace_authority_read(
-                    base.analyzer(),
-                    WorkspaceFactFamily::FieldSlots,
-                    AuthorityInputs::Fact {
-                        language: Language::Python,
-                        subject: subject.clone(),
-                        answer,
-                    },
-                );
-            }
-            PolicyUnitProduct::AssertFile(AssertFileProduct {
-                findings: Vec::new(),
-                unconcluded: Vec::new(),
-                row_completions: Vec::new(),
-                diagnostics: Vec::new(),
-                work: Default::default(),
-            })
-        });
+        let (product, reads, _) = recompute_unit(
+            base.analyzer(),
+            None,
+            || "policy=test partition=test".to_owned(),
+            || {
+                for (subject, answer) in subjects.iter().zip(before) {
+                    record_workspace_authority_read(
+                        base.analyzer(),
+                        WorkspaceFactFamily::FieldSlots,
+                        AuthorityInputs::Fact {
+                            language: Language::Python,
+                            subject: subject.clone(),
+                            answer,
+                        },
+                    );
+                }
+                PolicyUnitProduct::AssertFile(AssertFileProduct {
+                    findings: Vec::new(),
+                    unconcluded: Vec::new(),
+                    row_completions: Vec::new(),
+                    diagnostics: Vec::new(),
+                    work: Default::default(),
+                })
+            },
+        );
         let reads = reads.expect("bounded unit receipt");
         assert_eq!(
             reads.len(),
@@ -1074,6 +1655,7 @@ mod field_slot_verification_tests {
         let mut store = PersistedPolicyUnitStore::new(Arc::clone(base.store().expect("store")));
         store.publish(PolicyUnit::new(
             key.clone(),
+            Some(brokk_bifrost_analysis::gitblob::ParseVariant::Empty),
             product,
             reads,
             BudgetMode::Exhaustive,
@@ -1227,3 +1809,7 @@ mod field_slot_verification_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "unit_execution/field_slot_shareability_tests.rs"]
+mod field_slot_shareability_tests;

@@ -2944,6 +2944,7 @@ struct CompletedPathDominance {
 
 fn completed_path_dominance_with_poll(
     completed: &[CompletedPath],
+    rules: &dyn super::precedence::PrecedenceRules,
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> Option<CompletedPathDominance> {
@@ -2954,18 +2955,20 @@ fn completed_path_dominance_with_poll(
             if selection_cancelled(work, cancellation) {
                 return None;
             }
-            if path_shadows_with_poll(
+            if path_shadows_with_rules(
                 &completed[left].path,
                 &completed[right].path,
+                rules,
                 cancellation,
                 work,
             )? {
                 dominance[left].push(right);
                 indegree[right] += 1;
             }
-            if path_shadows_with_poll(
+            if path_shadows_with_rules(
                 &completed[right].path,
                 &completed[left].path,
+                rules,
                 cancellation,
                 work,
             )? {
@@ -3025,6 +3028,7 @@ struct AugmentedPathRelation {
 fn augmented_path_relation_with_poll(
     completed: &[CompletedPath],
     terminals: &[IncompleteTerminalPath],
+    rules: &dyn super::precedence::PrecedenceRules,
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> Option<AugmentedPathRelation> {
@@ -3070,11 +3074,11 @@ fn augmented_path_relation_with_poll(
             if selection_cancelled(work, cancellation) {
                 return None;
             }
-            if path_shadows_with_poll(path(left), path(right), cancellation, work)? {
+            if path_shadows_with_rules(path(left), path(right), rules, cancellation, work)? {
                 dominance[left].push(right);
                 indegree[right] += 1;
             }
-            if path_shadows_with_poll(path(right), path(left), cancellation, work)? {
+            if path_shadows_with_rules(path(right), path(left), rules, cancellation, work)? {
                 dominance[right].push(left);
                 indegree[left] += 1;
             }
@@ -3151,6 +3155,26 @@ pub(super) fn select_paths_with_cancellation_evidence(
     cancellation_evidence: ResolutionCompletion,
     cancellation: &CancellationToken,
 ) -> ResolutionAnswer {
+    select_paths_with_rules(
+        reference,
+        completed,
+        terminals,
+        unconditional_completion,
+        cancellation_evidence,
+        &super::precedence::DefaultPrecedenceRules,
+        cancellation,
+    )
+}
+
+pub(super) fn select_paths_with_rules(
+    reference: SemanticId,
+    completed: &[CompletedPath],
+    terminals: &[IncompleteTerminalPath],
+    unconditional_completion: ResolutionCompletion,
+    cancellation_evidence: ResolutionCompletion,
+    rules: &dyn super::precedence::PrecedenceRules,
+    cancellation: &CancellationToken,
+) -> ResolutionAnswer {
     let mut work = 0_usize;
     let mut selection_completion = BatchCompletionLedger::default();
     let mut cancelled =
@@ -3183,7 +3207,7 @@ pub(super) fn select_paths_with_cancellation_evidence(
         dominance,
         indegree,
         visited,
-    }) = completed_path_dominance_with_poll(completed, cancellation, &mut work)
+    }) = completed_path_dominance_with_poll(completed, rules, cancellation, &mut work)
     else {
         return cancelled_selection_from_ledger(
             conservative,
@@ -3300,7 +3324,13 @@ pub(super) fn select_paths_with_cancellation_evidence(
     };
     let mut lookup_decision = None;
     if precedence_consistent && !terminals.is_empty() {
-        match augmented_path_relation_with_poll(completed, terminals, cancellation, &mut work) {
+        match augmented_path_relation_with_poll(
+            completed,
+            terminals,
+            rules,
+            cancellation,
+            &mut work,
+        ) {
             None => cancelled = true,
             Some(relation) => {
                 let total = relation.dominance.len();
@@ -3546,12 +3576,38 @@ pub(super) fn select_paths_with_lazy_access(
     cancellation: &CancellationToken,
     access_lookup: &mut SelectionAccessLookup<'_>,
 ) -> StoreResult<ResolutionAnswer> {
-    select_paths_with_lazy_candidate_filter(
+    select_paths_with_lazy_access_using_rules(
         reference,
         completed,
         terminals,
         unconditional_completion,
         cancellation_evidence,
+        &super::precedence::DefaultPrecedenceRules,
+        cancellation,
+        access_lookup,
+    )
+}
+
+// The policy extends the existing selection inputs without changing the
+// wrapper's call shape for languages that use the default total order.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_paths_with_lazy_access_using_rules(
+    reference: SemanticId,
+    completed: Vec<CompletedPath>,
+    terminals: Vec<IncompleteTerminalPath>,
+    unconditional_completion: ResolutionCompletion,
+    cancellation_evidence: ResolutionCompletion,
+    rules: &dyn super::precedence::PrecedenceRules,
+    cancellation: &CancellationToken,
+    access_lookup: &mut SelectionAccessLookup<'_>,
+) -> StoreResult<ResolutionAnswer> {
+    select_paths_with_lazy_candidate_filter_using_rules(
+        reference,
+        completed,
+        terminals,
+        unconditional_completion,
+        cancellation_evidence,
+        rules,
         cancellation,
         &mut |reference, targets| {
             let Some(decisions) = access_lookup(reference, targets)? else {
@@ -3582,21 +3638,45 @@ pub(super) fn select_paths_with_lazy_access(
 /// removes at least one current candidate and makes the next selection progress.
 pub(super) fn select_paths_with_lazy_candidate_filter(
     reference: SemanticId,
-    mut completed: Vec<CompletedPath>,
+    completed: Vec<CompletedPath>,
     terminals: Vec<IncompleteTerminalPath>,
     unconditional_completion: ResolutionCompletion,
     cancellation_evidence: ResolutionCompletion,
     cancellation: &CancellationToken,
     filter: &mut impl FnMut(SemanticId, &[SemanticId]) -> StoreResult<Option<HashSet<SemanticId>>>,
 ) -> StoreResult<ResolutionAnswer> {
+    select_paths_with_lazy_candidate_filter_using_rules(
+        reference,
+        completed,
+        terminals,
+        unconditional_completion,
+        cancellation_evidence,
+        &super::precedence::DefaultPrecedenceRules,
+        cancellation,
+        filter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_paths_with_lazy_candidate_filter_using_rules(
+    reference: SemanticId,
+    mut completed: Vec<CompletedPath>,
+    terminals: Vec<IncompleteTerminalPath>,
+    unconditional_completion: ResolutionCompletion,
+    cancellation_evidence: ResolutionCompletion,
+    rules: &dyn super::precedence::PrecedenceRules,
+    cancellation: &CancellationToken,
+    filter: &mut impl FnMut(SemanticId, &[SemanticId]) -> StoreResult<Option<HashSet<SemanticId>>>,
+) -> StoreResult<ResolutionAnswer> {
     let mut work = 0_usize;
     loop {
-        let answer = select_paths_with_cancellation_evidence(
+        let answer = select_paths_with_rules(
             reference,
             &completed,
             &terminals,
             unconditional_completion.clone(),
             cancellation_evidence.clone(),
+            rules,
             cancellation,
         );
         if answer
@@ -4060,17 +4140,35 @@ fn path_shadows_with_poll(
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> Option<bool> {
+    path_shadows_with_rules(
+        left,
+        right,
+        &super::precedence::DefaultPrecedenceRules,
+        cancellation,
+        work,
+    )
+}
+
+fn path_shadows_with_rules(
+    left: &PartialPath,
+    right: &PartialPath,
+    rules: &dyn super::precedence::PrecedenceRules,
+    cancellation: &CancellationToken,
+    work: &mut usize,
+) -> Option<bool> {
+    use super::precedence::{BindingScopeRelation, Shadowing};
     let origin_rank = |path: &PartialPath| {
         path.precedence()
             .iter()
             .rfind(|step| step.tier == PrecedenceTier::CandidateOriginRank)
             .map(|step| step.ordinal)
     };
-    if let (Some(left_rank), Some(right_rank)) = (origin_rank(left), origin_rank(right)) {
-        match left_rank.cmp(&right_rank) {
-            std::cmp::Ordering::Less => return Some(true),
-            std::cmp::Ordering::Greater => return Some(false),
-            std::cmp::Ordering::Equal => {}
+    let ranks = origin_rank(left).zip(origin_rank(right));
+    if let Some((left_rank, right_rank)) = ranks {
+        match rules.shadows(left_rank, right_rank, BindingScopeRelation::Unrelated) {
+            Shadowing::Shadows => return Some(true),
+            Shadowing::Shadowed => return Some(false),
+            Shadowing::Incomparable => {}
         }
     }
     for left_step in left.precedence() {
@@ -4095,10 +4193,42 @@ fn path_shadows_with_poll(
         {
             continue;
         }
-        match (left_step.tier, left_step.ordinal).cmp(&(right_step.tier, right_step.ordinal)) {
-            std::cmp::Ordering::Less => return Some(true),
-            std::cmp::Ordering::Greater => return Some(false),
-            std::cmp::Ordering::Equal => {}
+        if let Some((left_rank, right_rank)) = ranks {
+            let binder = |step: &PrecedenceStep| {
+                step.ordinal == 0
+                    && matches!(
+                        step.tier,
+                        PrecedenceTier::LexicalBinding
+                            | PrecedenceTier::ExplicitImport
+                            | PrecedenceTier::WildcardImport
+                            | PrecedenceTier::PackageOrModule
+                            | PrecedenceTier::OtherCompilationUnitPackage
+                    )
+            };
+            let outward = |step: &PrecedenceStep| {
+                step.tier == PrecedenceTier::LexicalBinding && step.ordinal == 1
+            };
+            let relation = if binder(left_step) && outward(right_step) {
+                Some(BindingScopeRelation::Inner)
+            } else if outward(left_step) && binder(right_step) {
+                Some(BindingScopeRelation::Outer)
+            } else if binder(left_step) && binder(right_step) {
+                Some(BindingScopeRelation::Same)
+            } else {
+                None
+            };
+            if let Some(result) = rules.shared_choice_shadowing(
+                Some((left_rank, right_rank)),
+                relation,
+                left_step,
+                right_step,
+            ) {
+                return Some(result == Shadowing::Shadows);
+            }
+            continue;
+        }
+        if let Some(result) = rules.shared_choice_shadowing(None, None, left_step, right_step) {
+            return Some(result == Shadowing::Shadows);
         }
     }
     Some(false)
@@ -4431,6 +4561,7 @@ mod tests {
         StackVariableId, TypeTransferValueTransform,
     };
     use super::super::partial_path_id_for_test as path_id;
+    use super::super::precedence::{SCALA_PRECEDENCE_RULES, Shadowing};
     use super::super::runtime_type_for_test as runtime_type;
     use super::*;
     use crate::analyzer::resolution::test_support::{fragment, node, semantic};
@@ -4450,6 +4581,181 @@ mod tests {
         BoundedResolution, ResolutionSession,
     };
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn sequential_scala_imports_and_package_share_scope() {
+        let package_head = node("scala-package-clause-source");
+        let first_import = node("scala-first-import-checkpoint");
+        let second_import = node("scala-second-import-checkpoint");
+        let metadata = super::super::batch::FactReferenceSiteMetadata::new(
+            ResolutionSiteId::new(1),
+            ResolutionNamespace::Type,
+            ResolutionSiteKind::SyntheticReference,
+            10,
+            11,
+            true,
+            None,
+            None,
+        );
+        let evidence = super::super::batch::ReferenceLocalPathEvidence::new(
+            metadata,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            true,
+        )
+        .with_ordered_checkpoint_ancestry(vec![
+            (second_import, 0),
+            (first_import, 1),
+            (package_head, 2),
+        ]);
+        // Checkpoints still gate visibility, but SLS chapter 2 places both
+        // imports in the enclosing package body's scope with its definitions.
+        let first = evidence.binding_scope_coordinate(package_head).unwrap();
+        let second = evidence.binding_scope_coordinate(package_head).unwrap();
+        let package = evidence.binding_scope_coordinate(package_head).unwrap();
+        let same_file_definition = evidence.binding_scope_coordinate(package_head).unwrap();
+        assert_eq!(first, second);
+        assert!(package.outward.is_empty());
+        assert_eq!(same_file_definition, package);
+        assert_eq!(
+            SCALA_PRECEDENCE_RULES.shadows(1, 1, second.relative_to(&first)),
+            Shadowing::Incomparable
+        );
+        assert_eq!(
+            SCALA_PRECEDENCE_RULES.shadows(1, 2, first.relative_to(&package)),
+            Shadowing::Shadows
+        );
+        assert_eq!(
+            SCALA_PRECEDENCE_RULES.shadows(2, 1, first.relative_to(&second)),
+            Shadowing::Shadowed
+        );
+    }
+
+    #[test]
+    #[hardwon("#8279: native bound one of two same-precedence Scala bindings")]
+    fn scala_path_trace_keeps_outer_stronger_binding_incomparable() {
+        let checkpoint = semantic("scala-import-checkpoint-choice");
+        let package = semantic("scala-package-choice");
+        let step = |semantic, tier, ordinal| PrecedenceStep {
+            semantic,
+            tier,
+            ordinal,
+        };
+        let inner_import = path(
+            node("scala-inner-start"),
+            node("scala-inner-end"),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                step(checkpoint, PrecedenceTier::ExplicitImport, 0),
+                step(checkpoint, PrecedenceTier::CandidateOriginRank, 1),
+            ],
+        );
+        let outer_definition = path(
+            node("scala-outer-start"),
+            node("scala-outer-end"),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                step(checkpoint, PrecedenceTier::LexicalBinding, 1),
+                step(package, PrecedenceTier::LexicalBinding, 0),
+                step(package, PrecedenceTier::CandidateOriginRank, 0),
+            ],
+        );
+        let cancellation = CancellationToken::new();
+        let mut work = 0;
+        assert_eq!(
+            path_shadows_with_rules(
+                &inner_import,
+                &outer_definition,
+                SCALA_PRECEDENCE_RULES,
+                &cancellation,
+                &mut work,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            path_shadows_with_rules(
+                &outer_definition,
+                &inner_import,
+                SCALA_PRECEDENCE_RULES,
+                &cancellation,
+                &mut work,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            path_shadows_with_rules(
+                &outer_definition,
+                &inner_import,
+                &super::super::precedence::DefaultPrecedenceRules,
+                &cancellation,
+                &mut work,
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[hardwon("#8279: identical reference choice hid an inner Scala local binder")]
+    fn scala_path_trace_skips_common_prefix_before_inner_binder() {
+        let reference = semantic("scala-local-reference-choice");
+        let inner = semantic("scala-inner-local-choice");
+        let outer = semantic("scala-outer-local-choice");
+        let step = |semantic, tier, ordinal| PrecedenceStep {
+            semantic,
+            tier,
+            ordinal,
+        };
+        let inner_path = path(
+            node("scala-local-inner-start"),
+            node("scala-local-inner-end"),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                step(reference, PrecedenceTier::LexicalBinding, 0),
+                step(inner, PrecedenceTier::LexicalBinding, 0),
+                step(inner, PrecedenceTier::CandidateOriginRank, 0),
+            ],
+        );
+        let outer_path = path(
+            node("scala-local-outer-start"),
+            node("scala-local-outer-end"),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                step(reference, PrecedenceTier::LexicalBinding, 0),
+                step(inner, PrecedenceTier::LexicalBinding, 1),
+                step(outer, PrecedenceTier::LexicalBinding, 0),
+                step(outer, PrecedenceTier::CandidateOriginRank, 0),
+            ],
+        );
+        let cancellation = CancellationToken::new();
+        let mut work = 0;
+        assert_eq!(
+            path_shadows_with_rules(
+                &inner_path,
+                &outer_path,
+                SCALA_PRECEDENCE_RULES,
+                &cancellation,
+                &mut work,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            path_shadows_with_rules(
+                &outer_path,
+                &inner_path,
+                SCALA_PRECEDENCE_RULES,
+                &cancellation,
+                &mut work,
+            ),
+            Some(false)
+        );
+    }
 
     fn type_only_inventory_facts() -> FileResolutionFacts {
         crate::analyzer::resolution::test_support::unsupported_expression_gap_facts()
@@ -6989,6 +7295,7 @@ mod tests {
                 let quotient = augmented_path_relation_with_poll(
                     &completed,
                     &terminals,
+                    &crate::analyzer::resolution::precedence::DefaultPrecedenceRules,
                     &cancellation,
                     &mut quotient_work,
                 );

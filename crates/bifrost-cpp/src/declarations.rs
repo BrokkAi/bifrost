@@ -483,11 +483,8 @@ pub struct CppUsingDeclarationBinding {
     target_package: String,
 }
 
-/// The lexical identity of one block in a callable body: the callable's own
-/// identity plus a `block@line:column` segment at the block's opening brace.
-/// The coordinate is what separates same-named local classes in overloads
-/// (which share the callable's FqName) and in sibling blocks, without
-/// flattening the class into its enclosing namespace.
+/// A callable's stable declaration identity plus the lexical block's rank.
+/// The declaration ID separates overloads that share a qualified name.
 #[derive(Clone)]
 struct CppLocalBlock {
     callable: CodeUnit,
@@ -497,14 +494,18 @@ struct CppLocalBlock {
 
 impl CppLocalBlock {
     fn new(callable: &CodeUnit, block: Node<'_>) -> Self {
-        let position = block.start_position();
-        let segment = format!("block@{}:{}", position.row + 1, position.column + 1);
+        let name = cpp_synthetic_name(block);
+        let owner_id = callable.declaration_id().to_string();
+        let rank = name.rank.to_string();
+        let mut fq = callable.fq().clone();
+        let mut short_name = callable.short_name().to_string();
+        for segment in ["owner", owner_id.as_str(), name.kind, rank.as_str()] {
+            fq.push(segment_interner().intern(segment, SegmentKind::Nested));
+            short_name = cpp_join_nested_short(&short_name, segment);
+        }
         Self {
-            fq: callable
-                .fq()
-                .clone()
-                .with_pushed(segment_interner().intern(&segment, SegmentKind::Nested)),
-            short_name: cpp_join_nested_short(callable.short_name(), &segment),
+            fq,
+            short_name,
             callable: callable.clone(),
         }
     }
@@ -7624,17 +7625,13 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         // block scope an out-of-line `void C::f()` body already has; without
         // it a C++ header, where member bodies are usually inline, would keep
         // none of these owners (#3301).
-        let block_scope;
-        let scope = if scope.class_unit.is_some() {
-            block_scope = ScopeInfo {
-                class_unit: None,
-                declarations_are_fields: false,
-                ..scope.clone()
-            };
-            &block_scope
-        } else {
-            scope
+        let block_scope = ScopeInfo {
+            class_unit: None,
+            declarations_are_fields: false,
+            local_block: Some(CppLocalBlock::new(callable, body)),
+            ..scope.clone()
         };
+        let scope = &block_scope;
         let mut pending = vec![body];
         while let Some(node) = pending.pop() {
             if matches!(node.kind(), "function_definition" | "lambda_expression") {
@@ -10008,9 +10005,8 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
     /// Give a function-local anonymous aggregate a structured owner so its
     /// direct pointer bindings can be typed by the usage graph.  Unlike an
     /// anonymous aggregate in a class body, there is no source-level tag or
-    /// typedef to supply an identity.  The aggregate's CST range is therefore
-    /// part of a generated, collision-resistant identity; no source spelling
-    /// is consulted.  The declaration's own variable remains a file-level
+    /// typedef to supply an identity. Its rank within the named callable owner
+    /// supplies a generated identity; no source spelling is consulted.  The declaration's own variable remains a file-level
     /// field projection, while the aggregate body is visited as the generated
     /// class's field list.
     fn visit_anonymous_local_aggregate_declaration<'tree>(
@@ -10035,7 +10031,8 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         for declarator in &declarators {
             self.visit_variable_declaration(node, *declarator, scope, false, ancestry);
         }
-        let name = format!("<anonymous:{}>", aggregate.start_byte());
+        let synthetic = cpp_synthetic_name(aggregate);
+        let name = format!("{}@{}", synthetic.kind, synthetic.rank);
         self.visit_named_class_like_shape(
             aggregate,
             name,
@@ -22164,6 +22161,31 @@ fn cpp_overload_discriminator(declarator: Node<'_>, source: &str) -> [u8; 32] {
     overload_discriminator(tokens)
 }
 
+fn cpp_synthetic_name(node: Node<'_>) -> brokk_bifrost_core::analyzer::tree_walk::SyntheticName {
+    brokk_bifrost_core::analyzer::tree_walk::synthetic_name(
+        node,
+        |candidate| match candidate.kind() {
+            "compound_statement" => Some("block"),
+            "struct_specifier" | "union_specifier" | "class_specifier"
+                if candidate.child_by_field_name("name").is_none() =>
+            {
+                Some("anonymous")
+            }
+            _ => None,
+        },
+        |candidate| {
+            candidate.kind() == "function_definition"
+                || matches!(
+                    candidate.kind(),
+                    "class_specifier"
+                        | "struct_specifier"
+                        | "union_specifier"
+                        | "namespace_definition"
+                ) && candidate.child_by_field_name("name").is_some()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -22302,6 +22324,48 @@ mod tests {
     };
     use brokk_bifrost_test_macros::hardwon;
     use std::fmt::Write;
+
+    #[test]
+    fn synthetic_declaration_ids_follow_rank_across_edits() {
+        fn ids(source: &str) -> std::collections::BTreeSet<String> {
+            let parsed = parse_cpp_declarations(source, "rank.cpp");
+            parsed
+                .declarations()
+                .iter()
+                .filter(|unit| unit.identifier() == "Target")
+                .map(|unit| unit.declaration_id().to_string())
+                .collect()
+        }
+        let source = "void f(){ { class Target {}; } }";
+        let original = ids(source);
+        assert!(!original.is_empty(), "target declarations were produced");
+        assert_eq!(original, ids(&format!("// byte shift\n{source}")));
+        let inserted = ids("void f(){ {} { class Target {}; } }");
+        assert_eq!(original.len(), inserted.len());
+        assert!(
+            original.is_disjoint(&inserted),
+            "earlier siblings change ranks"
+        );
+    }
+
+    #[test]
+    fn overload_synthetic_declarations_keep_distinct_ids() {
+        let parsed = parse_cpp_declarations(
+            "struct Owner { void f(int) { { class Marker {}; } } void f(double) { { class Marker {}; } } };",
+            "overloads.cpp",
+        );
+        let ids: Vec<_> = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.identifier() == "Marker")
+            .map(|unit| unit.declaration_id())
+            .collect();
+        assert_eq!(ids.len(), 2, "both overloads keep their local declaration");
+        assert_ne!(
+            ids[0], ids[1],
+            "local declarations have distinct identities"
+        );
+    }
 
     fn parse_cpp_declarations(source: &str, name: &str) -> ParsedFile {
         let tree = crate::diagnostics::parse_cpp_tree(source);
@@ -27839,10 +27903,15 @@ class ARCCache {
                     "{name} must not mint {tag}, got {declarations:?}"
                 );
             }
+            let callable = declarations
+                .iter()
+                .find(|unit| unit.is_function() && unit.fq_name() == "run")
+                .unwrap();
+            let block = format!("run$owner${}$block$0", callable.declaration_id());
             for tag in [
-                "run$block@1:16$localtag",
-                "run$block@1:16$localtag$deeper",
-                "run$block@1:16$localtag.d",
+                format!("{block}$localtag"),
+                format!("{block}$localtag$deeper"),
+                format!("{block}$localtag.d"),
             ] {
                 assert_eq!(
                     declarations.iter().any(|unit| unit.fq_name() == tag),
@@ -27895,7 +27964,7 @@ class ARCCache {
                 parse_cpp_declarations(source, name)
                     .declarations()
                     .iter()
-                    .map(|unit| unit.fq_name())
+                    .map(|unit| (format!("{:?}", unit.kind()), unit.identifier().to_owned()))
                     .collect::<std::collections::BTreeSet<_>>()
             };
             let c_names = names("a.c");
@@ -27905,9 +27974,7 @@ class ARCCache {
                 "an anonymous aggregate declares no tag, so both dialects read {source:?} the same"
             );
             assert!(
-                c_names
-                    .iter()
-                    .any(|name| name.contains('.') && name != "outer"),
+                c_names.iter().any(|(kind, _)| kind == "Field"),
                 "{source:?} must index the anonymous aggregate's members, got {c_names:?}"
             );
         }

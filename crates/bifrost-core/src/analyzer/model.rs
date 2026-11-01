@@ -64,6 +64,11 @@ pub struct ScalaExportInfo {
 }
 
 impl Language {
+    /// The language's parse depends on the owning build configuration.
+    pub fn uses_configured_parse_variants(self) -> bool {
+        self == Self::CSharp
+    }
+
     pub const ANALYZABLE: [Self; 12] = [
         Language::Java,
         Language::Go,
@@ -766,6 +771,14 @@ impl ClassLikeKind {
 }
 
 impl ParameterMetadata {
+    /// Parameter metadata with source positions removed for read-key hashing.
+    pub fn without_source_positions(&self) -> Self {
+        let mut parameter = self.clone();
+        parameter.start_byte = 0;
+        parameter.end_byte = 0;
+        parameter
+    }
+
     /// Locate ordered parameter labels inside their rendered parameter text.
     pub fn from_signature_labels<'a>(
         signature: &str,
@@ -2912,6 +2925,17 @@ impl SignatureMetadata {
         &self.label
     }
 
+    /// Semantic signature projection used only by read-key hashing.
+    /// Parameter order and every non-location field remain observable.
+    pub fn without_source_positions(&self) -> Self {
+        let mut metadata = self.clone();
+        for parameter in &mut metadata.parameters {
+            parameter.start_byte = 0;
+            parameter.end_byte = 0;
+        }
+        metadata
+    }
+
     pub fn parameters(&self) -> &[ParameterMetadata] {
         &self.parameters
     }
@@ -3842,7 +3866,9 @@ impl CodeUnit {
     }
 
     pub fn is_anonymous(&self) -> bool {
-        self.short_name().contains("$anon$")
+        ["$anon$", "$lambda$", "$enum$"]
+            .iter()
+            .any(|marker| self.short_name().contains(marker))
     }
 
     pub fn fq_name(&self) -> String {
@@ -4037,6 +4063,11 @@ impl PartialOrd for CodeUnit {
     }
 }
 
+/// A byte span and its producer's line coordinates.
+///
+/// Ordinary declaration ranges use 1-based lines. Synthetic file-scope ranges
+/// and parsed declaration-name token ranges use 0-based lines. Consumers must
+/// use the convention of the producer that supplied the range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Range {
     pub start_byte: usize,

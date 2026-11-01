@@ -167,7 +167,11 @@ pub fn value_type_barrier_source_matches(
         ContentIdentity, OverlaySnapshotId, SourceRevision, StableDigest,
     };
     use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceOrigin;
-    let content = ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
+    let content = ContentIdentity::from_source_digest(
+        StableDigest::from_array(prepared.source_sha256()),
+        prepared.dialect().language(),
+        prepared.parse_variant(),
+    );
     match (
         observation.point().procedure().artifact().key().revision(),
         prepared.origin(),

@@ -175,6 +175,56 @@ pub fn execute_code_query_unit(
     project_unit_result(&detailed, row_keys)
 }
 
+/// Remaining physical allowance for sequential units or union leaves.
+/// Semantic limits pass through: SemanticBudget's contract bounds resident
+/// admission; its cumulative work is telemetry, not a cumulative limit.
+pub fn remaining_unit_limits(
+    limits: CodeQueryExecutionLimits,
+    work: &CodeQueryExecutionWork,
+    budgeted: &CodeQueryBudgetedWork,
+) -> Option<CodeQueryExecutionLimits> {
+    let subtract =
+        |cap: usize, used: u64| cap.saturating_sub(usize::try_from(used).unwrap_or(usize::MAX));
+    let remaining = CodeQueryExecutionLimits {
+        max_scanned_files: subtract(
+            limits.max_scanned_files,
+            work.scanned_files.max(budgeted.import_files_resolved),
+        ),
+        max_scanned_source_bytes: subtract(
+            limits.max_scanned_source_bytes,
+            work.scanned_source_bytes,
+        ),
+        max_fact_nodes: subtract(
+            limits.max_fact_nodes,
+            work.fact_nodes.saturating_add(work.examined_references),
+        ),
+        max_pipeline_rows: subtract(
+            limits.max_pipeline_rows,
+            work.pipeline_rows
+                .max(budgeted.provenance_steps)
+                .max(budgeted.import_edges_resolved),
+        ),
+        ..limits
+    };
+    (remaining.max_scanned_files > 0
+        && remaining.max_scanned_source_bytes > 0
+        && remaining.max_fact_nodes > 0
+        && remaining.max_pipeline_rows > 0)
+        .then_some(remaining)
+}
+
+/// Report units or leaves omitted after a physical allowance ran out.
+pub fn push_skipped_unit_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>, skipped: usize) {
+    push_budget_diagnostic(diagnostics, &CodeQueryExecutionBudget::default());
+    let diagnostic = diagnostics
+        .iter_mut()
+        .find(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted)
+        .expect("budget diagnostic was installed");
+    diagnostic
+        .message
+        .push_str(&format!("; skipped {skipped} units"));
+}
+
 /// Execute one eligible union unit leaf by leaf, preserving branch rows until
 /// the global unit merge. A leaf receives no result limit of its own: the
 /// query's limit is a cap on the union after all branches have been composed.
@@ -195,7 +245,13 @@ fn execute_seed_union_unit(
     let mut diagnostics = Vec::new();
     let mut truncated = false;
 
-    for (leaf, branch_path, inherited_suffix_steps) in leaves {
+    let leaf_count = leaves.len();
+    for (index, (leaf, branch_path, inherited_suffix_steps)) in leaves.into_iter().enumerate() {
+        let Some(remaining) = remaining_unit_limits(limits, &work, &budgeted_work) else {
+            push_skipped_unit_diagnostic(&mut diagnostics, leaf_count - index);
+            truncated = true;
+            break;
+        };
         let leaf_query = CodeQuery {
             schema_version: query.schema_version,
             plan: leaf,
@@ -222,7 +278,7 @@ fn execute_seed_union_unit(
             flow_state.clone(),
             workspace,
             &leaf_query,
-            limits,
+            remaining,
             cancellation,
             leaf_scope,
             &mut row_keys,
@@ -246,6 +302,10 @@ fn execute_seed_union_unit(
         rows.append(&mut leaf_result.rows);
     }
 
+    // Skipped suffix leaves still occupy their physical-plan counter slots.
+    budgeted_work
+        .step_outputs
+        .resize(unit_step_output_caps(query).len(), 0);
     UnitExecutionResult {
         rows,
         work,
@@ -1449,6 +1509,9 @@ pub enum UnitRowItemTerminal {
         /// subject's join: an assert names a capture, and the capture's AST id
         /// is what the row families are joined on.
         captures: Vec<UnitRowCapture>,
+        /// Why the selecting language relation is only a heuristic, when it
+        /// is one; the match adapter then reports the finding as possible.
+        heuristic: Option<Box<str>>,
     },
     Declaration {
         kind: Box<str>,
@@ -1611,6 +1674,7 @@ impl UnitRowItemTerminal {
                     kind: boxed(value.kind),
                     node_range: value.node_range,
                     captures: value.captures.iter().map(UnitRowCapture::project).collect(),
+                    heuristic: value.heuristic.map(boxed),
                 }
             }
             CodeQueryResultValue::Declaration { value } => UnitRowItemTerminal::Declaration {
@@ -2437,6 +2501,31 @@ impl MergedUnitRows {
     /// `CodeQueryResult::completion` derives one.
     pub fn completion(&self) -> CodeQueryCompletion {
         code_query_completion(self.truncated, &self.diagnostics)
+    }
+
+    /// Apply the root result limit after merging all seed partitions.
+    pub fn apply_result_limit(&mut self, limit: usize) {
+        let mut has_result_limit = false;
+        self.diagnostics.retain(|diagnostic| {
+            if diagnostic.code != CodeQueryDiagnosticCode::ResultLimitReached {
+                return true;
+            }
+            let first = !has_result_limit;
+            has_result_limit = true;
+            first
+        });
+        if self.items.len() > limit {
+            self.items.truncate(limit);
+            self.evidence.truncate(limit);
+            self.truncated = true;
+            if !has_result_limit {
+                push_truncation_diagnostic(
+                    &mut self.diagnostics,
+                    &CodeQueryExecutionBudget::default(),
+                    limit,
+                );
+            }
+        }
     }
 
     /// The merged evidence as the executor's own type, against `root`.

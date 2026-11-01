@@ -18,6 +18,7 @@
 //!
 //! [`PolicyUnitKey`]: https://docs.rs/  (crates/bifrost-policy/src/units.rs)
 
+use brokk_bifrost_core::gitblob::ParseVariant;
 #[cfg(test)]
 use brokk_bifrost_semantic::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
 use git2::Oid;
@@ -198,6 +199,8 @@ pub struct PolicyUnitRowKey {
 /// licence reusing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyUnitRow {
+    /// Write-time attachment input. Loaded rows have no write authority.
+    pub seed_parse_variant: Option<ParseVariant>,
     pub key: PolicyUnitRowKey,
     /// The product kind's stable label. Only `rows` exists today, and the
     /// schema says so.
@@ -818,7 +821,13 @@ fn write_unit(
     let (blob_id, lang) = match key.partition.blob() {
         Some((blob, language)) => {
             let lang = language.config_label();
-            let blob_key = super::BlobKey::unvaried(*blob, lang);
+            let blob_key = super::BlobKey {
+                oid: *blob,
+                lang: lang.to_owned(),
+                variant: unit
+                    .seed_parse_variant
+                    .expect("a computed file unit carries its seed parse variant"),
+            };
             // Resolved under the complete-blob condition the fact tables use:
             // a unit hangs off its seed blob so that re-parsing that blob
             // takes the unit with it.
@@ -894,13 +903,15 @@ fn write_unit(
         "a published unit's index answers hold on the snapshot that computed it"
     );
     insert_unit_snapshots(conn, unit_id, &unit.snapshots)?;
-    let mut intern = conn.prepare_cached(
-        "INSERT INTO policy_read_keys(
+    // policy_read_keys.digest is per-kind: File stores the parse variant
+    // (NULL means Empty); Lookup stores the answer digest; Models, Policy,
+    // Configuration and Epoch store the named non-source input's digest.
+    const INTERN_READ_KEY_SQL: &str = "INSERT INTO policy_read_keys(
            key_digest, kind, family, languages, rel_path, name, index_key,
            blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names
          ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, jsonb(?18))
-         ON CONFLICT(key_digest) DO NOTHING",
-    )?;
+         ON CONFLICT(key_digest) DO NOTHING";
+    let mut intern = conn.prepare_cached(INTERN_READ_KEY_SQL)?;
     let mut find =
         conn.prepare_cached("SELECT read_id FROM policy_read_keys WHERE key_digest = ?1")?;
     let mut member = conn.prepare_cached(
@@ -1084,6 +1095,7 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
     Ok((
         unit_id,
         PolicyUnitRow {
+            seed_parse_variant: None,
             key: PolicyUnitRowKey {
                 policy_semantic_hash,
                 family,
@@ -1136,8 +1148,7 @@ mod tests {
     use crate::analyzer::content_identity::WorkspaceContentIdentity;
     use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
     use crate::analyzer::read_ledger::{
-        CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, ProcedureCallSiteLocator,
-        read_set_digest,
+        CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, read_set_digest,
     };
     use crate::analyzer::semantic::ids::StableDigest;
     // Every EXPLAIN QUERY PLAN pin below runs its assertions once against a
@@ -1196,6 +1207,7 @@ mod tests {
                 Language::Java,
                 "src/Main.java",
                 Oid::from_str(BLOB).unwrap(),
+                brokk_bifrost_core::gitblob::ParseVariant::Empty,
             ),
             ReadKey::path_absent(Language::Java, "src/Missing.java"),
             ReadKey::index(IndexFamily::DefinitionExact, b"com.example.Main"),
@@ -1304,24 +1316,17 @@ mod tests {
                 LookupKind::Dispatch,
                 LookupQuestion::CallSite {
                     rel_path: Box::from("src/Main.java"),
-                    artifact: StableDigest::sha256(b"artifact"),
-                    site: CallSiteLocator {
-                        start_byte: 10,
-                        end_byte: 24,
-                    },
+                    procedure: StableDigest::sha256(b"artifact"),
+                    site: CallSiteLocator { ordinal: 0 },
                 },
                 digest,
             ),
             ReadKey::lookup(
                 LookupKind::ProcedureDispatch,
-                LookupQuestion::ProcedureCallSite {
+                LookupQuestion::CallSite {
                     rel_path: Box::from("src/Main.java"),
                     procedure: StableDigest::sha256(b"procedure"),
-                    site: ProcedureCallSiteLocator {
-                        start_byte: 4,
-                        end_byte: 18,
-                        ordinal: 0,
-                    },
+                    site: CallSiteLocator { ordinal: 0 },
                 },
                 digest,
             ),
@@ -1382,6 +1387,7 @@ mod tests {
 
     fn unit_row(rel_path: &str, reads: Vec<ReadKey>) -> PolicyUnitRow {
         PolicyUnitRow {
+            seed_parse_variant: Some(ParseVariant::Empty),
             key: seed_key(rel_path),
             product_kind: "rows".to_string(),
             product: "{\"rows\":[]}".to_string(),
@@ -1402,6 +1408,7 @@ mod tests {
         let reads = vec![ReadKey::Epoch(StableDigest::sha256(b"epoch"))];
         let seed = unit_row("src/Main.java", reads.clone());
         let asserted = PolicyUnitRow {
+            seed_parse_variant: Some(ParseVariant::Empty),
             key: assert_file_key("src/Main.java"),
             product_kind: "assert_file".to_string(),
             product: "{\"findings\":[]}".to_string(),
@@ -1859,6 +1866,7 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let reads = vec![ReadKey::Epoch(StableDigest::sha256(b"epoch"))];
         let mismatched = PolicyUnitRow {
+            seed_parse_variant: Some(ParseVariant::Empty),
             key: assert_file_key("src/Main.java"),
             product_kind: "rows".to_string(),
             product: "{\"rows\":[]}".to_string(),

@@ -563,12 +563,7 @@ impl PolicyRegistry {
             self.close_endpoint_sets(&parsed, &mut definition, source_bytes.len(), locators)?;
         let build = self.build_policy(&parsed, definition, source_bytes, locators, &imports)?;
         let attempted_endpoints = self.checked_endpoint_total(build.endpoint_slots)?;
-        // Cache replacement releases the prior parsed document. Its source
-        // reservation must not remain charged to every later policy.
-        let attempted_bytes = self
-            .checked_retained_total(build.retained_bytes)?
-            .checked_sub(imports.released_cache_bytes)
-            .expect("evicted cache bytes were previously reserved");
+        let attempted_bytes = self.checked_retained_delta(build.retained_bytes)?;
         self.check_cancellation()?;
         self.endpoint_set_cache = imports.cache;
         self.endpoint_set_parse_count += imports.parsed_documents;
@@ -583,10 +578,14 @@ impl PolicyRegistry {
     }
 
     fn checked_retained_total(&self, additional: usize) -> Result<usize, PolicyRegistryError> {
-        let attempted = self
-            .retained_source_and_selector_bytes
-            .checked_add(additional)
-            .ok_or(PolicyRegistryError::RetainedByteCountOverflow)?;
+        self.checked_retained_delta(additional as i128)
+    }
+
+    fn checked_retained_delta(&self, delta: i128) -> Result<usize, PolicyRegistryError> {
+        let total = self.retained_source_and_selector_bytes as i128 + delta;
+        assert!(total >= 0, "released cache bytes were previously reserved");
+        let attempted =
+            usize::try_from(total).map_err(|_| PolicyRegistryError::RetainedByteCountOverflow)?;
         if attempted > self.limits.max_retained_source_and_selector_bytes {
             return Err(PolicyRegistryError::RetainedByteLimitExceeded {
                 attempted,
@@ -912,7 +911,7 @@ impl PolicyRegistry {
         fixed_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
         locators: LocatorResolution<'_>,
         imports: &EndpointSetClosure,
     ) -> Result<(), PolicyRegistryError> {
@@ -1124,7 +1123,7 @@ impl PolicyRegistry {
         fixed_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
         locators: LocatorResolution<'_>,
     ) -> Result<(), PolicyRegistryError> {
         // Catalog storage is independently bounded, but each loaded policy
@@ -1345,7 +1344,7 @@ impl PolicyRegistry {
         fixed_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
         locators: LocatorResolution<'_>,
     ) -> Result<(), PolicyRegistryError> {
         for subject in &spec.subjects.entries {
@@ -1398,7 +1397,7 @@ impl PolicyRegistry {
         &self,
         uses: &[MatchUse],
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
         locators: LocatorResolution<'_>,
     ) -> Result<MatchBuild, PolicyRegistryError> {
         let directory_count = uses
@@ -1562,7 +1561,7 @@ impl PolicyRegistry {
         &self,
         key: &DirectoryCacheKey,
         first_usage: &MatchUse,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
         locators: LocatorResolution<'_>,
     ) -> Result<DirectoryClosure, PolicyRegistryError> {
         let root = self
@@ -1590,10 +1589,12 @@ impl PolicyRegistry {
                 .ok_or(PolicyRegistryError::RetainedByteCountOverflow)?;
             if transient_bytes > available {
                 return Err(PolicyRegistryError::RetainedByteLimitExceeded {
-                    attempted: self
-                        .retained_source_and_selector_bytes
-                        .saturating_add(*retained_bytes)
-                        .saturating_add(transient_bytes),
+                    attempted: usize::try_from(
+                        self.retained_source_and_selector_bytes as i128
+                            + *retained_bytes
+                            + transient_bytes as i128,
+                    )
+                    .unwrap_or(usize::MAX),
                     maximum: self.limits.max_retained_source_and_selector_bytes,
                 });
             }
@@ -1626,7 +1627,7 @@ impl PolicyRegistry {
         parsed: &ParsedRqlpDocument,
         path: PolicySelectorPath,
         authored: &PolicySelector,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
         locators: LocatorResolution<'_>,
     ) -> Result<ResolvedPolicySelector, PolicyRegistryError> {
         let loaded = resolve_parsed_selector(
@@ -1666,8 +1667,8 @@ impl PolicyRegistry {
         Ok(())
     }
 
-    fn available_local_bytes(&self, local: usize) -> Result<usize, PolicyRegistryError> {
-        let already = self.checked_retained_total(local)?;
+    fn available_local_bytes(&self, local: i128) -> Result<usize, PolicyRegistryError> {
+        let already = self.checked_retained_delta(local)?;
         Ok(self
             .limits
             .max_retained_source_and_selector_bytes
@@ -1675,18 +1676,14 @@ impl PolicyRegistry {
             .expect("checked retained total is within its limit"))
     }
 
-    fn ensure_local_retained_bytes(&self, local: usize) -> Result<(), PolicyRegistryError> {
+    fn ensure_local_retained_bytes(&self, local: i128) -> Result<(), PolicyRegistryError> {
         let _ = self.available_local_bytes(local)?;
         Ok(())
     }
 
-    fn charge_local(
-        &self,
-        local: &mut usize,
-        additional: usize,
-    ) -> Result<(), PolicyRegistryError> {
+    fn charge_local(&self, local: &mut i128, additional: usize) -> Result<(), PolicyRegistryError> {
         let attempted_local = local
-            .checked_add(additional)
+            .checked_add(additional as i128)
             .ok_or(PolicyRegistryError::RetainedByteCountOverflow)?;
         self.ensure_local_retained_bytes(attempted_local)?;
         *local = attempted_local;
@@ -1696,7 +1693,7 @@ impl PolicyRegistry {
 
 struct PolicyBuild {
     loaded: LoadedPolicy,
-    retained_bytes: usize,
+    retained_bytes: i128,
     endpoint_slots: usize,
 }
 

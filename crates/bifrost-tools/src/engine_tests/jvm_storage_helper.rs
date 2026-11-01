@@ -36,6 +36,13 @@ pub(crate) mod fixture {
         }
     }
     impl StoreLanguageAdapter for SourceStorageFixtureAdapter {
+        // Test adapter.
+        fn parse_time_semantic_lowerer(
+            &self,
+        ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer>
+        {
+            None
+        }
         fn language(&self) -> Language {
             Language::Java
         }

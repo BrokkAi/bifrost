@@ -1,0 +1,291 @@
+{
+  "analysis": {
+    "call_modeling": {
+      "unmodeled": "paranoid"
+    },
+    "catalogs": [],
+    "entry_points": [],
+    "external_models": [],
+    "finding_combinations": [],
+    "match_manifests": [],
+    "mode": "may",
+    "sanitizers": [],
+    "sinks": [
+      {
+        "analysis_projection_hash": "<digest>",
+        "definition": {
+          "accepts": [
+            "untrusted"
+          ],
+          "categories": [
+            "data.sensitive"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "Sink",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "match": {
+                "kind": "call"
+              },
+              "schema_version": 1
+            },
+            "schema_version": 1
+          },
+          "tags": []
+        },
+        "identity": {
+          "entry_id": "sink",
+          "policy_id": "test.canonical",
+          "type": "local"
+        },
+        "semantic_hash": "<digest>"
+      }
+    ],
+    "sources": [
+      {
+        "analysis_projection_hash": "<digest>",
+        "definition": {
+          "bind": {
+            "type": "return_value"
+          },
+          "categories": [
+            "input.user"
+          ],
+          "display_name": "Raw",
+          "evidence": null,
+          "labels": [
+            "untrusted"
+          ],
+          "selector": {
+            "query": {
+              "match": {
+                "kind": "call"
+              },
+              "schema_version": 1
+            },
+            "schema_version": 1
+          },
+          "threat_model": null
+        },
+        "identity": {
+          "entry_id": "raw",
+          "policy_id": "test.canonical",
+          "type": "local"
+        },
+        "semantic_hash": "<digest>"
+      }
+    ],
+    "stores": {
+      "reads": [],
+      "writes": [
+        {
+          "definition": {
+            "input": {
+              "type": "return_value"
+            },
+            "instance": null,
+            "key": {
+              "index": 0,
+              "type": "argument_index"
+            },
+            "selector": {
+              "query": {
+                "match": {
+                  "kind": "call"
+                },
+                "schema_version": 1
+              },
+              "schema_version": 1
+            },
+            "store": "alpha"
+          },
+          "identity": {
+            "entry_id": "alpha",
+            "policy_id": "test.canonical",
+            "type": "local"
+          }
+        },
+        {
+          "definition": {
+            "input": {
+              "type": "return_value"
+            },
+            "instance": null,
+            "key": {
+              "index": 0,
+              "type": "argument_index"
+            },
+            "selector": {
+              "query": {
+                "match": {
+                  "kind": "call"
+                },
+                "schema_version": 1
+              },
+              "schema_version": 1
+            },
+            "store": "beta"
+          },
+          "identity": {
+            "entry_id": "beta",
+            "policy_id": "test.canonical",
+            "type": "local"
+          }
+        }
+      ]
+    },
+    "threat_models": [
+      "remote"
+    ],
+    "transforms": [],
+    "type": "taint"
+  },
+  "endpoint_set_dependencies": [
+    "<digest>",
+    "<digest>"
+  ],
+  "id": "test.canonical",
+  "match_manifests": [],
+  "message": {
+    "text": "M",
+    "type": "static"
+  },
+  "name": "Canonical",
+  "precedence": [],
+  "report": {
+    "origins_per_finding": 8,
+    "witness": {
+      "max_bytes": 16384,
+      "max_steps": 64
+    },
+    "witnesses_per_finding": 8
+  },
+  "resolved_catalogs": [],
+  "resolved_endpoints": [
+    {
+      "analysis_projection_hash": "<digest>",
+      "definition_schema_version": 1,
+      "identity": {
+        "entry_id": "raw",
+        "policy_id": "test.canonical",
+        "type": "local"
+      },
+      "model": {
+        "binding": {
+          "type": "return_value"
+        },
+        "categories": [
+          "input.user"
+        ],
+        "display_name": "Raw",
+        "role": "source",
+        "supersedes": [],
+        "taint": {
+          "evidence": null,
+          "labels": [
+            "untrusted"
+          ],
+          "type": "source"
+        }
+      },
+      "selector_schema_version": 1,
+      "semantic_hash": "<digest>"
+    },
+    {
+      "analysis_projection_hash": "<digest>",
+      "definition_schema_version": 1,
+      "identity": {
+        "entry_id": "sink",
+        "policy_id": "test.canonical",
+        "type": "local"
+      },
+      "model": {
+        "binding": {
+          "index": 0,
+          "type": "argument_index"
+        },
+        "categories": [
+          "data.sensitive"
+        ],
+        "display_name": "Sink",
+        "role": "sink",
+        "supersedes": [],
+        "taint": {
+          "accepts": [
+            "untrusted"
+          ],
+          "impacts": [],
+          "tags": [],
+          "type": "sink"
+        }
+      },
+      "selector_schema_version": 1,
+      "semantic_hash": "<digest>"
+    }
+  ],
+  "resolved_selectors": [
+    {
+      "path": "/analysis/sinks/entries/sink/selector",
+      "selector": {
+        "query": {
+          "match": {
+            "kind": "call"
+          },
+          "schema_version": 1
+        },
+        "schema_version": 1
+      },
+      "semantic_hash": "<digest>"
+    },
+    {
+      "path": "/analysis/sources/entries/raw/selector",
+      "selector": {
+        "query": {
+          "match": {
+            "kind": "call"
+          },
+          "schema_version": 1
+        },
+        "schema_version": 1
+      },
+      "semantic_hash": "<digest>"
+    },
+    {
+      "path": "/analysis/stores/entries/alpha/selector",
+      "selector": {
+        "query": {
+          "match": {
+            "kind": "call"
+          },
+          "schema_version": 1
+        },
+        "schema_version": 1
+      },
+      "semantic_hash": "<digest>"
+    },
+    {
+      "path": "/analysis/stores/entries/beta/selector",
+      "selector": {
+        "query": {
+          "match": {
+            "kind": "call"
+          },
+          "schema_version": 1
+        },
+        "schema_version": 1
+      },
+      "semantic_hash": "<digest>"
+    }
+  ],
+  "schema_version": 1,
+  "severity": {
+    "level": "warning",
+    "type": "fixed"
+  },
+  "tags": [],
+  "type": "policy"
+}

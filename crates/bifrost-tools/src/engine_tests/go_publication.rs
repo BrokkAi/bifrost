@@ -316,3 +316,163 @@ class C {
         assert_published_canonical_source(&fixture, "src/C.java", "java", &JavaAdapter, &state);
     }
 }
+
+#[cfg(test)]
+mod go_semantic_ir_publication_tests {
+    use brokk_bifrost_core::analyzer::model::Language;
+    use brokk_bifrost_semantic::analyzer::semantic::service::SERVE_COUNTS;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::semantic::*;
+    use brokk_bifrost_analysis::analyzer::store::semantic_ir::{
+        SemanticIrMountScope, SemanticIrPublicationOutcome, semantic_ir_producer_epoch,
+    };
+    use brokk_bifrost_analysis::analyzer::store::test_support::parse_state;
+    use brokk_bifrost_analysis::analyzer::store::{AnalyzerStore, StoreLanguageAdapter};
+    use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{
+        PreparedSyntaxPreparation, prepare_exact_syntax_tree,
+    };
+    use brokk_bifrost_core::analyzer::prepared_syntax::{
+        PreparedSourceOrigin, PreparedSyntaxSource,
+    };
+    use brokk_bifrost_core::gitblob::BlobKey;
+    use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
+    use brokk_bifrost_semantic::analyzer::semantic::partial_flow::fixpoint::parse_time_partial_flows;
+    use brokk_bifrost_semantic::analyzer::semantic::service::semantic_artifact_key_from_content;
+
+    #[test]
+    fn go_semantic_ir_publication_reopens_artifact_and_partial_flows() {
+        let source = r#"package sample
+func pair(x string) (string, int) { return x, len(x) }
+func use(x string) string {
+    defer pair(x)
+    closure := func() string { return x }
+    y, _ := pair(closure())
+    return y
+}
+"#;
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/sample\n")
+            .file("sample.go", source)
+            .build();
+        let file = project.file("sample.go");
+        let lowerer = GoAdapter
+            .parse_time_semantic_lowerer()
+            .expect("Go publishes IR");
+        let lowerer = lowerer.lowerer();
+        let cancellation = CancellationToken::default();
+        let prepared = match prepare_exact_syntax_tree(
+            &GoAdapter,
+            &file,
+            PreparedSyntaxSource::Exact(Arc::from(source)),
+            PreparedSourceOrigin::Disk,
+            None,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        ) {
+            PreparedSyntaxPreparation::Complete(Some(prepared)) => prepared,
+            _ => panic!("Go fixture parses"),
+        };
+        let parts = match lowerer.lower(&file, &prepared, &SemanticBudget::default(), &cancellation)
+        {
+            Ok(SemanticOutcome::Complete { value, .. }) => value,
+            other => panic!("Go fixture lowers completely: {other:?}"),
+        };
+        let content =
+            ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
+        let key = semantic_artifact_key_from_content(
+            &file,
+            prepared.dialect(),
+            content,
+            None,
+            lowerer.identity(),
+        )
+        .unwrap();
+        let direct = Arc::new(
+            SemanticArtifact::try_new(key.clone(), lowerer.capabilities(), parts).unwrap(),
+        );
+        assert_eq!(
+            direct.procedures().len(),
+            3,
+            "fixture must exercise the closure"
+        );
+        assert!(
+            !direct.go_predeclared_builtin_assumptions().is_empty(),
+            "builtin assumptions must be exercised"
+        );
+        let flows = parse_time_partial_flows(&direct, &prepared, &cancellation).unwrap();
+        assert_eq!(flows.len(), 3);
+        let blob = BlobKey::unvaried(
+            brokk_bifrost_analysis::analyzer::store::test_blob_oid(source.as_bytes()),
+            "go",
+        );
+        let path = project.root().join("go-publication.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        store
+            .ensure_semantic_ir_producer_epoch(
+                "go",
+                &semantic_ir_producer_epoch(&lowerer.identity()),
+            )
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                &file,
+                &blob,
+                store.current_generation("go").unwrap(),
+                &GoAdapter,
+                &parse_state(&GoAdapter, &file),
+            )
+            .unwrap();
+        drop(store);
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let publication = store
+            .semantic_ir_publication(&blob)
+            .unwrap()
+            .expect("published head");
+        assert_eq!(publication.outcome, SemanticIrPublicationOutcome::Complete);
+        assert_eq!(publication.source_bytes, source.len());
+        let scope =
+            SemanticIrMountScope::new(key.mount(), key.path().clone(), key.language(), content);
+        let rebuilt = SemanticArtifact::try_new(
+            key,
+            lowerer.capabilities(),
+            store.read_semantic_ir(publication.blob_id, &scope).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.materialization_id(), direct.materialization_id());
+        assert_eq!(
+            rebuilt.go_predeclared_builtin_assumptions(),
+            direct.go_predeclared_builtin_assumptions()
+        );
+        for (procedure, expected) in direct.procedures().iter().zip(&flows) {
+            let stored = store
+                .read_partial_flows(publication.blob_id, procedure.id(), &scope)
+                .unwrap()
+                .expect("stored partial flows");
+            assert_eq!(&stored, expected);
+        }
+
+        let hits_before = SERVE_COUNTS.rows_hits.load(Ordering::Relaxed);
+        let workspace = project.workspace_analyzer(Default::default());
+        let mut budget = SemanticBudget::default();
+        let served = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("the public Go provider serves the artifact")
+            .available_value()
+            .cloned()
+            .expect("the artifact is complete");
+        assert!(
+            workspace
+                .has_complete_semantic_ir_rows(served.key())
+                .unwrap()
+        );
+        assert!(SERVE_COUNTS.rows_hits.load(Ordering::Relaxed) > hits_before);
+        assert_eq!(served.procedures().len(), direct.procedures().len());
+    }
+}

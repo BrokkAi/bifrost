@@ -1,3 +1,4 @@
+// Go package contexts use the empty parse variant throughout this module.
 //! Revision-selected Go tool output. Canonical discovery is request-owned;
 //! reusable package membership and provider relationships live in SQLite.
 

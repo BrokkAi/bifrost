@@ -52,8 +52,8 @@ use brokk_bifrost_jvm::java::graph_support::{
     java_type_name_candidate_fqns, resolve_java_lexical_type_name,
 };
 
-impl TypeHierarchyProvider for JavaAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+impl JavaAnalyzer {
+    fn legacy_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         HierarchyAnswer::complete(crate::analyzer::jvm::hierarchy::memoized_ancestors(
@@ -63,53 +63,56 @@ impl TypeHierarchyProvider for JavaAnalyzer {
             || java_direct_ancestors(self, token, code_unit),
         ))
     }
+}
+
+impl TypeHierarchyProvider for JavaAnalyzer {
+    fn with_hierarchy_query(
+        &self,
+        run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+            self.native_hierarchy_query(None, run);
+            return;
+        }
+        run(&mut brokk_bifrost_core::analyzer::capabilities::ForwardingHierarchyQuery(self));
+    }
+
+    fn with_hierarchy_query_for(
+        &self,
+        _root: &CodeUnit,
+        run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+            self.native_hierarchy_query(Some(_root), run);
+            return;
+        }
+        run(&mut brokk_bifrost_core::analyzer::capabilities::ForwardingHierarchyQuery(self));
+    }
+
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+            let mut answer = None;
+            self.with_hierarchy_query_for(code_unit, &mut |query| {
+                answer = Some(query.direct_ancestors(code_unit))
+            });
+            return answer.expect("hierarchy query runs once");
+        }
+        self.legacy_direct_ancestors(code_unit)
+    }
 
     fn member_family_ancestors(&self, owner: &CodeUnit) -> MemberFamilyAncestors {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        let mut unread = Vec::new();
-        for name in self.raw_supertypes_of(owner) {
-            if resolve_java_lexical_type_name(self, owner, &name)
-                .or_else(|| self.resolve_imported_type_name(token, owner.source(), &name))
-                .is_none()
-            {
-                unread.push(UnreadMemberFamilyAncestor {
-                    name,
-                    inventory: None,
-                });
-            }
-        }
-        // Every class ultimately inherits Object. Inventory matching and name
-        // deduplication avoid reparsing each frontier owner for its superclass.
-        let interface = self
-            .signature_metadata(owner)
-            .iter()
-            .any(|entry| entry.class_like_is_interface());
-        let root = match self.declaration_syntax_kind(owner) {
-            Some("enum_declaration") => Some("java.lang.Enum"),
-            Some("record_declaration") => Some("java.lang.Record"),
-            Some("interface_declaration" | "annotation_type_declaration") => {
-                Some("java.lang.Object")
-            }
-            _ if interface => Some("java.lang.Object"),
-            _ => Some("java.lang.Object"),
-        };
-        if let Some(name) = root {
-            let inventory = if interface {
-                implicit_interface_members(Language::Java).map(|root| root.methods)
-            } else {
-                overridable_method_inventory(name)
-            };
-            unread.push(UnreadMemberFamilyAncestor {
-                name: name.into(),
-                inventory,
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+            let mut answer = None;
+            self.with_hierarchy_query_for(owner, &mut |query| {
+                answer = Some(query.member_family_ancestors(owner))
             });
+            return answer.expect("hierarchy query runs once");
         }
-        MemberFamilyAncestors {
-            // S2b: MemberFamilyAncestors has no hierarchy ambiguity channel.
-            resolved: self.get_direct_ancestors(owner).definite().to_vec(),
-            unread,
-        }
+        self.legacy_member_family_ancestors(owner)
     }
 
     fn member_family_inventory_matches(
@@ -166,6 +169,18 @@ impl TypeHierarchyProvider for JavaAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+            if scope.cancellation().is_cancelled() {
+                return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
+            }
+            let mut answer = None;
+            self.with_hierarchy_query_for(code_unit, &mut |query| {
+                answer = Some(query.direct_descendants_within(code_unit, scope));
+            });
+            return answer.expect("hierarchy query runs once");
+        }
+
         crate::analyzer::jvm::authority::source_read(
             self,
             brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JavaDescendantIndex,
@@ -443,5 +458,73 @@ impl JavaAnalyzer {
     #[doc(hidden)]
     pub fn definition_query_count_for_test(&self) -> usize {
         self.inner.sql_definitions_query_count_for_test()
+    }
+}
+
+impl JavaAnalyzer {
+    fn legacy_member_family_ancestors(&self, owner: &CodeUnit) -> MemberFamilyAncestors {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let mut unread = Vec::new();
+        for name in self.raw_supertypes_of(owner) {
+            if resolve_java_lexical_type_name(self, owner, &name)
+                .or_else(|| self.resolve_imported_type_name(token, owner.source(), &name))
+                .is_none()
+            {
+                unread.push(UnreadMemberFamilyAncestor {
+                    name,
+                    inventory: None,
+                });
+            }
+        }
+        // Every class ultimately inherits Object. Inventory matching and name
+        // deduplication avoid reparsing each frontier owner for its superclass.
+        let interface = self
+            .signature_metadata(owner)
+            .iter()
+            .any(|entry| entry.class_like_is_interface());
+        let root = match self.declaration_syntax_kind(owner) {
+            Some("enum_declaration") => Some("java.lang.Enum"),
+            Some("record_declaration") => Some("java.lang.Record"),
+            Some("interface_declaration" | "annotation_type_declaration") => {
+                Some("java.lang.Object")
+            }
+            _ if interface => Some("java.lang.Object"),
+            _ => Some("java.lang.Object"),
+        };
+        if let Some(name) = root {
+            let inventory = if interface {
+                implicit_interface_members(Language::Java).map(|root| root.methods)
+            } else {
+                overridable_method_inventory(name)
+            };
+            unread.push(UnreadMemberFamilyAncestor {
+                name: name.into(),
+                inventory,
+            });
+        }
+        let answer = self.get_direct_ancestors(owner);
+        MemberFamilyAncestors {
+            resolved: answer.edges,
+            ambiguous: answer.ambiguous,
+            unread,
+        }
+    }
+}
+
+impl JavaAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_hierarchy_query(
+        &self,
+        root: Option<&CodeUnit>,
+        run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
+    ) {
+        let _scope = AnalyzerQueryScope::new(self);
+        crate::analyzer::jvm::native_hierarchy::with_native_query(
+            self.inner(),
+            root,
+            &mut |_, _| {},
+            run,
+        );
     }
 }

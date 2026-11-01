@@ -4,6 +4,34 @@ use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
 use brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs;
 use brokk_bifrost_analysis::analyzer::{FactSubject, IAnalyzer, Language, WorkspaceFactFamily};
 
+// Encode the exact stable reasons captured by the cache fill. Refused sources
+// that only explain an exclusion do not appear here unless a read recorded a
+// gap. The receipt rejects operational reasons, so they cannot be retained.
+pub(super) fn stable_completion(
+    reasons: Vec<brokk_bifrost_analysis::analyzer::QueryReadIncomplete>,
+) -> Vec<(u8, String)> {
+    use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    let mut completion = reasons
+        .into_iter()
+        .filter_map(|reason| match reason {
+            QueryReadIncomplete::StructureUnavailable(file) => {
+                Some((1, brokk_bifrost_core::path_utils::rel_path_string(&file)))
+            }
+            QueryReadIncomplete::ArtifactUnavailable(detail) => Some((2, detail.into_string())),
+            QueryReadIncomplete::SemanticEvidenceGap(detail) => Some((3, detail.into_string())),
+            // Execution-dependent reasons make the fill refuse, so a retained
+            // value never carries one. Listing them keeps a new variant from
+            // silently escaping the certificate.
+            QueryReadIncomplete::Cancelled
+            | QueryReadIncomplete::SemanticEvidenceUnavailable(_)
+            | QueryReadIncomplete::StoreFailure(_) => None,
+        })
+        .collect::<Vec<_>>();
+    completion.sort();
+    completion.dedup();
+    completion
+}
+
 pub(super) fn profile_answer(value: Option<[u8; 32]>) -> StableDigest {
     let mut hash =
         brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(b"go-build-profile-v1");
@@ -148,6 +176,73 @@ mod tests {
             &NoSummaryAnswers,
             &mut LookupMemo::new(),
         )
+    }
+
+    #[test]
+    #[hardwon(
+        "#8799: review found the workspace path answer certified index data but not its replayed stable gaps"
+    )]
+    fn go_workspace_fact_revalidation_tracks_stable_completion_both_ways() {
+        for (family, file, initial) in [
+            (
+                WorkspaceFactFamily::GoWorkspacePaths,
+                "other_test.go",
+                "package repro\n",
+            ),
+            (
+                WorkspaceFactFamily::GoImportFacts,
+                "other.go",
+                "// no package clause\n",
+            ),
+        ] {
+            let project = InlineTestProject::with_language(Language::Go)
+                .with_git()
+                .file("go.mod", "module example.com/repro\n\ngo 1.23\n")
+                .file("target.go", "package repro\ntype Target struct {}\n")
+                .file(file, initial)
+                .build();
+            let base = project.workspace_analyzer(Default::default());
+            let before = {
+                let (_, reads) = capture_query_reads(base.analyzer(), || match family {
+                    WorkspaceFactFamily::GoWorkspacePaths => {
+                        brokk_bifrost_analysis::analyzer::resolve_analyzer::<GoAnalyzer>(
+                            base.analyzer(),
+                        )
+                        .unwrap()
+                        .workspace_path_index();
+                    }
+                    WorkspaceFactFamily::GoImportFacts => {
+                        brokk_bifrost_analysis::analyzer::resolve_analyzer::<GoAnalyzer>(
+                            base.analyzer(),
+                        )
+                        .unwrap()
+                        .import_facts();
+                    }
+                    _ => unreachable!(),
+                });
+                assert!(reads.keys().iter().any(|key| matches!(key, ReadKey::Lookup { kind: LookupKind::WorkspaceFact, question: LookupQuestion::WorkspaceFact { family: recorded, .. }, .. } if *recorded == family)), "{family:?}: {:?}", reads.keys());
+                answer(base.analyzer(), family, Language::Go, &FactSubject::Whole).unwrap()
+            };
+            project
+                .file(file)
+                .write(format!("//{}\n", "x".repeat(16_001)))
+                .unwrap();
+            let gap = project.workspace_analyzer(Default::default());
+            let during =
+                { answer(gap.analyzer(), family, Language::Go, &FactSubject::Whole).unwrap() };
+            assert_ne!(
+                verify_fact(&gap, &base, family, FactSubject::Whole, before),
+                brokk_bifrost_analysis::analyzer::ReadVerdict::Unchanged,
+                "added gap: {family:?}"
+            );
+            project.file(file).write(initial).unwrap();
+            let restored = project.workspace_analyzer(Default::default());
+            assert_ne!(
+                verify_fact(&restored, &gap, family, FactSubject::Whole, during),
+                brokk_bifrost_analysis::analyzer::ReadVerdict::Unchanged,
+                "removed gap: {family:?}"
+            );
+        }
     }
 
     #[test]
@@ -433,7 +528,11 @@ mod tests {
                 let oid = go.inner.resolve_live_oid_for_file(&file).unwrap();
                 assert!(read_key_recorded_on_active_ledgers(
                     &go,
-                    &go.inner.file_read_key(&file, oid)
+                    &go.inner.file_read_key(
+                        &file,
+                        oid,
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty
+                    )
                 ));
                 assert!(scope.store_error().is_none());
                 Ok::<_, brokk_bifrost_go::graph::resolver::GoGraphBuildError>(indexes)

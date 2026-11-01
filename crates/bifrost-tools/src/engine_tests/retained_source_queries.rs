@@ -27,6 +27,12 @@ struct JavaRanges {
 }
 
 impl StoreLanguageAdapter for JavaRanges {
+    // Test adapter.
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        None
+    }
     fn source_fact_storage(
         &self,
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
@@ -468,6 +474,12 @@ struct CancellablePython {
     armed: Arc<AtomicBool>,
 }
 impl StoreLanguageAdapter for CancellablePython {
+    // Test adapter.
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        None
+    }
     fn source_fact_storage(
         &self,
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
@@ -626,6 +638,12 @@ struct CancellableStorage {
     cancel_at: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl StoreLanguageAdapter for CancellableStorage {
+    // Test adapter.
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        None
+    }
     fn source_fact_storage(
         &self,
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
@@ -718,4 +736,263 @@ fn cancellation_after_path_classification_discards_dirty_reference_candidates() 
     let candidates = analyzer.reverse_reference_candidates(&empty, &empty, &identifiers, &token);
     assert!(token.is_cancelled());
     assert!(candidates.is_empty(), "{candidates:?}");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8126: a workspace memo refused fills on a stable missing-artifact gap and rescanned on every call"
+)]
+fn stable_missing_artifact_hierarchy_failure_is_replayed_until_update() {
+    use brokk_bifrost_analysis::analyzer::common::complete_descendant_query;
+    use brokk_bifrost_analysis::analyzer::{
+        AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete, ReadKey, capture_query_reads,
+    };
+    use brokk_bifrost_core::analyzer::capabilities::{
+        DescendantIndexScope, HierarchyOpenReason, TypeHierarchyProvider,
+        build_direct_descendant_index,
+    };
+    use brokk_bifrost_cpp_analysis::CppAnalyzer;
+    use std::cell::Cell;
+    use std::collections::BTreeSet;
+
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("base.cpp", "struct Base {}; struct Derived : Base {};\n")
+        .build();
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+    let base = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.identifier() == "Base")
+        .unwrap();
+    let cancellation = CancellationToken::default();
+    let scope = DescendantIndexScope::whole_workspace(&cancellation);
+    let fills = Cell::new(0);
+    // Inject the stable artifact-producer outcome at the real memo's build
+    // boundary. Its absence probe must survive a failed-outcome cache hit.
+    let mut cold_receipt = None;
+    for attempt in 0..4 {
+        if attempt == 2 {
+            analyzer.with_descendant_memo_for_test(|memo| {
+                memo.invalidate_all();
+                memo.run_pending_tasks();
+            });
+        }
+        let reader = AnalyzerQueryScope::new(&analyzer);
+        let (answer, reads) = capture_query_reads(&analyzer, || {
+            analyzer.with_descendant_memo_for_test(|memo| {
+                complete_descendant_query(
+                    &analyzer,
+                    &scope,
+                    &base,
+                    memo,
+                    || {
+                        fills.set(fills.get() + 1);
+                        assert!(!fixture.root().join("dependency.hpp").exists());
+                        analyzer.record_read(ReadKey::path_absent(Language::Cpp, "dependency.hpp"));
+                        analyzer.record_query_incomplete(QueryReadIncomplete::ArtifactUnavailable(
+                            "missing dependency.hpp".into(),
+                        ));
+                        build_direct_descendant_index(&analyzer, &analyzer, &scope)
+                    },
+                    |_| {},
+                )
+            })
+        });
+        let answer = answer.expect("an uncancelled descendant query is not cancelled");
+        assert!(answer.edges.is_empty());
+        assert!(matches!(
+            answer.open.as_slice(),
+            [HierarchyOpenReason::DescendantIndexUnavailable]
+        ));
+        assert_eq!(
+            reader.read_completion(),
+            Err(QueryReadIncomplete::ArtifactUnavailable(
+                "missing dependency.hpp".into()
+            ))
+        );
+        assert!(
+            reads
+                .keys()
+                .contains(&ReadKey::path_absent(Language::Cpp, "dependency.hpp"))
+        );
+        assert_eq!(reads.execution_dependences(), 0);
+        let receipt = (reads.keys(), reads.unattributed_reads());
+        if let Some(cold) = &cold_receipt {
+            assert_eq!(&receipt, cold, "cold and warm failure receipts must agree");
+        } else {
+            cold_receipt = Some(receipt);
+        }
+        assert_eq!(fills.get(), attempt / 2 + 1);
+    }
+    // The product accessor consumes the very same retained failed outcome.
+    {
+        let reader = AnalyzerQueryScope::new(&analyzer);
+        assert!(
+            !analyzer
+                .get_direct_descendants_within(&base, &scope)
+                .expect("an uncancelled descendant query is not cancelled")
+                .is_complete()
+        );
+        assert!(reader.read_completion().is_err());
+    }
+    let artifact = fixture.file("dependency.hpp");
+    artifact.write("struct Dependency {};\n").unwrap();
+    let updated = analyzer.update(&BTreeSet::from([artifact]));
+    for _ in 0..2 {
+        let reader = AnalyzerQueryScope::new(&updated);
+        let descendants = updated
+            .get_direct_descendants_within(&base, &scope)
+            .unwrap();
+        assert!(descendants.is_complete());
+        assert!(
+            descendants
+                .edges
+                .iter()
+                .any(|unit| unit.identifier() == "Derived")
+        );
+        assert!(reader.read_completion().is_ok());
+    }
+}
+
+#[test]
+fn retained_fills_share_lookup_memos_and_record_each_receipt() {
+    use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, IAnalyzer, capture_query_reads};
+    use brokk_bifrost_jvm_analysis::JavaAnalyzer;
+
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+        .file("Owner.java", "class Owner { void method() {} }\n")
+        .build();
+    let analyzer = JavaAnalyzer::from_project(fixture.project().clone());
+    let method = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.identifier() == "method")
+        .unwrap();
+    let _request = AnalyzerQueryScope::new(&analyzer);
+    analyzer
+        .test_hooks()
+        .reset_definition_candidates_query_count_for_test();
+    let mut previous_count = None;
+    let mut previous = None;
+    for _ in 0..2 {
+        let entry = brokk_bifrost_analysis::analyzer::common::replayable_query_cache_value(
+            &analyzer,
+            || {
+                assert!(analyzer.inner().definition_parent_unit(&method).is_some());
+                assert!(!analyzer.definitions("Owner").collect::<Vec<_>>().is_empty());
+            },
+        )
+        .unwrap();
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            entry.replay();
+        });
+        let count = analyzer
+            .test_hooks()
+            .definition_candidates_query_count_for_test();
+        assert!(count > 0, "the cold fill must execute its lookup");
+        if let Some(previous_count) = previous_count {
+            assert_eq!(count, previous_count, "the second fill must hit the memo");
+        }
+        previous_count = Some(count);
+        let keys = reads.keys();
+        assert!(!keys.is_empty());
+        if let Some(previous) = &previous {
+            assert_eq!(previous, &keys);
+        }
+        previous = Some(keys);
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8191: retained fills re-hydrated file states the ordinary snapshot already held"
+)]
+fn retained_fill_reads_the_ordinary_file_state_snapshot_and_records_the_read() {
+    use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::common::replayable_query_cache_value;
+    use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{
+        BulkFileStateSource, TreeSitterAnalyzer,
+    };
+    use brokk_bifrost_jvm_analysis::JavaAnalyzer;
+
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+        .file("Owner.java", "class Owner { void method() {} }\n")
+        .file("Other.java", "class Other { void method() {} }\n")
+        .file("Partial.java", "class Partial { void method() {} }\n")
+        .build();
+    let primed = fixture.file("Owner.java");
+    let unprimed = fixture.file("Other.java");
+    let partial = fixture.file("Partial.java");
+    // Partial.java's parse times out, so it holds a parse-incomplete state.
+    let _timeout =
+        super::analyzer_file_states::ForcedParseTimeoutPathsGuard::push([partial.abs_path()]);
+    let analyzer = JavaAnalyzer::from_project(fixture.project().clone());
+    let key_of = |file: &ProjectFile| {
+        let oid = git2::Oid::hash_object(
+            git2::ObjectType::Blob,
+            &std::fs::read(file.abs_path()).expect("read fixture source"),
+        )
+        .expect("fixture blob identity");
+        TreeSitterAnalyzer::<JavaAdapter>::transient_cache_key(oid, file)
+    };
+    let reads_file = |keys: &[ReadKey], file: &ProjectFile| {
+        let rel_path = brokk_bifrost_core::path_utils::rel_path_string(file);
+        keys.iter()
+            .any(|key| matches!(key, ReadKey::File { rel_path: read, .. } if **read == *rel_path))
+    };
+    let _request = AnalyzerQueryScope::new(&analyzer);
+    analyzer.inner().bulk_file_states_for_query(
+        [primed.clone(), partial.clone()],
+        BulkFileStateSource::Include,
+    );
+    let published = analyzer
+        .inner()
+        .query_file_state_snapshot(&key_of(&primed))
+        .expect("the ordinary request published the primed state");
+    let partial_state = analyzer
+        .inner()
+        .query_file_state_snapshot(&key_of(&partial))
+        .expect("the ordinary request reads the partial state as before");
+    assert!(
+        !partial_state.parse_complete,
+        "the fixture must produce a parse-incomplete state, or this test pins nothing"
+    );
+
+    // A retained fill runs in its own request-cache domain. It must reuse the
+    // ordinary snapshot's complete state rather than hydrate the file again,
+    // and its receipt must record the read so an edit invalidates the fill.
+    let entry = replayable_query_cache_value(&analyzer, || {
+        let seen = analyzer
+            .inner()
+            .query_file_state_snapshot(&key_of(&primed))
+            .expect("a retained fill reads the ordinary snapshot");
+        assert!(
+            Arc::ptr_eq(&seen, &published),
+            "the fill reuses the published state"
+        );
+        assert!(
+            analyzer
+                .inner()
+                .query_file_state_snapshot(&key_of(&unprimed))
+                .is_none(),
+            "an unprimed key is absent, so the fill loads it in its own domain"
+        );
+        assert!(
+            analyzer
+                .inner()
+                .query_file_state_snapshot(&key_of(&partial))
+                .is_none(),
+            "the snapshot never serves a retained fill a parse-incomplete state"
+        );
+        assert!(analyzer.inner().fetch_file_state(&unprimed).is_some());
+    })
+    .unwrap();
+    let (_, reads) = brokk_bifrost_analysis::analyzer::capture_query_reads(&analyzer, || {
+        entry.replay();
+    });
+    assert!(
+        reads_file(&reads.keys(), &primed),
+        "the retained fill receipt must include its snapshot read: {reads:?}"
+    );
 }

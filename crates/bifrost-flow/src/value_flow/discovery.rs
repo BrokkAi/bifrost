@@ -54,11 +54,12 @@ pub struct CallSiteCoverage {
     /// summary evidence remains in `boundaries` but does not set this bit.
     pub has_uncovered_boundary: bool,
     /// The walk stopped before it could process at least one arm of this
-    /// call: a truncated dispatch enumeration, or an entered candidate left
-    /// unprocessed when the procedure cap was reached.
+    /// call: a truncated dispatch enumeration, an unenumerated workspace
+    /// hierarchy, or an entered candidate left unprocessed at the procedure cap.
+    /// This records possible omitted procedures, not an operational budget cause.
     pub truncated: bool,
-    /// The dispatch answer was truncated only because a syntax-derived
-    /// external receiver arm could not prove workspace override absence. A
+    /// The dispatch answer could not prove workspace override absence for a
+    /// syntax-derived external receiver arm. A
     /// complete type-flow receiver hint may refine that exact arm.
     pub complete_receiver_hint_refinable: bool,
     /// Whether dispatch produced a usable answer and the semantic quality of
@@ -80,10 +81,12 @@ impl CallSiteCoverage {
                 .boundaries()
                 .iter()
                 .any(dispatch_boundary_is_uncovered),
-            truncated: dispatch
-                .boundaries()
-                .iter()
-                .any(|boundary| matches!(boundary.kind, DispatchBoundaryKind::Truncated)),
+            truncated: dispatch.boundaries().iter().any(|boundary| {
+                matches!(
+                    boundary.kind,
+                    DispatchBoundaryKind::Truncated | DispatchBoundaryKind::HierarchyUnenumerated
+                )
+            }),
             complete_receiver_hint_refinable: dispatch.complete_receiver_hint_refinable(),
             dispatch: DispatchStatus::Resolved {
                 status: dispatch_status,

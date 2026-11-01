@@ -37,6 +37,8 @@ def verify(wheel_directory: Path, kind: str, version: str) -> None:
             assert archive.read(packaged), f"Empty license notice: {packaged}"
         if kind == "cli":
             verify_compressed_cli_layout(archive, Path(metadata[0]).parent.as_posix())
+        else:
+            verify_compressed_client_layout(archive)
 
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
@@ -75,20 +77,7 @@ def verify(wheel_directory: Path, kind: str, version: str) -> None:
             (fixture / "hello.py").write_text('def greet(name: str) -> str:\n    return "hello " + name\n')
             run(["git", "init", "--quiet", str(fixture)])
             run(["git", "-C", str(fixture), "add", "hello.py"])
-            probe = '''import importlib.metadata, json, sys
-import bifrost_searchtools
-from bifrost_searchtools import SearchToolsClient, _native
-assert importlib.metadata.version("brokk-bifrost-searchtools") == sys.argv[2]
-assert "site-packages" in bifrost_searchtools.__file__, bifrost_searchtools.__file__
-assert "site-packages" in _native.__file__, _native.__file__
-with SearchToolsClient(sys.argv[1], manual=True) as client:
-    result = client.search_symbols(["greet"], limit=10)
-    assert result.count == 1, result.render_text()
-    assert "greet" in result.render_text(), result.render_text()
-print(json.dumps({"package": bifrost_searchtools.__file__, "native": _native.__file__}))
-'''
-            print(run([*launcher, str(python), "-I", "-c", probe, str(fixture), version]).stdout,
-                  end="")
+            print(exercise_client_imports(python, launcher, fixture, version, run), end="")
         else:
             binary = exercise_cli_launchers(root, scripts, python, launcher, environment, version, run)
             probe = Path(__file__).with_name("verify-engine-compatibility.mjs")
@@ -97,18 +86,72 @@ print(json.dumps({"package": bifrost_searchtools.__file__, "native": _native.__f
                           "status": "installed-and-exercised"}))
 
 
+def verify_compressed_payload(archive: zipfile.ZipFile, package: str) -> dict:
+    """The wheel carries its native file xz-compressed beside the unpacker (#8288)."""
+    names = archive.namelist()
+    for name in (f"{package}/_xz_payload.py", f"{package}/payload.json"):
+        assert name in names, f"missing {name}: {names}"
+    payload = json.loads(archive.read(f"{package}/payload.json"))
+    compressed = f"{package}/{payload['compressed']}"
+    assert compressed in names, f"missing {compressed}: {names}"
+    assert archive.getinfo(compressed).compress_type == zipfile.ZIP_STORED
+    assert len(payload["sha256"]) == 64 and payload["size"] > 0, payload
+    return payload
+
+
+def verify_compressed_client_layout(archive: zipfile.ZipFile) -> None:
+    """The searchtools wheel carries its extension module xz-compressed (#8288)."""
+    raw = [name for name in archive.namelist()
+           if name.startswith("bifrost_searchtools/_native.") and not name.endswith(".xz")]
+    assert not raw, f"the searchtools wheel must not ship a raw extension module: {raw}"
+    payload = verify_compressed_payload(archive, "bifrost_searchtools")
+    assert payload["file"] in ("_native.abi3.so", "_native.pyd"), payload
+
+
 def verify_compressed_cli_layout(archive: zipfile.ZipFile, dist_info: str) -> None:
     """The CLI wheel carries its binary xz-compressed behind the launcher (#8288)."""
     names = archive.namelist()
     raw = [name for name in names if ".data/scripts/" in name]
     assert not raw, f"the CLI wheel must not ship raw scripts or binaries: {raw}"
-    for name in ("brokk_bifrost_cli/__init__.py", "brokk_bifrost_cli/payload.json",
-                 "brokk_bifrost_cli/bifrost.xz"):
-        assert name in names, f"missing {name}: {names}"
-    assert archive.getinfo("brokk_bifrost_cli/bifrost.xz").compress_type == zipfile.ZIP_STORED
+    assert "brokk_bifrost_cli/__init__.py" in names, f"missing the launcher: {names}"
+    payload = verify_compressed_payload(archive, "brokk_bifrost_cli")
+    assert payload["compressed"] == "bifrost.xz", payload
     entry_points = archive.read(f"{dist_info}/entry_points.txt").decode()
     for command in ("bifrost", "brokk-bifrost"):
         assert f"{command} = brokk_bifrost_cli:main" in entry_points, entry_points
+
+
+def exercise_client_imports(python, launcher, fixture, version, run):
+    """Import the installed client twice and run a query, and return the probe's report.
+
+    The first import unpacks the extension module beside its payload; the
+    second, in a new process, loads the unpacked copy.
+    """
+    probe = '''import importlib.metadata, json, sys, time
+started = time.monotonic()
+import bifrost_searchtools
+from bifrost_searchtools import SearchToolsClient, _native
+imported = time.monotonic() - started
+assert importlib.metadata.version("brokk-bifrost-searchtools") == sys.argv[2]
+assert "site-packages" in bifrost_searchtools.__file__, bifrost_searchtools.__file__
+assert "site-packages" in _native.__file__, _native.__file__
+with SearchToolsClient(sys.argv[1], manual=True) as client:
+    result = client.search_symbols(["greet"], limit=10)
+    assert result.count == 1, result.render_text()
+    assert "greet" in result.render_text(), result.render_text()
+print(json.dumps({"native": _native.__file__, "import_seconds": round(imported, 2)}))
+'''
+    reports = [json.loads(run([*launcher, str(python), "-I", "-c", probe, str(fixture), version]).stdout)
+               for _ in range(2)]
+    native = Path(reports[0]["native"])
+    assert native.parent.name.startswith("bin-") and native.parent.parent.name == "bifrost_searchtools", (
+        f"the extension module must unpack beside its payload: {native}"
+    )
+    assert reports[1]["native"] == reports[0]["native"], reports
+    leftovers = [path for path in native.parent.iterdir() if path != native]
+    assert not leftovers, f"unpacking left temporary files behind: {leftovers}"
+    return json.dumps({"native": str(native), "first_import_seconds": reports[0]["import_seconds"],
+                       "warm_import_seconds": reports[1]["import_seconds"]}) + "\n"
 
 
 def exercise_cli_launchers(root, scripts, python, launcher, environment, version, run):

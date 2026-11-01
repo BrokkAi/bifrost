@@ -161,14 +161,20 @@ fn strip_generic_type_arguments(input: &str) -> String {
 pub fn normalize_java_full_name(fq_name: &str) -> String {
     let mut normalized = strip_generic_type_arguments(fq_name);
 
-    if normalized.contains("$anon$") {
+    if ["$anon$", "$lambda$", "$enum$", "$owner$", "$local$"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
         let mut out = String::with_capacity(normalized.len());
         let mut chars = normalized.char_indices();
 
         while let Some((index, ch)) = chars.next() {
-            if normalized[index..].starts_with("$anon$") {
-                out.push_str("$anon$");
-                for _ in 0.."anon$".len() {
+            if let Some(marker) = ["$anon$", "$lambda$", "$enum$", "$owner$", "$local$"]
+                .into_iter()
+                .find(|marker| normalized[index..].starts_with(marker))
+            {
+                out.push_str(marker);
+                for _ in 0..marker.len() - 1 {
                     chars.next();
                 }
                 continue;
@@ -195,7 +201,14 @@ pub fn normalize_java_fq_name(fq_name: &FqName) -> FqName {
     let mut normalized = FqName::new();
     for &segment_id in fq_name.segments() {
         let (text, kind) = interner.resolve(segment_id);
-        let text = normalize_java_full_name(text);
+        let text = if ["anon$", "lambda$", "enum$", "owner$", "local$"]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+        {
+            text.to_string()
+        } else {
+            normalize_java_full_name(text)
+        };
         if text.is_empty() {
             continue;
         }
@@ -312,7 +325,9 @@ pub(super) fn looks_like_pascal_identifier(name: &str) -> bool {
 }
 
 pub fn is_java_anonymous_structure(fq_name: &str) -> bool {
-    fq_name.contains("$anon$")
+    ["$anon$", "$lambda$", "$enum$"]
+        .iter()
+        .any(|marker| fq_name.contains(marker))
         || fq_name
             // fqname-M4: classifies a JVM bytecode-derived anonymous-structure name, not a CodeUnit fq
             .rsplit_once('$')
@@ -406,24 +421,24 @@ pub fn class_like_code_unit(
     if simple_name.is_empty() {
         return None;
     }
-    let local_coordinate = parent.filter(|parent| parent.is_function()).map(|_| {
+    let local_name = parent.filter(|parent| parent.is_function()).map(|parent| {
         format!(
-            "local${}:{}",
-            node.start_position().row,
-            node.start_position().column
+            "owner${}{}",
+            parent.declaration_id(),
+            java_synthetic_name(node)
         )
     });
     let short_name = parent
-        .map(|parent| match &local_coordinate {
-            Some(coordinate) => format!("{}${coordinate}.{simple_name}", parent.short_name()),
+        .map(|parent| match &local_name {
+            Some(name) => format!("{}${name}.{simple_name}", parent.short_name()),
             None => format!("{}.{}", parent.short_name(), simple_name),
         })
         .unwrap_or_else(|| simple_name.to_string());
     let fq = match parent {
         Some(parent) => {
             let mut fq = parent.fq().clone();
-            if let Some(coordinate) = &local_coordinate {
-                fq.push(segment_interner().intern(coordinate, SegmentKind::Nested));
+            if let Some(name) = &local_name {
+                fq.push(segment_interner().intern(name, SegmentKind::Nested));
             }
             fq.with_pushed(segment_interner().intern(simple_name, SegmentKind::Type))
         }
@@ -468,8 +483,8 @@ fn declared_class_scope<'tree>(
 
 /// The scope an anonymous `new Base(...) { ... }` body introduces.
 ///
-/// The unit takes the same `$anon$line:column` marker the lambda units use, so
-/// no source spelling can name it and it stays synthetic. The written `Base`
+/// The unit takes a ranked anonymous-kind marker, so no source spelling can
+/// name it and it stays synthetic. The written `Base`
 /// becomes its one raw supertype, which is what lets a member the body
 /// inherits resolve exactly as a named subclass's would. The range anchors on
 /// the body, not on the whole expression: the constructor arguments are
@@ -525,10 +540,9 @@ fn enum_constant_class_scope<'tree>(
     package_name: &str,
     declaring_enum: &CodeUnit,
 ) -> JavaClassScopeFacts<'tree> {
-    let line = constant.start_position().row;
-    let column = constant.start_position().column;
-    let anon = segment_interner().intern(&format!("anon${line}:{column}"), SegmentKind::Nested);
-    let short_name = format!("{}$anon${line}:{column}", declaring_enum.short_name());
+    let name = java_synthetic_name(constant);
+    let anon = segment_interner().intern(&name[1..], SegmentKind::Nested);
+    let short_name = format!("{}{name}", declaring_enum.short_name());
     let fq = declaring_enum.fq().clone().with_pushed(anon);
     let header = source
         .get(constant.start_byte()..body.start_byte())
@@ -1124,47 +1138,22 @@ fn lambda_code_unit(
     )
 }
 
-/// The `$anon$line:column` short name and structured path a scope written at
-/// `node` hangs off `parent`.
-///
-/// The synthetic marker is a single `$anon$line:column` segment whose OWN text
-/// embeds a literal `$` between "anon" and the coordinate
-/// (`SegmentKind::Nested` renders one more `$` before it, regardless of the
-/// preceding segment's kind, and segment text is free-form, so the embedded
-/// `$` round-trips untouched). A lambda and an anonymous class body share this
-/// identity because no source spelling names either one, and no two of them
-/// can start at the same coordinate.
-///
-/// Where the marker hangs depends on what encloses it. A scope written in a
-/// callable body -- a method, a constructor, or another lambda -- and a scope
-/// written in an anonymous class body hang the marker straight off that
-/// owner's own `fq`. A scope written in a *named* class's field or
-/// class-level initializer runs in that class's implicit initializer, whose
-/// name is the class's own name, so the marker hangs off a repeat of the
-/// class's last segment (`F.F$anon$1:47`).
-///
-/// An anonymous owner has no written name to repeat, and repeating its marker
-/// segment was the #2161 regression: the short name joined the repeat with `.`
-/// while the structured name rendered the repeated `Nested` segment with `$`,
-/// so the two disagreed (`...$anon$140:43.anon$140:43$anon$146:51` against
-/// `...$anon$140:43$anon$140:43$anon$146:51`) and the construction-point
-/// boundary check in `CodeUnit::with_signature_and_fq` panicked the workspace
-/// build.
+/// Attach a ranked synthetic kind to the existing stable owner identity.
 fn java_anonymous_scope_identity(parent: &CodeUnit, node: Node<'_>) -> (String, FqName) {
-    let line = node.start_position().row;
-    let column = node.start_position().column;
-    let anon = segment_interner().intern(&format!("anon${line}:{column}"), SegmentKind::Nested);
+    let name = java_synthetic_name(node);
+    let name = if parent.is_function() {
+        format!("$owner${}{name}", parent.declaration_id())
+    } else {
+        name
+    };
+    let anon = segment_interner().intern(&name[1..], SegmentKind::Nested);
 
     if parent.is_function() || parent.is_synthetic() {
-        let short_name = format!("{}$anon${line}:{column}", parent.short_name());
+        let short_name = format!("{}{name}", parent.short_name());
         return (short_name, parent.fq().clone().with_pushed(anon));
     }
 
-    let short_name = format!(
-        "{}.{}$anon${line}:{column}",
-        parent.short_name(),
-        parent.identifier()
-    );
+    let short_name = format!("{}.{}{name}", parent.short_name(), parent.identifier());
     let mut fq = parent.fq().clone();
     fq.push(
         parent
@@ -3007,6 +2996,47 @@ fn java_overload_discriminator(parameters: Option<Node<'_>>, source: &str) -> [u
     overload_discriminator(tokens)
 }
 
+/// Grammar classification shared by public declarations and native bodies.
+pub(crate) fn java_synthetic_name(node: Node<'_>) -> String {
+    brokk_bifrost_core::analyzer::tree_walk::synthetic_name(
+        node,
+        |candidate| match candidate.kind() {
+            "lambda_expression" => Some("lambda"),
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration" => Some("local"),
+            "object_creation_expression" | "enum_constant" => {
+                let mut cursor = candidate.walk();
+                candidate
+                    .named_children(&mut cursor)
+                    .any(|child| child.kind() == "class_body")
+                    .then_some(if candidate.kind() == "enum_constant" {
+                        "enum"
+                    } else {
+                        "anon"
+                    })
+            }
+            _ => None,
+        },
+        |candidate| {
+            matches!(
+                candidate.kind(),
+                "method_declaration"
+                    | "constructor_declaration"
+                    | "compact_constructor_declaration"
+                    | "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            )
+        },
+    )
+    .to_string()
+}
+
 #[cfg(test)]
 mod same_package_identifier_tests {
 
@@ -3067,6 +3097,88 @@ mod source_shape_tests {
             "src/Fixture.java",
         );
         parse_java_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn synthetic_segment_normalization_preserves_rank() {
+        let interner = segment_interner();
+        for text in [
+            "anon$0",
+            "anon$1",
+            "lambda$2",
+            "enum$3",
+            "owner$decl:v1:abc",
+            "local$4",
+        ] {
+            let fq = FqName::new().with_pushed(interner.intern(text, SegmentKind::Nested));
+            let normalized = normalize_java_fq_name(&fq);
+            assert_eq!(interner.resolve(normalized.segments()[0]).0, text);
+        }
+    }
+
+    #[test]
+    fn overload_anonymous_declarations_keep_distinct_ids() {
+        let source = "class Owner { void f(int x) { Object v = new Object() { void marker() {} }; } void f(String x) { Object v = new Object() { void marker() {} }; } }";
+        let file = ProjectFile::new(std::env::temp_dir(), "Owner.java");
+        let parsed = parse_java_file(&file, source, &parse_tree(source).expect("java tree"));
+        let ids: Vec<_> = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.identifier() == "marker")
+            .map(|unit| unit.declaration_id())
+            .collect();
+        assert_eq!(ids.len(), 2, "both overloads keep their anonymous member");
+        assert_ne!(ids[0], ids[1], "anonymous members have distinct identities");
+    }
+
+    #[test]
+    fn synthetic_declaration_ids_follow_rank_across_edits() {
+        fn ids(source: &str) -> std::collections::BTreeSet<String> {
+            let parsed = parse(source);
+            parsed
+                .declarations()
+                .iter()
+                .filter(|unit| matches!(unit.identifier(), "target" | "localTarget"))
+                .map(|unit| {
+                    assert_eq!(
+                        unit.is_anonymous(),
+                        unit.identifier() == "target",
+                        "members retain their anonymous or named-local ancestry: {unit:?}"
+                    );
+                    unit.declaration_id().to_string()
+                })
+                .collect()
+        }
+        let source = "class Fixture { void f(){ class Local { void localTarget(){} } Object a = new Object(){ void target(){} }; } } enum E { A { void target(){} }; } record R(int x) { R { Object a = new Object(){ void target(){} }; } }";
+        let original = ids(source);
+        assert_eq!(
+            original.len(),
+            4,
+            "method, local-class, enum and compact-constructor members were produced"
+        );
+        assert_eq!(original, ids(&format!("// byte shift\n{source}")));
+        assert_eq!(
+            original,
+            ids(&source.replace(
+                "Object a =",
+                "Object plain = new Object(); Runnable r = () -> {}; Object a ="
+            ))
+        );
+        assert_eq!(
+            original,
+            ids(&source.replace(
+                "record R(int x) {",
+                "record R(int x) { static Object noise = new Object(){};"
+            ))
+        );
+        let inserted = ids(
+            "class Fixture { void f(){ class Before {} class Local { void localTarget(){} } Object earlier = new Object(){}; Object a = new Object(){ void target(){} }; } } enum E { B {}, A { void target(){} }; } record R(int x) { R { Object earlier = new Object(){}; Object a = new Object(){ void target(){} }; } }",
+        );
+        assert_eq!(original.len(), inserted.len());
+        assert!(
+            original.is_disjoint(&inserted),
+            "earlier siblings change ranks"
+        );
     }
 
     fn metadata<'a>(parsed: &'a ParsedFile, prefix: &str) -> &'a SignatureMetadata {

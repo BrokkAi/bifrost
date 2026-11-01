@@ -14,23 +14,44 @@ use brokk_bifrost_core::analyzer::php_facts::{PhpAliasKind, PhpAliasSourceFact};
 use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, SourceImportId};
 use tree_sitter::Node;
 
+use crate::aliases::PhpFileContext;
 pub use crate::aliases::{PhpImport, PhpImportKind, PhpImportSyntax, parse_php_import_syntax};
 
 /// Project a PHP include/require expression into the canonical source import
 /// arena. The expression is interpreted from its AST, with string decoding
 /// applied only after the grammar selected a plain string literal.
+///
+/// An unqualified `dirname(...)` written inside a namespace calls that
+/// namespace's own `dirname` when the workspace declares one. Whether it does
+/// is a cross-file question, so the fold keeps the path and records the
+/// namespace as the include's only lexical prefix; the include resolver and
+/// the dynamic-include diagnostic drop the static target when a function
+/// `<namespace>.dirname` is declared.
 pub fn project_include_source_fact(
     include: Node<'_>,
     expression: Option<Node<'_>>,
     source: &str,
+    context: &PhpFileContext,
     source_collector: &mut PrimarySourceFactCollector<'_>,
 ) -> SourceImportFact {
-    let static_segments = expression
-        .and_then(|node| fold_include_expression(node, source))
-        .and_then(|path| path_segments(&path));
-    let (kind, segments) = static_segments.map_or_else(
-        || (StructuredImportPathKind::DynamicInclude, Vec::new()),
-        |segments| (StructuredImportPathKind::FileInclude, segments),
+    let folded = expression
+        .and_then(|node| fold_include_expression(node, source, context))
+        .and_then(|(path, shadowing_namespace)| Some((path_segments(&path)?, shadowing_namespace)));
+    let (kind, segments, lexical_prefixes) = folded.map_or_else(
+        || {
+            (
+                StructuredImportPathKind::DynamicInclude,
+                Vec::new(),
+                Vec::new(),
+            )
+        },
+        |(segments, shadowing_namespace)| {
+            (
+                StructuredImportPathKind::FileInclude,
+                segments,
+                shadowing_namespace.into_iter().collect(),
+            )
+        },
     );
     let declaration = source_collector.intern_node(include);
     SourceImportFact::from_import(
@@ -43,7 +64,7 @@ pub fn project_include_source_fact(
             path: Some(StructuredImportPath {
                 segments,
                 kind: Some(kind),
-                lexical_prefixes: Vec::new(),
+                lexical_prefixes,
                 lexical_scopes: Vec::new(),
                 declaration_start_byte: include.start_byte(),
             }),
@@ -63,7 +84,13 @@ enum IncludePath {
     Directory { parents: usize, suffix: String },
 }
 
-fn fold_include_expression(node: Node<'_>, source: &str) -> Option<IncludePath> {
+/// Fold a static include path. The second value is the namespace whose own
+/// `dirname` would shadow a folded unqualified `dirname` call, if any.
+fn fold_include_expression(
+    node: Node<'_>,
+    source: &str,
+    context: &PhpFileContext,
+) -> Option<(IncludePath, Option<String>)> {
     enum Action<'tree> {
         Fold(Node<'tree>),
         Concatenate,
@@ -72,6 +99,7 @@ fn fold_include_expression(node: Node<'_>, source: &str) -> Option<IncludePath> 
 
     let mut actions = vec![Action::Fold(node)];
     let mut paths = Vec::new();
+    let mut shadowing_namespace = None;
     while let Some(action) = actions.pop() {
         match action {
             Action::Fold(node) => match node.kind() {
@@ -102,7 +130,10 @@ fn fold_include_expression(node: Node<'_>, source: &str) -> Option<IncludePath> 
                     actions.push(Action::Fold(left));
                 }
                 "function_call_expression" => {
-                    let (operand, levels) = dirname_operand(node, source)?;
+                    let (operand, levels, shadowable) = dirname_operand(node, source, context)?;
+                    if shadowable {
+                        shadowing_namespace = Some(context.namespace.clone());
+                    }
                     actions.push(Action::ApplyDirname(levels));
                     actions.push(Action::Fold(operand));
                 }
@@ -150,7 +181,8 @@ fn fold_include_expression(node: Node<'_>, source: &str) -> Option<IncludePath> 
             }
         }
     }
-    (paths.len() == 1).then(|| paths.pop()).flatten()
+    let path = (paths.len() == 1).then(|| paths.pop()).flatten()?;
+    Some((path, shadowing_namespace))
 }
 
 fn binary_operator_is_dot(node: Node<'_>, source: &str) -> bool {
@@ -158,11 +190,20 @@ fn binary_operator_is_dot(node: Node<'_>, source: &str) -> bool {
         .is_some_and(|operator| node_text(operator, source) == ".")
 }
 
-fn dirname_operand<'tree>(node: Node<'tree>, source: &str) -> Option<(Node<'tree>, usize)> {
+/// The operand and level count of a call that PHP binds to the global
+/// `dirname`. The flag is set when the call is unqualified inside a namespace,
+/// where a declared `<namespace>\dirname` is called instead.
+fn dirname_operand<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    context: &PhpFileContext,
+) -> Option<(Node<'tree>, usize, bool)> {
     let function = node.child_by_field_name("function")?;
-    if !node_text(function, source).eq_ignore_ascii_case("dirname") {
+    let candidates = crate::aliases::resolve_php_function_node(function, source, context, || true)?;
+    if !candidates.last().eq_ignore_ascii_case("dirname") {
         return None;
     }
+    let shadowable = candidates.iter().nth(1).is_some();
     let arguments = node.child_by_field_name("arguments")?;
     let mut arguments_cursor = arguments.walk();
     let mut args = arguments.named_children(&mut arguments_cursor);
@@ -185,7 +226,7 @@ fn dirname_operand<'tree>(node: Node<'tree>, source: &str) -> Option<(Node<'tree
     if args.next().is_some() {
         return None;
     }
-    Some((expression, levels))
+    Some((expression, levels, shadowable))
 }
 
 fn parse_positive_php_integer(node: Node<'_>, source: &str) -> Option<usize> {
@@ -201,7 +242,16 @@ fn parse_positive_php_integer(node: Node<'_>, source: &str) -> Option<usize> {
 fn path_segments(path: &IncludePath) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     if let IncludePath::Directory { parents, suffix } = path {
-        let suffix = trim_leading_path_separators(suffix);
+        // `__DIR__` and `dirname()` return no trailing separator, so only a
+        // suffix that starts with one names an entry inside the directory.
+        // `__DIR__ . 'x.php'` is `<parent>/<dirname>x.php`; the directory's
+        // own name is not in this path-independent fact, so the include stays
+        // dynamic rather than resolving to a child.
+        let trimmed = trim_leading_path_separators(suffix);
+        if trimmed.len() == suffix.len() && !suffix.is_empty() {
+            return None;
+        }
+        let suffix = trimmed;
         if !is_workspace_relative(suffix) {
             return None;
         }

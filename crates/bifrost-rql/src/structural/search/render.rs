@@ -1533,7 +1533,7 @@ pub(super) fn render_dispatch_target(
         completeness: arm.completeness,
         coverage: site.answer.coverage.label(),
         dispatch: site.answer.dispatch_label(arm),
-        boundary_kind: arm.boundary_kind,
+        boundary_kind: arm.boundary_kind.map(|kind| kind.label()),
     }
 }
 
@@ -4885,6 +4885,7 @@ pub(super) fn render_match(
             .enclosing_unit_for_lines(analyzer, file, range.start_line, range.end_line)
             .map(|code_unit| code_unit.fq_name()),
         python_import: None,
+        heuristic: fact_match.heuristic,
     }
 }
 

@@ -266,6 +266,35 @@ pub fn take_selected_definition_unit_sql_work() -> (u64, u64) {
 }
 
 pub(super) const SELECTED_DEFINITION_BLOB_SQL: &str = "SELECT interior.blob_id FROM temp.selected_resolution_mounts AS mount CROSS JOIN main.resolution_fragment_interiors AS interior ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language AND interior.semantic_language=mount.semantic_language AND interior.producer_epoch=mount.producer_epoch AND interior.interior_digest=mount.interior_digest AND interior.publication_state='complete' WHERE mount.mount_ordinal=?1";
+// Hierarchy units can come from legacy crosswalks or canonical source-native
+// bridges. Java publishes the latter; neither authority is a name fallback.
+// Singleton owners occupy the value namespace but have their own hierarchy.
+static HIERARCHY_DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
+        format!(
+    "SELECT {SELECTED_UNIT_COLUMNS}, definition.semantic_key
+     FROM main.resolution_fragment_interiors AS interior
+     JOIN (
+       SELECT crosswalk.definition_semantic_key AS semantic_key, crosswalk.unit_key
+       FROM main.resolution_definition_unit_crosswalks AS crosswalk
+       JOIN main.resolution_semantic_sites AS semantic ON semantic.blob_id=crosswalk.blob_id AND semantic.semantic_key=crosswalk.definition_semantic_key AND semantic.semantic_role='definition' AND (semantic.namespace='type' OR EXISTS (SELECT 1 FROM main.resolution_singleton_relations AS singleton WHERE singleton.blob_id=semantic.blob_id AND singleton.declaration_site=semantic.source_site))
+       WHERE crosswalk.blob_id=?1
+       UNION
+       SELECT semantic.semantic_key, link.unit_key
+       FROM main.source_fact_manifests AS source
+       JOIN main.resolution_semantic_sites AS semantic ON semantic.blob_id=source.blob_id AND semantic.semantic_role='definition' AND (semantic.namespace='type' OR EXISTS (SELECT 1 FROM main.resolution_singleton_relations AS singleton WHERE singleton.blob_id=semantic.blob_id AND singleton.declaration_site=semantic.source_site))
+       JOIN main.source_native_declaration_bridges AS bridge ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
+       JOIN main.source_declaration_units AS link ON link.blob_id=bridge.blob_id AND link.declaration_id=bridge.declaration_id
+       WHERE source.blob_id=?1 AND source.publication_state='complete'
+     ) AS definition
+     JOIN main.code_units AS units ON units.blob_id=interior.blob_id AND units.unit_key=definition.unit_key
+     JOIN main.blobs AS keys ON keys.id=units.blob_id
+     JOIN main.blob_meta AS meta ON meta.blob_id=units.blob_id
+     WHERE interior.blob_id=?1 AND interior.publication_state='complete' AND units.in_declarations=1 AND {}
+     ORDER BY definition.semantic_key", super::PARSED_BLOB_COMPLETE_CONDITION)
+    },
+);
+
 pub(super) static DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
@@ -435,9 +464,30 @@ impl SelectedResolutionMountInventory<'_> {
 
     /// Hydrate one immutable blob's declaration crosswalk. An overlay reader
     /// uses its masked file version to locate the persisted base explicitly.
+    pub(crate) fn hierarchy_definition_semantics_for_mount(
+        &self,
+        mount: SelectedResolutionMountOrdinal,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedDefinitionSemanticReadOutcome> {
+        let blob: i64 = self
+            .connection()
+            .prepare_cached(SELECTED_DEFINITION_BLOB_SQL)?
+            .query_row([i64::from(mount.get())], |row| row.get(0))?;
+        self.read_definition_semantics(blob, &HIERARCHY_DEFINITION_SEMANTICS_SQL, cancellation)
+    }
+
     pub(crate) fn definition_semantics_for_blob(
         &self,
         blob: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedDefinitionSemanticReadOutcome> {
+        self.read_definition_semantics(blob, &DEFINITION_SEMANTICS_SQL, cancellation)
+    }
+
+    fn read_definition_semantics(
+        &self,
+        blob: i64,
+        sql: &str,
         cancellation: &CancellationToken,
     ) -> Result<SelectedDefinitionSemanticReadOutcome> {
         if cancellation.is_cancelled() {
@@ -445,7 +495,7 @@ impl SelectedResolutionMountInventory<'_> {
         }
         let result =
             with_resolution_read_progress_handler(self.connection(), cancellation, |conn| {
-                let mut statement = conn.prepare_cached(&DEFINITION_SEMANTICS_SQL)?;
+                let mut statement = conn.prepare_cached(sql)?;
                 let rows = statement
                     .query_map([blob], |row| {
                         Ok((

@@ -88,6 +88,8 @@ mod display_path;
 mod evaluator;
 mod explain;
 mod finding;
+#[cfg(test)]
+mod finding_analysis_labels_tests;
 mod value_type_barrier_notes;
 pub use value_type_barrier_notes::{ValueTypeBarrierNote, ValueTypeBarrierNotes};
 mod finding_identity;
@@ -99,6 +101,8 @@ mod locator;
 mod parallel;
 mod projection;
 mod registry;
+#[cfg(test)]
+mod registry_admission_tests;
 mod relational;
 mod render;
 mod report;
@@ -164,6 +168,12 @@ pub(crate) const fn within_policy_limit(value: usize, hard_maximum: usize) -> bo
 #[cfg(test)]
 mod adapter_seam_tests;
 #[cfg(test)]
+mod byte_budget_exact_limit_tests;
+#[cfg(test)]
+mod canonical_authoring_tests;
+#[cfg(test)]
+mod evidence_wire_boundary_tests;
+#[cfg(test)]
 mod flow_policy_tests;
 #[cfg(test)]
 #[path = "../../../test-support/inline_project.rs"]
@@ -216,3 +226,24 @@ pub use taint_policy::with_icfg_taint_engine_for_test;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use taint_barriers::count_value_type_barrier_calls_for_test;
+
+#[cfg(test)]
+mod authored_projection_tests;
+#[cfg(test)]
+mod authoring_contract_tests;
+#[cfg(test)]
+mod barrier_note_wire_tests;
+#[cfg(test)]
+mod canonical_identity_tests;
+#[cfg(test)]
+mod catalog_authoring_tests;
+#[cfg(test)]
+mod catalog_dependency_contracts;
+#[cfg(test)]
+mod catalog_scope_contract_tests;
+#[cfg(test)]
+mod classification_contract_tests;
+#[cfg(test)]
+mod loaded_identity_contract_tests;
+#[cfg(test)]
+mod policy_authoring_boundaries_tests;

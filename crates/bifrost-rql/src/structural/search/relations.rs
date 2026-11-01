@@ -818,6 +818,7 @@ pub(super) fn expand_hierarchy(
     budget: &mut CodeQueryExecutionBudget,
     max_pipeline_rows: usize,
     omissions: &mut BTreeMap<(Language, &'static str), usize>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let Some(provider) = analyzer.type_hierarchy_provider() else {
         record_semantic_omission(
@@ -836,6 +837,37 @@ pub(super) fn expand_hierarchy(
         return (Vec::new(), false);
     }
 
+    let mut result = None;
+    provider.with_hierarchy_query_for(&declaration.unit, &mut |query| {
+        result = Some(expand_hierarchy_in_query(
+            analyzer,
+            declaration,
+            step,
+            traversal,
+            indexed,
+            budget,
+            max_pipeline_rows,
+            omissions,
+            diagnostics,
+            query,
+        ));
+    });
+    result.expect("hierarchy query runs once")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_hierarchy_in_query(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    step: &QueryStep,
+    traversal: HierarchyTraversal,
+    indexed: &mut IndexedDeclarations,
+    budget: &mut CodeQueryExecutionBudget,
+    max_pipeline_rows: usize,
+    omissions: &mut BTreeMap<(Language, &'static str), usize>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    query: &mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery,
+) -> (Vec<PipelineExpansion>, bool) {
     let max_depth = match traversal {
         HierarchyTraversal::Direct => 1,
         HierarchyTraversal::Depth(depth) => depth.get(),
@@ -852,14 +884,59 @@ pub(super) fn expand_hierarchy(
 
     while let Some(work) = queue.pop_front() {
         let answer = match step {
-            QueryStep::Supertypes(_) => provider.get_direct_ancestors(&work.unit),
-            QueryStep::Subtypes(_) => provider.get_direct_descendants(&work.unit),
+            QueryStep::Supertypes(_) => query.direct_ancestors(&work.unit),
+            QueryStep::Subtypes(_) => query.direct_descendants(&work.unit),
             _ => unreachable!("hierarchy expansion requires a hierarchy step"),
         };
-        if !answer.is_complete() {
-            return (expansions, true);
+        for reason in &answer.open {
+            diagnostics.push(incomplete_diagnostic(
+                CodeQueryDiagnosticCode::HierarchyIncomplete,
+                brokk_bifrost_rql::Incompleteness::Content,
+                crate::analyzer::common::language_for_file(work.unit.source()).config_label(),
+                format!(
+                    "hierarchy of {} is incomplete: {}",
+                    work.unit.fq_name(),
+                    reason.description()
+                ),
+                Vec::new(),
+            ));
         }
-        let mut related = answer.definite().to_vec();
+        for group in &answer.ambiguous {
+            let mut diagnostic = incomplete_diagnostic(
+                CodeQueryDiagnosticCode::HierarchyIncomplete,
+                brokk_bifrost_rql::Incompleteness::Content,
+                crate::analyzer::common::language_for_file(work.unit.source()).config_label(),
+                format!(
+                    "hierarchy of {} has an ambiguous boundary",
+                    work.unit.fq_name()
+                ),
+                Vec::new(),
+            );
+            for unit in group {
+                if let Some(range) = analyzer.ranges_of(unit).first() {
+                    diagnostic.related.push(CodeQueryRelatedSource {
+                        source: CodeQuerySourceSpan {
+                            path: unit
+                                .source()
+                                .rel_path()
+                                .to_string_lossy()
+                                .replace('\\', "/"),
+                            range: render::render_source_range(
+                                analyzer,
+                                unit.source(),
+                                range,
+                                &mut PipelineRenderCache::default(),
+                            ),
+                            start_byte: range.start_byte,
+                            end_byte: range.end_byte,
+                        },
+                        label: unit.fq_name().to_string(),
+                    });
+                }
+            }
+            diagnostics.push(diagnostic);
+        }
+        let mut related = answer.edges;
         related.sort();
         related.dedup();
         for unit in related {

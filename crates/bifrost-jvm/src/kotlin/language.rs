@@ -66,6 +66,37 @@ mod tests {
     }
 
     #[hardwon(
+        "#8591: Kotlin 2.2 context-parameter function types parsed as ERROR, leaving the kotlin-stdlib 2.2.20 pack Partial"
+    )]
+    #[test]
+    fn context_parameter_function_type_grammar_boundary() {
+        let source = "fun f(block: context(A, B) () -> R) {}";
+        let tree = assert_clean("context-parameter function type", source);
+        let start = source.find("context(").expect("context prefix");
+        let mut node = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + 1)
+            .expect("context node");
+        while node.kind() != "function_type" {
+            node = node.parent().expect("parameter function type");
+        }
+        assert_eq!(node.parent().expect("parameter").kind(), "parameter");
+        let mut cursor = node.walk();
+        let children = node
+            .named_children(&mut cursor)
+            .map(|child| child.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children,
+            [
+                "context_parameters",
+                "function_type_parameters",
+                "user_type"
+            ]
+        );
+    }
+
+    #[hardwon(
         "54ad924ea614: Kotlin newline-separated primary-constructor modifiers failed to parse cleanly"
     )]
     #[test]

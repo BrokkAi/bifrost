@@ -102,6 +102,42 @@ mod rust_departing_tests_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#8403: a same-named call with a different arity left a Rust reverse inventory incomplete"
+    )]
+    fn reverse_inventory_accounts_for_unrelated_callee_applicability() {
+        for unresolved in [false, true] {
+            let fixture = InlineTestProject::new()
+                .file("Cargo.toml", "[package]\nname='reverse_applicability'\nversion='0.1.0'\nedition='2021'\n")
+                .file("src/target.rs", "pub fn positive(value: &str, client: &()) {}\n")
+                .file("src/lib.rs", format!(
+                    "mod target;\n\
+                     pub fn real(value: &str, client: &()) {{ target::positive(value, client); }}\n\
+                     mod apis {{\n\
+                       pub fn run(client: &()) {{ positive(client); }}\n\
+                       fn positive(client: &()) {{}}\n\
+                     }}\n{}",
+                    if unresolved { "pub fn open(value: &str, client: &()) { missing::positive(value, client); }" } else { "" }
+                ))
+                .build();
+            let result = inverse_result_for(&fixture, "src/target.rs", "positive");
+            assert_eq!(
+                result.completeness.is_complete(),
+                !unresolved,
+                "unresolved={unresolved}: {result:?}"
+            );
+            if !unresolved {
+                assert_eq!(
+                    result.edges.len(),
+                    1,
+                    "the real caller survives: {result:?}"
+                );
+                assert_eq!(result.edges[0].site.file, fixture.file("src/lib.rs"));
+            }
+        }
+    }
+
+    #[test]
     fn reverse_inventory_gap_candidate_names_are_target_scoped() {
         let different = InlineTestProject::new()
             .file(

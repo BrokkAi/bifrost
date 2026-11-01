@@ -9,14 +9,14 @@ use crate::analyzer::structural::facts::FileFacts;
 use crate::analyzer::structural::reference_edges::ReferenceEdgeRow;
 use crate::analyzer::usages::call_relations::{
     CallRelationDiagnostic, CallRelationLimits, CallRelationResult, CallRelationWork, CallSite,
-    is_call_relation_unit, raw_call_site,
+    CallerInventoryCoverage, is_call_relation_unit, raw_call_site,
 };
 use crate::analyzer::usages::get_definition::call_sites::{
     CallSiteSyntax, call_site_syntax_for_reference,
 };
 use crate::analyzer::usages::proof_rank;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
-use brokk_bifrost_core::analyzer::usages::model::UsageProof;
+use brokk_bifrost_core::analyzer::usages::model::{ReferenceKind, UsageHitKind, UsageProof};
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashMap;
 
@@ -82,8 +82,22 @@ pub trait IncomingCallProjection {
     ) -> Result<IncomingFile, Self::Error>;
 
     /// Language grammar may exclude references before charging a candidate.
+    /// The shared projection marks the inventory Incomplete for every
+    /// rejected reference, because a rejection does not prove the occurrence
+    /// cannot call the target.
     fn accept_reference(&self, _edge: &ReferenceEdgeRow, _syntax: &CallSiteSyntax) -> bool {
         true
+    }
+
+    /// Whether dispatch can reach this target without a named reverse row.
+    ///
+    /// The projection asks only while the caller inventory is still Complete,
+    /// so a language that never seeds Complete before projecting never
+    /// reaches this hook. Java seeds no Complete inventory today; once it
+    /// does, it must answer here for targets the JDK can call back without a
+    /// source reference, such as `Runnable.run`, `compareTo` and `equals`.
+    fn unenumerable_dispatch(&mut self, _target: &CodeUnit) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 
     fn caller(&self, edge: &ReferenceEdgeRow, _syntax: &CallSiteSyntax) -> Option<CodeUnit> {
@@ -110,12 +124,25 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
     cancellation: &CancellationToken,
     result: &mut CallRelationResult,
 ) -> Result<Option<IncomingSites<M>>, P::Error> {
+    if cancellation.is_cancelled() {
+        result.cancelled = true;
+        result.caller_inventory = CallerInventoryCoverage::Incomplete;
+        return Ok(None);
+    }
+    // Ask only while the answer can still be Complete: otherwise the hook's
+    // reads cannot change the answer and would only add read keys.
+    if result.caller_inventory == CallerInventoryCoverage::Complete
+        && projection.unenumerable_dispatch(target)?
+    {
+        result.caller_inventory = CallerInventoryCoverage::Incomplete;
+    }
     let mut files = HashMap::default();
     let mut sites = Vec::new();
     for (edge, metadata) in rows {
         if cancellation.is_cancelled() {
             result.sites.clear();
             result.cancelled = true;
+            result.caller_inventory = CallerInventoryCoverage::Incomplete;
             return Ok(None);
         }
         assert_eq!(
@@ -146,6 +173,7 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
             files.insert(file.clone(), loaded);
         }
         let IncomingFile::Loaded(Some(facts)) = &files[file] else {
+            result.caller_inventory = CallerInventoryCoverage::Incomplete;
             continue;
         };
         let Some(syntax) = call_site_syntax_for_reference(
@@ -153,13 +181,40 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
             edge.site.range.start_byte,
             edge.site.range.end_byte,
         ) else {
+            // Loaded facts retain the complete call inventory: bounded or
+            // cancelled extraction publishes no FileFacts. Parser recovery can
+            // still hide calls, so absence of syntax is no proof in that case.
+            // Imports, binders and type-only references cannot invoke the target.
+            // Other non-callee occurrences can let its value escape; callers
+            // through that value are not enumerated by the selected inverse.
+            let non_value = matches!(
+                edge.usage_kind,
+                UsageHitKind::Import
+                    | UsageHitKind::Reexport
+                    | UsageHitKind::Definition
+                    | UsageHitKind::OverrideDeclaration
+            ) || matches!(
+                edge.reference_kind,
+                Some(
+                    ReferenceKind::TypeReference
+                        | ReferenceKind::SelfTypeAlias
+                        | ReferenceKind::Inheritance
+                )
+            );
+            if !non_value || !facts.recovered_regions().is_empty() {
+                result.caller_inventory = CallerInventoryCoverage::Incomplete;
+            }
             continue;
         };
         if !projection.accept_reference(edge, &syntax) {
+            // The hook only filters; it cannot prove that a rejected
+            // occurrence does not call the target, so the inventory is open.
+            result.caller_inventory = CallerInventoryCoverage::Incomplete;
             continue;
         }
         if result.work.examined_candidates >= limits.max_candidates {
             result.truncated = true;
+            result.caller_inventory = CallerInventoryCoverage::Incomplete;
             continue;
         }
         result.work.examined_candidates += 1;
@@ -167,6 +222,7 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
             .caller(edge, &syntax)
             .filter(is_call_relation_unit)
         else {
+            result.caller_inventory = CallerInventoryCoverage::Incomplete;
             result
                 .diagnostics
                 .push(projection.report_issue(IncomingProjectionIssue::OwnerUnavailable(edge)));
@@ -177,6 +233,11 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
             sites.len(),
             metadata,
         ));
+    }
+    if cancellation.is_cancelled() {
+        result.cancelled = true;
+        result.caller_inventory = CallerInventoryCoverage::Incomplete;
+        return Ok(None);
     }
     Ok(Some(IncomingSites(sites)))
 }

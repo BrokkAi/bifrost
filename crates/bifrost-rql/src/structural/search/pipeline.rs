@@ -450,7 +450,45 @@ fn call_argument_filter_matches(value: &CallBindingValue, selector: &CallArgumen
         && match selector {
             CallArgumentSelector::FormalName(name) => row.formal_name.as_ref() == Some(name),
             CallArgumentSelector::FormalIndex(index) => row.formal_index == Some(*index),
+            CallArgumentSelector::FormalAnnotationType(_) => {
+                unreachable!("a formal annotation type is matched against the callee declaration")
+            }
         }
+}
+
+/// The diagnostic for a bound actual whose formal's annotations could not be
+/// read or resolved, so `:formal-annotation-type` can neither select nor
+/// reject it. Dropping the row silently would read as "no actual reaches an
+/// annotated formal".
+fn formal_annotation_undecided_diagnostic(
+    value: &CallBindingValue,
+    annotation_type: &str,
+    reason: &str,
+) -> CodeQueryDiagnostic {
+    let report = &value.site.report;
+    let path = rel_path_string(&report.file);
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: Incompleteness::Content,
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: crate::analyzer::common::language_for_file(&report.file).config_label(),
+        message: format!(
+            "call_argument :formal-annotation-type {annotation_type:?} is undecided at a call in {path}: formal {} of {}: {reason}",
+            value
+                .row()
+                .formal_index
+                .expect("an exactly bound actual has a formal index"),
+            value.site.target.as_ref().map_or_else(
+                || "the resolved callee".to_string(),
+                |target| target.unit.fq_name()
+            ),
+        ),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: Some(path),
+    })
 }
 
 /// The diagnostic for a bound actual whose formal has no recorded name, so a
@@ -1492,14 +1530,15 @@ pub(super) fn apply_plan_step(
     }
 }
 
+fn fair_cap(current: usize, maximum: usize, remaining: usize) -> usize {
+    current.saturating_add(maximum.saturating_sub(current).div_ceil(remaining.max(1)))
+}
+
 pub(super) fn fair_branch_limits(
     budget: &CodeQueryExecutionBudget,
     parent: CodeQueryExecutionLimits,
     remaining_branches: usize,
 ) -> CodeQueryExecutionLimits {
-    fn fair_cap(current: usize, maximum: usize, remaining: usize) -> usize {
-        current.saturating_add(maximum.saturating_sub(current).div_ceil(remaining.max(1)))
-    }
     CodeQueryExecutionLimits {
         max_scanned_files: fair_cap(
             budget.scanned_files,
@@ -2451,6 +2490,12 @@ fn apply_pipeline_step_general<'a>(
     let mut procedure_reference_inventory = HashMap::default();
     let mut enclosing_declarations: HashMap<ProjectFile, EnclosingDeclarationIndex> =
         HashMap::default();
+    // Every actual bound to one callee formal shares its answer; this step
+    // carries one annotation type, so the callee declaration and formal key it.
+    let mut formal_annotations: HashMap<
+        (ProjectFile, usize, usize),
+        decorator_binding::FormalAnnotationMatch,
+    > = HashMap::default();
     let mut exhausted = false;
     let mut receiver_truncated = false;
     let mut filter_witnessed_candidate = false;
@@ -3400,7 +3445,7 @@ fn apply_pipeline_step_general<'a>(
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::ProcedureReturnProfile,
-            ) => python_rule_facts::procedure_return_profile_expansions(
+            ) => procedure_return_profile::procedure_return_profile_expansions(
                 analyzer,
                 environment_cache,
                 procedure,
@@ -3974,6 +4019,7 @@ fn apply_pipeline_step_general<'a>(
                     budget,
                     max_pipeline_rows,
                     &mut semantic_omissions,
+                    diagnostics,
                 );
                 row_exhausted = hierarchy_exhausted;
                 expansions
@@ -4951,6 +4997,61 @@ fn apply_pipeline_step_general<'a>(
                     Vec::new()
                 }
             }
+            (
+                PipelineValue::CallBinding(value),
+                QueryStep::CallArgument(CallArgumentSelector::FormalAnnotationType(
+                    annotation_type,
+                )),
+            ) => {
+                filter_witnessed_candidate = true;
+                if !call_argument_row_bound(value) {
+                    Vec::new()
+                } else {
+                    let decided = match value.site.target.as_ref() {
+                        Some(target) => formal_annotations
+                            .entry((
+                                target.unit.source().clone(),
+                                target.range.start_byte,
+                                value
+                                    .row()
+                                    .formal_index
+                                    .expect("an exactly bound actual has a formal index"),
+                            ))
+                            .or_insert_with(|| {
+                                decorator_binding::formal_annotation_match(
+                                    analyzer,
+                                    value,
+                                    annotation_type,
+                                    cancellation,
+                                )
+                            })
+                            .clone(),
+                        None => decorator_binding::formal_annotation_match(
+                            analyzer,
+                            value,
+                            annotation_type,
+                            cancellation,
+                        ),
+                    };
+                    match decided {
+                        decorator_binding::FormalAnnotationMatch::Carries => {
+                            filter_selected_candidate = true;
+                            vec![pipeline_expansion(PipelineValue::CallBinding(
+                                value.clone(),
+                            ))]
+                        }
+                        decorator_binding::FormalAnnotationMatch::Lacks => Vec::new(),
+                        decorator_binding::FormalAnnotationMatch::Undecided(reason) => {
+                            diagnostics.push(formal_annotation_undecided_diagnostic(
+                                value,
+                                annotation_type,
+                                &reason,
+                            ));
+                            Vec::new()
+                        }
+                    }
+                }
+            }
             (PipelineValue::CallBinding(value), QueryStep::CallArgument(selector)) => {
                 filter_witnessed_candidate = true;
                 if call_argument_filter_matches(value, selector) {
@@ -5033,31 +5134,30 @@ fn apply_pipeline_step_general<'a>(
                     diagnostics,
                 )
             }
+            // `resolved_value` decides each candidate itself: a candidate whose
+            // identity it cannot prove records its own incomplete diagnostic,
+            // and one that resolves exactly to another identity is a proven
+            // non-match. Neither counts toward the step-level rejection, which
+            // would otherwise turn a clean near miss inconclusive (#8300).
             (PipelineValue::CallBinding(value), QueryStep::ResolvedValue(filter)) => {
-                filter_witnessed_candidate = true;
-                let expansions = resolved_value::call_binding_expansions(
+                resolved_value::call_binding_expansions(
                     analyzer,
                     environment_cache,
                     value,
                     filter,
                     cancellation,
                     diagnostics,
-                );
-                filter_selected_candidate |= !expansions.is_empty();
-                expansions
+                )
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::ResolvedValue(filter)) => {
-                filter_witnessed_candidate = true;
-                let expansions = resolved_value::structural_expansions(
+                resolved_value::structural_expansions(
                     analyzer,
                     environment_cache,
                     seed,
                     filter,
                     cancellation,
                     diagnostics,
-                );
-                filter_selected_candidate |= !expansions.is_empty();
-                expansions
+                )
             }
             (PipelineValue::File(file), QueryStep::OccurrencesIn(filter)) => {
                 occurrence_expansions_for_file(

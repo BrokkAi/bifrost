@@ -386,10 +386,12 @@ impl GoAnalyzer {
         self.memo_caches.import_facts.read(
             &memo_attribution(self),
             |memo| {
-                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
                     self,
                     memo,
                     || {
+                        let completion_scope =
+                            AnalyzerQueryScope::capturing_read_incompleteness(self);
                         let files = self.inner.all_files();
                         let mut package_of_file: HashMap<ProjectFile, String> = HashMap::default();
                         for file in &files {
@@ -435,9 +437,11 @@ impl GoAnalyzer {
                                 .push(file.clone());
                         }
 
+                        // The answer certifies the replayed value: package rows
+                        // and the stable completion this build recorded.
                         let mut hash =
                             brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
-                                b"go-import-facts-v1",
+                                b"go-import-facts-v2",
                             );
                         let mut rows = package_of_file
                             .iter()
@@ -453,14 +457,21 @@ impl GoAnalyzer {
                             hash.value(file.as_bytes());
                             hash.value(package.as_bytes());
                         });
+                        let completion = super::workspace_facts::stable_completion(
+                            completion_scope.captured_read_incompleteness(),
+                        );
+                        hash.sequence("completion", &completion, |hash, (kind, detail)| {
+                            hash.value(&[*kind]);
+                            hash.value(detail.as_bytes());
+                        });
                         let answer = StableDigest::from_array(hash.finish());
-                        GoImportFacts {
+                        Arc::new(GoImportFacts {
                             answer,
                             package_of_file,
                             package_files: Arc::new(share(package_files)),
                             dir_parent_files: Arc::new(share(dir_parent_files)),
                             dir_parent_suffix_files: Arc::new(share(dir_parent_suffix_files)),
-                        }
+                        })
                     },
                 )
             },

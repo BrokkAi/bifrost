@@ -187,6 +187,56 @@ mod tests {
         assert!(analyzer.rust_usage_facts_ready());
     }
 
+    // Pins the replay rule: a stable reason recorded while the memoized route
+    // index was built is reported by every later retained fill in the request.
+    // Whether a real unparseable member reaches that recorder is open (#8655).
+    #[test]
+    fn route_memo_replays_structure_gap_in_later_retained_fill() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"routes\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub mod part;\n")
+            .file("src/part.rs", "pub fn target() {\0}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let malformed = fixture.file("src/part.rs");
+        let oid = analyzer
+            .live_path_snapshot()
+            .oid_for_path(&malformed)
+            .expect("live malformed member");
+        let cold = std::sync::atomic::AtomicBool::new(true);
+        let keep_going = || {
+            // Refused files are absent from selected summary rows. Exercise the
+            // same recorder at the route builder's read boundary.
+            if cold.load(std::sync::atomic::Ordering::Relaxed) {
+                assert!(
+                    analyzer
+                        .inner
+                        .record_structure_unavailable_if_unparseable(&malformed, oid)
+                );
+            }
+            true
+        };
+        let _request = AnalyzerQueryScope::new(&analyzer);
+        for pass in 0..2 {
+            let fill = AnalyzerQueryScope::for_retained_fill(&analyzer);
+            let _routes = analyzer
+                .cargo_routes_while(&keep_going)
+                .expect("published Cargo routes");
+            cold.store(false, std::sync::atomic::Ordering::Relaxed);
+            let completion = fill.read_completion();
+            assert!(
+                matches!(
+                    completion,
+                    Err(QueryReadIncomplete::StructureUnavailable(_))
+                ),
+                "pass {pass}: {completion:?}"
+            );
+        }
+    }
+
     #[test]
     fn malformed_empty_inner_attribute_keeps_canonical_route_publication() {
         let malformed = "#![]\n#![p = ]\n#![p::]\n#![p:: =]\n#![unsafe]\n#![unsafe =]\n";

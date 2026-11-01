@@ -210,24 +210,6 @@ pub fn reference_hits_from_fuzzy_result(
                 .collect(),
             false,
         ),
-        FuzzyResult::Ambiguous {
-            hits_by_overload, ..
-        } => (
-            hits_by_overload
-                .into_iter()
-                .flat_map(|(target, hits)| {
-                    hits.into_iter().map(move |hit| {
-                        reference_hit_for_target(
-                            analyzer,
-                            hit,
-                            target.clone(),
-                            UsageProof::Unproven,
-                        )
-                    })
-                })
-                .collect(),
-            false,
-        ),
         FuzzyResult::TooManyCallsites {
             sample_hits, limit, ..
         } => fallback_targets.first().map_or_else(
@@ -1908,6 +1890,9 @@ pub fn inverse_edges_for_declaration(
         // The candidate set is a superset the reader confirms, and it is a
         // cross-file answer: a new reference in an unrelated file changes it
         // while no key the reader recorded moves.
+        for edge in &result.edges {
+            crate::analyzer::record_position_read(analyzer, &edge.site.file);
+        }
         analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
             crate::analyzer::read_ledger::LookupKind::ReferenceCandidates,
             crate::analyzer::read_ledger::LookupQuestion::declaration(declaration),
@@ -1949,9 +1934,8 @@ pub(crate) fn inverse_edge_answer_digest(result: &EdgeDerivationResult) -> Stabl
             EdgeCompleteness::Incomplete { .. } => b"incomplete".as_slice(),
         },
     );
-    for (path, start, end) in sites {
-        hasher.field(&path, &(start as u64).to_be_bytes());
-        hasher.value(&(end as u64).to_be_bytes());
+    for (rank, (path, _, _)) in sites.into_iter().enumerate() {
+        hasher.field(&path, &(rank as u64).to_be_bytes());
     }
     StableDigest::from_array(hasher.finish())
 }
@@ -2272,7 +2256,7 @@ class Child extends Base {
         }
         let mut moved = baseline.clone();
         moved.edges[0].site.range.end_byte += 1;
-        assert_ne!(inverse_edge_answer_digest(&moved), digest);
+        assert_eq!(inverse_edge_answer_digest(&moved), digest);
         moved = baseline.clone();
         moved.edges[0].site.file = ProjectFile::new(roots[0].path(), "c.py");
         assert_ne!(inverse_edge_answer_digest(&moved), digest);

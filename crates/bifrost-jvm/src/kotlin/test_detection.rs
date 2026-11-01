@@ -28,6 +28,7 @@
 //! *inside* a `test`/`it` body without risking double-scoring the same
 //! block twice.
 
+use crate::kotlin::resolution::{annotation_has_simple_name, kotlin_declaration_has_annotation};
 use crate::kotlin::supertypes::extract_kotlin_supertypes;
 use crate::kotlin::syntax::{
     kotlin_call_trailing_lambda_body, kotlin_callee, kotlin_named_argument_label,
@@ -140,27 +141,9 @@ pub fn kotlin_changed_file_contains_tests(file: &ProjectFile, source: &str) -> b
 }
 
 fn kotlin_test_annotation(node: Node<'_>, source: &str) -> bool {
-    kotlin_annotation_simple_name(node, source)
-        .is_some_and(|name| KOTLIN_TEST_ANNOTATIONS.contains(&name))
-}
-
-/// The simple (rightmost) name an `annotation` node spells, whether it holds
-/// a bare `user_type` (`@Test`) or a `constructor_invocation` wrapping one
-/// (`@ParameterizedTest(...)`).
-fn kotlin_annotation_simple_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    let user_type = named_children(node)
-        .into_iter()
-        .find_map(|child| match child.kind() {
-            "user_type" => Some(child),
-            "constructor_invocation" => named_children(child)
-                .into_iter()
-                .find(|inner| inner.kind() == "user_type"),
-            _ => None,
-        })?;
-    named_children(user_type)
-        .into_iter()
-        .rfind(|child| child.kind() == "type_identifier")
-        .map(|segment| kotlin_identifier_text(segment, source))
+    KOTLIN_TEST_ANNOTATIONS
+        .iter()
+        .any(|name| annotation_has_simple_name(node, name, source))
 }
 
 fn kotlin_test_spec_supertype(node: Node<'_>, source: &str) -> bool {
@@ -270,19 +253,9 @@ fn collect_kotlin_test_cases<'tree>(
 }
 
 fn kotlin_function_is_junit_test(function: Node<'_>, source: &str) -> bool {
-    let Some(modifiers) = named_children(function)
-        .into_iter()
-        .find(|child| child.kind() == "modifiers")
-    else {
-        return false;
-    };
-    named_children(modifiers)
-        .into_iter()
-        .filter(|child| child.kind() == "annotation")
-        .any(|annotation| {
-            kotlin_annotation_simple_name(annotation, source)
-                .is_some_and(|name| KOTLIN_TEST_ANNOTATIONS.contains(&name))
-        })
+    KOTLIN_TEST_ANNOTATIONS
+        .iter()
+        .any(|name| kotlin_declaration_has_annotation(function, name, source))
 }
 
 fn kotlin_function_body_node(function: Node<'_>) -> Option<Node<'_>> {

@@ -479,3 +479,452 @@ mod jvm_extraction_tests {
             .collect()
     }
 }
+
+#[test]
+fn jvm_direct_supertype_reference_bindings_preserve_alternatives() {
+    jvm_supertype_reference_admission_probe("c/Child.java");
+}
+
+#[test]
+fn jvm_direct_supertype_reference_admits_candidate_file_imports() {
+    jvm_supertype_reference_admission_probe("a/Base.java");
+}
+
+fn jvm_supertype_reference_admission_probe(caller_path: &str) {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        LoweredSemanticRole, SelectedFactOperationBlueprintConstruction,
+        SelectedResolutionContextValidationOutcome, SelectedSemanticLocator,
+        SelectedTypedFactSource, TypedFactPageVisitor, TypedFactRequest,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("a/Base.java", "package a; public class Base {}")
+        .file("b/Base.java", "package b; public class Base {}")
+        .file("c/Child.java", "package c; import a.*; import b.*; class Child extends Base {} class D extends a.Base {}")
+        .file("d/Other.java", "package d; import a.Base; class Other extends Base {}")
+        .build();
+    let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+    for path in ["a/Base.java", "b/Base.java", "c/Child.java", "d/Other.java"] {
+        analyzer.fetch_file_state(&fixture.file(path)).unwrap();
+    }
+    let state = analyzer
+        .fetch_file_state(&fixture.file("c/Child.java"))
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let snapshots = analyzer.selected_workspace_snapshots();
+    let languages = [SelectedResolutionLanguage::new("java", Language::Java)];
+    let input = SelectedResolutionOperationInput::new(
+        analyzer.project(),
+        analyzer.workspace_id(),
+        snapshots.as_ref(),
+        &languages,
+        &[],
+    );
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = analyzer
+        .analyzer_store()
+        .open_selected_resolution_operation(input, &cancellation)
+        .unwrap()
+    else {
+        panic!("open operation")
+    };
+    let jvm_context::JvmImportContext::Ready {
+        context,
+        scoped_gaps: gaps,
+        ..
+    } = operation
+        .java_import_context(caller_path, &cancellation)
+        .unwrap()
+    else {
+        panic!("import context")
+    };
+    let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+        .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+        .unwrap()
+    else {
+        panic!("validate context")
+    };
+    let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+        .ready
+        .collect_blueprint(context, &cancellation)
+        .unwrap()
+    else {
+        panic!("blueprint")
+    };
+    let lexical = operation.ready.lexical_source();
+    let typed = operation.ready.typed_source();
+    let session = ResolutionSession::unbounded();
+    operation
+        .with_jvm_hierarchy_query(
+            JvmForwardOperationContext {
+                storage_language: "java",
+                blueprint: &blueprint,
+                caller_path,
+                import_gaps: &gaps,
+                lexical: &lexical,
+                typed: &typed,
+                cancellation: &cancellation,
+                session: &session,
+            },
+            |query| {
+                for (ordinal, expected) in [(0, 2), (1, 1), (1, 1)] {
+                    let site = state.resolution_facts.supertypes[ordinal].subtype;
+                    let locator = SelectedSemanticLocator::new(
+                        "java",
+                        "c/Child.java",
+                        site,
+                        LoweredSemanticRole::Definition,
+                    );
+                    let LocatedSemantic::Found(definition) =
+                        operation
+                            .ready
+                            .lookup_locator(&lexical, &locator, &cancellation)?
+                    else {
+                        panic!("locate definition")
+                    };
+                    let answer = query.jvm_direct_supertype_answer(definition)?;
+                    assert_eq!(answer.parents.len(), 1, "{answer:?}");
+                    assert_eq!(answer.parents[0].targets.len(), expected, "{answer:?}");
+                    let mut candidates = Vec::new();
+                    let outcome = typed.visit_supertype_pages_for_definitions(
+                        TypedFactRequest::new(&[definition]), &cancellation,
+                        &mut TypedFactPageVisitor::new(&mut |page| {
+                            candidates.extend(page.iter().map(|selected| selected.row().clone()));
+                            Ok(true)
+                        }),
+                    )?;
+                    assert!(outcome.is_exhausted());
+                    for target in &answer.parents[0].targets {
+                        let reverse = query.jvm_direct_descendant_answer(*target, &candidates, outcome.evidence().clone())?;
+                        assert!(reverse.open.is_empty(), "{reverse:?}");
+                        if expected > 1 {
+                            assert!(reverse.edges.is_empty(), "{reverse:?}");
+                            assert_eq!(reverse.ambiguous, vec![definition]);
+                        } else {
+                            assert_eq!(reverse.edges, vec![definition]);
+                            assert!(reverse.ambiguous.is_empty(), "{reverse:?}");
+                        }
+                    }
+
+                    // #8290 must remain a witness of the shared engine, even
+                    // when the hierarchy projection reuses its first result.
+                    let uncached = query.resolve_reference_uncached_for_test(answer.parents[0].reference)?;
+                    assert_eq!(*uncached.binding().completion(), brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete, "uncached binding: {uncached:?}");
+                    assert_eq!(answer.parents[0].completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete, "repeated parent binding must stay closed: {answer:?}");
+                }
+                let other = analyzer.fetch_file_state(&fixture.file("d/Other.java")).unwrap();
+                let locator = SelectedSemanticLocator::new(
+                    "java", "d/Other.java", other.resolution_facts.supertypes[0].subtype,
+                    LoweredSemanticRole::Definition,
+                );
+                let LocatedSemantic::Found(definition) = operation.ready.lookup_locator(&lexical, &locator, &cancellation)? else {
+                    panic!("locate second candidate");
+                };
+                let answer = query.jvm_direct_supertype_answer(definition)?;
+                assert_eq!(answer.parents[0].targets.len(), 1, "second candidate must use its own explicit import: {answer:?}");
+                assert_eq!(answer.parents[0].completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete, "{answer:?}");
+                let profile = brokk_bifrost_core::cache_db::sql_profile::request_scope("7027_r4_descendants");
+                let walk = operation.jvm_descendant_walk(query, answer.parents[0].targets[0], "Base", Language::Java, &cancellation, &session)?;
+                drop(profile);
+                brokk_bifrost_core::cache_db::sql_profile::flush();
+                assert_eq!(walk.rounds, 1);
+                assert_eq!(walk.answer.edges.len(), 2, "{:?}", walk.answer);
+                assert_eq!(walk.answer.ambiguous.len(), 1, "{:?}", walk.answer);
+                assert!(walk.answer.open.is_empty(), "{:?}", walk.answer);
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn jvm_descendant_alias_worklist() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        LoweredSemanticRole, SelectedFactOperationBlueprintConstruction,
+        SelectedResolutionContextValidationOutcome, SelectedSemanticLocator,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_jvm_analysis::analyzer::scala::adapter::ScalaAdapter;
+    let fixture = InlineTestProject::with_language(Language::Scala)
+        .file("a/Base.scala", "package a; class Base")
+        .file(
+            "c/Alias.scala",
+            "package c; object Aliases { type B = a.Base }",
+        )
+        .file(
+            "d/Child.scala",
+            "package d; import c.Aliases.B; class E extends B",
+        )
+        .file(
+            "e/Renamed.scala",
+            "package e; import a.{Base => R}; class C extends R",
+        )
+        .build();
+    let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), ScalaAdapter);
+    for path in [
+        "a/Base.scala",
+        "c/Alias.scala",
+        "d/Child.scala",
+        "e/Renamed.scala",
+    ] {
+        analyzer.fetch_file_state(&fixture.file(path)).unwrap();
+    }
+    let state = analyzer
+        .fetch_file_state(&fixture.file("a/Base.scala"))
+        .unwrap();
+    // #8367 removes synthetic parent rows. Locate the declaration through
+    // its own structured identifier rather than through a parent edge.
+    let base = state.resolution_facts.identifiers.iter().find(|identifier| {
+        identifier.role == brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole::Declaration
+            && identifier.namespace == brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type
+            && state.resolution_facts.names[identifier.name.index()].spelling == "Base"
+    }).expect("fixture Base declaration").site;
+    let caller_path = "a/Base.scala";
+    let cancellation = CancellationToken::new();
+    let snapshots = analyzer.selected_workspace_snapshots();
+    let languages = [SelectedResolutionLanguage::new("scala", Language::Scala)];
+    let input = SelectedResolutionOperationInput::new(
+        analyzer.project(),
+        analyzer.workspace_id(),
+        snapshots.as_ref(),
+        &languages,
+        &[],
+    );
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = analyzer
+        .analyzer_store()
+        .open_selected_resolution_operation(input, &cancellation)
+        .unwrap()
+    else {
+        panic!("open operation")
+    };
+    let jvm_context::JvmImportContext::Ready {
+        context,
+        scoped_gaps: gaps,
+        ..
+    } = operation
+        .jvm_import_context(Language::Scala, caller_path, &cancellation)
+        .unwrap()
+    else {
+        panic!("import context")
+    };
+    let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+        .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+        .unwrap()
+    else {
+        panic!("validate context")
+    };
+    let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+        .ready
+        .collect_blueprint(context, &cancellation)
+        .unwrap()
+    else {
+        panic!("blueprint")
+    };
+    let lexical = operation.ready.lexical_source();
+    let typed = operation.ready.typed_source();
+    let session = ResolutionSession::unbounded();
+    operation
+        .with_jvm_hierarchy_query(
+            JvmForwardOperationContext {
+                storage_language: "scala",
+                blueprint: &blueprint,
+                caller_path,
+                import_gaps: &gaps,
+                lexical: &lexical,
+                typed: &typed,
+                cancellation: &cancellation,
+                session: &session,
+            },
+            |query| {
+                let locator = SelectedSemanticLocator::new(
+                    "scala",
+                    caller_path,
+                    base,
+                    LoweredSemanticRole::Definition,
+                );
+                let LocatedSemantic::Found(target) =
+                    operation
+                        .ready
+                        .lookup_locator(&lexical, &locator, &cancellation)?
+                else {
+                    panic!("locate Base");
+                };
+                let walk = operation.jvm_descendant_walk(
+                    query,
+                    target,
+                    "Base",
+                    Language::Scala,
+                    &cancellation,
+                    &session,
+                )?;
+                // #8367 removes #8261's synthetic AnyRef row; #8427 binds it.
+                // Either a closed answer or an open answer naming exactly that
+                // implicit parent is valid. Openness itself is not the contract.
+                let aliases = analyzer.fetch_file_state(&fixture.file("c/Alias.scala")).unwrap();
+                let mut implicit = Vec::new();
+                for parent in &aliases.resolution_facts.supertypes {
+                    if parent.kind != brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind::ImplicitSuperclass { continue; }
+                    let locator = SelectedSemanticLocator::new("scala", "c/Alias.scala", parent.supertype_reference, LoweredSemanticRole::Reference);
+                    if let LocatedSemantic::Found(reference) = operation.ready.lookup_locator(&lexical, &locator, &cancellation)? { implicit.push(reference); }
+                }
+                assert!(walk.answer.open.iter().all(|reference| implicit.contains(reference)), "{:?}", walk.answer);
+                assert_eq!(walk.rounds, 2);
+                assert_eq!(walk.answer.edges.len(), 2, "{:?}", walk.answer);
+                assert!(walk.answer.ambiguous.is_empty(), "{:?}", walk.answer);
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn jvm_descendant_r4_profile() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        LoweredSemanticRole, SelectedFactOperationBlueprintConstruction,
+        SelectedResolutionContextValidationOutcome, SelectedSemanticLocator,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
+    // The java-native-ancestors golden sources, inlined: a public engine test
+    // cannot include the private root-test fixtures.
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("a/Base.java", "package a;\npublic class Base { public void run() {} }\n")
+        .file("b/Base.java", "package b;\npublic class Base { public void run() {} }\n")
+        .file("c/Child.java", "package c;\nimport a.*;\nimport b.*;\npublic class Child extends Base { public void run() {} }\nclass D extends a.Base { public void run() {} }\nclass Unresolved extends Missing {}\n")
+        .file("c/Partial.java", "// Test-only hierarchy completeness fixture for #7027 S2c.\npackage c;\ninterface Known {}\nclass Partial extends Missing implements Known {}\n")
+        .file("e/Unseen.java", "// Test-only reverse hierarchy fixture for #7027 S3.\npackage e;\nclass Unseen extends Base { public void run() {} }\n")
+        .build();
+    let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+    for path in [
+        "a/Base.java",
+        "b/Base.java",
+        "c/Child.java",
+        "c/Partial.java",
+        "e/Unseen.java",
+    ] {
+        analyzer.fetch_file_state(&fixture.file(path)).unwrap();
+    }
+    let state = analyzer
+        .fetch_file_state(&fixture.file("c/Child.java"))
+        .unwrap();
+    let caller_path = "c/Child.java";
+    let cancellation = CancellationToken::new();
+    let snapshots = analyzer.selected_workspace_snapshots();
+    let languages = [SelectedResolutionLanguage::new("java", Language::Java)];
+    let input = SelectedResolutionOperationInput::new(
+        analyzer.project(),
+        analyzer.workspace_id(),
+        snapshots.as_ref(),
+        &languages,
+        &[],
+    );
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = analyzer
+        .analyzer_store()
+        .open_selected_resolution_operation(input, &cancellation)
+        .unwrap()
+    else {
+        panic!("open operation")
+    };
+    let jvm_context::JvmImportContext::Ready {
+        context,
+        scoped_gaps: gaps,
+        ..
+    } = operation
+        .jvm_import_context(Language::Java, caller_path, &cancellation)
+        .unwrap()
+    else {
+        panic!("import context")
+    };
+    let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+        .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+        .unwrap()
+    else {
+        panic!("validate context")
+    };
+    let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+        .ready
+        .collect_blueprint(context, &cancellation)
+        .unwrap()
+    else {
+        panic!("blueprint")
+    };
+    let lexical = operation.ready.lexical_source();
+    let typed = operation.ready.typed_source();
+    let session = ResolutionSession::unbounded();
+    operation
+        .with_jvm_hierarchy_query(
+            JvmForwardOperationContext {
+                storage_language: "java",
+                blueprint: &blueprint,
+                caller_path,
+                import_gaps: &gaps,
+                lexical: &lexical,
+                typed: &typed,
+                cancellation: &cancellation,
+                session: &session,
+            },
+            |query| {
+                let locator = SelectedSemanticLocator::new(
+                    "java",
+                    caller_path,
+                    state.resolution_facts.supertypes[1].subtype,
+                    LoweredSemanticRole::Definition,
+                );
+                let LocatedSemantic::Found(child) =
+                    operation
+                        .ready
+                        .lookup_locator(&lexical, &locator, &cancellation)?
+                else {
+                    panic!("locate D");
+                };
+                let target = query.jvm_direct_supertype_answer(child)?.parents[0].targets[0];
+                let profile =
+                    brokk_bifrost_core::cache_db::sql_profile::request_scope("7027_r4_round");
+                let walk = operation.jvm_descendant_walk(
+                    query,
+                    target,
+                    "Base",
+                    Language::Java,
+                    &cancellation,
+                    &session,
+                )?;
+                drop(profile);
+                brokk_bifrost_core::cache_db::sql_profile::flush();
+                for max_scope_nodes in [1, 3] {
+                    // One step cuts membership; three steps reach hydration
+                    // and cut there. Neither cut promises a surviving subset.
+                    let budget = brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget { max_scope_nodes, ..Default::default() };
+                    let limited = ResolutionSession::bounded(budget, Some(&cancellation));
+                    let cut = operation.jvm_descendant_walk(query, target, "Base", Language::Java, &cancellation, &limited)?;
+                    assert!(cut.answer.open_reasons.iter().any(|reason| matches!(reason, brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::MemberFamily(brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason::HierarchyTruncated))), "{:?}", cut.answer);
+                }
+                assert_eq!(walk.rounds, 1);
+                assert_eq!(walk.answer.edges, vec![child]);
+                assert_eq!(walk.answer.ambiguous.len(), 1, "{:?}", walk.answer);
+                assert!(!walk.answer.open.is_empty(), "{:?}", walk.answer);
+                Ok(())
+            },
+        )
+        .unwrap();
+}

@@ -1140,6 +1140,30 @@ pub fn parse_go_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFil
     parse_go_file_with_package_name(file, source, tree, declared_package, package_name)
 }
 
+/// Shared grammar classification for declaration and native type projections.
+pub(crate) fn go_synthetic_name(node: Node<'_>) -> String {
+    brokk_bifrost_core::analyzer::tree_walk::synthetic_name(
+        node,
+        |candidate| match candidate.kind() {
+            "struct_type" => Some("anon"),
+            "interface_type" => Some("interface"),
+            "type_spec" => Some("local"),
+            _ => None,
+        },
+        |candidate| {
+            matches!(
+                candidate.kind(),
+                "function_declaration" | "method_declaration" | "method_elem" | "type_spec"
+            ) || matches!(candidate.kind(), "var_spec" | "const_spec")
+                && candidate
+                    .parent()
+                    .and_then(|parent| parent.parent())
+                    .is_some_and(|parent| parent.kind() == "source_file")
+        },
+    )
+    .to_string()
+}
+
 #[cfg(test)]
 pub(crate) fn parse_go_tree(source: &str) -> Tree {
     let mut parser = tree_sitter::Parser::new();
@@ -1470,14 +1494,20 @@ where
         }
         match node.kind() {
             "struct_type" => {
-                let name = format!("$anon${}", node.start_byte());
-                let fq = go_package_fq(&self.package_name)
+                let name = go_synthetic_name(node);
+                let owner = self.synthetic_owner(node);
+                let fq = owner
+                    .as_ref()
+                    .map(|owner| owner.fq().clone())
+                    .unwrap_or_else(|| go_package_fq(&self.package_name))
                     .with_pushed(segment_interner().intern(&name, SegmentKind::Type));
                 let unit = CodeUnit::new_fq(
                     self.file.clone(),
                     CodeUnitType::Class,
                     self.package_name.clone(),
-                    name,
+                    owner.as_ref().map_or(name.clone(), |owner| {
+                        format!("{}.{}", owner.short_name(), name)
+                    }),
                     fq,
                 );
                 GoDeclarationContext::TypeOwner {
@@ -1748,6 +1778,23 @@ where
         self.register_function(node, Some(parent));
     }
 
+    fn synthetic_owner(&self, node: Node<'_>) -> Option<CodeUnit> {
+        self.source_declaration_units
+            .iter()
+            .filter_map(|(_, unit)| {
+                self.parsed
+                    .declaration_ranges(unit)
+                    .iter()
+                    .filter(|range| {
+                        range.start_byte < node.start_byte() && node.end_byte() <= range.end_byte
+                    })
+                    .map(|range| (range.end_byte - range.start_byte, unit))
+                    .min_by_key(|(width, _)| *width)
+            })
+            .min_by_key(|(width, _)| *width)
+            .map(|(_, unit)| unit.clone())
+    }
+
     fn register_type_spec(&mut self, node: Node<'_>) -> Option<GoDeclarationContext> {
         let name_node = node.child_by_field_name("name")?;
         let type_node = node.child_by_field_name("type")?;
@@ -1767,9 +1814,13 @@ where
         let short_name = if file_scope {
             name.to_string()
         } else {
-            let scope = format!("$local${}", node.start_byte());
+            let scope = go_synthetic_name(node);
+            let owner = self
+                .synthetic_owner(node)
+                .expect("local type has a named owner");
+            fq = owner.fq().clone();
             fq = fq.with_pushed(segment_interner().intern(&scope, SegmentKind::Member));
-            format!("{scope}.{name}")
+            format!("{}.{scope}.{name}", owner.short_name())
         };
         let fq = fq.with_pushed(segment_interner().intern(name, SegmentKind::Type));
         let code_unit = CodeUnit::new_fq(
@@ -2323,6 +2374,35 @@ mod coordinated_producer_tests {
             .join("bifrost-go-producer-tests");
         let file = ProjectFile::new(root, "sample.go");
         parse_go_file_with_package_name(&file, source, &tree, "p".to_string(), "p".to_string())
+    }
+
+    #[test]
+    fn synthetic_declaration_ids_follow_rank_across_edits() {
+        fn ids(source: &str) -> std::collections::BTreeSet<String> {
+            let parsed = parse(source);
+            parsed
+                .declarations()
+                .iter()
+                .filter(|unit| unit.identifier() == "Target")
+                .map(|unit| unit.declaration_id().to_string())
+                .collect()
+        }
+        let source = "package p\nfunc a(){ type Target int }\nfunc b(){ type Target int }";
+        let original = ids(source);
+        assert_eq!(
+            original.len(),
+            2,
+            "both enclosing functions have distinct local types"
+        );
+        assert_eq!(original, ids(&format!("// byte shift\n{source}")));
+        let inserted = ids(
+            "package p\nfunc a(){ type Earlier int; type Target int }\nfunc b(){ type Earlier int; type Target int }",
+        );
+        assert_eq!(original.len(), inserted.len());
+        assert!(
+            original.is_disjoint(&inserted),
+            "earlier siblings change ranks"
+        );
     }
 
     fn declaration_names(parsed: &ParsedFile) -> BTreeSet<String> {

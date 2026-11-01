@@ -2427,7 +2427,7 @@ fn validate_call_argument_wrapper(
         analysis.error(
             args[0].range.clone(),
             "unknown-property",
-            "call-argument requires :formal-name or :formal-index",
+            "call-argument requires :formal-name, :formal-index or :formal-annotation-type",
         );
         return;
     };
@@ -2468,7 +2468,16 @@ fn validate_call_argument_wrapper(
                 );
             }
         }
-        _ => unreachable!("call-argument registry contains only its two options"),
+        QueryStepField::FormalAnnotationType => {
+            if !matches!(args[1].kind, ExprKind::String(_) | ExprKind::Symbol(_)) {
+                analysis.error(
+                    args[1].range.clone(),
+                    "wrong-value-shape",
+                    "formal annotation type must be a qualified-name string or symbol",
+                );
+            }
+        }
+        _ => unreachable!("call-argument registry contains only its three options"),
     }
 }
 

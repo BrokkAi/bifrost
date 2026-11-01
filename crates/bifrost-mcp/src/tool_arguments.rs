@@ -620,7 +620,7 @@ fn normalize_mcp_path_argument(raw: &str, workspace_root: &Path) -> Result<Optio
     }
 
     if contains_glob_syntax(trimmed) {
-        return normalize_absolute_path_lexically(trimmed, workspace_root).map(Some);
+        return normalize_absolute_glob(trimmed, workspace_root).map(Some);
     }
 
     normalize_absolute_literal_path(trimmed, workspace_root).map(Some)
@@ -641,6 +641,14 @@ fn normalize_absolute_literal_path(raw: &str, workspace_root: &Path) -> Result<S
     }
 
     normalize_absolute_path_lexically(raw, workspace_root)
+}
+
+fn normalize_absolute_glob(raw: &str, workspace_root: &Path) -> Result<String, String> {
+    let Some(relative) = crate::mcp_common::canonical_relative_glob(raw, workspace_root) else {
+        return normalize_absolute_path_lexically(raw, workspace_root);
+    };
+    normalize_relative_slash_path(&relative?)
+        .map_err(|_| crate::mcp_common::absolute_path_outside_workspace_error(raw, workspace_root))
 }
 
 fn normalize_absolute_path_lexically(raw: &str, workspace_root: &Path) -> Result<String, String> {

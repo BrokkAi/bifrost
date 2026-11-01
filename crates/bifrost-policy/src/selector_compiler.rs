@@ -44,8 +44,8 @@ use brokk_bifrost_rql::structural::{
     CodeQuerySemanticWork,
 };
 use brokk_bifrost_rql::{
-    CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, PlanPartitioning, QueryStep,
-    ResolvedCallProof,
+    CallArgumentSelector, CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
+    PlanPartitioning, QueryStep, ResolvedCallProof,
 };
 
 #[derive(Debug)]
@@ -161,6 +161,9 @@ fn query_guarantees_declared_call_proof(plan: &CodeQueryPlan) -> bool {
 fn query_guarantees_workspace_exact_call_proof(plan: &CodeQueryPlan) -> bool {
     let mut pending = vec![(plan, false)];
     while let Some((plan, has_workspace_exact_proof)) = pending.pop() {
+        // A formal-annotation filter reads the formal from the declaration the
+        // resolver selected, so a surviving row proves the same declared
+        // target/formal relation an exact workspace `resolved-call` does.
         let has_workspace_exact_proof = has_workspace_exact_proof
             || plan.steps.iter().any(|step| {
                 matches!(
@@ -168,6 +171,9 @@ fn query_guarantees_workspace_exact_call_proof(plan: &CodeQueryPlan) -> bool {
                     QueryStep::ResolvedCall(filter)
                         if filter.proof == ResolvedCallProof::Exact
                             && filter.resolves_to.is_resolved_workspace_declaration()
+                ) || matches!(
+                    step,
+                    QueryStep::CallArgument(CallArgumentSelector::FormalAnnotationType(_))
                 )
             });
         match &plan.source {
@@ -1361,8 +1367,18 @@ impl<'a> PolicySelectorSession<'a> {
         let semantic_before = self.semantic_budget.replay_snapshot();
         let refusals_before = self.semantic_budget.refusal_count();
         let execution_before = self.semantic_execution_budget.work();
-        let (executed, mut reads, elapsed) =
-            recompute_unit(self.workspace.analyzer(), Some(self.cancellation), || {
+        let (executed, mut reads, elapsed) = recompute_unit(
+            self.workspace.analyzer(),
+            Some(self.cancellation),
+            || {
+                format!(
+                    "policy={} partition=selector selector={:?} file={}",
+                    units.policy.definition().metadata.id,
+                    selector.path,
+                    rel_path_string(file)
+                )
+            },
+            || {
                 execute_code_query_selector_unit(
                     self.workspace,
                     &self.flow_state,
@@ -1379,7 +1395,8 @@ impl<'a> PolicySelectorSession<'a> {
                     )
                     .with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
                 )
-            });
+            },
+        );
         units.reuse.record_recompute(elapsed);
         let mut detailed = executed.detailed;
         let rows = executed.unit;

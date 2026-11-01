@@ -894,6 +894,12 @@ impl SpliceMount for ReferenceLocalPathEvidence {
                 .map(|(scope, depth)| (translation.node(*scope), *depth))
                 .collect(),
         )
+        .with_ordered_checkpoint_ancestry(
+            self.ordered_checkpoint_ancestry()
+                .iter()
+                .map(|(scope, depth)| (translation.node(*scope), *depth))
+                .collect(),
+        )
     }
 }
 

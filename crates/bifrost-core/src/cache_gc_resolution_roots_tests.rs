@@ -143,6 +143,12 @@ fn real_collector_root_seeks_have_constant_vm_work_across_history_sizes() {
                     .unwrap(),
                 0
             );
+            // The decision join is a primary-key point probe, independent of unrelated history.
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("decisions USING INTEGER PRIMARY KEY")),
+                "{plan:?}"
+            );
             let vm = delete.get_status(rusqlite::StatementStatus::VmStep);
             eprintln!(
                 "resolution root collector: state={state:?}, roots={count}, bindings=({OID},java,1), vm={vm}, plan={plan:?}"
@@ -153,4 +159,56 @@ fn real_collector_root_seeks_have_constant_vm_work_across_history_sizes() {
             previous_vm = Some(vm);
         }
     }
+}
+
+#[test]
+fn configured_file_version_pins_only_its_published_variant() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    cache_db::configure_connection(&mut conn).unwrap();
+    cache_db::migrate(&mut conn).unwrap();
+    conn.execute_batch("INSERT INTO workspace_revisions VALUES(printf('%064d',0),'csharp',1,1);
+        INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from)
+        VALUES(printf('%064d',0),'csharp',1,'App.cs',printf('%040d',1),printf('%064d',0),1);
+        INSERT INTO csharp_file_version_decisions(file_version_id,decision_digest,assignment_digest) VALUES(1,zeroblob(32),zeroblob(32));").unwrap();
+    let oid = git2::Oid::from_str(&format!("{:040}", 1)).unwrap();
+    for digest in [[0_u8; 32], [1_u8; 32]] {
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation,parse_variant) VALUES(?1,'csharp',1,?2)",
+            rusqlite::params![oid.to_string(), digest.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO csharp_source_condition_symbols VALUES(?1,'DEBUG')",
+            [conn.last_insert_rowid()],
+        )
+        .unwrap();
+    }
+    let tx = conn.transaction().unwrap();
+    let candidates = [[0_u8; 32], [1_u8; 32]].map(|digest| {
+        (
+            BlobKey {
+                oid,
+                lang: "csharp".into(),
+                variant: ParseVariant::Digest(digest),
+            },
+            1,
+        )
+    });
+    assert_eq!(delete_analyzer_candidates(&tx, &candidates).unwrap(), 1);
+    tx.commit().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT parse_variant FROM blobs", [], |row| row
+            .get::<_, ParseVariant>(0))
+            .unwrap(),
+        ParseVariant::Digest([0; 32])
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM csharp_source_condition_symbols",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
 }

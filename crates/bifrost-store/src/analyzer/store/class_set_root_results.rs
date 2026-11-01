@@ -1,5 +1,6 @@
 //! Normalized persistence for complete finding-free RQL class-set projections.
 
+use brokk_bifrost_core::gitblob::ParseVariant;
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -309,7 +310,7 @@ pub(crate) static CLASS_SET_ROOT_RESULT_HEADER_SQL: LazyLock<String> = LazyLock:
                 length(CAST(results.owner_rel_path AS BLOB)),
                 length(CAST(blobs.blob_oid AS BLOB)),
                 length(CAST(blobs.lang AS BLOB)),
-                results.owner_rel_path,blobs.blob_oid,blobs.lang
+                results.owner_rel_path,blobs.blob_oid,blobs.lang,blobs.parse_variant
          FROM class_set_root_result_generations AS generations
          JOIN class_set_finding_free_root_results AS results
            ON results.generation_id=generations.generation_id
@@ -777,6 +778,7 @@ fn load_result(
         ClassSetSummaryAttachment {
             rel_path: owner_rel_path,
             blob_oid: owner_blob_oid,
+            parse_variant: header.get::<_, ParseVariant>(12)?,
             storage_language_key: owner_storage_language_key,
             language: key.generation.language,
         },
@@ -1040,10 +1042,11 @@ fn live_owner_blob_id(
     let storage_language_key = &result.key.owner_storage_language_key;
     super::live_class_set_owner_blob_id(
         conn,
-        &super::BlobKey::unvaried(
-            git2::Oid::from_str(&result.attachment.blob_oid)?,
-            storage_language_key.as_str(),
-        ),
+        &super::BlobKey {
+            oid: git2::Oid::from_str(&result.attachment.blob_oid)?,
+            lang: storage_language_key.as_str().to_owned(),
+            variant: result.attachment.parse_variant,
+        },
     )?
     .ok_or_else(|| {
         StoreError::new(format!(
@@ -1366,6 +1369,7 @@ mod tests {
             ClassSetSummaryAttachment {
                 rel_path: "src/app.py".to_string(),
                 blob_oid: BLOB.to_string(),
+                parse_variant: ParseVariant::Empty,
                 storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_adapter(
                     "python",
                 ),
@@ -1426,6 +1430,7 @@ mod tests {
             ClassSetSummaryAttachment {
                 rel_path: "src/app.py".to_string(),
                 blob_oid: BLOB.to_string(),
+                parse_variant: ParseVariant::Empty,
                 storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_adapter(
                     "python",
                 ),
@@ -1488,6 +1493,7 @@ mod tests {
             ClassSetSummaryAttachment {
                 rel_path: path.to_owned(),
                 blob_oid: BLOB.to_owned(),
+                parse_variant: ParseVariant::Empty,
                 storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_adapter(
                     storage_key,
                 ),

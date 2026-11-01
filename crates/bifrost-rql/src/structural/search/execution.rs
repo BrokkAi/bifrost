@@ -1717,6 +1717,8 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
             | CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
             | CodeQueryDiagnosticCode::UsesTargetsAmbiguous
+            | CodeQueryDiagnosticCode::HierarchyIncomplete
+            | CodeQueryDiagnosticCode::WorkspaceSemanticModelsNotLoaded
             | CodeQueryDiagnosticCode::BroadQuery => None,
         };
         if let Some(termination) = termination {

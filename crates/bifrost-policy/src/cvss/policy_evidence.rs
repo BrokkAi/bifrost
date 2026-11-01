@@ -919,3 +919,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "policy_evidence_contract_tests.rs"]
+mod policy_evidence_contract_tests;

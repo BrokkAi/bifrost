@@ -769,6 +769,7 @@ pub struct UnreadMemberFamilyAncestor {
 #[derive(Debug, Default)]
 pub struct MemberFamilyAncestors {
     pub resolved: Vec<CodeUnit>,
+    pub ambiguous: Vec<Vec<CodeUnit>>,
     pub unread: Vec<UnreadMemberFamilyAncestor>,
 }
 
@@ -782,6 +783,25 @@ pub enum HierarchyOpenReason {
     DescendantIndexUnavailable,
     /// Preserve the unread name and any language-specified member inventory.
     UnreadAncestor(UnreadMemberFamilyAncestor),
+}
+
+impl HierarchyOpenReason {
+    /// Stable reason label with the boundary name retained as data.
+    pub fn description(&self) -> String {
+        match self {
+            Self::UnreadAncestor(ancestor) => format!("{}: {}", self.as_str(), ancestor.name),
+            _ => self.as_str().to_string(),
+        }
+    }
+
+    /// Stable public reason label, shared by hierarchy presentation surfaces.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MemberFamily(reason) => reason.label(),
+            Self::DescendantIndexUnavailable => "descendant_index_unavailable",
+            Self::UnreadAncestor(_) => "unread_ancestor",
+        }
+    }
 }
 
 /// A hierarchy answer owned by one request. Never retain it in a memo or cache.
@@ -826,15 +846,86 @@ impl HierarchyAnswer {
     }
 }
 
+/// One caller-owned hierarchy session, borrowed by every step of a walk.
+/// The handle has one borrower and is never shared between Rayon tasks.
+pub trait HierarchyQuery {
+    fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer;
+    fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer;
+    fn member_family_ancestors(&mut self, unit: &CodeUnit) -> MemberFamilyAncestors;
+
+    fn direct_ancestors_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        query_within_scope(scope, || self.direct_ancestors(unit))
+    }
+
+    fn direct_descendants_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        query_within_scope(scope, || self.direct_descendants(unit))
+    }
+}
+
+/// Compatibility adapter for providers whose direct reads need no session.
+/// Each method forwards to the original provider, including scoped overrides.
+pub struct ForwardingHierarchyQuery<'a, P: ?Sized>(pub &'a P);
+
+impl<P: TypeHierarchyProvider + ?Sized> HierarchyQuery for ForwardingHierarchyQuery<'_, P> {
+    fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+        self.0.get_direct_ancestors(unit)
+    }
+    fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+        self.0.get_direct_descendants(unit)
+    }
+    fn member_family_ancestors(&mut self, unit: &CodeUnit) -> MemberFamilyAncestors {
+        self.0.member_family_ancestors(unit)
+    }
+    fn direct_ancestors_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        self.0.get_direct_ancestors_within(unit, scope)
+    }
+    fn direct_descendants_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        self.0.get_direct_descendants_within(unit, scope)
+    }
+}
+
 pub trait TypeHierarchyProvider: Send + Sync {
+    /// Invoke the walk once with a request-local hierarchy handle.
+    fn with_hierarchy_query(&self, run: &mut dyn FnMut(&mut dyn HierarchyQuery)) {
+        run(&mut ForwardingHierarchyQuery(self));
+    }
+
+    /// Root-aware entry lets workspace dispatch exclude unrelated delegates.
+    /// Providers without workspace routing use their ordinary query boundary.
+    fn with_hierarchy_query_for(
+        &self,
+        _root: &CodeUnit,
+        run: &mut dyn FnMut(&mut dyn HierarchyQuery),
+    ) {
+        self.with_hierarchy_query(run);
+    }
+
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer;
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer;
 
     /// The nominal member walk also needs the ancestors not represented by
     /// workspace declarations. Languages opt in without changing type lookup.
     fn member_family_ancestors(&self, owner: &CodeUnit) -> MemberFamilyAncestors {
+        let answer = self.get_direct_ancestors(owner);
         MemberFamilyAncestors {
-            resolved: self.get_direct_ancestors(owner).edges,
+            resolved: answer.edges,
+            ambiguous: answer.ambiguous,
             unread: Vec::new(),
         }
     }
@@ -854,11 +945,23 @@ pub trait TypeHierarchyProvider: Send + Sync {
     }
 
     fn get_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
-        traverse_hierarchy(code_unit, |next| self.get_direct_ancestors(next))
+        let mut result = None;
+        self.with_hierarchy_query_for(code_unit, &mut |query| {
+            result = Some(traverse_hierarchy(code_unit, query, |query, next| {
+                query.direct_ancestors(next)
+            }));
+        });
+        result.expect("hierarchy query callback runs once")
     }
 
     fn get_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
-        let mut answer = traverse_hierarchy(code_unit, |next| self.get_direct_descendants(next));
+        let mut result = None;
+        self.with_hierarchy_query_for(code_unit, &mut |query| {
+            result = Some(traverse_hierarchy(code_unit, query, |query, next| {
+                query.direct_descendants(next)
+            }));
+        });
+        let mut answer = result.expect("hierarchy query callback runs once");
         answer.edges.sort();
         answer
     }
@@ -913,9 +1016,16 @@ pub trait TypeHierarchyProvider: Send + Sync {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Result<HierarchyAnswer, Cancelled> {
-        let mut answer = traverse_hierarchy_while(code_unit, scope.cancellation(), |next| {
-            self.get_direct_descendants_within(next, scope)
-        })?;
+        let mut result = None;
+        self.with_hierarchy_query_for(code_unit, &mut |query| {
+            result = Some(traverse_hierarchy_while(
+                code_unit,
+                query,
+                scope.cancellation(),
+                |query, next| query.direct_descendants_within(next, scope),
+            ));
+        });
+        let mut answer = result.expect("hierarchy query callback runs once")?;
         answer.edges.sort();
         Ok(answer)
     }
@@ -948,6 +1058,25 @@ pub struct DirectDescendantIndex {
 }
 
 impl DirectDescendantIndex {
+    pub fn estimated_retained_bytes(&self) -> usize {
+        let node_bytes = self
+            .nodes
+            .iter()
+            .map(|unit| {
+                std::mem::size_of::<CodeUnit>()
+                    + unit.fq_name().len()
+                    + unit.signature().map_or(0, str::len)
+                    + unit.source().rel_path().as_os_str().len()
+                    + unit.source().root().as_os_str().len()
+            })
+            .sum::<usize>();
+        std::mem::size_of::<Self>()
+            + node_bytes * 2
+            + self.row_by_ancestor.capacity()
+                * (std::mem::size_of::<CodeUnit>() + std::mem::size_of::<u32>() + 1)
+            + self.descendants.estimated_bytes() as usize
+    }
+
     pub fn from_indexed_nodes(
         nodes: Vec<CodeUnit>,
         index_by_node: HashMap<CodeUnit, u32>,
@@ -1037,15 +1166,28 @@ where
     A: CodeUnitIndex,
     P: TypeHierarchyProvider + ?Sized,
 {
+    let mut result = None;
+    provider.with_hierarchy_query(&mut |query| {
+        result = Some(build_direct_descendant_index_in_query(
+            analyzer, query, scope,
+        ));
+    });
+    result.expect("hierarchy query callback runs once")
+}
+
+/// Invert ancestors inside an already-open query without opening another one.
+pub fn build_direct_descendant_index_in_query<A: CodeUnitIndex>(
+    analyzer: &A,
+    query: &mut dyn HierarchyQuery,
+    scope: &DescendantIndexScope<'_>,
+) -> Option<DirectDescendantIndex> {
     build_direct_descendant_index_from_candidates(
         analyzer
             .all_declarations()
             .filter(|candidate| candidate.is_class() && scope.admits(candidate))
             .collect(),
         |candidate| {
-            let answer = provider
-                .get_direct_ancestors_within(candidate, scope)
-                .ok()?;
+            let answer = query.direct_ancestors_within(candidate, scope).ok()?;
             // Legacy indexes cannot represent uncertainty. Do not publish an
             // incomplete inverse relation as a complete cached index.
             answer.is_complete().then_some(answer.edges)
@@ -1124,11 +1266,28 @@ where
     ))
 }
 
+fn traverse_hierarchy(
+    root: &CodeUnit,
+    query: &mut dyn HierarchyQuery,
+    mut next: impl FnMut(&mut dyn HierarchyQuery, &CodeUnit) -> HierarchyAnswer,
+) -> HierarchyAnswer {
+    traverse_hierarchy_edges(root, |unit| next(query, unit))
+}
+
+fn traverse_hierarchy_while(
+    root: &CodeUnit,
+    query: &mut dyn HierarchyQuery,
+    cancellation: &CancellationToken,
+    mut next: impl FnMut(&mut dyn HierarchyQuery, &CodeUnit) -> Result<HierarchyAnswer, Cancelled>,
+) -> Result<HierarchyAnswer, Cancelled> {
+    traverse_hierarchy_edges_while(root, cancellation, |unit| next(query, unit))
+}
+
 /// [`traverse_hierarchy`] under a deadline: polls once per node popped and
 /// propagates a stopped step as `Err(Cancelled)` rather than returning the nodes it had
 /// already collected. A partial subtype set read as complete would let a caller
 /// conclude that a class has no further subclasses.
-fn traverse_hierarchy_while<F>(
+fn traverse_hierarchy_edges_while<F>(
     root: &CodeUnit,
     cancellation: &CancellationToken,
     mut next: F,
@@ -1156,13 +1315,13 @@ where
     Ok(result)
 }
 
-fn traverse_hierarchy<F>(root: &CodeUnit, mut next: F) -> HierarchyAnswer
+fn traverse_hierarchy_edges<F>(root: &CodeUnit, mut next: F) -> HierarchyAnswer
 where
     F: FnMut(&CodeUnit) -> HierarchyAnswer,
 {
     // Both variants share the traversal and completeness accounting. An owned
     // live token makes stopping impossible for this unscoped request.
-    traverse_hierarchy_while(root, &CancellationToken::new(), |unit| Ok(next(unit)))
+    traverse_hierarchy_edges_while(root, &CancellationToken::new(), |unit| Ok(next(unit)))
         .expect("unscoped hierarchy traversal cannot stop")
 }
 
@@ -1184,6 +1343,112 @@ mod hierarchy_traversal_properties {
         )
     }
 
+    #[test]
+    fn transitive_walks_borrow_one_query_and_preserve_scoped_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Provider(AtomicUsize);
+        struct Query;
+        impl HierarchyQuery for Query {
+            fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+                let index = index_of(unit);
+                HierarchyAnswer::complete(if index < 2 {
+                    vec![node(index + 1)]
+                } else {
+                    Vec::new()
+                })
+            }
+            fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+                self.direct_ancestors(unit)
+            }
+            fn member_family_ancestors(&mut self, _unit: &CodeUnit) -> MemberFamilyAncestors {
+                MemberFamilyAncestors::default()
+            }
+            fn direct_descendants_within(
+                &mut self,
+                _unit: &CodeUnit,
+                _scope: &DescendantIndexScope<'_>,
+            ) -> Result<HierarchyAnswer, Cancelled> {
+                Err(Cancelled)
+            }
+        }
+        impl TypeHierarchyProvider for Provider {
+            fn get_direct_ancestors(&self, _unit: &CodeUnit) -> HierarchyAnswer {
+                panic!("the walk must use its query")
+            }
+            fn get_direct_descendants(&self, _unit: &CodeUnit) -> HierarchyAnswer {
+                panic!("the walk must use its query")
+            }
+            fn with_hierarchy_query(&self, run: &mut dyn FnMut(&mut dyn HierarchyQuery)) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                run(&mut Query);
+            }
+        }
+        let provider = Provider(AtomicUsize::new(0));
+        assert_eq!(
+            provider.get_ancestors(&node(0)).edges,
+            vec![node(1), node(2)]
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            provider.get_descendants(&node(0)).edges,
+            vec![node(1), node(2)]
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 2);
+        let cancellation = CancellationToken::new();
+        assert!(
+            provider
+                .get_descendants_within(
+                    &node(0),
+                    &DescendantIndexScope::whole_workspace(&cancellation)
+                )
+                .is_err()
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn default_query_forwards_scoped_provider_overrides() {
+        struct Provider;
+        impl TypeHierarchyProvider for Provider {
+            fn get_direct_ancestors(&self, _unit: &CodeUnit) -> HierarchyAnswer {
+                HierarchyAnswer::complete(vec![node(1)])
+            }
+            fn get_direct_descendants(&self, _unit: &CodeUnit) -> HierarchyAnswer {
+                HierarchyAnswer::complete(vec![node(2)])
+            }
+            fn get_direct_ancestors_within(
+                &self,
+                _unit: &CodeUnit,
+                _scope: &DescendantIndexScope<'_>,
+            ) -> Result<HierarchyAnswer, Cancelled> {
+                Err(Cancelled)
+            }
+            fn member_family_ancestors(&self, _unit: &CodeUnit) -> MemberFamilyAncestors {
+                MemberFamilyAncestors {
+                    resolved: vec![node(3)],
+                    ..Default::default()
+                }
+            }
+        }
+        let cancellation = CancellationToken::new();
+        Provider.with_hierarchy_query(&mut |query| {
+            assert_eq!(query.direct_ancestors(&node(0)).edges, vec![node(1)]);
+            assert_eq!(query.direct_descendants(&node(0)).edges, vec![node(2)]);
+            assert_eq!(
+                query.member_family_ancestors(&node(0)).resolved,
+                vec![node(3)]
+            );
+            assert!(
+                query
+                    .direct_ancestors_within(
+                        &node(0),
+                        &DescendantIndexScope::whole_workspace(&cancellation)
+                    )
+                    .is_err()
+            );
+        });
+    }
+
     fn index_of(unit: &CodeUnit) -> usize {
         unit.fq_name()[1..].parse().expect("test node name")
     }
@@ -1191,7 +1456,7 @@ mod hierarchy_traversal_properties {
     #[test]
     fn closure_preserves_uncertainty_without_traversing_alternatives() {
         let mut visited = Vec::new();
-        let answer = traverse_hierarchy(&node(0), |unit| {
+        let answer = traverse_hierarchy_edges(&node(0), |unit| {
             let id = index_of(unit);
             visited.push(id);
             match id {
@@ -1270,7 +1535,7 @@ mod hierarchy_traversal_properties {
             root in 0..NODES,
         ) {
             let mut calls: BTreeMap<usize, usize> = BTreeMap::new();
-            let result = traverse_hierarchy(&node(root), |unit| {
+            let result = traverse_hierarchy_edges(&node(root), |unit| {
                 let id = index_of(unit);
                 *calls.entry(id).or_default() += 1;
                 HierarchyAnswer::complete(graph[id].iter().map(|&to| node(to)).collect())
@@ -1294,7 +1559,7 @@ mod hierarchy_traversal_properties {
 
             // The deadline-aware variant agrees when never cancelled.
             let live = CancellationToken::new();
-            let guarded = traverse_hierarchy_while(&node(root), &live, |unit| {
+            let guarded = traverse_hierarchy_edges_while(&node(root), &live, |unit| {
                 Ok(HierarchyAnswer::complete(graph[index_of(unit)].iter().map(|&to| node(to)).collect()))
             });
             let guarded = guarded.expect("live traversal");
@@ -1312,7 +1577,7 @@ mod hierarchy_traversal_properties {
             fail_on in 0..NODES,
         ) {
             let reachable = reference_distances(&graph, root);
-            let failing = traverse_hierarchy_while(&node(root), &CancellationToken::new(), |unit| {
+            let failing = traverse_hierarchy_edges_while(&node(root), &CancellationToken::new(), |unit| {
                 let id = index_of(unit);
                 if id == fail_on { Err(Cancelled) } else { Ok(HierarchyAnswer::complete(graph[id].iter().map(|&to| node(to)).collect())) }
             });
@@ -1323,7 +1588,7 @@ mod hierarchy_traversal_properties {
 
             let cancelled = CancellationToken::new();
             cancelled.cancel();
-            let stopped = traverse_hierarchy_while(&node(root), &cancelled, |unit| {
+            let stopped = traverse_hierarchy_edges_while(&node(root), &cancelled, |unit| {
                 Ok(HierarchyAnswer::complete(graph[index_of(unit)].iter().map(|&to| node(to)).collect()))
             });
             prop_assert_eq!(stopped.is_err(), !graph[root].is_empty());

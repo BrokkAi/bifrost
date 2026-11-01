@@ -1186,6 +1186,7 @@ pub enum ResolutionNameLookupKind {
     EmbeddedType,
     InterfaceMethod,
     SupertypeName,
+    AliasTarget,
 }
 
 /// The positioned identifier carrying a candidate lookup name.

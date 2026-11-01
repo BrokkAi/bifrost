@@ -89,7 +89,8 @@ use brokk_bifrost_jvm::kotlin::declarations::{
 };
 use brokk_bifrost_jvm::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
 use brokk_bifrost_jvm::kotlin::syntax::{
-    kotlin_declared_type_parameter_names, kotlin_type_spelling, kotlin_user_type_segments,
+    kotlin_declared_type_parameter_names, kotlin_function_type_has_context_parameters,
+    kotlin_type_spelling, kotlin_user_type_segments,
 };
 use tree_sitter::{Node, Tree};
 
@@ -291,6 +292,26 @@ impl KotlinSourceJarPackProducer {
             let Some((tree, parsed)) = parse_entry(&name, &source, &mut diagnostics) else {
                 continue;
             };
+            let mut stack = vec![tree.root_node()];
+            let mut context_function_type = false;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "function_type"
+                    && kotlin_function_type_has_context_parameters(node)
+                {
+                    context_function_type = true;
+                    break;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            if context_function_type {
+                diagnostics.warning_for_source_entry(
+                    "kotlin.source.context_function_type",
+                    Some(name.clone()),
+                    accountable_source_entry(&name),
+                    "Kotlin context-parameter function type is open until its leading inputs are modeled",
+                );
+            }
             let (mut entry_types, mut entry_members) = entry_facts(
                 &name,
                 &source,
@@ -1069,6 +1090,9 @@ fn type_ref_with_parameters(
             }
         }
         "function_type" => {
+            if kotlin_function_type_has_context_parameters(node) {
+                return TypeRef::Unknown;
+            }
             let mut arguments = Vec::new();
             if let Some(parameters) = first_named_child_of_kind(node, "function_type_parameters") {
                 for child in named_children(parameters) {

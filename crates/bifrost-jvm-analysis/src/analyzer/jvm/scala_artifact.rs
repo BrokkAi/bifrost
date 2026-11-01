@@ -167,7 +167,9 @@ impl ScalaSourceJarPackProducer {
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
                     source_entry: None,
-                    code: "limit.archive_directory".to_owned(),
+                    code: super::producer_codes::LIMIT_ARCHIVE_DIRECTORY
+                        .code
+                        .to_owned(),
                     location: None,
                     declaration: None,
                     message: "Scala JAR central directory exceeds bounded entry or byte limits"
@@ -311,7 +313,7 @@ fn parse_source_entry(
         "tree-sitter Scala language must load",
     ) else {
         diagnostics.warning(
-            "scala.source.parse",
+            super::producer_codes::SCALA_SOURCE_PARSE.code,
             Some(entry_name.to_owned()),
             "Scala source entry could not be parsed",
         );
@@ -319,7 +321,7 @@ fn parse_source_entry(
     };
     if tree.root_node().has_error() {
         diagnostics.warning(
-            "scala.source.parse",
+            super::producer_codes::SCALA_SOURCE_PARSE.code,
             Some(entry_name.to_owned()),
             "Scala source entry contains unsupported or malformed syntax",
         );
@@ -580,7 +582,7 @@ fn scala_entry_facts(
         if omit_signature {
             diagnostics.absorb(vec![ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Warning,
-                code: "scala.signature.repeated_parameter_list".to_owned(),
+                code: super::producer_codes::SCALA_SIGNATURE_REPEATED_PARAMETER_LIST.code.to_owned(),
                 location: Some(entry_name.to_owned()),
                 source_entry: None,
                 declaration: Some(declaration.fq_name()),
@@ -975,7 +977,7 @@ fn finish_production(
 ) -> ArtifactProduction {
     if types.is_empty() {
         diagnostics.error(
-            "scala.archive.no_external_declarations",
+            super::producer_codes::SCALA_ARCHIVE_NO_EXTERNAL_DECLARATIONS.code,
             None,
             "JAR contains no externally visible Scala declarations",
         );
@@ -1768,18 +1770,27 @@ trait Map[K, V] {
                 ("Map", "update", Some(Completeness::Partial)),
             ]
         );
-        let withheld = production
+        // Each withheld declaration is its own declaration gap (#8324): a
+        // reject without one is unaccounted, and release verification refuses
+        // the partial scala-library pack.
+        let mut withheld = production
             .diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.code == "scala.collection_flow.unproven")
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| {
+                (
+                    diagnostic.declaration.as_deref(),
+                    diagnostic.source_entry.as_deref(),
+                )
+            })
             .collect::<Vec<_>>();
-        assert!(
-            matches!(withheld.as_slice(), [message]
-                if message.contains("scala.collection.mutable.Map.apply")
-                    && message.contains("scala.collection.mutable.Map.foreach")
-                    && !message.contains("Map.update")),
-            "{withheld:?}"
+        withheld.sort_unstable();
+        assert_eq!(
+            withheld,
+            [
+                (Some("scala.collection.mutable.Map.apply"), None),
+                (Some("scala.collection.mutable.Map.foreach"), None),
+            ]
         );
         let factory = members
             .iter()

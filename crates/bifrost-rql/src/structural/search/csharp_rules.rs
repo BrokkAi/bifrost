@@ -7,7 +7,7 @@
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language_preprocessed,
+    DefinitionLookupRequest, DefinitionLookupStatus,
     resolve_definition_batch_with_source,
 };
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
@@ -38,17 +38,20 @@ pub(super) fn matches_for_file(
     if language_for_file(file) != Language::CSharp {
         return LanguageRuleMatches::default();
     }
-    let Some((tree, preprocessor)) = parse_tree_for_language_preprocessed(file, Language::CSharp, source) else {
-        return LanguageRuleMatches::default();
+    let syntax = match super::language_rules::selected_syntax(analyzer, file, source) {
+        Ok(syntax) => syntax,
+        Err(result) => return result,
     };
+    let tree = syntax.tree();
+    let preprocessor = syntax.preprocessor();
     let fields = field_sites(analyzer, file);
     let mut undecided = Vec::new();
     let ranges = match rule {
         CSharpRule::StaticArray => {
-            static_array_fields(analyzer, file, &tree, source, &fields, &mut undecided, &preprocessor.as_ref().map(|p| p.conditional_regions(source)).unwrap_or_default())
+            static_array_fields(analyzer, file, tree, source, &fields, &mut undecided, &preprocessor.as_ref().map(|p| p.conditional_regions(source)).unwrap_or_default())
         }
         CSharpRule::UseNumberConstant => {
-            number_constant_uses(&tree, source, &fields, &mut undecided)
+            number_constant_uses(tree, source, &fields, &mut undecided)
         }
     };
     LanguageRuleMatches::decided(

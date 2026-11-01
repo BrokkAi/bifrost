@@ -8,12 +8,6 @@ use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
 
 use brokk_bifrost_core::analyzer::weighted_cache::weight_bytes;
 
-use brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant;
-
-use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
-
-use brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo;
-
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 
 use brokk_bifrost_analysis::analyzer::estimate_collection_bytes;
@@ -33,7 +27,7 @@ pub(crate) struct JavaMemoCaches {
         ),
         Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
     >,
-    pub(crate) statement_facts: crate::analyzer::jvm::hierarchy::DerivedMemo<
+    pub(crate) statement_facts: crate::analyzer::jvm::hierarchy::RawDerivedMemo<
         (git2::Oid, ProjectFile, Option<[u8; 32]>),
         brokk_bifrost_core::analyzer::statement_facts::StatementFactRows,
     >,
@@ -42,16 +36,10 @@ pub(crate) struct JavaMemoCaches {
     pub(crate) relevant_imports:
         crate::analyzer::jvm::hierarchy::DerivedMemo<CodeUnit, HashSet<String>>,
     pub(crate) direct_ancestors: crate::analyzer::jvm::hierarchy::AncestorMemo,
-    /// `PoolSafeMemo`, not `OnceLock`, for the same reason as the two sibling
-    /// cells below: this whole-workspace build is reached from rayon workers
-    /// during cold scans, and a blocking `get_or_init` parks every one of them
-    /// behind the single initializer for its full duration.
-    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
-    /// gets an index that was never built over them (issue #1748). Two cells at
-    /// most, because the exclusion verdict is a pure function of the analyzer
-    /// and the file.
+    /// Byte-bounded outcomes and read receipts, separated by test-filter
+    /// variant (#1748). Cold builds do not wait behind another query's deadline.
     pub(crate) direct_descendant_index:
-        KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>,
+        brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo,
     pub(crate) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(crate) same_package_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
@@ -68,12 +56,13 @@ impl JavaMemoCaches {
                     u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
                 },
             ),
-            statement_facts: crate::analyzer::jvm::hierarchy::derived_memo(budget_bytes / 16),
+            statement_facts: crate::analyzer::jvm::hierarchy::raw_derived_memo(budget_bytes / 16),
             package_names: build_weighted_cache(budget_bytes / 16, weight_package_name),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
             relevant_imports: crate::analyzer::jvm::hierarchy::derived_memo(budget_bytes / 8),
             direct_ancestors: crate::analyzer::jvm::hierarchy::ancestor_memo(budget_bytes / 8),
-            direct_descendant_index: KeyedPoolSafeMemo::new(),
+            direct_descendant_index:
+                brokk_bifrost_analysis::analyzer::common::new_replayable_descendant_memo(),
             reverse_import_index: PoolSafeMemo::new(),
             same_package_reference_index: PoolSafeMemo::new(),
         }

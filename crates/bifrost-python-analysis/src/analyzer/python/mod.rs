@@ -184,17 +184,11 @@ use brokk_bifrost_core::analyzer::model::CloneSmellWeights;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
-use brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant;
-
-use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
-
 use brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::ForwardQueryProvider;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
-
-use brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo;
 
 use brokk_bifrost_core::analyzer::model::Language;
 
@@ -348,15 +342,10 @@ pub struct PythonAnalyzer {
     >,
     module_member_mutation_free:
         Arc<WorkspaceAuthorityMemo<Cache<PythonModuleMemberMutationKey, bool>>>,
-    // PoolSafeMemo, not OnceLock: same constraint as `usage_index` below. The
-    // build walks every workspace class and is reached from rayon workers, so a
-    // blocking get_or_init parks each arriving worker behind one initializer.
-    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
-    /// gets an index that was never built over them (issue #1748). Two cells at
-    /// most, because the exclusion verdict is a pure function of the analyzer
-    /// and the file.
+    /// Byte-bounded outcomes and read receipts, separated by test-filter
+    /// variant (#1748). Cold builds do not wait behind another query's deadline.
     direct_descendant_index:
-        PythonWholeAuthority<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+        PythonWholeAuthority<brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo>,
     reverse_import_index:
         PythonWholeAuthority<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     // PoolSafeMemo, not OnceLock: this cell is reached from inside rayon workers -- the graph
@@ -697,7 +686,7 @@ impl PythonAnalyzer {
             direct_descendant_index: Arc::new(WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::PythonDescendants,
                 (
-                    KeyedPoolSafeMemo::new(),
+                    brokk_bifrost_analysis::analyzer::common::new_replayable_descendant_memo(),
                     brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
                 ),
             )),
@@ -827,7 +816,9 @@ impl PythonAnalyzer {
         keep_going: &dyn Fn() -> bool,
     ) -> Option<Arc<brokk_bifrost_python::source_facts::PythonModuleGlobalSourceFacts>> {
         let oid = self.inner.resolve_live_oid_for_file(file)?;
-        let keys = self.inner.file_read_key(file, oid);
+        let keys =
+            self.inner
+                .file_read_key(file, oid, brokk_bifrost_core::gitblob::ParseVariant::Empty);
         debug_assert!(matches!(keys, ReadKey::File { .. }));
         self.record_read(keys);
         self.inner.cached_python_module_global_source_facts(
@@ -1128,7 +1119,11 @@ impl PythonUsageSource for PythonAnalyzer {
                 // The syntax builder itself reads nodes already selected by its caller.
                 // Retain that source obligation even when this memo was filled uncaptured.
                 if let Some(oid) = self.inner.resolve_live_oid_for_file(file) {
-                    self.record_read(self.inner.file_read_key(file, oid));
+                    self.record_read(self.inner.file_read_key(
+                        file,
+                        oid,
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                    ));
                 } else {
                     self.record_unattributed_read();
                 }
@@ -3498,7 +3493,7 @@ fn reverse_import_digest(index: &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>
 
 impl PythonAnalyzer {
     fn descendants_authority_digest(&self) -> Option<StableDigest> {
-        // Whole covers both variant cells. Always force the complete unfiltered value,
+        // Both filter variants share the cache. Force the unfiltered outcome,
         // then project its edges without recording a recursive authority read.
         let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
         let scope =
@@ -3510,11 +3505,13 @@ impl PythonAnalyzer {
             brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(self, digest, || {
                 let mut classes: Vec<_> = self.all_declarations().filter(CodeUnit::is_class).collect();
                 classes.sort();
-                let index = brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool_independent(self, &memo.cell(&scope.variant()), || {
-                    brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index(self, self, &scope).expect("uncancelled hierarchy completes")
+                let fill = || brokk_bifrost_analysis::analyzer::common::replayable_descendant_fill(self, &scope, || {
+                    brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index(self, self, &scope)
                 });
+                let index = brokk_bifrost_analysis::analyzer::common::read_replayable_query_cache(memo, &scope.variant(), fill);
+                let index = index.replay();
                 authority_digest(classes.iter().map(|class| {
-                    let mut children: Vec<_> = index.descendants(class).into_iter().map(|child| child.declaration_id()).collect(); children.sort();
+                    let mut children: Vec<_> = index.as_ref().map(|index| index.descendants(class)).unwrap_or_default().into_iter().map(|child| child.declaration_id()).collect(); children.sort();
                     format!("{}:{children:?}", class.declaration_id())
                 }).collect())
             })

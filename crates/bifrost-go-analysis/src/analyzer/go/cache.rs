@@ -1,5 +1,5 @@
 use crate::analyzer::go::imports::{GoImportFacts, GoReverseImports};
-use brokk_bifrost_analysis::analyzer::common::QueryCacheCell;
+use brokk_bifrost_analysis::analyzer::common::{QueryCacheCell, ReplayableQueryCacheValue};
 use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{
     ReplayingMemo, ReplayingMemoEntry, WorkspaceAuthorityMemo,
@@ -51,10 +51,17 @@ pub(crate) struct GoMemoCaches {
     /// The source-authoritative path does not run a parser pass, so this is the
     /// meaningful per-file cost metric that replaces the old parse counter.
     pub(crate) workspace_source_fact_load_count: Arc<AtomicUsize>,
-    pub(crate) workspace_path_index:
-        WorkspaceAuthorityMemo<Arc<QueryCacheCell<WorkspacePathSnapshot>>>,
+    // The Whole GoWorkspacePaths fact answer certifies the replayed value: it
+    // hashes the index data and the stable completion the build recorded. The
+    // cell receipt replays those gaps, not source read keys.
+    pub(crate) workspace_path_index: WorkspaceAuthorityMemo<
+        Arc<QueryCacheCell<ReplayableQueryCacheValue<WorkspacePathSnapshot>>>,
+    >,
     pub(crate) workspace_path_index_build_count: Arc<AtomicUsize>,
-    pub(crate) import_facts: WorkspaceAuthorityMemo<Arc<QueryCacheCell<Arc<GoImportFacts>>>>,
+    // The Whole GoImportFacts fact answer certifies this replayed value the same
+    // way: package rows plus the stable completion the build recorded.
+    pub(crate) import_facts:
+        WorkspaceAuthorityMemo<Arc<QueryCacheCell<ReplayableQueryCacheValue<Arc<GoImportFacts>>>>>,
 }
 
 impl GoMemoCaches {

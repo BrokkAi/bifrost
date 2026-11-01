@@ -658,9 +658,17 @@ fn bench() {}
         store.conn.execute(|conn| {
             // Compilation configuration is not a per-blob resolution family.
             // Explicitly account its schema and zero row cost for this Rust blob.
-            for table in ["csharp_compilations", "csharp_compilation_symbols"] {
+            for table in [
+                "csharp_compilations", "csharp_compilation_symbols",
+                "csharp_using_publications", "csharp_compilation_members", "csharp_global_using_extent",
+                "csharp_compilation_using_coverage",
+            ] {
                 let columns = conn.prepare("SELECT name FROM pragma_table_info(?1)").unwrap().query_map([table], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-                assert!(!columns.iter().any(|column| column == "blob_id"), "{table}: {columns:?}");
+                // The sparse compilation extent has a blob FK, but is
+                // selection-owned and must stay empty for this Rust blob.
+                if !matches!(table,"csharp_global_using_extent" | "csharp_using_publications") {
+                    assert!(!columns.iter().any(|column| column == "blob_id"), "{table}: {columns:?}");
+                }
                 let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap();
                 assert_eq!(count, 0, "{table} must not grow per Rust blob");
             }

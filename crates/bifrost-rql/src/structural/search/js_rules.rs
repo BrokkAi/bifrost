@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use strsim::damerau_levenshtein;
 use tree_sitter::{Node, Tree};
 
-use super::language_rules::LanguageRuleMatches;
+use super::language_rules::{LanguageRuleMatch, LanguageRuleMatches};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum ScopeKind {
@@ -76,6 +76,13 @@ pub(super) fn matches_for_file(
     };
     ranges.sort_unstable();
     ranges.dedup();
+    let ranges = match heuristic_reason(rule) {
+        Some(reason) => ranges
+            .into_iter()
+            .map(|range| LanguageRuleMatch::heuristic(range, reason))
+            .collect(),
+        None => ranges.into_iter().map(LanguageRuleMatch::from).collect::<Vec<_>>(),
+    };
     if !unknown_property_keys.is_empty() {
         return LanguageRuleMatches::incomplete(
             ranges,
@@ -106,6 +113,26 @@ pub(super) fn matches_for_file(
         }
     }
     LanguageRuleMatches::from_ranges(ranges)
+}
+
+/// Why a rule's matches are guesses rather than structural facts. The other
+/// rules decide their relation from scopes, bindings and class members, so
+/// what they select holds; this one ranks likely typos by edit distance and
+/// frequency, and a close, rarer spelling can be a different word.
+fn heuristic_reason(rule: JsRule) -> Option<&'static str> {
+    match rule {
+        JsRule::MisspelledIdentifier => Some(
+            "edit-distance guess: one typing slip from a more frequent identifier part in the same file",
+        ),
+        JsRule::FunctionDeclarationConflict
+        | JsRule::VariableRedeclaration
+        | JsRule::VariableInitializationConflict
+        | JsRule::MissingVariableDeclaration
+        | JsRule::NestedFunctionReferenceInDefaultParameter
+        | JsRule::MissingThisQualifier
+        | JsRule::MixedStaticInstanceThisAccess
+        | JsRule::OverwrittenProperty => None,
+    }
 }
 
 fn function_declaration_conflicts(root: Node<'_>, source: &str) -> Vec<Range> {
@@ -898,13 +925,22 @@ fn misspelled_identifiers(tree: &Tree, source: &str) -> Vec<Range> {
     ranges
 }
 
+/// One slip of a typist: two adjacent letters swapped anywhere (`lenght`), or
+/// a letter substituted, inserted or dropped inside the word (`lenngth`,
+/// `lenth`). The same edit at either end usually spells another word, not a
+/// typo: a plural or tense (`item`/`items`, `change`/`changed`), a prefix
+/// (`ref`/`href`) or a different initial (`node`/`mode`) (#7800).
 fn likely_typo(wrong: &str, right: &str) -> bool {
-    let wrong_first = wrong.chars().next();
-    let right_first = right.chars().next();
-    let wrong_last = wrong.chars().last();
-    let right_last = right.chars().last();
-    damerau_levenshtein(wrong, right) == 1
-        && (wrong_first == right_first || wrong_last == right_last)
+    if damerau_levenshtein(wrong, right) != 1 {
+        return false;
+    }
+    let same_ends = wrong.chars().next() == right.chars().next()
+        && wrong.chars().last() == right.chars().last();
+    // At one Damerau edit, equal lengths with two differing positions can
+    // only be an adjacent transposition.
+    let transposed = wrong.chars().count() == right.chars().count()
+        && wrong.chars().zip(right.chars()).filter(|(w, r)| w != r).count() == 2;
+    same_ends || transposed
 }
 
 fn identifier_parts<'tree>(node: Node<'tree>, source: &str) -> Vec<IdentifierPartRef<'tree>> {

@@ -467,4 +467,53 @@ mod tests {
         assert_eq!(vec!["notes.md"], result.analysis.paths_outside_analysis);
         assert!(result.analysis.unresolved_changed_paths.is_empty());
     }
+
+    #[test]
+    fn added_file_and_inline_test_are_reported_with_start_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let repo = test_repo::init_repo(root);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "// base\n").unwrap();
+        test_repo::commit_all(&repo, "base");
+        fs::write(root.join("src/added.rs"), "// new\npub fn added(x: i32) -> i32 {\n    if x > 0 { x } else { 0 }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn checks() { assert_eq!(2, 2); }\n}\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod added;\n").unwrap();
+        test_repo::commit_all(&repo, "target");
+        let result = cyclomatic_complexity_at_root(
+            root,
+            CyclomaticComplexityParams {
+                base: Some("HEAD~1".into()),
+                target: Some("HEAD".into()),
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let added = result
+            .functions
+            .iter()
+            .find(|f| f.after.name == "added")
+            .expect("added function");
+        assert_eq!(added.after.path, "src/added.rs");
+        assert_eq!(added.after.start_line, 2);
+        assert!(added.after.complexity > 1);
+        assert_eq!(result.summary.introduced, 2, "{:?}", result.functions);
+        let checks = result
+            .functions
+            .iter()
+            .find(|f| f.after.name == "checks")
+            .expect("inline test");
+        assert!(checks.after.is_test);
+        let rendered = result.render_text(RenderOptions {
+            render_line_numbers: true,
+        });
+        assert!(rendered.contains("src/added.rs:2"), "{rendered}");
+        assert!(!rendered.contains("Unresolved changed paths"), "{rendered}");
+    }
 }

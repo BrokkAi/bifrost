@@ -2898,9 +2898,28 @@ callable identity, use the endpoint-specific RQL pipeline:
 `:receiver-type`. An unquoted identity is a stable analyzer/model ID. A quoted
 qualified name is resolved once, with provenance, while the policy is loaded
 against its workspace and active semantic models. `call-argument` accepts
-exactly one `:formal-name` or zero-based `:formal-index`; it retains only a
-non-terminal row with an argument identity, exact mapping, and exhaustive
-actual coverage. Those guarantees are why `call-input :parameter-name` is not
+exactly one `:formal-name`, zero-based `:formal-index`, or
+`:formal-annotation-type`; it retains only a non-terminal row with an argument
+identity, exact mapping, and exhaustive actual coverage.
+
+`:formal-annotation-type` keeps the actuals whose formal, in the declaration
+the resolver selected, carries a Java annotation or C# attribute of that exact
+qualified name. Because it reads the declared target rather than an
+implementation, it binds calls through an interface whose implementation is
+generated at build time, such as a Refit or Retrofit client:
+
+```lisp
+(call-argument :formal-annotation-type "Refit.HeaderAttribute"
+  (call-bindings (call-shape (call))))
+```
+
+A surviving row proves the declared target/formal relation, as an exact
+workspace `resolved-call` does, so a sink binds it with `:dangerous-operand
+matched-value` even while runtime dispatch stays open. A formal whose
+annotation type cannot be resolved is reported as an incomplete selection
+rather than dropped. Attribute constructor arguments are ordinary literal
+facts inside the decorator, for example
+`(inside (decorator :name "Header") (literal))`. Those guarantees are why `call-input :parameter-name` is not
 an equivalent endpoint selector: `call-input` projects the expression site and
 does not retain the call-binding proof row.
 
@@ -4212,6 +4231,14 @@ bifrost --root . --policy-file policies/security.rqlp --sources src/auth
 `--policy-cost-hints <path>` reads a JSON object mapping non-empty policy IDs
 to non-negative integer milliseconds. Parallel batches start unknown policies
 first, then hinted policies from longest to shortest; hints never change the report.
+
+`--policy-deadlines-ms <path>` reads a JSON object mapping non-empty policy IDs
+to integer milliseconds of at least 1, at most 256 entries; a relative path is
+read from the current directory. Each listed policy
+stops at its own deadline, counted from when its evaluation starts: it ends
+`inconclusive` with reason `rule_deadline_exceeded`, the exit status is 2, and
+`execution.timed_out_policy_ids` lists it, while the other policies keep
+running. A policy without an entry runs until the batch finishes.
 
 `--policy-timings` adds each policy's elapsed evaluation time to its report
 work metrics as `evaluation.elapsed_ms`. A policy that ran unit by unit also

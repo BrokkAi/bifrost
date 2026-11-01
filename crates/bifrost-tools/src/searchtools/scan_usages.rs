@@ -777,17 +777,6 @@ pub(crate) fn too_many_resolution_candidates_note(total_candidates: usize, cap: 
     )
 }
 
-pub(crate) fn scan_usages_ambiguity_note(surface: ScanUsagesSurface) -> &'static str {
-    match surface {
-        ScanUsagesSurface::Reference => {
-            "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets."
-        }
-        ScanUsagesSurface::Location => {
-            "Ambiguous location; refine the line/column target and re-call scan_usages_by_location."
-        }
-    }
-}
-
 pub(crate) enum ScanUsageTargetResolution {
     Lexical {
         symbol: String,
@@ -1260,9 +1249,6 @@ fn fuzzy_result_has_hits(result: &FuzzyResult) -> bool {
             hits_by_overload, ..
         }
         | FuzzyResult::Incomplete {
-            hits_by_overload, ..
-        }
-        | FuzzyResult::Ambiguous {
             hits_by_overload, ..
         } => hits_by_overload.values().any(|hits| !hits.is_empty()),
         FuzzyResult::TooManyCallsites { sample_hits, .. } => !sample_hits.is_empty(),
@@ -2158,60 +2144,6 @@ pub(crate) fn scan_usages_target_matches_range(
     }
 }
 
-pub(crate) fn retain_hits_resolving_to_overloads(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    overloads: &[CodeUnit],
-    hits: Vec<UsageHit>,
-    cancellation: &CancellationToken,
-) -> (Vec<UsageHit>, bool) {
-    if hits.is_empty() || overloads.is_empty() {
-        return (hits, true);
-    }
-
-    let mut retained = Vec::new();
-    // Keep the non-cancellable definition resolver slices deliberately small;
-    // the shared request token is checked between slices.
-    for chunk in hits.chunks(8) {
-        if cancellation.is_cancelled() {
-            return (retained, false);
-        }
-        let requests = chunk
-            .iter()
-            .map(|hit| {
-                brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest {
-                    file: hit.file.clone(),
-                    line: None,
-                    column: None,
-                    start_byte: Some(hit.start_offset),
-                    end_byte: Some(hit.end_offset),
-                }
-            })
-            .collect();
-        let outcomes =
-            brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_batch(
-                analyzer, token, requests,
-            );
-        retained.extend(
-            chunk
-                .iter()
-                .cloned()
-                .zip(outcomes)
-                .filter_map(|(hit, outcome)| {
-                    (!outcome.definitions.is_empty()
-                        && outcome
-                            .definitions
-                            .iter()
-                            .any(|definition| overloads.contains(definition))
-                        || (outcome.definitions.is_empty()
-                            && unresolved_hit_matches_target_shape(analyzer, overloads, &hit)))
-                    .then_some(hit)
-                }),
-        );
-    }
-    (retained, !cancellation.is_cancelled())
-}
-
 pub(crate) fn resolved_usage_definition(
     analyzer: &dyn IAnalyzer,
     overloads: &[CodeUnit],
@@ -2234,51 +2166,6 @@ pub(crate) fn resolved_usage_definition(
             path: rel_path_string(unit.source()),
             line: range.start_line,
         })
-}
-
-pub(crate) fn unresolved_hit_matches_target_shape(
-    analyzer: &dyn IAnalyzer,
-    overloads: &[CodeUnit],
-    hit: &UsageHit,
-) -> bool {
-    let hit_is_member_access = usage_hit_is_member_access(analyzer, hit);
-    overloads.iter().any(|unit| {
-        declaration_is_member_access(analyzer, unit)
-            .map(|is_member| is_member == hit_is_member_access)
-            .unwrap_or(true)
-    })
-}
-
-pub(crate) fn usage_hit_is_member_access(analyzer: &dyn IAnalyzer, hit: &UsageHit) -> bool {
-    // `hit.start_offset` was produced by the analyzer's own usage scan, so
-    // it is only meaningful against the same analyzed snapshot.
-    source_has_dot_before(
-        analyzer.indexed_source(&hit.file).as_deref(),
-        hit.start_offset,
-    )
-}
-
-pub(crate) fn declaration_is_member_access(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-) -> Option<bool> {
-    let range = primary_range(analyzer, unit)?;
-    let source = analyzer.indexed_source(unit.source())?;
-    let identifier_offset = source
-        .get(range.start_byte..range.end_byte)?
-        .find(unit.identifier())
-        .map(|offset| range.start_byte + offset)?;
-    Some(source_has_dot_before(Some(&source), identifier_offset))
-}
-
-pub(crate) fn source_has_dot_before(source: Option<&str>, byte: usize) -> bool {
-    let Some(source) = source else {
-        return false;
-    };
-    source
-        .get(..byte.min(source.len()))
-        .and_then(|prefix| prefix.chars().rev().find(|ch| !ch.is_whitespace()))
-        == Some('.')
 }
 
 pub(crate) fn present_reference_only_sibling_extensions_by_language(
@@ -3032,120 +2919,6 @@ fn scan_usages_backend_on_pool(
                     incomplete_reason,
                 });
             }
-            FuzzyResult::Ambiguous {
-                short_name,
-                candidate_targets,
-                hits_by_overload,
-            } => {
-                if location_selected {
-                    let hits: Vec<UsageHit> = overloads
-                        .iter()
-                        .flat_map(|code_unit| {
-                            hits_by_overload
-                                .get(code_unit)
-                                .into_iter()
-                                .flat_map(|hits| hits.iter().cloned())
-                        })
-                        .collect();
-                    let (hits, resolution_complete) = retain_hits_resolving_to_overloads(
-                        analyzer,
-                        token,
-                        &overloads,
-                        hits,
-                        &context.cancellation,
-                    );
-                    if !resolution_complete {
-                        incomplete_reason = Some(context.interruption_reason());
-                        if hits.is_empty() {
-                            work_entries.push(incomplete_work_entry(
-                                request,
-                                Some(symbol),
-                                incomplete_reason.expect("interruption reason is present"),
-                            ));
-                            continue;
-                        }
-                    }
-                    let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
-                    let state = SymbolUsageRenderState::new(
-                        symbol,
-                        resolved_definition.clone(),
-                        truncated,
-                        filtered.definition_sites_excluded,
-                        filtered.hits,
-                        0,
-                        Vec::new(),
-                        None,
-                        reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
-                        filtered.same_owner,
-                        include_same_owner,
-                    );
-                    work_entries.push(ScanUsagesWorkEntry::Usage {
-                        request,
-                        state,
-                        candidate_files_sample,
-                        target_is_method,
-                        incomplete_reason,
-                    });
-                    continue;
-                }
-                let groups = distinct_definitions(
-                    analyzer,
-                    token,
-                    candidate_targets.iter().cloned().collect(),
-                );
-                let surface = request.surface;
-                let detail_source = ambiguous_usage_symbol_from_groups(
-                    analyzer,
-                    surface,
-                    symbol.clone(),
-                    short_name.clone(),
-                    groups.clone(),
-                    scan_usages_ambiguity_note(surface),
-                );
-                let deduped_targets: Vec<String> = groups
-                    .iter()
-                    .map(|(selector, _)| selector.clone())
-                    .collect();
-                let mut candidates = Vec::new();
-                let mut definition_sites_excluded = 0usize;
-                for (target, grouped_overloads) in groups {
-                    let grouped_hits: Vec<UsageHit> = grouped_overloads
-                        .iter()
-                        .flat_map(|code_unit| {
-                            hits_by_overload
-                                .get(code_unit)
-                                .into_iter()
-                                .flat_map(|hits| hits.iter().cloned())
-                        })
-                        .filter(|hit| hit.confidence >= CONFIDENCE_THRESHOLD)
-                        .collect();
-                    let filtered =
-                        filter_and_dedupe_hits(analyzer, &grouped_overloads, grouped_hits);
-                    definition_sites_excluded += filtered.definition_sites_excluded;
-                    candidates.push(AmbiguousUsageCandidate {
-                        target,
-                        total_hits: filtered.hits.len(),
-                    });
-                }
-                let item = AmbiguousUsageSymbol {
-                    symbol,
-                    short_name,
-                    candidate_targets: deduped_targets,
-                    candidate_details: detail_source.candidate_details,
-                    candidate_details_total: detail_source.candidate_details_total,
-                    candidate_details_truncated: detail_source.candidate_details_truncated,
-                    candidates,
-                    candidate_files_truncated: truncated,
-                    definition_sites_excluded: some_if_nonzero(definition_sites_excluded),
-                    too_many_candidates: None,
-                    note: detail_source.note,
-                };
-                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
-                    request,
-                    item,
-                    incomplete_reason,
-                });
-            }
             FuzzyResult::Failure {
                 fq_name,
                 reason_kind,
@@ -3335,10 +3108,7 @@ fn classify_scan_usages_reference_entry(entry: &ScanUsagesWorkEntry) -> ScanUsag
 }
 
 fn raw_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
-    let mut usages = symbol_usages_base(state);
-    usages.rendering = UsageRendering::Full;
-    usages.unproven_files = raw_summary_file_groups(&state.unproven_rows);
-    usages
+    symbol_usages_base(state)
 }
 
 fn symbol_usages_base(state: &SymbolUsageRenderState) -> SymbolUsages {
@@ -3362,21 +3132,6 @@ fn symbol_usages_base(state: &SymbolUsageRenderState) -> SymbolUsages {
         unproven_files: Vec::new(),
         model_relations: Vec::new(),
     }
-}
-
-fn raw_summary_file_groups(rows: &[UsageHitRow]) -> Vec<UsageFileGroup> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for row in rows {
-        *counts.entry(row.path.clone()).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .map(|(path, hit_count)| UsageFileGroup {
-            path,
-            hits: Vec::new(),
-            hit_count: Some(hit_count),
-        })
-        .collect()
 }
 
 fn raw_reference_files(
@@ -3690,6 +3445,53 @@ pub struct UsageGraphResult {
     pub file_notes: Vec<UsageGraphFileNote>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub build_configurations: Vec<UsageGraphBuildConfiguration>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub csharp_compilations: Vec<UsageGraphCSharpCompilation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphCSharpCompilation {
+    pub project_path: Option<String>,
+    pub configuration: String,
+    pub target_framework: Option<String>,
+    pub defined_symbols: Vec<String>,
+    pub closed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_reason: Option<String>,
+}
+
+fn usage_graph_csharp_compilations(
+    analyzer: &dyn IAnalyzer,
+) -> Option<Vec<UsageGraphCSharpCompilation>> {
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+    if let Some(csharp) =
+        resolve_analyzer::<brokk_bifrost_csharp_analysis::CSharpAnalyzer>(analyzer)
+    {
+        return Some(
+            csharp
+                .selected_usage_graph_configurations()?
+                .into_iter()
+                .map(|compilation| UsageGraphCSharpCompilation {
+                    project_path: compilation.project_path,
+                    configuration: compilation.configuration,
+                    target_framework: compilation.target_framework,
+                    defined_symbols: compilation.symbols,
+                    closed: compilation.closed,
+                    open_reason: compilation.open_reason,
+                })
+                .collect(),
+        );
+    }
+    // Disk C# sources create a delegate; only an unsaved overlay can add C# without one.
+    if analyzer.project().overlay_content().is_some_and(|content| {
+        content
+            .entries()
+            .iter()
+            .any(|(file, _)| language_for_file(file) == Language::CSharp)
+    }) {
+        return None;
+    }
+    Some(Vec::new())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4553,6 +4355,7 @@ fn usage_graph_with_passes(
     let mut layer_catalog_once: Option<(usize, WorkspaceUsageCatalog)> = None;
     let mut native_projections: Vec<SelectedWorkspaceUsageGraphProjection> = Vec::new();
     let mut legacy_withheld = Vec::new();
+    let mut missing_relative_imports = BTreeSet::new();
     let mut legacy_withheld_complete = true;
     let mut native_admitted_callers = HashSet::default();
     let mut skipped_callers = std::collections::BTreeMap::new();
@@ -4810,6 +4613,11 @@ fn usage_graph_with_passes(
                 Some(brokk_bifrost_analysis::analyzer::languages::LanguageEdgeSites::Fqn(
                     result,
                 )) => {
+                    for (path, targets) in &result.unresolved_relative_imports {
+                        for target in targets {
+                            missing_relative_imports.insert((path.clone(), target.clone()));
+                        }
+                    }
                     legacy_withheld_complete &= result.unproven_sites_complete;
                     legacy_withheld.extend(legacy_usage_graph_withheld_references(
                         analyzer,
@@ -4838,6 +4646,11 @@ fn usage_graph_with_passes(
                 Some(brokk_bifrost_analysis::analyzer::languages::LanguageEdgeSites::Scoped(
                     result,
                 )) => {
+                    for (path, targets) in &result.unresolved_relative_imports {
+                        for target in targets {
+                            missing_relative_imports.insert((path.clone(), target.clone()));
+                        }
+                    }
                     legacy_withheld_complete &= result.unproven_sites_complete;
                     legacy_withheld.extend(legacy_usage_graph_withheld_references(
                         analyzer,
@@ -5727,6 +5540,22 @@ fn usage_graph_with_passes(
         truncated_by_id,
         incomplete,
     );
+    result
+        .incomplete_reasons
+        .extend(missing_relative_imports.into_iter().map(|(path, gap)| {
+            let (code, status) = match gap.kind {
+                brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportGapKind::Absent => ("unresolved_relative_import", "is absent"),
+                brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportGapKind::OutsideWorkspace => ("relative_import_outside_workspace", "leaves the workspace"),
+            };
+            UsageGraphIncompleteReason {
+                discovery_error: None,
+                code: code.into(),
+                message: format!("{path}: relative import target {:?} {status}", gap.target),
+                path: Some(path),
+                module_path: None,
+            }
+        }));
+    result.complete = result.incomplete_reasons.is_empty();
     result.withheld_references = public_withheld;
     result.withheld_references_complete = legacy_withheld_complete
         && unavailable_passes.is_empty()
@@ -5819,7 +5648,6 @@ fn record_graph_domain_failures(
                 module_path: None,
             });
         }
-        result.complete = false;
     }
 }
 
@@ -5830,7 +5658,6 @@ fn record_graph_build_selection_unavailable(
     >,
 ) {
     if let Some(reason) = reason {
-        result.complete = false;
         result.incomplete_reasons.push(UsageGraphIncompleteReason {
             code: "build_selection_unavailable".into(),
             message: "Go build selection is unavailable; build directives could not be evaluated"
@@ -6078,6 +5905,19 @@ fn finalize_usage_graph_result(
             ),
         });
     }
+    let csharp_compilations = match usage_graph_csharp_compilations(analyzer) {
+        Some(configurations) => configurations,
+        None => {
+            incomplete_reasons.push(UsageGraphIncompleteReason {
+                discovery_error: None,
+                path: None,
+                module_path: None,
+                code: "csharp_selected_configuration_unavailable".to_string(),
+                message: "the selected C# compilation configurations were unavailable".to_string(),
+            });
+            Vec::new()
+        }
+    };
     let result = UsageGraphResult {
         withheld_references: Vec::new(),
         withheld_references_complete: incomplete_reasons.is_empty(),
@@ -6089,6 +5929,7 @@ fn finalize_usage_graph_result(
         incomplete_reasons,
         file_notes: Vec::new(),
         build_configurations: usage_graph_build_configurations(analyzer),
+        csharp_compilations,
     };
     debug_assert_unique_usage_graph_file_notes(&result);
     result
@@ -6301,6 +6142,7 @@ fn finalize_selected_usage_graph_result(
         incomplete_reasons,
         file_notes: Vec::new(),
         build_configurations: Vec::new(),
+        csharp_compilations: Vec::new(),
     })
 }
 
@@ -8352,7 +8194,7 @@ pub fn classify_test_files(
     let mut classifications = BTreeMap::new();
     let mut unresolved = Vec::new();
     for input in params.file_paths.iter() {
-        match resolver.resolve_literal(input.trim()) {
+        match resolver.resolve_literal(input) {
             ResolvedFileInput::File(file) if file.exists() => {
                 classifications.insert(
                     rel_path_string(&file),
@@ -8394,6 +8236,10 @@ pub(crate) fn classify_resolved_test_file(
 
 #[cfg(test)]
 mod tests {
+    mod incomplete_absence_render;
+
+    #[path = "tests_boundary_coverage.rs"]
+    mod boundary_coverage;
 
     use crate::searchtools::scan_usages::*;
 

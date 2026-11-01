@@ -95,7 +95,7 @@ apply to policy mode:
   exclude each other. None can be combined with `--format`, `--fail-on`,
   `--suppressions-file`, `--scope-file`, `--baseline-file`,
   `--accept-current`, `--evaluation-date`, `--diff-base`, `--policy-timings`, `--policy-cost-hints`,
-  `--verbose`, `--color`, or `--sources`. An explanation needs an explicit
+  `--policy-deadlines-ms`, `--verbose`, `--color`, or `--sources`. An explanation needs an explicit
   `--policy-file` or built-in selector, and the selection must resolve to one
   policy. `--explain-near-misses N` accepts 1 to 64.
 - `--explain-generation HEX` requires one of the three explanation flags.
@@ -103,6 +103,12 @@ apply to policy mode:
 - `--policy-cost-hints <path>` reads a JSON object mapping non-empty policy IDs
   to non-negative integer milliseconds. Parallel batches start unknown policies
   first, then hinted policies from longest to shortest; hints never change the report.
+- `--policy-deadlines-ms <path>` reads a JSON object mapping non-empty policy IDs
+  to integer milliseconds of at least 1, at most 256 entries. Each listed policy
+  stops at its own deadline, counted from when its evaluation starts: it ends
+  `inconclusive` with reason `rule_deadline_exceeded`, the exit status is 2, and
+  `execution.timed_out_policy_ids` lists it, while the other policies keep
+  running.
 - `--policy-timings` adds each policy's elapsed evaluation time to its report
   work metrics. It also prints the stage timings to standard error as one
   JSON object after the text `bifrost: policy stage timings`.
@@ -1226,7 +1232,7 @@ The named binding must come earlier and use an inline `rql` query or a
 #### `join`
 
 ```lisp
-(join :left NAME :right NAME [:kind inner|semi|anti] :on ((LEFT RIGHT)...))
+(join :left NAME :right NAME [:kind inner|left|semi|anti] :on ((LEFT RIGHT)...))
 ```
 
 Join two named row relations by registered equal-typed fields. Legal in: policy, `assertion`.
@@ -1235,7 +1241,7 @@ Join two named row relations by registered equal-typed fields. Legal in: policy,
 | --- | --- | --- | --- |
 | `:left` | required | a bounded row binding, group, or aggregate name | `:left NAME`. Name the left row binding. |
 | `:right` | required | a bounded row binding, group, or aggregate name | `:right NAME`. Name the right row binding. |
-| `:kind` | optional | inner, semi, or anti | `:kind inner\|semi\|anti`. Choose an inner join, a semi join that keeps matching left rows without the right relation columns, or an anti-join that keeps left rows with no partner; omission means inner. |
+| `:kind` | optional | inner, left, semi, or anti | `:kind inner\|left\|semi\|anti`. Choose an inner join, a left join that keeps every left row with absent right-side fields when no partner exists, a semi join that keeps matching left rows without the right relation columns, or an anti-join that keeps left rows with no partner; omission means inner. |
 | `:on` | required | one or more equality field pairs; list (source order kept) of 1 to 16 items | `:on ((LEFT-FIELD RIGHT-FIELD)...)`. Declare equal-typed field pairs relative to the left and right bindings. |
 
 #### `group`

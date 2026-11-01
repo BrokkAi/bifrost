@@ -6,7 +6,9 @@ use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_direct_declared_class_parent;
 use crate::graph_support::php_is_constructor_name;
+use crate::knowledge::PhpKnowledge;
 use crate::phpdoc::parameter_element_type as phpdoc_parameter_element_type;
+use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
 use brokk_bifrost_core::analyzer::php_facts::{
     PhpDeclarationSourceFact, PhpDeclaredSourceType, PhpFieldWriteKind,
 };
@@ -336,6 +338,25 @@ pub fn static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
         .or_else(|| node.child_by_field_name("constant"))
         .or_else(|| node.named_child(1))?;
     Some((scope, name))
+}
+
+/// Whether `raw` spells one of PHP's class-relative scope keywords. Keywords
+/// are ASCII case-insensitive, so `SELF::` and `Parent::` name the same scopes
+/// as their lowercase spellings.
+pub fn is_relative_scope_keyword(raw: &str) -> bool {
+    ["self", "static", "parent"]
+        .iter()
+        .any(|keyword| raw.eq_ignore_ascii_case(keyword))
+}
+
+/// Whether a declared PHP member answers to the name written at a use site.
+/// Method names are ASCII case-insensitive while property and constant names
+/// are exact; the rule itself is [`PhpKnowledge`]'s terminal-name normalization,
+/// which the shared unproven-site accounting applies too.
+pub fn php_member_name_matches(candidate: &CodeUnit, written: &str) -> bool {
+    let kind = candidate.kind();
+    PhpKnowledge.normalize_terminal_name(candidate.identifier(), kind)
+        == PhpKnowledge.normalize_terminal_name(written, kind)
 }
 
 /// Resolve the class named by a PHP static scope. Unlike ordinary type syntax,
@@ -1575,7 +1596,12 @@ pub fn direct_call_return_type_fq_name(
                 enclosing_owner,
             )?;
             let member = literal_member_identifier(member, source)?;
-            format!("{owner}.{member}")
+            // `Child::make()` and `Owner::MAKE()` both call the method the
+            // scope class effectively has: declared on it or inherited, under
+            // PHP's case-insensitive method names.
+            declared_member_family(php, analyzer, &owner, member, CodeUnit::is_function)?
+                .first()?
+                .fq_name()
         }
         _ => return None,
     };
@@ -1593,6 +1619,97 @@ pub fn direct_call_return_type_fq_name(
         return None;
     }
     declared_callable_return_type_fq_name(php, analyzer, &callable)
+}
+
+/// Whether `$this` at `this_node` may name some object other than the lexical
+/// one. A closure keeps its creator's `$this` only until `Closure::bind`,
+/// `bindTo` or `call` gives it another object, so a closure whose value
+/// reaches one of those in the body that creates it has no known `$this`.
+/// Arrow functions take `$this` from the scope around them; a named function
+/// or method ends the search.
+fn this_is_rebound_closure_object(this_node: Node<'_>, source: &str, ctx: &PhpFileContext) -> bool {
+    let mut current = this_node;
+    let closure = loop {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        match parent.kind() {
+            "anonymous_function" | "anonymous_function_creation" => break parent,
+            "function_definition" | "method_declaration" => return false,
+            _ => current = parent,
+        }
+    };
+    let mut value = closure;
+    while value
+        .parent()
+        .is_some_and(|parent| parent.kind() == "parenthesized_expression")
+    {
+        value = value.parent().expect("checked closure parent");
+    }
+    let bound_variable = value.parent().and_then(|parent| {
+        let (left, right) = assignment_parts(parent)?;
+        (right == value && left.kind() == "variable_name")
+            .then(|| variable_identifier(left, source))
+    });
+    let scope = {
+        let mut scope = value;
+        while let Some(parent) = scope.parent() {
+            scope = parent;
+            if is_local_scope(scope) {
+                break;
+            }
+        }
+        scope
+    };
+    let is_bound_value = |candidate: Node<'_>| {
+        let candidate = unwrap_parenthesized(candidate);
+        candidate == closure
+            || bound_variable.is_some_and(|name| {
+                candidate.kind() == "variable_name"
+                    && variable_identifier(candidate, source) == name
+            })
+    };
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "member_call_expression" | "nullsafe_member_call_expression" => {
+                if let (Some(object), Some(name)) = (
+                    node.child_by_field_name("object"),
+                    node.child_by_field_name("name"),
+                ) && ["bindTo", "call"]
+                    .iter()
+                    .any(|method| node_text(name, source).eq_ignore_ascii_case(method))
+                    && is_bound_value(object)
+                {
+                    return true;
+                }
+            }
+            "scoped_call_expression" => {
+                if let Some((scope, name)) = static_member_parts(node)
+                    && node_text(name, source).eq_ignore_ascii_case("bind")
+                    && resolve_php_type(node_text(scope, source), ctx)
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case("Closure"))
+                    && first_argument_value(node).is_some_and(is_bound_value)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push(node.named_child(index).expect("valid named child"));
+        }
+    }
+    false
+}
+
+/// The value expression of a call's first positional argument.
+fn first_argument_value(call: Node<'_>) -> Option<Node<'_>> {
+    let argument = call.child_by_field_name("arguments")?.named_child(0)?;
+    if argument.kind() != "argument" || argument.child_by_field_name("name").is_some() {
+        return None;
+    }
+    argument.named_child(argument.named_child_count().checked_sub(1)?)
 }
 
 /// Resolve the declared object type of a PHP instance receiver without walking
@@ -1657,7 +1774,9 @@ fn instance_receiver_type_fq_name_inner(
                         {
                             resolve_php_type(node_text(type_node, source), ctx)
                         } else if name == "this" {
-                            enclosing_owner(node.start_byte(), node.end_byte())
+                            (!this_is_rebound_closure_object(node, source, ctx))
+                                .then(|| enclosing_owner(node.start_byte(), node.end_byte()))
+                                .flatten()
                         } else if let Some(collection) =
                             enclosing_foreach_collection(node, source, || true)
                         {
@@ -1929,7 +2048,10 @@ fn declared_member(
     Some(candidate.clone())
 }
 
-fn declared_member_family(
+/// Every declaration of the member `owner_fq_name` effectively has under
+/// `member`: its own, or else the nearest ancestor level's when exactly one
+/// member family answers there. `None` means no answer or an ambiguous level.
+pub fn declared_member_family(
     php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     owner_fq_name: &str,
@@ -1942,13 +2064,7 @@ fn declared_member_family(
         .filter(CodeUnit::is_class)
         .flat_map(|owner| analyzer.index.direct_children(&owner))
         .filter(wanted)
-        .filter(|candidate| {
-            if candidate.is_function() {
-                candidate.identifier().eq_ignore_ascii_case(member)
-            } else {
-                candidate.identifier() == member
-            }
-        })
+        .filter(|candidate| php_member_name_matches(candidate, member))
         .collect();
     if !direct.is_empty() {
         return Some(direct);
@@ -1981,13 +2097,7 @@ fn declared_member_family(
                 .filter(CodeUnit::is_class)
                 .flat_map(|owner| analyzer.index.direct_children(&owner))
                 .filter(wanted)
-                .filter(|candidate| {
-                    if candidate.is_function() {
-                        candidate.identifier().eq_ignore_ascii_case(member)
-                    } else {
-                        candidate.identifier() == member
-                    }
-                });
+                .filter(|candidate| php_member_name_matches(candidate, member));
             for definition in definitions {
                 families
                     .entry(definition.fq_name())

@@ -3487,6 +3487,7 @@ mod tests {
             captures: Vec::new(),
             enclosing_symbol: None,
             python_import: None,
+            heuristic: None,
         };
         let output = render_code_query_repl_output(
             &CodeQueryResult {

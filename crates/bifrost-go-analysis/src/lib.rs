@@ -34,23 +34,12 @@ pub mod analyzer {
     pub use go::native_rename::{GoNativeRenameProvider, go_native_rename};
     #[cfg(any(test, feature = "test-support"))]
     pub use go::native_usages::GoNativeUsageStrategy;
-    pub use go::package_identity::modeled_go_callable_result_nominal_type;
     #[cfg(any(test, feature = "test-support"))]
     pub use go::persist_live_go_sources_for_test;
     #[cfg(any(test, feature = "test-support"))]
     pub use go::selected_reverse::{
         GoNativeSelectedInverseProvider, GoNativeSelectedReferenceIndex, GoSelectedReverseOutcome,
         go_selected_inverse_for,
-    };
-    pub use go::{
-        GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES,
-        GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS, GoHttpHandlerDispatch,
-        GoHttpHandlerOpenReason, go_http_handler_dispatch,
-        go_modeled_result_binding_type_identity_is_exact,
-        go_modeled_result_binding_type_identity_proof_work,
-        go_native_error_function_value_obligation, go_native_error_result_obligation,
-        go_native_obligation_exclusion, reference_assertion_payload_type_is_exact,
-        workspace_reference_assertion_accepts_payload,
     };
     pub use go::{
         GoAggregateOperand, GoAggregateSourceBinding, GoAnalyzer,
@@ -71,6 +60,13 @@ pub mod analyzer {
         resolve_go_semantic_pack_dependencies,
     };
     pub use go::{GoCallResultUseIndex, go_call_result_use};
+    pub use go::{
+        GoHttpHandlerDispatch, GoHttpHandlerOpenReason, go_http_handler_dispatch,
+        go_native_error_function_value_obligation, go_native_error_result_obligation,
+        go_native_obligation_exclusion, reference_assertion_payload_type_is_exact,
+        workspace_reference_assertion_accepts_payload,
+    };
+    pub use go::{go_explicit_binding_type_identity, go_selected_callable_result_type_identities};
 
     pub mod usages {
         pub mod get_definition {

@@ -46,7 +46,7 @@ use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder
 use crate::analyzer::workspace::WorkspaceAnalyzer;
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, DescendantIndexScope, IAnalyzer, Language, ProjectFile,
-    QueryScope, Range,
+    QueryScope,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -1185,71 +1185,17 @@ fn replay_dispatch(
     question: &LookupQuestion,
     limits: LookupReplayLimits,
 ) -> Option<StableDigest> {
-    match (kind, question) {
-        (LookupKind::Dispatch, LookupQuestion::CallSite { .. }) => {
-            replay_source_dispatch(head, question, limits)
-        }
-        (LookupKind::ProcedureDispatch, LookupQuestion::ProcedureCallSite { .. }) => {
-            replay_procedure_dispatch(head, question, limits)
-        }
-        _ => {
-            debug_assert!(
-                false,
-                "a {} lookup recorded a {} question: {question:?}",
-                kind.stable_label(),
-                question.stable_label()
-            );
-            None
-        }
-    }
-}
-
-/// Replay artifact-pinned dispatch at the recorded absolute source range.
-///
-/// The recorded artifact fingerprint is part of the question, so a head whose
-/// artifact for that file moved has no answer to it. That is exactly right:
-/// "dispatch at this range of this artifact" and "dispatch at this range of
-/// whatever artifact the file has now" are different questions.
-fn replay_source_dispatch(
-    head: &WorkspaceAnalyzer,
-    question: &LookupQuestion,
-    limits: LookupReplayLimits,
-) -> Option<StableDigest> {
-    let LookupQuestion::CallSite {
-        rel_path,
-        artifact,
-        site,
-    } = question
-    else {
-        unreachable!("replay_source_dispatch is called only for a source call-site question")
-    };
-    let file = analyzed_file(head.analyzer(), rel_path)?;
-    let mut budget = SemanticBudget::new(limits.semantic).ok()?;
-    let cancellation = CancellationToken::default();
-    let mut request = SemanticRequest::new(&mut budget, &cancellation);
-    let materialized = head
-        .materialize_program_semantics(&file, &mut request)
-        .ok()?;
-    if materialized.available_value()?.key().public_fingerprint() != *artifact {
+    if !matches!(
+        (kind, question),
+        (
+            LookupKind::Dispatch | LookupKind::ProcedureDispatch,
+            LookupQuestion::CallSite { .. }
+        )
+    ) {
+        debug_assert!(false, "a dispatch read needs a ranked call question");
         return None;
     }
-    // Only the byte range addresses a call site: the source projection selects
-    // by span containment and never reads the line coordinates.
-    let range = Range {
-        start_byte: site.start_byte,
-        end_byte: site.end_byte,
-        start_line: 0,
-        end_line: 0,
-    };
-    let outcome = head
-        .semantic_oracle_provider()
-        .dispatch_at_source_in_artifact(materialized, range, &mut request)
-        .ok()?;
-    Some(
-        crate::analyzer::semantic::workspace_oracle::dispatch_answer_digest(
-            outcome.available_value(),
-        ),
-    )
+    replay_procedure_dispatch(head, question, limits)
 }
 
 fn replay_procedure_dispatch(
@@ -1305,8 +1251,8 @@ pub enum ProcedureDispatchReadCallError {
 /// accepts an already materialized procedure, so a caller that also needs the
 /// live dispatch result can invoke its cached provider exactly once and retain
 /// that outcome for coverage and boundary reconstruction. Whole-artifact
-/// content is not an equality input: the procedure lineage and procedure-local
-/// source range admit an unchanged procedure after an unrelated sibling edit.
+/// content is not an equality input: stable procedure lineage and call rank
+/// admit an unchanged procedure after an unrelated sibling edit.
 pub fn procedure_dispatch_read_call(
     procedure: &ProcedureHandle,
     key: &ReadKey,
@@ -1315,7 +1261,7 @@ pub fn procedure_dispatch_read_call(
     let ReadKey::Lookup {
         kind: LookupKind::ProcedureDispatch,
         question:
-            LookupQuestion::ProcedureCallSite {
+            LookupQuestion::CallSite {
                 rel_path,
                 procedure: expected_procedure,
                 site: expected_site,
@@ -1344,7 +1290,7 @@ fn replay_procedure_dispatch_with_request(
     oracle: &WorkspaceSemanticOracle<'_>,
     request: &mut SemanticRequest<'_>,
 ) -> Option<StableDigest> {
-    let LookupQuestion::ProcedureCallSite {
+    let LookupQuestion::CallSite {
         rel_path,
         procedure: expected_procedure,
         site: expected_site,
@@ -1393,60 +1339,22 @@ fn replay_procedure_dispatch_with_request(
 
 fn procedure_dispatch_call_at_relative_site(
     procedure: &ProcedureHandle,
-    expected_site: &crate::analyzer::read_ledger::ProcedureCallSiteLocator,
+    expected_site: &crate::analyzer::read_ledger::CallSiteLocator,
     request: &mut SemanticRequest<'_>,
 ) -> Result<Option<CallSiteHandle>, ProcedureDispatchReadCallError> {
     if request.cancellation.is_cancelled() {
         return Err(ProcedureDispatchReadCallError::Cancelled);
     }
-    let procedure_start = procedure.semantics().locator().anchor().span().start_byte() as usize;
-    let Some(expected_start) = procedure_start.checked_add(expected_site.start_byte) else {
-        return Ok(None);
-    };
-    let Some(expected_end) = procedure_start.checked_add(expected_site.end_byte) else {
-        return Ok(None);
-    };
-    let mut matched_call = None;
-    let mut ordinal = 0;
-    for semantic_call in procedure.semantics().call_sites() {
-        if request.cancellation.is_cancelled() {
-            return Err(ProcedureDispatchReadCallError::Cancelled);
-        }
-        request.budget.charge_work(SemanticWork {
-            call_sites: 1,
-            source_mappings: 1,
-            ..SemanticWork::default()
-        });
-        if !crate::analyzer::semantic::workspace_oracle::source::call_row_has_exact_bytes(
-            procedure,
-            semantic_call,
-            expected_start,
-            expected_end,
-        ) {
-            continue;
-        }
-        if ordinal == expected_site.ordinal {
-            request.budget.charge_work(SemanticWork {
-                nested_entries: 1,
-                ..SemanticWork::default()
-            });
-            matched_call = procedure.call_site_handle(semantic_call.id);
-            break;
-        }
-        ordinal += 1;
-    }
-    let Some(call) = matched_call else {
-        return Ok(None);
-    };
-    let Ok(range) = crate::analyzer::semantic::workspace_oracle::exact_call_range(&call) else {
-        return Ok(None);
-    };
-    if range.start_byte.checked_sub(procedure_start) != Some(expected_site.start_byte)
-        || range.end_byte.checked_sub(procedure_start) != Some(expected_site.end_byte)
-    {
-        return Ok(None);
-    }
-    Ok(Some(call))
+    let calls =
+        crate::analyzer::semantic::workspace_oracle::source::source_ordered_calls(procedure);
+    request.budget.charge_work(SemanticWork {
+        call_sites: calls.len(),
+        source_mappings: calls.len(),
+        ..SemanticWork::default()
+    });
+    Ok(calls
+        .get(expected_site.ordinal)
+        .and_then(|call| procedure.call_site_handle(call.id)))
 }
 
 /// The engine's analysis epoch: every grammar and query epoch it could derive
@@ -1623,8 +1531,26 @@ pub fn verify_read_set_for_artifact(
                 language,
                 rel_path,
                 blob,
+                parse_variant,
             } => match memo.head_blob(head, changed, *language, rel_path) {
                 Ok(after) => {
+                    let file = ProjectFile::new(
+                        head.analyzer().project().root().to_path_buf(),
+                        Path::new(rel_path.as_ref()),
+                    );
+                    if after == Some(*blob)
+                        && brokk_bifrost_core::analyzer::project_reads::without_project_reads(
+                            || head.analyzer().selected_parse_variant(&file),
+                        ) != Some(*parse_variant)
+                    {
+                        return ReadVerdict::Changed(Box::new(ChangedRead {
+                            key: key.clone(),
+                            reason: InvalidationReason::DependencyChanged {
+                                artifact,
+                                dependency: key.canonical_digest(),
+                            },
+                        }));
+                    }
                     (after != Some(*blob)).then(|| InvalidationReason::InputContentChanged {
                         artifact,
                         before: blob_identity(Some(*blob)),
@@ -2172,17 +2098,34 @@ mod tests {
         for root in [base_root.path(), head_root.path()] {
             std::fs::create_dir(root.join("config")).unwrap();
             std::fs::write(root.join(relative), b"[project]\nname='example'\n").unwrap();
+            std::fs::write(root.join("Shared.cs"), "class Shared {}\n").unwrap();
         }
         let base_project = FilesystemProject::new(base_root.path()).unwrap();
         let base_file = base_project.file_by_rel_path(Path::new(relative)).unwrap();
         let blob = base_project.read_source_snapshot(&base_file).unwrap().oid();
         // The language identifies the authority that read the file, rather
         // than the configuration file's syntax (TOML).
+        use brokk_bifrost_core::gitblob::ParseVariant;
+        let source_file = base_project
+            .file_by_rel_path(Path::new("Shared.cs"))
+            .unwrap();
+        let source_blob = base_project
+            .read_source_snapshot(&source_file)
+            .unwrap()
+            .oid();
+        let selected = ReadKey::file(
+            Language::CSharp,
+            "Shared.cs",
+            source_blob,
+            ParseVariant::Digest([7; 32]),
+        );
         let reads = vec![
+            selected.clone(),
             ReadKey::file(
                 Language::Python,
                 crate::path_utils::rel_path_string(&base_file),
                 blob,
+                brokk_bifrost_core::gitblob::ParseVariant::Empty,
             ),
             ReadKey::path_absent(Language::Python, "config/package.json"),
         ];
@@ -2198,6 +2141,7 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .publish_policy_units(vec![PolicyUnitRow {
+                seed_parse_variant: None,
                 key: key.clone(),
                 product_kind: "rows".into(),
                 product: "{\"rows\":[]}".into(),
@@ -2212,10 +2156,19 @@ mod tests {
             .pop()
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.reads.len(), 2);
-        let head = WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(Arc::new(
-            FilesystemProject::new(head_root.path()).unwrap(),
-        )));
+        assert_eq!(loaded.reads.len(), 3);
+        let persisted_selected = loaded
+            .reads
+            .iter()
+            .find(|key| **key == selected)
+            .expect("persisted non-NULL variant round-trips");
+        let head_with_variant = |variant| {
+            WorkspaceAnalyzer::Empty(
+                EmptyAnalyzer::new(Arc::new(FilesystemProject::new(head_root.path()).unwrap()))
+                    .with_csharp_parse_variant_for_test(variant),
+            )
+        };
+        let head = head_with_variant(ParseVariant::Digest([7; 32]));
         let base = WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(Arc::new(base_project)));
         let changed = ChangedFacts::between(&base, &head);
         let inputs = HeadInputs {
@@ -2225,10 +2178,10 @@ mod tests {
             configuration: digest,
             epoch: digest,
         };
-        let verify = |key: &ReadKey| {
+        let verify = |head: &WorkspaceAnalyzer, key: &ReadKey| {
             verify_read_set_for_artifact(
                 DerivedArtifactId::semantic_artifact(digest),
-                &head,
+                head,
                 &changed,
                 &inputs,
                 std::slice::from_ref(key),
@@ -2238,8 +2191,20 @@ mod tests {
             )
         };
         for key in &loaded.reads {
-            assert_eq!(verify(key), ReadVerdict::Unchanged, "{key:?}");
+            assert_eq!(verify(&head, key), ReadVerdict::Unchanged, "{key:?}");
         }
+        // Both comparisons use the decoded persisted row and the same source OID.
+        assert_eq!(verify(&head, persisted_selected), ReadVerdict::Unchanged);
+        let changed_variant_head = head_with_variant(ParseVariant::Digest([8; 32]));
+        let variant_verdict = verify(&changed_variant_head, persisted_selected);
+        assert_eq!(
+            variant_verdict
+                .changed()
+                .expect("different selected decision")
+                .key,
+            *persisted_selected
+        );
+        std::fs::write(head_root.path().join("Shared.cs"), "class Changed {}\n").unwrap();
         std::fs::write(
             head_root.path().join(relative),
             "[project]\nname='changed'\n",
@@ -2247,7 +2212,7 @@ mod tests {
         .unwrap();
         std::fs::write(head_root.path().join("config/package.json"), "{}").unwrap();
         for key in &loaded.reads {
-            let verdict = verify(key);
+            let verdict = verify(&head, key);
             assert_eq!(verdict.changed().expect("changed input").key, *key);
         }
     }

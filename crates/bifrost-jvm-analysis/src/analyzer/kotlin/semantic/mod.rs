@@ -99,15 +99,21 @@ use brokk_bifrost_jvm::kotlin::value_classes::{
 ///
 /// Bumped for #6940: control-flow and carrier sites now read hexadecimal,
 /// binary and unsigned integer literals.
+///
+/// Bumped for #8523: brokk-tree-sitter-kotlin 0.4.7 parses an empty
+/// collection literal `[]` instead of recovering it with a MISSING node.
 // Bumping this rotates every public wire id hashed from the adapter
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v16";
+// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
+// #8689: invalidate Kotlin artifacts after mutable closure captures acquire shared cells.
+// #8591: context-parameter function types change Kotlin semantic identities.
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v24";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
-struct KotlinSemanticLowerer;
+pub(crate) struct KotlinSemanticLowerer;
 
 impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
@@ -196,6 +202,7 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
                             .map(|capture| LexicalCaptureSource {
                                 name: capture.name.into(),
                                 declaration_start: capture.declaration_start,
+                                mutable: capture.mutable,
                             })
                             .collect(),
                     },
@@ -417,8 +424,9 @@ struct LoweringContext<'tree, 'targets> {
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     /// Kotlin primitive scalar types proven for local and parameter values.
     scalar_types: HashMap<ValueId, KotlinScalarType>,
-    /// Mutable local bindings, used to keep captured writes open.
+    /// Mutable local bindings, used to publish shared capture cells.
     mutable_locals: HashSet<ValueId>,
+    shared_binding_locations: HashMap<ValueId, (MemoryLocationId, MemoryAccessKind)>,
     /// Locals declared `by` a delegate. Reading or assigning one calls the
     /// delegate's `getValue` or `setValue`, which is not a binding access.
     delegated_locals: HashSet<ValueId>,

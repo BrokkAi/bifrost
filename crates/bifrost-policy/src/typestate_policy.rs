@@ -395,7 +395,7 @@ struct CloseSiteFact {
     /// close passes it, including the exceptional continuation of the close
     /// itself, so it is the barrier a reachability walk cuts.
     point: ProgramPointHandle,
-    /// Whether the heap analysis proved the close acts on exactly that target.
+    /// Whether the heap analysis proved this candidate target relation.
     proven: bool,
 }
 
@@ -1381,6 +1381,13 @@ impl<'a> RootUnits<'a> {
             return;
         }
         if !ledger.is_bounded() {
+            crate::unit_execution::note_refused_unit(ledger, || {
+                format!(
+                    "policy={} partition={:?}",
+                    self.policy.definition().metadata.id,
+                    self.keys[root_index].partition,
+                )
+            });
             self.all_published = false;
             self.attempt.unbounded();
             return;
@@ -3160,7 +3167,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     let flow_condition = argument_condition.map(|condition| {
                         TypestateEventCondition::boolean_argument(condition.index, condition.equals)
                     });
-                    if release_event {
+                    if release_event && !matches!(condition_matches, Some(None | Some(false))) {
                         self.note_close_sites(&resolved, &mut close_sites)?;
                     }
                     for object in &resolved.objects {
@@ -4881,21 +4888,34 @@ impl<'a> TypestatePolicyCompiler<'a> {
         let mut barriers = Vec::new();
         let mut different_formal = false;
         let mut unbound = false;
+        // Different callers can supply different objects for the same formal.
+        // A close point is a barrier for this formal only when every fact
+        // recorded there is a proven close of this formal.
+        let mut definite_points = HashMap::new();
         for fact in close_sites
             .iter()
             .filter(|fact| fact.procedure.durable_key() == performing)
         {
+            let closes_formal = fact.proven
+                && matches!(fact.target, CloseSiteTarget::Formal { ordinal: closed } if closed == ordinal);
+            definite_points
+                .entry(fact.point.id())
+                .and_modify(|definite| *definite &= closes_formal)
+                .or_insert(closes_formal);
             if !fact.proven {
                 continue;
             }
             match fact.target {
-                CloseSiteTarget::Formal { ordinal: closed } if closed == ordinal => {
-                    barriers.push(fact.point.id())
-                }
+                CloseSiteTarget::Formal { ordinal: closed } if closed == ordinal => {}
                 CloseSiteTarget::Formal { .. } => different_formal = true,
                 CloseSiteTarget::NonFormal | CloseSiteTarget::Foreign => unbound = true,
             }
         }
+        barriers.extend(
+            definite_points
+                .into_iter()
+                .filter_map(|(point, definite)| definite.then_some(point)),
+        );
         // A nested call that provably hands this same formal to a callee whose
         // own contract is discharged is a close of it too, so the walk cuts at
         // the call that performs it. The nested walk runs even when this body

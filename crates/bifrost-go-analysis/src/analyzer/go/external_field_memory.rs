@@ -5,7 +5,14 @@
 //! declaration to the exact activated artifact, and replays only those routes.
 //! It does not establish callback invocation or retain workspace-sized state.
 
-use crate::analyzer::go::package_identity::GoOverlayPackages;
+use brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind;
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
+use brokk_bifrost_analysis::analyzer::semantic_model::Visibility;
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+    ModelMembersState, ModelOwnerAnswer, ModelProvider, ModelProviderSelection,
+    ModelTypeOwnerAnswer, SemanticModelOverlayBuildError,
+};
 
 use crate::analyzer::go::GoOuterTypeShape;
 
@@ -77,6 +84,7 @@ pub enum GoExternalFieldGap {
 #[derive(Debug, Clone)]
 pub struct GoExternalField<'a> {
     symbol: std::sync::Arc<SemanticModelSymbol>,
+    owner: std::sync::Arc<SemanticModelSymbol>,
     artifact_sha256: &'a str,
     copy: MemoryValueCopy,
 }
@@ -174,26 +182,17 @@ impl Eq for GoExternalField<'_> {}
 /// does not establish source applicability: the activated artifact must match.
 pub fn resolve_go_external_field<'a>(
     overlay: &'a SemanticModelOverlay,
+    selection: &ModelProviderSelection,
     owner: &str,
     member: &str,
     artifact: &'a ExactArtifact,
+    cancellation: &CancellationToken,
 ) -> Result<GoExternalField<'a>, GoExternalFieldGap> {
     let artifact_sha256 = artifact.sha256();
-    let packages = GoOverlayPackages::new(Some(overlay));
-    let owner_symbol = packages
-        .unique_symbol(owner)
-        .ok_or(GoExternalFieldGap::DeclarationUnresolved)?;
-    let field = packages
-        .concrete_receiver_field(owner, member)
-        .ok_or_else(|| {
-            if owner_symbol.provenance.completeness == SemanticModelCompleteness::Partial {
-                GoExternalFieldGap::EffectiveStateIncomplete
-            } else {
-                GoExternalFieldGap::DeclarationUnresolved
-            }
-        })?;
-    let owner = owner_symbol;
+    let owner = selected_go_struct_owner(overlay, selection, owner, cancellation)?;
+    let field = selected_go_direct_field(overlay, selection, &owner, member, cancellation)?;
     if owner.provenance.ambiguous
+        || owner.provenance.active_model_set_hash != overlay.active_model_set_hash()
         || owner.provenance.proof != SemanticModelProof::ExactArtifact
         || field.provenance.active_model_set_hash != overlay.active_model_set_hash()
         || owner.provenance.active_model_set_hash != field.provenance.active_model_set_hash
@@ -220,11 +219,147 @@ pub fn resolve_go_external_field<'a>(
     }
     // Classification is supplied by the same declaration resolver rather than
     // by signature text or by assuming imported fields are references.
-    let copy = packages.concrete_receiver_field_value_copy(&owner.qualified_name, member);
+    let copy = field_value_copy(&field, overlay, selection, cancellation)?;
     Ok(GoExternalField {
         symbol: field,
+        owner,
         artifact_sha256,
         copy,
+    })
+}
+
+fn model_overlay_gap(error: SemanticModelOverlayBuildError) -> GoExternalFieldGap {
+    match error {
+        SemanticModelOverlayBuildError::Cancelled => GoExternalFieldGap::Cancelled,
+        SemanticModelOverlayBuildError::RetainedBytesExceeded(_)
+        | SemanticModelOverlayBuildError::GoSurfaceTraversalExceeded => {
+            GoExternalFieldGap::BudgetExhausted
+        }
+    }
+}
+
+fn selected_go_struct_owner(
+    overlay: &SemanticModelOverlay,
+    selection: &ModelProviderSelection,
+    owner: &str,
+    cancellation: &CancellationToken,
+) -> Result<std::sync::Arc<SemanticModelSymbol>, GoExternalFieldGap> {
+    let nominal = TypeRef::Named {
+        name: owner.to_owned(),
+        arguments: Vec::new(),
+        nullable: false,
+    };
+    let answer = overlay
+        .model_type_owner("go", &nominal, selection, cancellation)
+        .map_err(model_overlay_gap)?;
+    let ModelTypeOwnerAnswer::Unique { declaration, .. } = answer else {
+        return Err(GoExternalFieldGap::DeclarationUnresolved);
+    };
+    if declaration.language != "go"
+        || declaration.owner_id.is_some()
+        || declaration.kind != SemanticModelSymbolKind::Struct
+        || declaration.visibility != Visibility::Public
+    {
+        return Err(GoExternalFieldGap::DeclarationUnresolved);
+    }
+    Ok(std::sync::Arc::new(declaration))
+}
+
+fn selected_go_direct_field(
+    overlay: &SemanticModelOverlay,
+    selection: &ModelProviderSelection,
+    owner: &SemanticModelSymbol,
+    member: &str,
+    cancellation: &CancellationToken,
+) -> Result<std::sync::Arc<SemanticModelSymbol>, GoExternalFieldGap> {
+    let reference = brokk_bifrost_analysis::analyzer::semantic_model::overlay::ModelSymbolRef {
+        symbol_id: owner.id.clone(),
+        provider: ModelProvider::from(&owner.provenance),
+    };
+    let Some(ModelOwnerAnswer::Declared(declarations)) = overlay
+        .model_member_declarations(&reference, selection, cancellation)
+        .map_err(model_overlay_gap)?
+    else {
+        return Err(GoExternalFieldGap::DeclarationUnresolved);
+    };
+    // MayIncludePromotionCopies: an embedding the composition could not
+    // resolve can leave promoted copies without promoted_from, so filtering
+    // marked copies cannot prove the named field is in the owner's own layout.
+    if declarations.members_state != ModelMembersState::Exact {
+        return Err(GoExternalFieldGap::FieldLayoutIncomplete);
+    }
+    let mut named = declarations
+        .members
+        .into_iter()
+        .filter(|entry| entry.declaration.name == member);
+    let Some(field) = named.next() else {
+        return Err(
+            if owner.provenance.completeness == SemanticModelCompleteness::Partial {
+                GoExternalFieldGap::EffectiveStateIncomplete
+            } else {
+                GoExternalFieldGap::DeclarationUnresolved
+            },
+        );
+    };
+    if named.next().is_some()
+        || field.declaration.kind != SemanticModelSymbolKind::Field
+        || field.declaration.visibility != Visibility::Public
+        || field.declaration.is_static()
+        || field.declaration.has_receiver()
+        || field.declaration.promoted_from.is_some()
+        || field.declaration.provenance.ambiguous
+    {
+        return Err(GoExternalFieldGap::DeclarationUnresolved);
+    }
+    Ok(std::sync::Arc::new(field.declaration))
+}
+
+fn field_value_copy(
+    field: &SemanticModelSymbol,
+    overlay: &SemanticModelOverlay,
+    selection: &ModelProviderSelection,
+    cancellation: &CancellationToken,
+) -> Result<MemoryValueCopy, GoExternalFieldGap> {
+    let Some(signature) = field.structured_signature() else {
+        return Ok(MemoryValueCopy::Unknown);
+    };
+    if !signature.parameters.is_empty() {
+        return Ok(MemoryValueCopy::Unknown);
+    }
+    let Some(field_type) = signature.returns.as_ref() else {
+        return Ok(MemoryValueCopy::Unknown);
+    };
+    Ok(match field_type {
+        TypeRef::Function { .. } | TypeRef::Pointer { .. } | TypeRef::Channel { .. } => {
+            MemoryValueCopy::Reference
+        }
+        TypeRef::Slice { .. } => MemoryValueCopy::BackingStore {
+            identity: IndexedLocationIdentity::Element,
+        },
+        TypeRef::Map { .. } => MemoryValueCopy::BackingStore {
+            identity: IndexedLocationIdentity::Aggregate,
+        },
+        TypeRef::FixedArray { .. } => MemoryValueCopy::Value,
+        TypeRef::Declared { .. } => {
+            match overlay
+                .model_type_owner("go", field_type, selection, cancellation)
+                .map_err(model_overlay_gap)?
+            {
+                ModelTypeOwnerAnswer::Unique { declaration, .. }
+                    if declaration.language == "go"
+                        && declaration.owner_id.is_none()
+                        && declaration.kind == SemanticModelSymbolKind::Struct
+                        && !declaration.provenance.ambiguous =>
+                {
+                    MemoryValueCopy::Value
+                }
+                _ => MemoryValueCopy::Unknown,
+            }
+        }
+        // A Named spelling can denote a package-local alias, a predeclared
+        // scalar, or an unresolved imported type. Do not infer storage from
+        // that display name; the producer must supply a structured identity.
+        _ => MemoryValueCopy::Unknown,
     })
 }
 
@@ -662,6 +797,7 @@ pub fn bind_go_aggregate_operand_source(
 pub fn bind_go_external_field_source(
     field: &GoExternalField<'_>,
     overlay: &SemanticModelOverlay,
+    selection: &ModelProviderSelection,
     artifact: &ExactArtifact,
     package: &super::GoPinnedPackage,
     max_nodes: usize,
@@ -670,33 +806,18 @@ pub fn bind_go_external_field_source(
     if field.artifact_sha256() != artifact.sha256() {
         return Err(GoExternalFieldGap::ArtifactUnbound);
     }
-    let owners = field
-        .symbol()
-        .owner_id
-        .as_deref()
-        .map(|owner_id| {
-            overlay
-                .symbols_with_id(owner_id)
-                .records
-                .into_iter()
-                // ID postings also admit semantic contributor IDs.
-                .filter(|symbol| symbol.id == owner_id)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    // Ambiguity is independent of candidate position and the work budget.
-    if owners.len() > 1 {
+    if field.symbol().owner_id.as_deref() != Some(field.owner.id.as_str())
+        || !selection.contains(&ModelProvider::from(&field.owner.provenance))
+    {
         return Err(GoExternalFieldGap::DeclarationUnresolved);
     }
     let mut remaining = max_nodes;
     charge_route_work(&mut remaining, cancellation)?;
-    let owner = owners
-        .into_iter()
-        .next()
-        .ok_or(GoExternalFieldGap::DeclarationUnresolved)?;
+    let owner = &field.owner;
     charge_route_work(&mut remaining, cancellation)?;
     if owner.provenance.ambiguous
         || owner.provenance.pack_digest != field.symbol().provenance.pack_digest
+        || owner.provenance.active_model_set_hash != overlay.active_model_set_hash()
         || owner.provenance.active_model_set_hash != field.symbol().provenance.active_model_set_hash
         || owner.provenance.proof != SemanticModelProof::ExactArtifact
         || owner
@@ -776,27 +897,19 @@ pub fn bind_go_external_field_source(
 /// field does not claim that unrelated fields, embedded fields, or the whole
 /// aggregate are modeled.
 fn bind_go_external_field_layout<'a>(
-    overlay: &'a SemanticModelOverlay,
+    query: &GoExternalFieldQuery<'a>,
     owner_fqn: &str,
     member: &str,
-    artifact: &'a ExactArtifact,
-    package: &super::GoPinnedPackage,
     max_nodes: usize,
-    cancellation: &CancellationToken,
 ) -> Result<BoundGoExternalFieldLayout<'a>, GoExternalFieldGap> {
+    let overlay = query.overlay;
+    let selection = &query.selection;
+    let artifact = query.artifact;
+    let package = query.package;
+    let cancellation = query.cancellation;
     let mut remaining = max_nodes;
     charge_route_work(&mut remaining, cancellation)?;
-    let packages = GoOverlayPackages::new(Some(overlay));
-    let owner = packages
-        .unique_symbol(owner_fqn)
-        .ok_or(GoExternalFieldGap::DeclarationUnresolved)?;
-    if owner.language != "go"
-        || owner.owner_id.is_some()
-        || owner.kind
-            != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Struct
-    {
-        return Err(GoExternalFieldGap::DeclarationUnresolved);
-    }
+    let owner = selected_go_struct_owner(overlay, selection, owner_fqn, cancellation)?;
     if owner.provenance.completeness != SemanticModelCompleteness::Complete {
         return Err(GoExternalFieldGap::FieldLayoutIncomplete);
     }
@@ -884,19 +997,31 @@ fn bind_go_external_field_layout<'a>(
     let (field_index, mut source, name) =
         selected.ok_or(GoExternalFieldGap::FieldLayoutIncomplete)?;
     source.name_anchors = vec![name];
-    let field = packages
-        .concrete_receiver_field(owner_fqn, member)
-        .ok_or(GoExternalFieldGap::FieldLayoutIncomplete)?;
-    let field = GoExternalField {
-        symbol: field,
-        artifact_sha256: artifact.sha256(),
-        copy: packages.concrete_receiver_field_value_copy(owner_fqn, member),
-    };
+    let field = resolve_go_external_field(
+        overlay,
+        selection,
+        owner_fqn,
+        member,
+        artifact,
+        cancellation,
+    )
+    .map_err(|gap| match gap {
+        GoExternalFieldGap::DeclarationUnresolved
+        | GoExternalFieldGap::EffectiveStateIncomplete => GoExternalFieldGap::FieldLayoutIncomplete,
+        gap => gap,
+    })?;
     if field.symbol().provenance.completeness != SemanticModelCompleteness::Complete {
         return Err(GoExternalFieldGap::FieldLayoutIncomplete);
     }
-    let actual =
-        bind_go_external_field_source(&field, overlay, artifact, package, remaining, cancellation)?;
+    let actual = bind_go_external_field_source(
+        &field,
+        overlay,
+        selection,
+        artifact,
+        package,
+        remaining,
+        cancellation,
+    )?;
     if actual != source {
         return Err(GoExternalFieldGap::FieldLayoutIncomplete);
     }
@@ -1417,6 +1542,7 @@ impl<'a> GoExternalFieldMemory<'a> {
 pub struct GoExternalFieldQuery<'a> {
     workspace: &'a brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
     overlay: &'a SemanticModelOverlay,
+    selection: ModelProviderSelection,
     artifact: &'a ExactArtifact,
     package: &'a super::GoPinnedPackage,
     max_source_bytes: usize,
@@ -1429,6 +1555,7 @@ impl<'a> GoExternalFieldQuery<'a> {
     pub fn new(
         workspace: &'a brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
         overlay: &'a SemanticModelOverlay,
+        selection: ModelProviderSelection,
         artifact: &'a ExactArtifact,
         package: &'a super::GoPinnedPackage,
         cancellation: &'a CancellationToken,
@@ -1436,6 +1563,7 @@ impl<'a> GoExternalFieldQuery<'a> {
         Self {
             workspace,
             overlay,
+            selection,
             artifact,
             package,
             cancellation,
@@ -1907,9 +2035,6 @@ impl<'a> GoExternalFieldQuery<'a> {
     ) -> Result<BoundGoExternalFieldLayout<'a>, GoExternalFieldGap> {
         let Self {
             workspace,
-            overlay,
-            artifact,
-            package,
             max_source_bytes,
             max_source_nodes,
             cancellation,
@@ -1961,13 +2086,10 @@ impl<'a> GoExternalFieldQuery<'a> {
                 }
                 if layout.is_none() {
                     layout = Some(bind_go_external_field_layout(
-                        overlay,
+                        self,
                         &owner,
                         member,
-                        artifact,
-                        package,
                         max_source_nodes,
-                        cancellation,
                     )?);
                 }
                 let next = layout.as_ref().expect("layout was just initialized");
@@ -2164,11 +2286,18 @@ impl<'a> GoExternalFieldQuery<'a> {
                         if owner != layout.owner {
                             return Err(GoExternalFieldGap::EffectiveStateIncomplete);
                         }
-                        let field =
-                            resolve_go_external_field(overlay, &owner, &source_member, artifact)?;
+                        let field = resolve_go_external_field(
+                            overlay,
+                            &self.selection,
+                            &owner,
+                            &source_member,
+                            artifact,
+                            cancellation,
+                        )?;
                         let source = bind_go_external_field_source(
                             &field,
                             overlay,
+                            &self.selection,
                             artifact,
                             package,
                             max_source_nodes,
@@ -2624,10 +2753,18 @@ impl<'a> GoExternalFieldQuery<'a> {
         if layout.field_named(&member).is_none() {
             return Err(GoExternalFieldGap::FieldLayoutIncomplete);
         }
-        let field = resolve_go_external_field(overlay, &owner, &member, artifact)?;
+        let field = resolve_go_external_field(
+            overlay,
+            &self.selection,
+            &owner,
+            &member,
+            artifact,
+            cancellation,
+        )?;
         let source_identity = bind_go_external_field_source(
             &field,
             overlay,
+            &self.selection,
             artifact,
             package,
             remaining,
@@ -2641,6 +2778,15 @@ impl<'a> GoExternalFieldQuery<'a> {
 mod tests {
 
     use crate::analyzer::go::external_field_memory::*;
+
+    fn selection(overlay: &SemanticModelOverlay) -> ModelProviderSelection {
+        ModelProviderSelection::new(
+            overlay
+                .symbols()
+                .iter()
+                .map(|symbol| ModelProvider::from(&symbol.provenance)),
+        )
+    }
     use brokk_bifrost_test_macros::hardwon;
 
     use brokk_bifrost_analysis::analyzer::semantic::ir::go_extraction_support_26::capabilities;
@@ -2977,6 +3123,7 @@ mod tests {
         // tested separately. This test checks ordered state rather than names.
         let field = GoExternalField {
             symbol: std::sync::Arc::clone(symbol),
+            owner: std::sync::Arc::clone(&overlay.symbols()[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
@@ -3045,6 +3192,7 @@ mod tests {
         ] {
             let field = GoExternalField {
                 symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
+                owner: std::sync::Arc::clone(&overlay.symbols()[0]),
                 artifact_sha256: "bytes",
                 copy,
             };
@@ -3070,6 +3218,7 @@ mod tests {
         }
         let field = GoExternalField {
             symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
+            owner: std::sync::Arc::clone(&overlay.symbols()[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Value,
         };
@@ -3099,6 +3248,7 @@ mod tests {
         let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
         let field = GoExternalField {
             symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
+            owner: std::sync::Arc::clone(&overlay.symbols()[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
@@ -3134,6 +3284,7 @@ mod tests {
         let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
         let field = GoExternalField {
             symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
+            owner: std::sync::Arc::clone(&overlay.symbols()[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
@@ -3198,9 +3349,15 @@ mod tests {
             overlay.symbols().len() > budget,
             "the old whole-set scan must exceed this budget"
         );
-        let field =
-            resolve_go_external_field(&overlay, "example.test/ssh.Config", "Callback", &artifact)
-                .unwrap();
+        let field = resolve_go_external_field(
+            &overlay,
+            &selection(&overlay),
+            "example.test/ssh.Config",
+            "Callback",
+            &artifact,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         let package = super::super::GoPinnedPackage {
             import_path: "example.test/ssh".to_owned(),
             name: "ssh".to_owned(),
@@ -3209,6 +3366,7 @@ mod tests {
         let anchor = bind_go_external_field_source(
             &field,
             &overlay,
+            &selection(&overlay),
             &artifact,
             &package,
             budget,
@@ -3244,9 +3402,15 @@ mod tests {
         )
         .unwrap();
         let overlay = go_callback_source_field_test_overlay(artifact.sha256());
-        let field =
-            resolve_go_external_field(&overlay, "example.test/ssh.Config", "Callback", &artifact)
-                .unwrap();
+        let field = resolve_go_external_field(
+            &overlay,
+            &selection(&overlay),
+            "example.test/ssh.Config",
+            "Callback",
+            &artifact,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         let package = super::super::GoPinnedPackage {
             import_path: "example.test/ssh".to_owned(),
             name: "ssh".to_owned(),
@@ -3256,6 +3420,7 @@ mod tests {
         let anchor = bind_go_external_field_source(
             &field,
             &overlay,
+            &selection(&overlay),
             &artifact,
             &package,
             100_000,
@@ -3274,15 +3439,18 @@ mod tests {
         );
         let wrong_field = resolve_go_external_field(
             &wrong_locator,
+            &selection(&wrong_locator),
             "example.test/ssh.Config",
             "Callback",
             &artifact,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(
             bind_go_external_field_source(
                 &wrong_field,
                 &wrong_locator,
+                &selection(&wrong_locator),
                 &artifact,
                 &package,
                 100_000,
@@ -3291,7 +3459,15 @@ mod tests {
             Err(GoExternalFieldGap::DeclarationUnresolved)
         );
         assert_eq!(
-            bind_go_external_field_source(&field, &overlay, &artifact, &package, 0, &cancellation),
+            bind_go_external_field_source(
+                &field,
+                &overlay,
+                &selection(&overlay),
+                &artifact,
+                &package,
+                0,
+                &cancellation
+            ),
             Err(GoExternalFieldGap::BudgetExhausted)
         );
         cancellation.cancel();
@@ -3299,6 +3475,7 @@ mod tests {
             bind_go_external_field_source(
                 &field,
                 &overlay,
+                &selection(&overlay),
                 &artifact,
                 &package,
                 100_000,
@@ -3333,16 +3510,29 @@ mod tests {
         )
         .unwrap();
         let overlay = go_callback_field_test_overlay(artifact.sha256(), Visibility::Public, false);
-        let field =
-            resolve_go_external_field(&overlay, "example.test/ssh.Config", "Callback", &artifact)
-                .unwrap();
+        let field = resolve_go_external_field(
+            &overlay,
+            &selection(&overlay),
+            "example.test/ssh.Config",
+            "Callback",
+            &artifact,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(field.value_copy(), MemoryValueCopy::Reference);
         assert_eq!(field.artifact_sha256(), artifact.sha256());
         assert_eq!(field.symbol().id, "field.callback");
         let wrong = go_callback_field_test_overlay("different bytes", Visibility::Public, false);
         assert_eq!(
-            resolve_go_external_field(&wrong, "example.test/ssh.Config", "Callback", &artifact)
-                .unwrap_err(),
+            resolve_go_external_field(
+                &wrong,
+                &selection(&wrong),
+                "example.test/ssh.Config",
+                "Callback",
+                &artifact,
+                &CancellationToken::new()
+            )
+            .unwrap_err(),
             GoExternalFieldGap::ArtifactUnbound
         );
         for (visibility, conflict) in [(Visibility::Private, false), (Visibility::Public, true)] {
@@ -3350,17 +3540,26 @@ mod tests {
             assert_eq!(
                 resolve_go_external_field(
                     &overlay,
+                    &selection(&overlay),
                     "example.test/ssh.Config",
                     "Callback",
-                    &artifact
+                    &artifact,
+                    &CancellationToken::new()
                 )
                 .unwrap_err(),
                 GoExternalFieldGap::DeclarationUnresolved
             );
         }
         assert_eq!(
-            resolve_go_external_field(&overlay, "local.ssh.Config", "Callback", &artifact)
-                .unwrap_err(),
+            resolve_go_external_field(
+                &overlay,
+                &selection(&overlay),
+                "local.ssh.Config",
+                "Callback",
+                &artifact,
+                &CancellationToken::new()
+            )
+            .unwrap_err(),
             GoExternalFieldGap::DeclarationUnresolved
         );
     }

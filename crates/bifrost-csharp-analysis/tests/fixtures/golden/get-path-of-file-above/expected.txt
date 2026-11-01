@@ -1,0 +1,35 @@
+resolved:
+src/App/Source.cs: proven=1 open=0
+src/App/Extra.cs: proven=0 open=0
+conditioned/Source.cs: proven=1 open=0
+project=Some("src/App/App.csproj") items=[(Include, "src/App/Source.cs")]
+project=Some("conditioned/Conditional.csproj") items=[(Include, "conditioned/Source.cs")]
+missing:
+other/Source.cs: proven=0 open=1
+project=Some("other/Other.csproj") items=[(DefaultTree, "other"), (OpenTree, "")]
+gap=unresolved_import "other/Directory.Build.props": GetPathOfFileAbove("Missing.props"): candidate "other/Missing.props" has unknown presence; the file may exist there unselected
+gap=unresolved_compilation_metadata "other/Other.csproj": an unsupported configuration shape can change compilation metadata
+unselected-nearer-candidate:
+src/App/Source.cs: proven=0 open=1
+src/App/Extra.cs: proven=0 open=1
+project=Some("src/App/App.csproj") items=[(DefaultTree, "src/App"), (Include, "src/App/Source.cs"), (OpenTree, "")]
+gap=unresolved_import "src/App/App.csproj": GetPathOfFileAbove("Custom.props"): candidate "src/App/Custom.props" has unknown presence; the file may exist there unselected
+gap=unresolved_compilation_metadata "src/App/App.csproj": an unsupported configuration shape can change compilation metadata
+escaped-start:
+src/App/Source.cs: proven=0 open=1
+src/App/Extra.cs: proven=0 open=1
+project=Some("src/App/App.csproj") items=[(DefaultTree, "src/App"), (Include, "src/App/Source.cs"), (OpenTree, "")]
+gap=unsupported_project_items "src/App/App.csproj": unresolved Import: [("Project", "$([MSBuild]::GetPathOfFileAbove('Common.props', '$(MSBuildThisFileDirectory)%2e%2e/'))")]
+gap=unresolved_compilation_metadata "src/App/App.csproj": an unsupported configuration shape can change compilation metadata
+spaced-start:
+src/App/Source.cs: proven=0 open=1
+src/App/Extra.cs: proven=0 open=1
+project=Some("src/App/App.csproj") items=[(DefaultTree, "src/App"), (Include, "src/App/Source.cs"), (OpenTree, "")]
+gap=unsupported_project_items "src/App/App.csproj": unresolved Import: [("Project", "$([MSBuild]::GetPathOfFileAbove('Common.props', '$(MSBuildThisFileDirectory) dir/'))")]
+gap=unresolved_compilation_metadata "src/App/App.csproj": an unsupported configuration shape can change compilation metadata
+empty-nearer-input:
+src/App/Source.cs: proven=0 open=1
+src/App/Extra.cs: proven=0 open=1
+project=Some("src/App/App.csproj") items=[(DefaultTree, "src/App"), (Include, "src/App/Source.cs"), (OpenTree, "")]
+gap=unsupported_project_items "src/App/Common.props": invalid XML or unsupported project shape
+gap=unresolved_compilation_metadata "src/App/App.csproj": an unsupported configuration shape can change compilation metadata

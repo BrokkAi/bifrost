@@ -343,6 +343,7 @@ mod python_extraction_tests {
                 "java",
                 a,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: row.rel_path.clone(),
                     blob_oid: row.blob_oid,
                 }],
@@ -390,10 +391,12 @@ mod python_extraction_tests {
                 a,
                 &[
                     WorkspaceFileRow {
+                        decision: None,
                         rel_path: row.rel_path.clone(),
                         blob_oid: oid,
                     },
                     WorkspaceFileRow {
+                        decision: None,
                         rel_path: second_row.rel_path.clone(),
                         blob_oid: oid,
                     },
@@ -483,6 +486,7 @@ mod python_extraction_tests {
                 "python",
                 python_generation,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: python_row.rel_path.clone(),
                     blob_oid: python_oid,
                 }],
@@ -603,6 +607,7 @@ mod python_extraction_tests {
                 "java",
                 b,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: current_row.rel_path.clone(),
                     blob_oid: current_oid,
                 }],

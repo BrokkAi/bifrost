@@ -2892,8 +2892,11 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ReceiverType,
                 ) if resolved_call => {}
                 Some(QueryStepField::ResolvesTo | QueryStepField::CallProof) if resolved_value => {}
-                Some(QueryStepField::FormalName | QueryStepField::FormalIndex) if call_argument => {
-                }
+                Some(
+                    QueryStepField::FormalName
+                    | QueryStepField::FormalIndex
+                    | QueryStepField::FormalAnnotationType,
+                ) if call_argument => {}
                 Some(QueryStepField::RowWhere) if row_filter => {}
                 Some(QueryStepField::Columns) if row_project => {}
                 Some(QueryStepField::ProgramPointId) if program_point_by_id => {}
@@ -3057,6 +3060,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ReceiverType
                     | QueryStepField::FormalName
                     | QueryStepField::FormalIndex
+                    | QueryStepField::FormalAnnotationType
                     | QueryStepField::RowWhere
                     | QueryStepField::Columns
                     | QueryStepField::ProgramPointId
@@ -3177,17 +3181,33 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             };
             step = QueryStep::ResolvedValue(ResolvedValueFilter { resolves_to, proof });
         } else if call_argument {
-            let selector_count = ["formal_name", "formal_index"]
+            let selector_count = ["formal_name", "formal_index", "formal_annotation_type"]
                 .into_iter()
                 .filter(|field| object.contains_key(*field))
                 .count();
             if selector_count != 1 {
                 return Err(QueryError::new(
                     &entry_path,
-                    "call_argument requires exactly one of formal_name or formal_index",
+                    "call_argument requires exactly one of formal_name, formal_index or formal_annotation_type",
                 ));
             }
-            let selector = if let Some(value) = object.get("formal_name") {
+            let selector = if let Some(value) = object.get("formal_annotation_type") {
+                let path = child_path(&entry_path, "formal_annotation_type");
+                let name = value
+                    .as_str()
+                    .filter(|name| {
+                        !name.is_empty() && name.len() <= MAX_DECORATOR_BINDING_FILTER_LENGTH
+                    })
+                    .ok_or_else(|| {
+                        QueryError::new(
+                            path,
+                            format!(
+                                "expected a qualified name between 1 and {MAX_DECORATOR_BINDING_FILTER_LENGTH} bytes"
+                            ),
+                        )
+                    })?;
+                CallArgumentSelector::FormalAnnotationType(name.to_owned())
+            } else if let Some(value) = object.get("formal_name") {
                 let path = child_path(&entry_path, "formal_name");
                 let shape = QueryStepField::FormalName.value_shape();
                 let name = value

@@ -10,6 +10,7 @@ mod declaration_candidates;
 mod declaration_inventory_bounds;
 mod declaration_limits;
 mod go_native_graph;
+mod go_retained_receiver_oracle;
 mod overlay_bounded_declarations;
 mod point_latency;
 mod retained_source_queries;

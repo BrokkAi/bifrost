@@ -106,18 +106,26 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         ..CSharpCompilationFacts::default()
     };
     let gap = |facts: &mut CSharpCompilationFacts, code: &str, path: &str, evidence: &str| {
+        if let Some(index) = facts
+            .gaps
+            .iter()
+            .position(|gap| gap.code == code && gap.path == path && gap.evidence == evidence)
+        {
+            return index;
+        }
         facts.gaps.push(CSharpCompilationGap {
             code: code.to_owned(),
             path: path.to_owned(),
             evidence: evidence.to_owned(),
         });
+        facts.gaps.len() - 1
     };
     // Every configuration input parsed once; `None` when unread or not UTF-8.
     let mut parsed = HashMap::<&str, Option<ParsedProject>>::default();
     let mut projects = Vec::new();
     for input in inputs {
-        // Empty retained ancestor files encode absence and cannot shadow a
-        // present parent during nearest-file selection.
+        // Empty retained ancestor inputs can represent either a missing probe
+        // or a present 0-byte file. Neither can establish a loadable import.
         if input.source.as_deref().is_some_and(<[u8]>::is_empty)
             && Path::new(&input.rel_path)
                 .file_name()
@@ -165,7 +173,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         facts.membership_complete = false;
         gap(
             &mut facts,
-            "project_file_cap",
+            csharp_compilation::PROJECT_FILE_CAP,
             projects[MAX_PROJECT_FILES],
             &format!("more than {MAX_PROJECT_FILES} project files"),
         );
@@ -176,6 +184,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             symbols: Default::default(),
             project_path: None,
             items: Vec::new(),
+            inventory_gap_indices: Vec::new(),
             references: Vec::new(),
             references_complete: true,
             transitive_flow: false,
@@ -185,6 +194,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 ..Default::default()
             },
         });
+        finish_compilation_facts(&mut facts, inputs);
         return facts;
     }
 
@@ -211,10 +221,34 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         let Some(Some(project)) = parsed.get(project_path) else {
             // Unread or undecodable (already a gap): its items and
             // references are unknown.
+            let indices = facts
+                .gaps
+                .iter()
+                .enumerate()
+                .filter_map(|(index, gap)| {
+                    (gap.path == project_path
+                        && matches!(
+                            gap.code.as_str(),
+                            "configuration_byte_cap" | "configuration_not_utf8"
+                        ))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert!(!indices.is_empty(), "an unread project records its cause");
+            let items = indices
+                .iter()
+                .map(|&index| CSharpCompileItem {
+                    kind: CSharpCompileItemKind::OpenTree,
+                    rel_path: String::new(),
+                    excluded_trees: Vec::new(),
+                    gap_indices: vec![index],
+                })
+                .collect();
             facts.compilations.push(CSharpCompilationFact {
                 symbols: Default::default(),
                 project_path: Some(project_path.to_owned()),
-                items: Vec::new(),
+                items,
+                inventory_gap_indices: indices,
                 references: Vec::new(),
                 references_complete: false,
                 transitive_flow: false,
@@ -232,7 +266,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         // reaches them only through its own (dynamic, so unsupported)
         // Microsoft.Common imports.
         let mut chain = Vec::<(&str, &ParsedProject)>::new();
-        let mut chain_gaps = Vec::<(&str, String)>::new();
+        let mut chain_gaps = Vec::<(&str, String, Option<String>)>::new();
         let implicit_imports = |names: &[&'static str]| {
             names
                 .iter()
@@ -243,19 +277,85 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         for path in implicit_imports(&["Directory.Build.props", "Directory.Packages.props"]) {
             expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
         }
+        let intermediate = project
+            .properties
+            .base_intermediate_output_path
+            .as_deref()
+            .or_else(|| {
+                chain.iter().rev().find_map(|(_, fragment)| {
+                    fragment.properties.base_intermediate_output_path.as_deref()
+                })
+            })
+            .filter(|path| static_item_path(path))
+            .unwrap_or("obj");
+        let restore_paths = ["props", "targets"].map(|suffix| {
+            let pattern = format!(
+                "{intermediate}/{}.nuget.g.{suffix}",
+                Path::new(project_path)
+                    .file_name()
+                    .expect("project")
+                    .to_string_lossy()
+            );
+            match static_membership_pattern(directory, &pattern) {
+                MembershipPattern::Resolved { path, .. } => Some(path),
+                MembershipPattern::Unknown | MembershipPattern::OutsideWorkspace => None,
+            }
+        });
+        if let Some((path, _)) = restore_paths[0]
+            .as_deref()
+            .and_then(|path| parsed.get_key_value(path))
+            && inputs
+                .iter()
+                .any(|input| input.rel_path == *path && configuration_input_is_acquired(input))
+        {
+            expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
+        }
         let body_start = chain.len();
         expand_chain(&parsed, project_path, 0, &mut chain, &mut chain_gaps);
         let targets_start = chain.len();
         for path in implicit_imports(&["Directory.Build.targets"]) {
             expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
         }
+        if let Some((path, _)) = restore_paths[1]
+            .as_deref()
+            .and_then(|path| parsed.get_key_value(path))
+            && inputs
+                .iter()
+                .any(|input| input.rel_path == *path && configuration_input_is_acquired(input))
+        {
+            expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
+        }
         let metadata_chain_complete = chain_gaps.is_empty();
-        for (path, evidence) in chain_gaps {
+        let mut pending_regions = Vec::<(String, MembershipRegion, usize)>::new();
+        let mut inventory_gap_indices = Vec::new();
+        for (path, evidence, import) in chain_gaps {
             facts.membership_complete = false;
-            gap(&mut facts, "unresolved_import", path, &evidence);
+            let index = facts
+                .gaps
+                .iter()
+                .position(|gap| {
+                    gap.path == path
+                        && matches!(
+                            gap.code.as_str(),
+                            "configuration_byte_cap" | "configuration_not_utf8"
+                        )
+                })
+                .unwrap_or_else(|| gap(&mut facts, "unresolved_import", path, &evidence));
+            pending_regions.push((
+                path.to_owned(),
+                import
+                    .map(MembershipRegion::Import)
+                    .unwrap_or(MembershipRegion::Root),
+                index,
+            ));
         }
 
         let mut properties = DefaultItemProperties::default();
+        // Output-root exclusions are applied from the evaluated roots below.
+        // Before any authored assignment, the extra exclusion list is empty.
+        let mut default_excludes = String::new();
+        let mut default_candidates = vec!["bin/**".to_owned(), "obj/**".to_owned()];
+        let mut default_unknown = false;
         let mut output_roots = None;
         let mut default_position = None;
         let mut transitive_flow = project.sdk_project;
@@ -271,25 +371,155 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 output_roots = Some(properties.fill_sdk_defaults());
             }
             let is_project = *path == project_path;
-            if !fragment.complete
-                || (!is_project && (fragment.sdk_project || fragment.compiles_nothing))
-            {
-                facts.membership_complete = false;
-                gap(
+            for issue in &fragment.issues {
+                let index = gap(
                     &mut facts,
                     "unsupported_project_items",
                     path,
-                    "an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property",
+                    &issue.evidence,
                 );
+                let region = match &issue.region {
+                    MembershipRegion::Root => MembershipRegion::Root,
+                    MembershipRegion::Project => MembershipRegion::Project,
+                    MembershipRegion::Pattern(value) => MembershipRegion::Pattern(value.clone()),
+                    MembershipRegion::DefaultTrees => MembershipRegion::DefaultTrees,
+                    MembershipRegion::Import(value) => MembershipRegion::Import(value.clone()),
+                };
+                pending_regions.push(((*path).to_owned(), region, index));
             }
-            if output_roots.is_some() && fragment.properties.sets_output_roots() {
-                facts.membership_complete = false;
-                gap(
+            if !is_project && (fragment.sdk_project || fragment.compiles_nothing) {
+                let index = gap(
                     &mut facts,
                     "unsupported_project_items",
                     path,
-                    "the default Compile excludes are expanded before this file sets an output root",
+                    "an imported file selects an SDK",
                 );
+                pending_regions.push(((*path).to_owned(), MembershipRegion::Root, index));
+            }
+            for (kind, conditioned, value) in &fragment.default_assignments {
+                let late = output_roots.is_some()
+                    && matches!(
+                        kind,
+                        PropertyKind::BaseOutputPath | PropertyKind::BaseIntermediateOutputPath
+                    );
+                let mut known = HashMap::default();
+                known.insert(
+                    "defaultitemexcludes".to_owned(),
+                    Ok(default_excludes.clone()),
+                );
+                let expanded = symbols::expand(value, &known);
+                let kind_label = match kind {
+                    PropertyKind::OutputTree(name)
+                    | PropertyKind::DefaultPattern(name)
+                    | PropertyKind::ProjectDefault(name) => (*name).to_owned(),
+                    _ => format!("{kind:?}"),
+                };
+                let unmodeled_default = matches!(
+                    kind,
+                    PropertyKind::OutputTree(_)
+                        | PropertyKind::DefaultPattern(_)
+                        | PropertyKind::ProjectDefault(_)
+                );
+                let mut patterns = Vec::new();
+                let mut project_region = false;
+                match kind {
+                    PropertyKind::DefaultItemExcludes => match expanded {
+                        Ok(value) => {
+                            patterns.extend(
+                                value
+                                    .split(';')
+                                    .filter(|s| !s.trim().is_empty())
+                                    .map(str::to_owned),
+                            );
+                            default_excludes = value;
+                        }
+                        Err(_) => project_region = true,
+                    },
+                    PropertyKind::BaseOutputPath | PropertyKind::BaseIntermediateOutputPath => {
+                        if static_property_value(value) {
+                            patterns.push(if value.is_empty() {
+                                if matches!(kind, PropertyKind::BaseOutputPath) {
+                                    "bin"
+                                } else {
+                                    "obj"
+                                }
+                                .into()
+                            } else {
+                                value.clone()
+                            });
+                        } else {
+                            project_region = true;
+                        }
+                    }
+                    PropertyKind::OutputTree(_) => {
+                        if static_property_value(value) {
+                            if !value.trim().is_empty() {
+                                patterns.push(value.clone());
+                            }
+                        } else {
+                            project_region = true;
+                        }
+                    }
+                    PropertyKind::DefaultPattern(_) => match expanded {
+                        Ok(value) => patterns.extend(
+                            value
+                                .split(';')
+                                .filter(|s| !s.trim().is_empty())
+                                .map(str::to_owned),
+                        ),
+                        Err(_) => project_region = true,
+                    },
+                    PropertyKind::ProjectDefault(_) => project_region = true,
+                    PropertyKind::EnableDefaultItems | PropertyKind::EnableDefaultCompileItems => {
+                        if *conditioned
+                            || !matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "" | "true" | "false"
+                            )
+                        {
+                            project_region = true;
+                        }
+                    }
+                    PropertyKind::Unsupported => {
+                        let index = gap(
+                            &mut facts,
+                            "unsupported_project_items",
+                            path,
+                            "an unmodeled property can change imported membership",
+                        );
+                        pending_regions.push(((*path).to_owned(), MembershipRegion::Root, index));
+                    }
+                    PropertyKind::Metadata(_) | PropertyKind::ReferenceFlow => unreachable!(),
+                }
+                default_unknown |= project_region;
+                for pattern in &patterns {
+                    let candidate = if matches!(
+                        kind,
+                        PropertyKind::BaseOutputPath
+                            | PropertyKind::BaseIntermediateOutputPath
+                            | PropertyKind::OutputTree(_)
+                    ) {
+                        format!("{}/**", pattern.trim_end_matches(['/', '\\']))
+                    } else {
+                        pattern.clone()
+                    };
+                    default_candidates.push(candidate);
+                }
+                if project_region || *conditioned || late || unmodeled_default {
+                    let index = gap(
+                        &mut facts,
+                        "open_default_glob",
+                        path,
+                        &format!(
+                            "{kind_label} assignment is conditioned, late or unknown: {value}"
+                        ),
+                    );
+                    pending_regions.push((
+                        (*path).to_owned(),
+                        MembershipRegion::DefaultTrees,
+                        index,
+                    ));
+                }
             }
             properties.overlay(&fragment.properties);
             transitive_flow &= fragment.transitive_flow;
@@ -313,6 +543,140 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             }
             operations.extend(fragment.operations.iter().cloned());
             raw_references.extend(fragment.references.iter().map(|raw| (*path, raw)));
+        }
+        if project
+            .sdks
+            .iter()
+            .any(|sdk| sdk_path_properties(sdk).is_some())
+        {
+            let sources = chain
+                .iter()
+                .filter_map(|(path, _)| inputs.iter().find(|input| input.rel_path == *path))
+                .filter_map(|input| input.source.as_deref())
+                .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+                .collect::<Vec<_>>();
+            let sdk_properties = symbols::membership_properties(sources.iter().copied());
+            let frameworks = sdk_properties.as_ref().ok().and_then(|properties| {
+                if properties.contains_key("targetframework") {
+                    return None;
+                }
+                properties
+                    .get("targetframeworks")?
+                    .as_ref()
+                    .ok()
+                    .map(|value| {
+                        value
+                            .split(';')
+                            .map(str::trim)
+                            .filter(|entry| !entry.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+            });
+            for sdk in &project.sdks {
+                if let Some((names, declarations)) = sdk_path_properties(sdk) {
+                    let mut evidence = Vec::new();
+                    let mut open_root = false;
+                    let selected = frameworks.as_deref();
+                    if selected.is_some_and(<[_]>::is_empty) {
+                        open_root = true;
+                        evidence.push("TargetFrameworks has no selected framework".to_owned());
+                    }
+                    if selected.is_none()
+                        && sdk_properties.as_ref().ok().is_some_and(|properties| {
+                            !properties.contains_key("targetframework")
+                                && properties
+                                    .get("targetframeworks")
+                                    .is_some_and(Result::is_err)
+                        })
+                        && let Some(raw) = symbols::raw_target_frameworks(sources.iter().copied())
+                    {
+                        evidence.push(format!(
+                            "TargetFrameworks has an unenumerable entry in {raw:?}"
+                        ));
+                    }
+                    let evaluations = selected.map_or_else(
+                        || vec![(None, sdk_properties.clone())],
+                        |entries| {
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    let valid = !entry.contains(['$', '@', '%', '/', '\\', ':']);
+                                    (
+                                        Some(*entry),
+                                        if valid {
+                                            symbols::membership_properties_with_globals(
+                                                sources.iter().copied(),
+                                                &[("TargetFramework", entry)],
+                                            )
+                                        } else {
+                                            Err("unknown_framework_entry")
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    );
+                    for (framework, properties) in &evaluations {
+                        if let Err(reason) = properties {
+                            open_root = true;
+                            if let Some(framework) = framework {
+                                evidence.push(format!(
+                                    "TargetFramework={framework} evaluation unknown: {reason}"
+                                ));
+                            }
+                        }
+                        for name in names {
+                            let value = properties
+                                .as_ref()
+                                .ok()
+                                .and_then(|properties| properties.get(&name.to_ascii_lowercase()))
+                                .and_then(|value| value.as_ref().ok());
+                            let inside = value.is_some_and(|value| {
+                                static_item_path(value)
+                                    && !value.contains(':')
+                                    && resolve_item_path(directory, value)
+                                        .is_some_and(|path| path.starts_with(directory))
+                            });
+                            open_root |= !inside;
+                            evidence.push(format!(
+                                "{}{name}={} ({})",
+                                framework
+                                    .map(|entry| format!("TargetFramework={entry} "))
+                                    .unwrap_or_default(),
+                                value.map(String::as_str).unwrap_or("unknown"),
+                                if inside {
+                                    "inside project"
+                                } else {
+                                    "outside or unknown"
+                                }
+                            ));
+                        }
+                    }
+                    let unknown = sdk_properties
+                        .as_ref()
+                        .err()
+                        .map(|reason| format!("; SDK property evaluation unknown: {reason}"))
+                        .unwrap_or_default();
+                    let index = gap(
+                        &mut facts,
+                        "unsupported_project_items",
+                        project_path,
+                        &format!(
+                            "{sdk} {declarations} and SDK Compile effects: {}{unknown}; workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework",
+                            evidence.join("; ")
+                        ),
+                    );
+                    pending_regions.push((
+                        project_path.to_owned(),
+                        if open_root {
+                            MembershipRegion::Root
+                        } else {
+                            MembershipRegion::Project
+                        },
+                        index,
+                    ));
+                }
+            }
         }
         let (base_output, base_intermediate) =
             output_roots.unwrap_or_else(|| properties.fill_sdk_defaults());
@@ -343,7 +707,34 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                     excluded_trees.push(root);
                 } else {
                     facts.membership_complete = false;
-                    gap(&mut facts, "unresolved_compile_item", project_path, &root);
+                    let index = gap(&mut facts, "unresolved_compile_item", project_path, &root);
+                    pending_regions.push((
+                        project_path.to_owned(),
+                        MembershipRegion::Project,
+                        index,
+                    ));
+                }
+            }
+            for pattern in default_excludes.split(';').filter(|p| !p.trim().is_empty()) {
+                let pattern = pattern.trim().replace('\\', "/");
+                // Only a whole-tree exclusion can enter excluded_trees. A
+                // filename pattern opens its literal region instead of
+                // discarding every sibling in that directory.
+                let tree = tree_glob(&pattern).or_else(|| {
+                    pattern
+                        .strip_suffix("/**")
+                        .filter(|base| static_item_path(base))
+                        .map(str::to_owned)
+                });
+                if let Some(tree) = tree {
+                    excluded_trees.push(tree);
+                } else {
+                    let index = gap(&mut facts, "open_default_glob", project_path, &pattern);
+                    pending_regions.push((
+                        project_path.to_owned(),
+                        MembershipRegion::Pattern(pattern),
+                        index,
+                    ));
                 }
             }
             // A project its own props import revisits is not in the chain
@@ -363,33 +754,75 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         // item was written.
         let mut items = Vec::new();
         for operation in operations {
-            let Some(path) = resolve_item_path(directory, &operation.path) else {
-                facts.membership_complete = false;
-                gap(
-                    &mut facts,
-                    "unresolved_compile_item",
-                    project_path,
-                    &operation.path,
-                );
-                continue;
+            let path = match static_membership_pattern(directory, &operation.path) {
+                MembershipPattern::Resolved { path, .. } => path,
+                region => {
+                    let index = gap(
+                        &mut facts,
+                        "unresolved_compile_item",
+                        project_path,
+                        &format!("Compile item {:?}: {}", operation.path, region.evidence()),
+                    );
+                    inventory_gap_indices.push(index);
+                    if matches!(region, MembershipPattern::Unknown) {
+                        pending_regions.push((
+                            project_path.to_owned(),
+                            MembershipRegion::Root,
+                            index,
+                        ));
+                    }
+                    continue;
+                }
             };
             if let Some(exclude) = operation.exclude.as_deref() {
-                let Some(excluded) = resolve_item_path(directory, exclude) else {
-                    facts.membership_complete = false;
-                    gap(&mut facts, "unresolved_compile_item", project_path, exclude);
-                    continue;
-                };
-                if excluded == path {
-                    continue;
+                match static_membership_pattern(directory, exclude) {
+                    MembershipPattern::Resolved { path: excluded, .. } => {
+                        if excluded == path {
+                            continue;
+                        }
+                    }
+                    region => {
+                        let index = gap(
+                            &mut facts,
+                            "unresolved_compile_item",
+                            project_path,
+                            &format!("Compile exclude {exclude:?}: {}", region.evidence()),
+                        );
+                        inventory_gap_indices.push(index);
+                        if matches!(region, MembershipPattern::Unknown) {
+                            pending_regions.push((
+                                project_path.to_owned(),
+                                MembershipRegion::Root,
+                                index,
+                            ));
+                            continue;
+                        }
+                    }
                 }
             }
             let mut excluded_trees = Vec::new();
             for tree in &operation.excluded_trees {
-                match resolve_item_path(directory, tree) {
-                    Some(tree) => excluded_trees.push(portable_rel_path(&tree)),
-                    None => {
-                        facts.membership_complete = false;
-                        gap(&mut facts, "unresolved_compile_item", project_path, tree);
+                match static_membership_pattern(directory, tree) {
+                    MembershipPattern::Resolved { path, .. } => excluded_trees.push(path),
+                    region => {
+                        let index = gap(
+                            &mut facts,
+                            "unresolved_compile_item",
+                            project_path,
+                            &format!("Compile excluded tree {tree:?}: {}", region.evidence()),
+                        );
+                        inventory_gap_indices.push(index);
+                        if matches!(region, MembershipPattern::Unknown) {
+                            pending_regions.push((
+                                project_path.to_owned(),
+                                MembershipRegion::Root,
+                                index,
+                            ));
+                        } else if matches!(region, MembershipPattern::OutsideWorkspace) {
+                            // Every pure escape is an ancestor of the workspace root,
+                            // so excluding it excludes the whole workspace.
+                            excluded_trees.push(String::new());
+                        }
                     }
                 }
             }
@@ -400,10 +833,139 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                     CompileOperationKind::DefaultTree => CSharpCompileItemKind::DefaultTree,
                     CompileOperationKind::Remove => CSharpCompileItemKind::Remove,
                 },
-                rel_path: portable_rel_path(&path),
+                rel_path: path,
                 excluded_trees,
+                gap_indices: Vec::new(),
             });
         }
+        let packages = chain
+            .iter()
+            .flat_map(|(_, fragment)| fragment.package_references.iter())
+            .collect::<Vec<_>>();
+        if !packages.is_empty()
+            && restore_paths.iter().any(|expected| {
+                expected.as_deref().is_none_or(|expected| {
+                    !inputs.iter().any(|input| {
+                        input.rel_path == expected && configuration_input_is_acquired(input)
+                    })
+                })
+            })
+        {
+            let assets = restore_paths[0]
+                .as_deref()
+                .and_then(|path| Path::new(path).parent())
+                .map(|parent| parent.join("project.assets.json"))
+                .and_then(|assets| {
+                    inputs
+                        .iter()
+                        .find(|input| Path::new(&input.rel_path) == assets)
+                })
+                .and_then(|input| input.source.as_deref())
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+            for (id, declared) in &packages {
+                let versions = assets
+                    .as_ref()
+                    .and_then(|assets| assets.get("libraries"))
+                    .and_then(serde_json::Value::as_object)
+                    .into_iter()
+                    .flat_map(|libraries| libraries.iter())
+                    .filter_map(|(name, value)| {
+                        let (package, version) = name.rsplit_once('/')?;
+                        (package.eq_ignore_ascii_case(id)
+                            && value.get("type").and_then(serde_json::Value::as_str)
+                                == Some("package"))
+                        .then_some(version.to_owned())
+                    })
+                    .collect::<Vec<_>>();
+                let versions = if versions.is_empty() {
+                    vec![if static_property_value(declared) {
+                        (*declared).clone()
+                    } else {
+                        "unresolved-version".to_owned()
+                    }]
+                } else {
+                    versions
+                };
+                for version in versions {
+                    inventory_gap_indices.push(gap(&mut facts,"unacquired_package_import",project_path,&format!("package ({id}, {version}): injected declarations are unacquired; a package target may remove workspace items")));
+                }
+            }
+        }
+        default_candidates.sort();
+        default_candidates.dedup();
+        let pending_regions = pending_regions
+            .into_iter()
+            .flat_map(|(path, region, index)| {
+                if matches!(region, MembershipRegion::DefaultTrees) {
+                    if default_unknown {
+                        vec![(path, MembershipRegion::Project, index)]
+                    } else {
+                        default_candidates
+                            .iter()
+                            .cloned()
+                            .map(|candidate| {
+                                (path.clone(), MembershipRegion::Pattern(candidate), index)
+                            })
+                            .collect()
+                    }
+                } else {
+                    vec![(path, region, index)]
+                }
+            })
+            .collect::<Vec<_>>();
+        for (written_in, region, index) in pending_regions {
+            if let MembershipRegion::Import(value) = &region {
+                let acquired = resolve_item_path(
+                    Path::new(&written_in).parent().unwrap_or(Path::new("")),
+                    value,
+                )
+                .map(|path| portable_rel_path(&path))
+                .is_some_and(|path| {
+                    inputs.iter().any(|input| {
+                        input.rel_path == path && configuration_input_is_acquired(input)
+                    })
+                });
+                if !acquired && let Some(subject) = package_import_subject(value, &packages) {
+                    inventory_gap_indices.push(gap(&mut facts,"unacquired_package_import",&written_in,&format!("package {subject}: injected declarations are unacquired; a package target may remove workspace items")));
+                    continue;
+                }
+            }
+            inventory_gap_indices.push(index);
+            let (tree, path) = match region {
+                MembershipRegion::Root | MembershipRegion::Import(_) => (true, String::new()),
+                MembershipRegion::Project => (true, portable_rel_path(directory)),
+                MembershipRegion::DefaultTrees => unreachable!("expanded after every assignment"),
+                MembershipRegion::Pattern(pattern) => {
+                    match static_membership_pattern(directory, &pattern) {
+                        MembershipPattern::Resolved { tree, path } => (tree, path),
+                        MembershipPattern::Unknown => (true, String::new()),
+                        MembershipPattern::OutsideWorkspace => {
+                            inventory_gap_indices.push(gap(
+                                &mut facts,
+                                "unresolved_compile_item",
+                                &written_in,
+                                &format!(
+                                    "Compile pattern {pattern:?}: outside the selected workspace"
+                                ),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            };
+            items.push(CSharpCompileItem {
+                kind: if tree {
+                    CSharpCompileItemKind::OpenTree
+                } else {
+                    CSharpCompileItemKind::Open
+                },
+                rel_path: path,
+                excluded_trees: Vec::new(),
+                gap_indices: vec![index],
+            });
+        }
+        inventory_gap_indices.sort_unstable();
+        inventory_gap_indices.dedup();
         // Only SDK projects receive their references' references by default;
         // a legacy project's direct references still reach it.
         if !transitive_flow {
@@ -445,6 +1007,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             symbols: Default::default(),
             project_path: Some(project_path.to_owned()),
             items,
+            inventory_gap_indices,
             references,
             references_complete,
             transitive_flow,
@@ -458,10 +1021,156 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             ),
         });
     }
+    finish_compilation_facts(&mut facts, inputs);
+    facts
+}
+fn finish_compilation_facts(
+    facts: &mut CSharpCompilationFacts,
+    inputs: &[CSharpConfigurationInput],
+) {
+    let global_gaps = facts
+        .gaps
+        .iter()
+        .enumerate()
+        .filter_map(|(i, g)| csharp_compilation::is_membership_cap(&g.code).then_some(i))
+        .collect::<Vec<_>>();
     for compilation in &mut facts.compilations {
+        for &index in &global_gaps {
+            compilation.items.push(CSharpCompileItem {
+                kind: CSharpCompileItemKind::OpenTree,
+                rel_path: String::new(),
+                excluded_trees: Vec::new(),
+                gap_indices: vec![index],
+            });
+            compilation.inventory_gap_indices.push(index);
+        }
+        compilation.inventory_gap_indices.sort_unstable();
+        compilation.inventory_gap_indices.dedup();
         compilation.symbols = symbols::derive(inputs, compilation.project_path.as_deref());
     }
-    facts
+    facts.membership_complete = !facts.compilations.iter().any(|c| {
+        c.items.iter().any(|i| {
+            matches!(
+                i.kind,
+                CSharpCompileItemKind::Open | CSharpCompileItemKind::OpenTree
+            )
+        })
+    });
+}
+
+// Empty retained probes represent absence. None instead means a selected
+// configuration input whose bytes were capped, so it stays an ordinary
+// acquired-but-unread import rather than an unacquired package obligation.
+fn configuration_input_is_acquired(input: &CSharpConfigurationInput) -> bool {
+    input.source.as_ref().is_none_or(|bytes| !bytes.is_empty())
+}
+
+/// A selected MSBuild item value, not C# syntax. Preserve parent components
+/// until the literal prefix is resolved against the declaring project.
+enum MembershipPattern {
+    Unknown,
+    OutsideWorkspace,
+    Resolved { tree: bool, path: String },
+}
+impl MembershipPattern {
+    fn evidence(&self) -> &'static str {
+        match self {
+            Self::Unknown => "pattern cannot be resolved",
+            Self::OutsideWorkspace => "outside the selected workspace",
+            Self::Resolved { .. } => unreachable!("resolved patterns need no gap"),
+        }
+    }
+}
+fn static_membership_pattern(directory: &Path, value: &str) -> MembershipPattern {
+    let value = value.trim().replace('\\', "/");
+    // Without an absolute workspace root these values cannot be located.
+    // Only a pure relative parent escape proves an outside-workspace inventory.
+    if !static_property_value(&value) || value.starts_with('/') || value.contains(':') {
+        return MembershipPattern::Unknown;
+    }
+    // The producer is shared by linked worktrees and cannot know the absolute
+    // root name. A normal component after escaping could re-enter that root.
+    let mut depth = directory.components().count();
+    let mut escaped = false;
+    for component in Path::new(&value).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if depth == 0 {
+                    escaped = true;
+                } else {
+                    depth -= 1;
+                }
+            }
+            std::path::Component::Normal(_) => {
+                if escaped {
+                    return MembershipPattern::Unknown;
+                }
+                depth += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut base = PathBuf::new();
+    let mut tree = false;
+    for part in Path::new(&value).components() {
+        if part.as_os_str().to_string_lossy().contains(['*', '?']) {
+            tree = true;
+            break;
+        }
+        base.push(part.as_os_str());
+    }
+    match resolve_item_path(directory, base.to_str().expect("UTF-8 item value")) {
+        Some(path) => MembershipPattern::Resolved {
+            tree,
+            path: portable_rel_path(&path),
+        },
+        None => MembershipPattern::OutsideWorkspace,
+    }
+}
+fn package_import_subject(value: &str, packages: &[&(String, String)]) -> Option<String> {
+    let value = value.replace('\\', "/");
+    let nuget_root = value.starts_with("$(NuGetPackageRoot)");
+    let value = value.strip_prefix("$(NuGetPackageRoot)").unwrap_or(&value);
+    if !static_property_value(value) {
+        return None;
+    }
+    let path = Path::new(value);
+    let name = path.file_name()?.to_str()?;
+    if name.ends_with(".nuget.g.props") || name.ends_with(".nuget.g.targets") {
+        return Some(format!(
+            "(restore-generated, unresolved-version) from {value}"
+        ));
+    }
+    if !name.ends_with(".props") && !name.ends_with(".targets") {
+        return None;
+    }
+    let parts = path
+        .components()
+        .map(|c| c.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    // https://learn.microsoft.com/en-us/nuget/concepts/msbuild-props-and-targets#build-folders
+    const BUILD_FOLDERS: [&str; 3] = ["build", "buildTransitive", "buildMultiTargeting"];
+    let build = parts.iter().position(|p| BUILD_FOLDERS.contains(p))?;
+    // A package build folder alone is not package provenance. The root is
+    // NuGet's, or the path names a package from structured PackageReference.
+    if build >= 2
+        && (nuget_root
+            || packages
+                .iter()
+                .any(|package| package.0.eq_ignore_ascii_case(parts[build - 2])))
+    {
+        return Some(format!("({}, {})", parts[build - 2], parts[build - 1]));
+    }
+    if build >= 1 {
+        for (id, _) in packages {
+            if let Some(version) = parts[build - 1].strip_prefix(&format!("{id}."))
+                && !version.is_empty()
+            {
+                return Some(format!("({id}, {version})"));
+            }
+        }
+    }
+    None
 }
 
 /// Ordered configuration items; these are MSBuild values, not C# source syntax.
@@ -871,6 +1580,27 @@ fn nearest_input<'a>(
     })
 }
 
+enum AuthoritativeImport<'a> {
+    Found(&'a str),
+    Unknown(String),
+}
+
+/// A property-function search cannot pass a directory without authoritative
+/// absence. Retained empty inputs conflate absent probes and present empty files,
+/// so the first candidate missing from `parsed` stops the walk.
+fn nearest_authoritative_input<'a>(
+    parsed: &HashMap<&'a str, Option<ParsedProject>>,
+    directory: &Path,
+    name: &str,
+) -> AuthoritativeImport<'a> {
+    let candidate = portable_rel_path(&directory.join(name));
+    if let Some((path, _)) = parsed.get_key_value(candidate.as_str()) {
+        AuthoritativeImport::Found(path)
+    } else {
+        AuthoritativeImport::Unknown(candidate)
+    }
+}
+
 /// Append `path` to `chain`, preceded by the files it imports. Imports that
 /// leave the inputs, cycle or nest too deeply are recorded in `gaps`.
 fn expand_chain<'a>(
@@ -878,14 +1608,18 @@ fn expand_chain<'a>(
     path: &'a str,
     depth: usize,
     chain: &mut Vec<(&'a str, &'a ParsedProject)>,
-    gaps: &mut Vec<(&'a str, String)>,
+    gaps: &mut Vec<(&'a str, String, Option<String>)>,
 ) {
     if depth > MAX_IMPORT_DEPTH {
-        gaps.push((path, format!("imports nest deeper than {MAX_IMPORT_DEPTH}")));
+        gaps.push((
+            path,
+            format!("imports nest deeper than {MAX_IMPORT_DEPTH}"),
+            None,
+        ));
         return;
     }
     if chain.iter().any(|(chained, _)| *chained == path) {
-        gaps.push((path, "the import chain revisits this file".to_owned()));
+        gaps.push((path, "the import chain revisits this file".to_owned(), None));
         return;
     }
     let Some((path, Some(fragment))) = parsed
@@ -895,19 +1629,44 @@ fn expand_chain<'a>(
         gaps.push((
             path,
             "imported file is not a readable configuration input".to_owned(),
+            Some(path.to_owned()),
         ));
         return;
     };
     let directory = Path::new(path).parent().unwrap_or(Path::new(""));
     for import in &fragment.imports {
-        match resolve_item_path(directory, import)
-            .map(|resolved| portable_rel_path(&resolved))
-            .and_then(|resolved| parsed.get_key_value(resolved.as_str()).map(|(key, _)| *key))
-        {
+        let function = get_path_of_file_above(import);
+        let mut function_gap = None;
+        let resolved = if let Some((name, start)) = function {
+            match resolve_item_path(directory, start) {
+                Some(start) => match nearest_authoritative_input(parsed, &start, name) {
+                    AuthoritativeImport::Found(path) => Some(path),
+                    AuthoritativeImport::Unknown(candidate) => {
+                        function_gap = Some(format!(
+                            "GetPathOfFileAbove({name:?}): candidate {candidate:?} has unknown presence; the file may exist there unselected"
+                        ));
+                        None
+                    }
+                },
+                None => {
+                    function_gap = Some(format!(
+                        "GetPathOfFileAbove({name:?}) starts outside the selected workspace from {directory:?}/{start}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            resolve_item_path(directory, import)
+                .map(|resolved| portable_rel_path(&resolved))
+                .and_then(|resolved| parsed.get_key_value(resolved.as_str()).map(|(key, _)| *key))
+        };
+        match resolved {
             Some(imported) => expand_chain(parsed, imported, depth + 1, chain, gaps),
             None => gaps.push((
                 path,
-                format!("import {import} is not a configuration input"),
+                function_gap
+                    .unwrap_or_else(|| format!("import {import} is not a configuration input")),
+                Some(import.clone()),
             )),
         }
     }
@@ -926,6 +1685,14 @@ fn portable_rel_path(path: &Path) -> String {
 }
 
 impl CSharpAnalyzer {
+    /// Selected compilation configurations for a tool result, read outside policy units.
+    pub fn selected_usage_graph_configurations(
+        &self,
+    ) -> Option<Vec<csharp_compilation::SelectedCSharpCompilationConfiguration>> {
+        let selection = self.selected_compilations()??;
+        self.record_membership_read(selection.configurations())
+    }
+
     /// The compilation rules this generation's selected revision publishes.
     /// `Some(None)` when the revision has no valid selection; `None` after a
     /// store error, which is recorded.
@@ -987,6 +1754,11 @@ impl CSharpAnalyzer {
         else {
             return Some(CSharpCompilationVisibility::Unresolved);
         };
+        if !from.open.is_empty() || !to.open.is_empty() {
+            return Some(CSharpCompilationVisibility::Unresolved);
+        }
+        let from = from.proven;
+        let to = to.proven;
         if from.is_empty() || to.is_empty() {
             return Some(CSharpCompilationVisibility::Unresolved);
         }
@@ -1009,6 +1781,7 @@ impl CSharpAnalyzer {
             } else {
                 let (reached, complete) =
                     self.record_membership_read(selection.referenced_closure(compilation))?;
+                // Closure completeness includes every reached inventory.
                 if complete && !meets(&reached) {
                     CSharpCompilationVisibility::NotVisible
                 } else {
@@ -1021,6 +1794,65 @@ impl CSharpAnalyzer {
             answer = Some(instance);
         }
         answer
+    }
+
+    /// Request-owned evidence for definitions and decided-negative legacy answers.
+    /// Missing declarations can come from any open reachable inventory, even when
+    /// no candidate exists to trigger compilation_visibility.
+    pub(crate) fn compilation_inventory_obligations(
+        &self,
+        reference: &ProjectFile,
+    ) -> Option<Vec<String>> {
+        let Some(selection) = self.selected_compilations()? else {
+            return Some(vec![
+                "selected C# compilation inventory is unavailable".into(),
+            ]);
+        };
+        if selection.membership_capped() {
+            return Some(
+                self.record_membership_read(selection.gaps())?
+                    .into_iter()
+                    .filter(|gap| csharp_compilation::is_membership_cap(&gap.code))
+                    .map(|gap| format!("{} at {}: {}", gap.code, gap.path, gap.evidence))
+                    .collect(),
+            );
+        }
+        let Some(membership) =
+            self.record_membership_read(selection.compilations_of(&rel_path_string(reference)))?
+        else {
+            return Some(vec![
+                "caller is not selected by the C# compilation inventory".into(),
+            ]);
+        };
+        let mut reasons = Vec::new();
+        for open in membership.open {
+            for region in open.regions {
+                for gap in region.gaps {
+                    reasons.push(format!(
+                        "compilation {:?}: {} region {}: {} at {}: {}",
+                        open.project_path,
+                        region.kind,
+                        region.rel_path,
+                        gap.code,
+                        gap.path,
+                        gap.evidence
+                    ));
+                }
+            }
+        }
+        for id in membership.proven {
+            for inventory in self.record_membership_read(selection.open_inventories(id))? {
+                for gap in inventory.gaps {
+                    reasons.push(format!(
+                        "compilation {:?} inventory is open: {} at {}: {}",
+                        inventory.project_path, gap.code, gap.path, gap.evidence
+                    ));
+                }
+            }
+        }
+        reasons.sort();
+        reasons.dedup();
+        Some(reasons)
     }
 
     /// For each of `files`, the global-using sources compiled with it, and
@@ -1040,7 +1872,8 @@ impl CSharpAnalyzer {
         // either absent. One project (or none) is the boundary the earlier
         // compilation index already certified and is kept; several projects
         // were never certified and stay incomplete.
-        let mut complete = selection.membership_complete()
+        let mut complete = !selection.membership_capped()
+            && self.record_membership_read(selection.membership_complete())?
             && self.record_membership_read(selection.includes_selected())?
             && self.record_membership_read(selection.project_count())? <= 1;
         if !complete && brokk_bifrost_core::profiling::enabled() {
@@ -1052,8 +1885,17 @@ impl CSharpAnalyzer {
         let mut compilation_of = |file: &ProjectFile| -> Option<Option<i64>> {
             let compilations =
                 self.record_membership_read(selection.compilations_of(&rel_path_string(file)))?;
-            Some(match compilations.as_deref() {
-                Some([compilation]) => Some(*compilation),
+            Some(match compilations.as_ref() {
+                Some(membership) if membership.open.is_empty() && membership.proven.len() == 1 => {
+                    let id = membership.proven[0];
+                    if !self
+                        .record_membership_read(selection.inventory_gaps(id))?
+                        .is_empty()
+                    {
+                        complete = false;
+                    }
+                    Some(id)
+                }
                 // Unproven, uncompiled, or one physical node for several
                 // compiled instances.
                 _ => {
@@ -1134,6 +1976,9 @@ struct ParsedProject {
     /// A traversal or no-targets SDK project: no compilation at all.
     compiles_nothing: bool,
     operations: Vec<CompileOperation>,
+    issues: Vec<MembershipIssue>,
+    default_assignments: Vec<(PropertyKind, bool, String)>,
+    package_references: Vec<(String, String)>,
     /// Whether the Compile items and default-item properties are all in
     /// supported static shapes.
     complete: bool,
@@ -1155,6 +2000,20 @@ struct ParsedProject {
     properties: DefaultItemProperties,
 }
 
+#[derive(Debug)]
+struct MembershipIssue {
+    region: MembershipRegion,
+    evidence: String,
+}
+#[derive(Debug)]
+enum MembershipRegion {
+    Root,
+    Project,
+    Pattern(String),
+    DefaultTrees,
+    Import(String),
+}
+
 /// The last unconditioned value a file (or a chain prefix) assigns to each
 /// property the SDK default Compile item reads; `None` when unassigned.
 #[derive(Debug, Default, Clone)]
@@ -1163,6 +2022,7 @@ struct DefaultItemProperties {
     enable_default_compile_items: Option<String>,
     base_output_path: Option<String>,
     base_intermediate_output_path: Option<String>,
+    default_item_excludes: Option<String>,
     // Some(None) is an assignment whose value or condition is not statically known.
     metadata: HashMap<String, Option<String>>,
 }
@@ -1172,19 +2032,24 @@ impl DefaultItemProperties {
         match kind {
             PropertyKind::EnableDefaultItems => Some(&mut self.enable_default_items),
             PropertyKind::EnableDefaultCompileItems => Some(&mut self.enable_default_compile_items),
+            PropertyKind::DefaultItemExcludes => Some(&mut self.default_item_excludes),
             PropertyKind::BaseOutputPath => Some(&mut self.base_output_path),
             PropertyKind::BaseIntermediateOutputPath => {
                 Some(&mut self.base_intermediate_output_path)
             }
-            PropertyKind::Unsupported | PropertyKind::ReferenceFlow | PropertyKind::Metadata(_) => {
-                None
-            }
+            PropertyKind::Unsupported
+            | PropertyKind::ReferenceFlow
+            | PropertyKind::Metadata(_)
+            | PropertyKind::OutputTree(_)
+            | PropertyKind::DefaultPattern(_)
+            | PropertyKind::ProjectDefault(_) => None,
         }
     }
 
     fn is_empty(&self) -> bool {
         self.enable_default_items.is_none()
             && self.enable_default_compile_items.is_none()
+            && self.default_item_excludes.is_none()
             && !self.sets_output_roots()
     }
 
@@ -1200,6 +2065,10 @@ impl DefaultItemProperties {
             (
                 &mut self.enable_default_compile_items,
                 &later.enable_default_compile_items,
+            ),
+            (
+                &mut self.default_item_excludes,
+                &later.default_item_excludes,
             ),
             (&mut self.base_output_path, &later.base_output_path),
             (
@@ -1287,10 +2156,14 @@ struct PropertyCapture {
 #[derive(Debug, Clone, Copy)]
 enum PropertyKind {
     Metadata(&'static str),
+    DefaultItemExcludes,
     EnableDefaultItems,
     EnableDefaultCompileItems,
     BaseOutputPath,
     BaseIntermediateOutputPath,
+    OutputTree(&'static str),
+    DefaultPattern(&'static str),
+    ProjectDefault(&'static str),
     /// A property that changes the default Compile item or which files the
     /// evaluation imports in a way this parser does not model.
     Unsupported,
@@ -1317,6 +2190,9 @@ fn parse_project(source: &str) -> ParsedProject {
     let mut sdks = Vec::<String>::new();
     let mut properties = DefaultItemProperties::default();
     let mut complete = true;
+    let mut issues = Vec::new();
+    let mut default_assignments = Vec::new();
+    let mut package_references = Vec::new();
     let mut capture = None::<PropertyCapture>;
     let mut buffer = Vec::new();
     let mut nodes = 0usize;
@@ -1326,6 +2202,10 @@ fn parse_project(source: &str) -> ParsedProject {
             Ok(event) => event,
             Err(_) => {
                 complete = false;
+                issues.push(MembershipIssue {
+                    region: MembershipRegion::Root,
+                    evidence: "invalid XML or unsupported project shape".into(),
+                });
                 break;
             }
         };
@@ -1342,7 +2222,13 @@ fn parse_project(source: &str) -> ParsedProject {
                             capture.text.push_str(&text);
                         }
                     }
-                    _ => complete = false,
+                    _ => {
+                        complete = false;
+                        issues.push(MembershipIssue {
+                            region: MembershipRegion::Root,
+                            evidence: "invalid XML character data".into(),
+                        });
+                    }
                 }
                 buffer.clear();
                 continue;
@@ -1363,7 +2249,13 @@ fn parse_project(source: &str) -> ParsedProject {
                             capture.text.push_str(&text);
                         }
                     }
-                    _ => complete = false,
+                    _ => {
+                        complete = false;
+                        issues.push(MembershipIssue {
+                            region: MembershipRegion::Root,
+                            evidence: "invalid XML character data".into(),
+                        });
+                    }
                 }
                 buffer.clear();
                 continue;
@@ -1375,7 +2267,13 @@ fn parse_project(source: &str) -> ParsedProject {
                             capture.text.push_str(&text);
                         }
                     }
-                    _ => complete = false,
+                    _ => {
+                        complete = false;
+                        issues.push(MembershipIssue {
+                            region: MembershipRegion::Root,
+                            evidence: "invalid XML character data".into(),
+                        });
+                    }
                 }
                 buffer.clear();
                 continue;
@@ -1384,6 +2282,10 @@ fn parse_project(source: &str) -> ParsedProject {
                 // Their raw bytes are a slice of the UTF-8 source.
                 if !std::str::from_utf8(&buffer).is_ok_and(is_xml_text) {
                     complete = false;
+                    issues.push(MembershipIssue {
+                        region: MembershipRegion::Root,
+                        evidence: "invalid XML or unsupported project shape".into(),
+                    });
                 }
                 buffer.clear();
                 continue;
@@ -1395,6 +2297,16 @@ fn parse_project(source: &str) -> ParsedProject {
                 {
                     let property = capture.take().expect("capture was checked");
                     if is_xml_text(&property.text) {
+                        if !matches!(
+                            property.kind,
+                            PropertyKind::Metadata(_) | PropertyKind::ReferenceFlow
+                        ) {
+                            default_assignments.push((
+                                property.kind,
+                                property.conditioned,
+                                property.text.clone(),
+                            ));
+                        }
                         assign_property(
                             property.kind,
                             property.conditioned,
@@ -1405,6 +2317,10 @@ fn parse_project(source: &str) -> ParsedProject {
                         );
                     } else {
                         complete = false;
+                        issues.push(MembershipIssue {
+                            region: MembershipRegion::Root,
+                            evidence: "invalid XML or unsupported project shape".into(),
+                        });
                     }
                 }
                 if pending_reference
@@ -1422,6 +2338,10 @@ fn parse_project(source: &str) -> ParsedProject {
                     .is_none_or(|frame| end_name.as_deref() != Some(frame.name.as_str()))
                 {
                     complete = false;
+                    issues.push(MembershipIssue {
+                        region: MembershipRegion::Root,
+                        evidence: "invalid XML or unsupported project shape".into(),
+                    });
                     break;
                 }
                 buffer.clear();
@@ -1432,20 +2352,36 @@ fn parse_project(source: &str) -> ParsedProject {
         nodes = nodes.saturating_add(1);
         if nodes > MAX_XML_NODES || (!is_empty && stack.len() >= MAX_XML_DEPTH) {
             complete = false;
+            issues.push(MembershipIssue {
+                region: MembershipRegion::Root,
+                evidence: "invalid XML or unsupported project shape".into(),
+            });
             break;
         }
         let Some(name) = msbuild_name(element.name().as_ref()) else {
             complete = false;
+            issues.push(MembershipIssue {
+                region: MembershipRegion::Root,
+                evidence: "invalid XML or unsupported project shape".into(),
+            });
             break;
         };
         let Some(attributes) = element_attributes(&reader, &element) else {
             complete = false;
+            issues.push(MembershipIssue {
+                region: MembershipRegion::Root,
+                evidence: "invalid XML or unsupported project shape".into(),
+            });
             break;
         };
         if let Some(capture) = capture.as_mut() {
             // XML children in a scalar property are not a statically known value.
             capture.conditioned = true;
             complete = false;
+            issues.push(MembershipIssue {
+                region: MembershipRegion::Root,
+                evidence: "invalid XML or unsupported project shape".into(),
+            });
         }
         let parent = stack.last().map(|frame| frame.name.as_str());
         let conditioned = stack.last().is_some_and(|frame| frame.conditioned)
@@ -1481,6 +2417,10 @@ fn parse_project(source: &str) -> ParsedProject {
                 let attribute_name = if name == "project" { "Sdk" } else { "Name" };
                 if name == "project" && conditioned {
                     complete = false;
+                    issues.push(MembershipIssue {
+                        region: MembershipRegion::Root,
+                        evidence: "invalid XML or unsupported project shape".into(),
+                    });
                 }
                 let value = attribute(&attributes, attribute_name);
                 if name == "sdk"
@@ -1491,9 +2431,17 @@ fn parse_project(source: &str) -> ParsedProject {
                             .any(|(_, value)| !static_property_value(value)))
                 {
                     complete = false;
+                    issues.push(MembershipIssue {
+                        region: MembershipRegion::Root,
+                        evidence: "invalid XML or unsupported project shape".into(),
+                    });
                 } else if let Some(value) = value {
                     if conditioned || !static_property_value(value) {
                         complete = false;
+                        issues.push(MembershipIssue {
+                            region: MembershipRegion::Root,
+                            evidence: "invalid XML or unsupported project shape".into(),
+                        });
                     } else {
                         sdks.extend(sdk_names(value));
                     }
@@ -1509,13 +2457,25 @@ fn parse_project(source: &str) -> ParsedProject {
                     || !metadata_gaps.is_empty()
                     || !properties.metadata.is_empty();
                 let imports_before = imports.len();
+                let mut import_complete = true;
                 collect_import(
                     &attributes,
                     conditioned,
+                    stack.last().is_some_and(|frame| frame.conditioned),
                     content_seen,
                     &mut imports,
-                    &mut complete,
+                    &mut import_complete,
                 );
+                if !import_complete {
+                    complete = false;
+                    metadata_imports_complete = false;
+                    issues.push(MembershipIssue {
+                        region: MembershipRegion::Import(
+                            attribute(&attributes, "Project").unwrap_or("").to_owned(),
+                        ),
+                        evidence: format!("unresolved Import: {attributes:?}"),
+                    });
+                }
                 if metadata_seen && imports.len() != imports_before {
                     metadata_imports_complete = false;
                     metadata_gaps.push(("configuration".to_owned(),
@@ -1523,7 +2483,64 @@ fn parse_project(source: &str) -> ParsedProject {
                 }
             }
             "compile" if !is_property => {
-                collect_compile_operation(&attributes, conditioned, &mut operations, &mut complete);
+                let mut item_complete = true;
+                collect_compile_operation(
+                    &attributes,
+                    conditioned,
+                    &mut operations,
+                    &mut item_complete,
+                );
+                if !item_complete {
+                    complete = false;
+                    let paths = [
+                        attribute(&attributes, "Include"),
+                        attribute(&attributes, "Remove"),
+                    ];
+                    let mut found = false;
+                    for path in paths.into_iter().flatten() {
+                        for pattern in path.split(';').filter(|p| !p.trim().is_empty()) {
+                            found = true;
+                            issues.push(MembershipIssue {
+                                region: MembershipRegion::Pattern(pattern.to_owned()),
+                                evidence: format!("open Compile item: {attributes:?}"),
+                            });
+                        }
+                    }
+                    if !found {
+                        issues.push(MembershipIssue {
+                            region: MembershipRegion::Root,
+                            evidence: format!("unsupported Compile item: {attributes:?}"),
+                        });
+                    }
+                }
+            }
+            "output"
+                if attribute(&attributes, "ItemName")
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Compile")) =>
+            {
+                issues.push(MembershipIssue {
+                    region: MembershipRegion::Root,
+                    evidence: format!("task output can publish Compile items: {attributes:?}"),
+                });
+                complete = false;
+            }
+            "createitem" => {
+                issues.push(MembershipIssue {
+                    region: MembershipRegion::Root,
+                    evidence: format!("CreateItem can publish Compile items: {attributes:?}"),
+                });
+                complete = false;
+            }
+            "packagereference" if !is_property => {
+                if let Some(id) = attribute(&attributes, "Include") {
+                    package_references.push((
+                        id.to_owned(),
+                        attribute(&attributes, "Version")
+                            .or_else(|| attribute(&attributes, "VersionOverride"))
+                            .unwrap_or("unresolved-version")
+                            .to_owned(),
+                    ));
+                }
             }
             "projectreference" if !is_property => {
                 // A definition sets defaults for every ProjectReference; a
@@ -1545,6 +2562,12 @@ fn parse_project(source: &str) -> ParsedProject {
         }
         if is_empty {
             if let Some(kind) = property {
+                if !matches!(
+                    kind,
+                    PropertyKind::Metadata(_) | PropertyKind::ReferenceFlow
+                ) {
+                    default_assignments.push((kind, conditioned, String::new()));
+                }
                 assign_property(
                     kind,
                     conditioned,
@@ -1578,13 +2601,23 @@ fn parse_project(source: &str) -> ParsedProject {
         }
         buffer.clear();
     }
-    if !stack.is_empty() || capture.is_some() {
+    if nodes == 0 || !stack.is_empty() || capture.is_some() {
         complete = false;
+        issues.push(MembershipIssue {
+            region: MembershipRegion::Root,
+            evidence: "invalid XML or unsupported project shape".into(),
+        });
     }
     if pending_reference.is_some() {
         references_complete = false;
     }
-    let metadata_complete = complete && metadata_imports_complete;
+    let metadata_complete = metadata_imports_complete
+        && !issues.iter().any(|issue| {
+            matches!(
+                issue.region,
+                MembershipRegion::Root | MembershipRegion::Import(_)
+            )
+        });
     // Only Microsoft.NET.Sdk's default Compile item is modeled. A traversal
     // or no-targets project compiles nothing; any other SDK (including the
     // Microsoft.NET.Sdk.* family, whose props add their own excludes) is
@@ -1597,12 +2630,18 @@ fn parse_project(source: &str) -> ParsedProject {
             || sdk.eq_ignore_ascii_case("Microsoft.Build.NoTargets")
     };
     let compiles_nothing = !sdks.is_empty() && sdks.iter().all(is_compiles_nothing_sdk);
-    if sdks
-        .iter()
-        .any(|sdk| !sdk.eq_ignore_ascii_case("Microsoft.NET.Sdk") && !is_compiles_nothing_sdk(sdk))
-        || (sdk_project && sdks.iter().any(is_compiles_nothing_sdk))
+    if sdks.iter().any(|sdk| {
+        !sdk.eq_ignore_ascii_case("Microsoft.NET.Sdk")
+            && !is_compiles_nothing_sdk(sdk)
+            && sdk_path_properties(sdk).is_none()
+    }) || ((sdk_project || sdks.iter().any(|sdk| sdk_path_properties(sdk).is_some()))
+        && sdks.iter().any(is_compiles_nothing_sdk))
     {
         complete = false;
+        issues.push(MembershipIssue {
+            region: MembershipRegion::Root,
+            evidence: format!("unmodeled SDK membership: {sdks:?}"),
+        });
     }
     ParsedProject {
         sdks,
@@ -1612,6 +2651,9 @@ fn parse_project(source: &str) -> ParsedProject {
         sdk_project,
         compiles_nothing,
         operations,
+        issues,
+        default_assignments,
+        package_references,
         complete,
         references,
         references_complete,
@@ -1635,14 +2677,26 @@ fn msbuild_name(raw: &[u8]) -> Option<String> {
 fn collect_import(
     attributes: &[(String, String)],
     conditioned: bool,
+    parent_conditioned: bool,
     content_seen: bool,
     imports: &mut Vec<String>,
     complete: &mut bool,
 ) {
     const THIS_FILE_DIRECTORY: &str = "$(MSBuildThisFileDirectory)";
-    let supported_attributes = attributes
-        .iter()
-        .all(|(name, _)| matches!(name.as_str(), "Project" | "Label"));
+    let project = attribute(attributes, "Project").map(str::trim);
+    let function = project.and_then(get_path_of_file_above);
+    let condition = attribute(attributes, "Condition");
+    let function_condition = function.is_some()
+        && condition.is_none_or(|value| {
+            project.is_some_and(|project| value.trim() == format!("Exists('{project}')"))
+        });
+    let supported_attributes = attributes.iter().all(|(name, _)| {
+        matches!(name.as_str(), "Project" | "Label") || (function_condition && name == "Condition")
+    });
+    if function_condition && !content_seen && supported_attributes && !parent_conditioned {
+        imports.push(project.unwrap().to_owned());
+        return;
+    }
     let path = attribute(attributes, "Project").map(|project| {
         let project = project.trim();
         match project.get(..THIS_FILE_DIRECTORY.len()) {
@@ -1662,6 +2716,32 @@ fn collect_import(
     }
 }
 
+/// Read the one supported MSBuild property function without evaluating other expressions.
+fn get_path_of_file_above(value: &str) -> Option<(&str, &str)> {
+    let args = value
+        .strip_prefix("$([MSBuild]::GetPathOfFileAbove(")?
+        .strip_suffix("))")?;
+    let args = args.strip_prefix('\'')?;
+    let (name, rest) = args.split_once('\'')?;
+    if !static_item_path(name) || name != name.trim() || name.contains(['/', '\\', ':', '\'', '%'])
+    {
+        return None;
+    }
+    let start = if rest.is_empty() {
+        ""
+    } else {
+        let start = rest.strip_prefix(", '")?.strip_suffix('\'')?;
+        start.strip_prefix("$(MSBuildThisFileDirectory)")?
+    };
+    if start != start.trim()
+        || start.contains(['$', '\'', ',', '%'])
+        || Path::new(start).is_absolute()
+    {
+        return None;
+    }
+    Some((name, start))
+}
+
 /// The SDK names an `Sdk` value lists, without versions (`Name/1.0`).
 fn sdk_names(value: &str) -> impl Iterator<Item = String> + '_ {
     value
@@ -1678,6 +2758,39 @@ fn sdk_names(value: &str) -> impl Iterator<Item = String> + '_ {
 fn is_conditioning_element(name: &str, attributes: &[(String, String)]) -> bool {
     matches!(name, "target" | "choose" | "when" | "otherwise")
         || attribute(attributes, "Condition").is_some()
+}
+
+/// SDK effects bounded by the declared path properties below.
+fn sdk_path_properties(sdk: &str) -> Option<(&'static [&'static str], &'static str)> {
+    const WEB: &[&str] = &["AppDesignerFolder"];
+    const GENERATED: &[&str] = &[
+        "BaseIntermediateOutputPath",
+        "Configuration",
+        "TargetFramework",
+        "IntermediateOutputPath",
+    ];
+    match sdk.to_ascii_lowercase().as_str() {
+        // dotnet/sdk release/10.0.3xx and release/10.0.4xx:
+        // src/WebSdk/ProjectSystem/Targets/Microsoft.NET.Sdk.Web.DefaultItems.props:19-35.
+        "microsoft.net.sdk.web" => Some((WEB, "generated Razor/cshtml declarations")),
+        // dotnet/sdk release/10.0.3xx and release/10.0.4xx:
+        // src/WebSdk/Worker/Targets/Microsoft.NET.Sdk.Worker.props:48 imports AppDesignerFolder removals.
+        "microsoft.net.sdk.worker" => Some((WEB, "unmodeled worker declaration inventory")),
+        // dotnet/sdk release/10.0.3xx and release/10.0.4xx:
+        // src/RazorSdk/Targets/Microsoft.NET.Sdk.Razor.GenerateAssemblyInfo.targets:25,167-168.
+        "microsoft.net.sdk.razor" => Some((GENERATED, "generated Razor/cshtml declarations")),
+        // dotnet/sdk release/10.0.3xx and release/10.0.4xx:
+        // src/BlazorWasmSdk/Targets/Microsoft.NET.Sdk.BlazorWebAssembly.Current.props:37 imports Razor.
+        "microsoft.net.sdk.blazorwebassembly" => {
+            Some((GENERATED, "generated Razor component declarations"))
+        }
+        // dotnet/wpf release/10.0 (the desktop SDK for both SDK bands):
+        // src/Microsoft.DotNet.Wpf/src/PresentationBuildTasks/Microsoft.WinFX.targets:237-244.
+        "microsoft.net.sdk.windowsdesktop" => {
+            Some((GENERATED, "generated XAML .g.cs declarations"))
+        }
+        _ => None,
+    }
 }
 
 /// How assigning the property `name` (lowercase; MSBuild property names
@@ -1706,16 +2819,25 @@ fn property_kind(name: &str) -> Option<PropertyKind> {
         // The other inputs of the SDK default Compile item and its excludes
         // (Microsoft.NET.Sdk.DefaultItems.props/.targets, the output paths
         // PublishDir derives from, the artifacts layout).
-        "defaultitemexcludes"
-        | "defaultexcludesinprojectfolder"
-        | "defaultitemexcludesinprojectfolder"
-        | "disabledefaultitemsinprojectfolder"
-        | "defaultlanguagesourceextension"
-        | "usingnetsdkdefaults"
-        | "outputpath"
-        | "publishdir"
-        | "useartifactsoutput"
-        | "artifactspath" => PropertyKind::Unsupported,
+        "defaultitemexcludes" => PropertyKind::DefaultItemExcludes,
+        "defaultexcludesinprojectfolder" => {
+            PropertyKind::DefaultPattern("DefaultExcludesInProjectFolder")
+        }
+        "defaultitemexcludesinprojectfolder" => {
+            PropertyKind::DefaultPattern("DefaultItemExcludesInProjectFolder")
+        }
+        "disabledefaultitemsinprojectfolder" => {
+            PropertyKind::ProjectDefault("DisableDefaultItemsInProjectFolder")
+        }
+        "defaultlanguagesourceextension" => {
+            PropertyKind::ProjectDefault("DefaultLanguageSourceExtension")
+        }
+        "usingnetsdkdefaults" => PropertyKind::ProjectDefault("UsingNETSdkDefaults"),
+        "useartifactsoutput" => PropertyKind::ProjectDefault("UseArtifactsOutput"),
+        "outputpath" => PropertyKind::OutputTree("OutputPath"),
+        "intermediateoutputpath" => PropertyKind::OutputTree("IntermediateOutputPath"),
+        "publishdir" => PropertyKind::OutputTree("PublishDir"),
+        "artifactspath" => PropertyKind::OutputTree("ArtifactsPath"),
         // The import hooks of Microsoft.Common.props/.targets and the SDK's
         // Sdk.props/.targets (`ImportDirectoryBuildProps`,
         // `CustomBeforeMicrosoftCommonTargets`, `DirectoryBuildPropsPath`,
@@ -1941,7 +3063,7 @@ fn resolve_item_path(project_directory: &Path, raw: &str) -> Option<PathBuf> {
         .map(|character| if character == '\\' { '/' } else { character })
         .collect::<String>();
     let item = Path::new(&portable);
-    if item.is_absolute() {
+    if item.is_absolute() || portable.contains(':') {
         return None;
     }
     let mut components = Vec::<OsString>::new();
@@ -2027,6 +3149,293 @@ mod tests {
         analyzer
             .global_using_dependencies(files, std::slice::from_ref(global))
             .expect("membership reads succeed")
+    }
+
+    #[test]
+    #[hardwon(
+        "#8632: a parent-relative conditional Compile item opened the wrong path, leaving a false proven owner"
+    )]
+    fn parent_relative_open_membership_keeps_independent_proven_owner() {
+        let case = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/golden/open-membership/parent-relative");
+        let names = [
+            "Feature/Feature.csproj",
+            "Plain/Plain.csproj",
+            "Outside/Outside.csproj",
+            "Shared.cs",
+            "Feature/Probe.cs",
+            "obj/Feature.csproj.nuget.g.props",
+        ];
+        let owned = names
+            .iter()
+            .map(|name| (*name, fs::read_to_string(case.join(name)).unwrap()))
+            .collect::<Vec<_>>();
+        let files = owned
+            .iter()
+            .map(|(name, source)| (*name, source.as_str()))
+            .collect::<Vec<_>>();
+        let (_root, _project, _files, analyzer) = analyzed(&files);
+        let selected = analyzer.selected_compilations().unwrap().unwrap();
+        let membership = selected.compilations_of("Shared.cs").unwrap().unwrap();
+        assert_eq!(membership.open.len(), 2, "{membership:?}");
+        assert_eq!(
+            membership.open[0].project_path.as_deref(),
+            Some("Feature/Feature.csproj")
+        );
+        assert_eq!(membership.open[0].regions[0].rel_path, "Shared.cs");
+        let restored = selected
+            .compilations_of("Feature/Probe.cs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.proven,
+            [membership.open[0].compilation_id],
+            "the parent-relative restore props must publish its Compile item"
+        );
+        assert_eq!(restored.open.len(), 1, "{restored:?}");
+        assert_eq!(
+            restored.open[0].project_path.as_deref(),
+            Some("Outside/Outside.csproj")
+        );
+        assert!(
+            restored.open[0]
+                .regions
+                .iter()
+                .all(|region| region.rel_path.is_empty())
+        );
+        let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+        let projects = membership
+            .proven
+            .iter()
+            .map(|id| {
+                conn.query_row(
+                    "SELECT project_path FROM csharp_compilations WHERE compilation_id=?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projects, ["Plain/Plain.csproj"]);
+        let (id, inventory): (i64,bool) = conn.query_row("SELECT compilation_id,inventory_open FROM csharp_compilations WHERE project_path='Outside/Outside.csproj'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert!(inventory);
+        let items: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM csharp_compilation_items WHERE compilation_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            items, 2,
+            "escaping items with remaining names must open the workspace root"
+        );
+        assert!(
+            selected
+                .inventory_gaps(id)
+                .unwrap()
+                .iter()
+                .any(|g| g.evidence.contains("External.cs"))
+        );
+        let (_root, _project, _files, unknown) = analyzed(&[
+            (
+                "Feature/Feature.csproj",
+                r#"<Project><ItemGroup><Compile Include="C:Shared.cs" /></ItemGroup></Project>"#,
+            ),
+            ("Shared.cs", "class Shared {}"),
+        ]);
+        let selected = unknown.selected_compilations().unwrap().unwrap();
+        let membership = selected.compilations_of("Shared.cs").unwrap().unwrap();
+        assert_eq!(
+            membership.open.len(),
+            1,
+            "an unlocatable drive-relative item is not a proven outside item: {membership:?}"
+        );
+        assert_eq!(membership.open[0].regions[0].rel_path, "");
+        let (root, _, _, _) = analyzed(&[]);
+        let root_name = root.path().file_name().unwrap().to_str().unwrap();
+        let pattern = format!("../../{root_name}/Shared.cs");
+        // This path really re-enters this workspace; production must remain
+        // conservative without depending on this absolute location.
+        fs::create_dir(root.path().join("Feature")).unwrap();
+        fs::write(root.path().join("Shared.cs"), "class Shared {}").unwrap();
+        assert_eq!(
+            root.path()
+                .join("Feature")
+                .join(&pattern)
+                .canonicalize()
+                .unwrap(),
+            root.path().join("Shared.cs").canonicalize().unwrap()
+        );
+        let xml =
+            format!("<Project><ItemGroup><Compile Include=\"{pattern}\" /></ItemGroup></Project>");
+        let facts = facts_of(&[("Feature/Feature.csproj", &xml)]);
+        assert!(!facts.membership_complete, "{facts:?}");
+        assert!(
+            facts.compilations[0].items.iter().any(|item| item.kind
+                == CSharpCompileItemKind::OpenTree
+                && item.rel_path.is_empty()),
+            "{facts:?}"
+        );
+        assert!(matches!(
+            static_membership_pattern(Path::new("Feature"), "../.."),
+            MembershipPattern::OutsideWorkspace
+        ));
+    }
+
+    #[test]
+    fn capped_empty_global_using_inputs_remain_incomplete() {
+        let paths = (0..=MAX_PROJECT_FILES)
+            .map(|index| format!("P{index:04}.csproj"))
+            .collect::<Vec<_>>();
+        let mut inputs = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.as_str(),
+                    "<Project Sdk=\"Microsoft.Build.NoTargets\" />",
+                )
+            })
+            .collect::<Vec<_>>();
+        inputs.push(("Caller.cs", "class Caller {}"));
+        let (_root, _project, _, analyzer) = analyzed(&inputs);
+        {
+            let selected = analyzer.selected_compilations().unwrap().unwrap();
+            assert!(selected.membership_capped());
+            assert_eq!(selected.project_count().unwrap(), 0);
+        }
+        let (dependencies, complete) = analyzer.global_using_dependencies(&[], &[]).unwrap();
+        assert!(dependencies.is_empty());
+        assert!(!complete);
+    }
+
+    #[test]
+    #[hardwon("#8831: any Target made the property evaluator drop every property of its file")]
+    #[hardwon(
+        "#8845: a multi-targeting Razor project could not evaluate IntermediateOutputPath, so its row stayed Root"
+    )]
+    fn target_assignments_open_only_their_properties() {
+        use std::fmt::Write;
+        let (_root, _project, _files, analyzer) = analyzed(&[
+            (
+                "Plain/Plain.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk.Razor"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><Target Name="Clean"><PropertyGroup><CleanGeneratedFiles>true</CleanGeneratedFiles></PropertyGroup><ItemGroup><Compile Include="Generated.cs" /></ItemGroup></Target></Project>"#,
+            ),
+            ("Plain/Source.cs", "class Plain {}"),
+            (
+                "Path/Path.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk.Razor"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><Target Name="Build"><PropertyGroup><IntermediateOutputPath>other/</IntermediateOutputPath></PropertyGroup></Target><PropertyGroup><IntermediateOutputPath>obj/</IntermediateOutputPath></PropertyGroup></Project>"#,
+            ),
+            ("Path/Source.cs", "class PathSource {}"),
+            (
+                "Multi/Multi.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk.Razor"><PropertyGroup><TargetFrameworks>net8.0;net9.0</TargetFrameworks></PropertyGroup></Project>"#,
+            ),
+            ("Multi/Source.cs", "class Multi {}"),
+            (
+                "Unknown/Unknown.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk.Razor"><PropertyGroup><TargetFrameworks>net8.0;$(Undefined)</TargetFrameworks></PropertyGroup></Project>"#,
+            ),
+            ("Unknown/Source.cs", "class Unknown {}"),
+            (
+                "Local/Local.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk.Razor" TreatAsLocalProperty="TargetFramework"><PropertyGroup><TargetFrameworks>net8.0;net9.0</TargetFrameworks></PropertyGroup></Project>"#,
+            ),
+            ("Local/Source.cs", "class Local {}"),
+            (
+                "Dynamic/Dynamic.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk.Razor"><PropertyGroup><TargetFramework>net10.0</TargetFramework><Dest>DefineConstants</Dest></PropertyGroup><Target Name="Build"><CreateProperty Value="X"><Output TaskParameter="Value" PropertyName="$(Dest)" /></CreateProperty></Target></Project>"#,
+            ),
+            ("Dynamic/Source.cs", "class DynamicSource {}"),
+        ]);
+        let selected = analyzer.selected_compilations().unwrap().unwrap();
+        let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+        let mut rendered = String::new();
+        for (project, source) in [
+            ("Plain/Plain.csproj", "Plain/Source.cs"),
+            ("Path/Path.csproj", "Path/Source.cs"),
+            ("Multi/Multi.csproj", "Multi/Source.cs"),
+            ("Unknown/Unknown.csproj", "Unknown/Source.cs"),
+            ("Local/Local.csproj", "Local/Source.cs"),
+            ("Dynamic/Dynamic.csproj", "Dynamic/Source.cs"),
+        ] {
+            let (id, inventory_open): (i64, bool) = conn.query_row(
+                "SELECT compilation_id, inventory_open FROM csharp_compilations WHERE project_path=?1",
+                [project], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert!(inventory_open, "{project}");
+            let membership = selected.compilations_of(source).unwrap().unwrap();
+            let regions = membership
+                .open
+                .iter()
+                .filter(|entry| entry.compilation_id == id)
+                .flat_map(|entry| {
+                    entry
+                        .regions
+                        .iter()
+                        .map(|region| (region.kind.as_str(), region.rel_path.as_str()))
+                })
+                .collect::<Vec<_>>();
+            assert!(!regions.is_empty(), "{project}: {membership:?}");
+            if project == "Plain/Plain.csproj" || project == "Multi/Multi.csproj" {
+                assert!(
+                    regions.iter().all(|(_, path)| !path.is_empty()),
+                    "{project}: {regions:?}"
+                );
+            }
+            if project == "Dynamic/Dynamic.csproj" {
+                assert!(
+                    regions.iter().any(|(_, path)| path.is_empty()),
+                    "{project}: {regions:?}"
+                );
+            }
+            writeln!(
+                rendered,
+                "{project}: inventory_open={inventory_open} regions={regions:?}"
+            )
+            .unwrap();
+        }
+        assert!(selected.gaps().unwrap().iter().any(|gap| {
+            gap.path == "Local/Local.csproj" && gap.evidence.contains("treat_as_local_property")
+        }));
+        let project = "Append/Append.csproj";
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/golden/compilation-symbols/Append");
+        let mut symbol_inputs = vec![CSharpConfigurationInput {
+            rel_path: project.into(),
+            source: Some(br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><DefineConstants>FOO</DefineConstants></PropertyGroup><Target><PropertyGroup><DefineConstants>BAR</DefineConstants></PropertyGroup></Target><PropertyGroup><DefineConstants>LATER</DefineConstants></PropertyGroup></Project>"#.to_vec()),
+        }];
+        for name in [
+            "project.assets.json",
+            "Append.csproj.nuget.g.props",
+            "Append.csproj.nuget.g.targets",
+        ] {
+            symbol_inputs.push(CSharpConfigurationInput {
+                rel_path: format!("Append/obj/{name}"),
+                source: Some(fs::read(fixture.join("obj").join(name)).unwrap()),
+            });
+        }
+        let symbols = symbols::derive(&symbol_inputs, Some(project));
+        assert!(symbols.symbols.is_empty());
+        writeln!(
+            rendered,
+            "{project}: symbols_reason={:?}",
+            symbols.open_reason
+        )
+        .unwrap();
+        symbol_inputs[0].source = Some(br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><Dest>DefineConstants</Dest></PropertyGroup><Target Name="Build"><CreateProperty Value="X"><Output TaskParameter="Value" PropertyName="$(Dest)" /></CreateProperty></Target></Project>"#.to_vec());
+        let dynamic_symbols = symbols::derive(&symbol_inputs, Some(project));
+        assert!(dynamic_symbols.symbols.is_empty());
+        writeln!(
+            rendered,
+            "Append/Append.csproj dynamic Output: symbols_reason={:?}",
+            dynamic_symbols.open_reason
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            include_str!("../../../tests/fixtures/golden/target-property-scope/expected.txt")
+        );
     }
 
     /// Evaluated configuration crosses the producer/SQLite/selected-reader boundary.
@@ -2889,7 +4298,11 @@ mod tests {
                     &file(&project, "A/App.cs"),
                     &file(&project, "A/Other.cs")
                 ),
-                Some(CSharpCompilationVisibility::Unresolved),
+                Some(if evidence == "a non-tree glob" {
+                    CSharpCompilationVisibility::Visible
+                } else {
+                    CSharpCompilationVisibility::Unresolved
+                }),
                 "{evidence}"
             );
         }
@@ -3206,7 +4619,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_default_excludes_are_reported_incomplete() {
+    fn static_default_tree_excludes_keep_membership_complete() {
         let (_root, project, analyzed, analyzer) = analyzed(&[
             (
                 "A/A.csproj",
@@ -3218,8 +4631,11 @@ mod tests {
         let global = file(&project, "A/GlobalUsings.cs");
         let (dependencies, complete) = global_dependencies(&analyzer, &analyzed, &global);
 
-        assert!(!complete);
-        assert!(dependencies.is_empty(), "{dependencies:?}");
+        assert!(complete);
+        assert_eq!(
+            dependencies[&file(&project, "A/App.cs")],
+            [global].into_iter().collect()
+        );
     }
 
     #[test]
@@ -3288,7 +4704,8 @@ mod tests {
             .expect("membership reads succeed")
         {
             None => "unproven",
-            Some(compilations) if compilations.is_empty() => "outside",
+            Some(membership) if !membership.open.is_empty() => "unproven",
+            Some(membership) if membership.proven.is_empty() => "outside",
             Some(_) => "member",
         }
     }
@@ -3302,6 +4719,177 @@ mod tests {
             })
             .collect::<Vec<_>>();
         compilation_facts(&inputs)
+    }
+
+    #[test]
+    fn get_path_of_file_above_membership_golden() {
+        use std::fmt::Write;
+        let resolved_files = [
+            (
+                "Directory.Build.props",
+                "<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>",
+            ),
+            (
+                "src/Directory.Build.props",
+                "<Project><Import Project=\"$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))\" /></Project>",
+            ),
+            (
+                "src/App/App.csproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><Compile Include=\"Source.cs\" /></ItemGroup></Project>",
+            ),
+            ("src/App/Source.cs", "class Source {}"),
+            ("src/App/Extra.cs", "class Extra {}"),
+            (
+                "conditioned/Directory.Build.props",
+                r#"<Project><Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" Condition="Exists('$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))')" /></Project>"#,
+            ),
+            (
+                "conditioned/Conditional.csproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><Compile Include=\"Source.cs\" /></ItemGroup></Project>",
+            ),
+            ("conditioned/Source.cs", "class Conditional {}"),
+        ];
+        let missing_files = [
+            (
+                "other/Directory.Build.props",
+                "<Project><Import Project=\"$([MSBuild]::GetPathOfFileAbove('Missing.props'))\" /></Project>",
+            ),
+            (
+                "other/Other.csproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\" />",
+            ),
+            ("other/Source.cs", "class Other {}"),
+        ];
+        let unselected_files = [
+            (
+                "Custom.props",
+                "<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>",
+            ),
+            (
+                "src/App/App.csproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><Import Project=\"$([MSBuild]::GetPathOfFileAbove('Custom.props'))\" /><ItemGroup><Compile Include=\"Source.cs\" /></ItemGroup></Project>",
+            ),
+            ("src/App/Source.cs", "class Source {}"),
+            ("src/App/Extra.cs", "class Extra {}"),
+        ];
+        let escaped_start_files = [
+            (
+                "src/Common.props",
+                "<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>",
+            ),
+            (
+                "src/App/%2e%2e/Common.props",
+                "<Project><PropertyGroup><EnableDefaultCompileItems>true</EnableDefaultCompileItems></PropertyGroup></Project>",
+            ),
+            (
+                "src/App/App.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk"><Import Project="$([MSBuild]::GetPathOfFileAbove('Common.props', '$(MSBuildThisFileDirectory)%2e%2e/'))" /><ItemGroup><Compile Include="Source.cs" /></ItemGroup></Project>"#,
+            ),
+            ("src/App/Source.cs", "class Source {}"),
+            ("src/App/Extra.cs", "class Extra {}"),
+        ];
+        let spaced_start_files = [
+            (
+                "src/App/ dir/Common.props",
+                "<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>",
+            ),
+            (
+                "src/App/dir/Common.props",
+                "<Project><PropertyGroup><EnableDefaultCompileItems>true</EnableDefaultCompileItems></PropertyGroup></Project>",
+            ),
+            (
+                "src/App/App.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk"><Import Project="$([MSBuild]::GetPathOfFileAbove('Common.props', '$(MSBuildThisFileDirectory) dir/'))" /><ItemGroup><Compile Include="Source.cs" /></ItemGroup></Project>"#,
+            ),
+            ("src/App/Source.cs", "class Source {}"),
+            ("src/App/Extra.cs", "class Extra {}"),
+        ];
+        let empty_nearer_files = [
+            (
+                "Common.props",
+                "<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>",
+            ),
+            ("src/App/Common.props", ""),
+            (
+                "src/App/App.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk"><Import Project="$([MSBuild]::GetPathOfFileAbove('Common.props'))" /><ItemGroup><Compile Include="Source.cs" /></ItemGroup></Project>"#,
+            ),
+            ("src/App/Source.cs", "class Source {}"),
+            ("src/App/Extra.cs", "class Extra {}"),
+        ];
+        let mut output = String::new();
+        for (label, files, paths) in [
+            (
+                "resolved",
+                resolved_files.as_slice(),
+                &[
+                    "src/App/Source.cs",
+                    "src/App/Extra.cs",
+                    "conditioned/Source.cs",
+                ][..],
+            ),
+            (
+                "missing",
+                missing_files.as_slice(),
+                &["other/Source.cs"][..],
+            ),
+            (
+                "unselected-nearer-candidate",
+                unselected_files.as_slice(),
+                &["src/App/Source.cs", "src/App/Extra.cs"][..],
+            ),
+            (
+                "escaped-start",
+                escaped_start_files.as_slice(),
+                &["src/App/Source.cs", "src/App/Extra.cs"][..],
+            ),
+            (
+                "spaced-start",
+                spaced_start_files.as_slice(),
+                &["src/App/Source.cs", "src/App/Extra.cs"][..],
+            ),
+            (
+                "empty-nearer-input",
+                empty_nearer_files.as_slice(),
+                &["src/App/Source.cs", "src/App/Extra.cs"][..],
+            ),
+        ] {
+            writeln!(output, "{label}:").unwrap();
+            let (_root, _, _, analyzer) = analyzed(files);
+            let facts = facts_of(files);
+            let selection = analyzer.selected_compilations().unwrap().unwrap();
+            for path in paths {
+                let placement = selection.compilations_of(path).unwrap().unwrap();
+                writeln!(
+                    output,
+                    "{path}: proven={} open={}",
+                    placement.proven.len(),
+                    placement.open.len()
+                )
+                .unwrap();
+            }
+            for fact in &facts.compilations {
+                writeln!(
+                    output,
+                    "project={:?} items={:?}",
+                    fact.project_path,
+                    fact.items
+                        .iter()
+                        .map(|item| (&item.kind, &item.rel_path))
+                        .collect::<Vec<_>>()
+                )
+                .unwrap();
+            }
+            for gap in &facts.gaps {
+                writeln!(output, "gap={} {:?}: {}", gap.code, gap.path, gap.evidence).unwrap();
+            }
+        }
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/golden/get-path-of-file-above/expected.txt");
+        if std::env::var_os("BIFROST_BLESS").is_some() {
+            fs::write(&expected, &output).unwrap();
+        }
+        assert_eq!(fs::read_to_string(expected).unwrap(), output);
     }
 
     #[test]
@@ -3379,6 +4967,14 @@ mod tests {
         ] {
             assert_eq!(membership(&analyzer, path), expected, "{path}");
         }
+        for (output, expected) in [("../../outside/", "unproven"), ("../../", "outside")] {
+            let xml = format!(
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><BaseIntermediateOutputPath>{output}</BaseIntermediateOutputPath></PropertyGroup></Project>"
+            );
+            let (_root, _, _, analyzer) =
+                analyzed(&[("App/App.csproj", &xml), ("App/A.cs", "class A {}")]);
+            assert_eq!(membership(&analyzer, "App/A.cs"), expected, "{output}");
+        }
     }
 
     #[test]
@@ -3400,7 +4996,6 @@ mod tests {
             "<UseArtifactsOutput>true</UseArtifactsOutput>",
             "<ArtifactsPath>out</ArtifactsPath>",
             "<BaseOutputPath>$(Root)out/</BaseOutputPath>",
-            "<BaseIntermediateOutputPath>../../outside/</BaseIntermediateOutputPath>",
             "<CustomBeforeDirectoryBuildProps>x.props</CustomBeforeDirectoryBuildProps>",
             "<AlternateCommonProps>x.props</AlternateCommonProps>",
             "<BeforeMicrosoftNETSdkTargets>x.targets</BeforeMicrosoftNETSdkTargets>",
@@ -3409,6 +5004,12 @@ mod tests {
             let facts = facts_of(&[("App/App.csproj", &project(properties))]);
             assert!(!facts.membership_complete, "{properties}: {facts:?}");
         }
+        // A normal component after escape may re-enter the actual root.
+        let facts = facts_of(&[(
+            "App/App.csproj",
+            &project("<BaseIntermediateOutputPath>../../outside/</BaseIntermediateOutputPath>"),
+        )]);
+        assert!(!facts.membership_complete, "{facts:?}");
         // The default excludes are expanded before Directory.Build.targets.
         let facts = facts_of(&[
             ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
@@ -3571,7 +5172,12 @@ mod tests {
             "App.csproj",
             "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><defaultitemexcludes>X/**</defaultitemexcludes></PropertyGroup></Project>",
         )]);
-        assert!(!facts.membership_complete, "{facts:?}");
+        assert!(facts.membership_complete, "{facts:?}");
+        assert!(
+            facts.compilations[0].items[0]
+                .excluded_trees
+                .contains(&"X".to_owned())
+        );
     }
     #[test]
     fn review_r5_unsupported_property_gaps_reach_membership_reader() {
@@ -3581,7 +5187,6 @@ mod tests {
             "<PublishDir>Excluded/</PublishDir>",
             "<DefaultLanguageSourceExtension>.cs2</DefaultLanguageSourceExtension>",
             "<BaseOutputPath>$(Root)out/</BaseOutputPath>",
-            "<BaseIntermediateOutputPath>../../outside/</BaseIntermediateOutputPath>",
         ] {
             let xml = format!(
                 "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>{property}</PropertyGroup></Project>"
@@ -3594,6 +5199,14 @@ mod tests {
                 "{property}"
             );
         }
+        let (_root, _, _, analyzer) = analyzed(&[
+            (
+                "App.csproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><BaseIntermediateOutputPath>../../outside/</BaseIntermediateOutputPath></PropertyGroup></Project>",
+            ),
+            ("Excluded/X.cs", "class X {}"),
+        ]);
+        assert_eq!(membership(&analyzer, "Excluded/X.cs"), "unproven");
     }
     #[test]
     #[hardwon("#6296: an XML character reference in a property value was dropped")]
@@ -3695,7 +5308,12 @@ mod tests {
                 ("x.props", "<Project/>"),
                 ("X.cs", "class X {}"),
             ]);
-            assert_eq!(membership(&analyzer, "X.cs"), "unproven", "{import}");
+            let expected = if import.contains("GetPathOfFileAbove") {
+                "member"
+            } else {
+                "unproven"
+            };
+            assert_eq!(membership(&analyzer, "X.cs"), expected, "{import}");
         }
     }
 

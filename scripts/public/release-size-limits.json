@@ -11,7 +11,7 @@
       "registry": "PyPI brokk-bifrost-searchtools",
       "pattern": "^brokk_bifrost_searchtools-.*\\.(whl|tar\\.gz)$",
       "limit_bytes": 104857600,
-      "source": "PyPI's default per-file limit of 100 MiB. v0.14.2's manylinux aarch64 wheel (104698118 bytes) uploaded; v0.14.3's was refused with 400 File too large (release run 40897040195)."
+      "source": "PyPI's default per-file limit of 100 MiB. v0.14.2's manylinux aarch64 wheel (104698118 bytes) uploaded; v0.14.3's was refused with 400 File too large (release run 40897040195). The v0.14.4 wheels reached 89.5% of it (manylinux x86_64, 93821347 bytes), so since #8288 the wheel carries its extension module xz-compressed (293.6 MB to 55.5 MB at xz -9e on manylinux x86_64) and the client unpacks it on first import."
     },
     {
       "registry": "PyPI brokk-bifrost",

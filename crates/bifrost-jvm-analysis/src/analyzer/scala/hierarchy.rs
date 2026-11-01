@@ -59,8 +59,8 @@ enum ScalaExternalRootLanding {
     Ambiguous,
 }
 
-impl TypeHierarchyProvider for ScalaAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+impl ScalaAnalyzer {
+    fn legacy_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
         HierarchyAnswer::complete(crate::analyzer::jvm::hierarchy::memoized_ancestors(
@@ -69,6 +69,45 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
             code_unit,
             || self.resolve_direct_ancestors(token, code_unit),
         ))
+    }
+}
+
+impl TypeHierarchyProvider for ScalaAnalyzer {
+    fn with_hierarchy_query(
+        &self,
+        run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some() {
+            self.native_hierarchy_query(None, run);
+            return;
+        }
+        run(&mut brokk_bifrost_core::analyzer::capabilities::ForwardingHierarchyQuery(self));
+    }
+
+    fn with_hierarchy_query_for(
+        &self,
+        _root: &CodeUnit,
+        run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some() {
+            self.native_hierarchy_query(Some(_root), run);
+            return;
+        }
+        run(&mut brokk_bifrost_core::analyzer::capabilities::ForwardingHierarchyQuery(self));
+    }
+
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some() {
+            let mut answer = None;
+            self.with_hierarchy_query_for(code_unit, &mut |query| {
+                answer = Some(query.direct_ancestors(code_unit))
+            });
+            return answer.expect("hierarchy query runs once");
+        }
+        self.legacy_direct_ancestors(code_unit)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
@@ -96,6 +135,18 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
         code_unit: &CodeUnit,
         scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
     ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some() {
+            if scope.cancellation().is_cancelled() {
+                return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
+            }
+            let mut answer = None;
+            self.with_hierarchy_query_for(code_unit, &mut |query| {
+                answer = Some(query.direct_descendants_within(code_unit, scope));
+            });
+            return answer.expect("hierarchy query runs once");
+        }
+
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
         if scope.cancellation().is_cancelled() {
@@ -209,19 +260,9 @@ impl ScalaLazyHierarchyIndex {
             &scala.direct_ancestors,
             scala,
             candidate,
-            || {
-                self.contexts
-                    .get(candidate)
-                    .map(|context| {
-                        scala.resolve_direct_ancestor_units_with_context(
-                            token,
-                            candidate,
-                            &self.types,
-                            context,
-                        )
-                    })
-                    .unwrap_or_default()
-            },
+            // Read project types and this owner's context inside the retained
+            // ancestor fill; the lazy candidate index may have incomplete inputs.
+            || scala.resolve_direct_ancestors(token, candidate),
         ))
     }
 
@@ -829,7 +870,7 @@ impl ScalaAnalyzer {
         {
             return ScalaExternalRootLanding::Ambiguous;
         }
-        match Self::external_type_spelling_in(&external, package_name, &spelling, imports) {
+        match self.external_type_spelling_in(&external, package_name, &spelling, imports) {
             Some(external_type) if external_type.fqn() == external_root_fqn => {
                 ScalaExternalRootLanding::ExternalRoot
             }
@@ -1018,6 +1059,82 @@ fn hierarchy_path_package_prefixes(
     }
 }
 
+impl ScalaAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_hierarchy_query(
+        &self,
+        root: Option<&CodeUnit>,
+        run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
+    ) {
+        let _scope = AnalyzerQueryScope::new(self);
+        crate::analyzer::jvm::native_hierarchy::with_native_query(
+            self.tree_sitter_analyzer(),
+            root,
+            &mut |owner, parents| self.normalize_native_parents(owner, parents),
+            run,
+        );
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    fn normalize_native_parents(
+        &self,
+        owner: &CodeUnit,
+        parents: &mut Vec<crate::analyzer::jvm::native_hierarchy::MappedParent>,
+    ) {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind;
+        let no_written_parent = parents
+            .iter()
+            .all(|parent| parent.kind == Some(ResolutionSupertypeKind::ImplicitSuperclass));
+        let first = parents
+            .iter_mut()
+            .filter(|parent| parent.kind == Some(ResolutionSupertypeKind::Superclass))
+            .min_by_key(|parent| parent.ordinal);
+        let trait_first = if !self.is_scala_trait_declaration(owner)
+            && let Some(first) = first
+            && first.complete
+            && first.alternatives == 1
+            && let [target] = first.targets.as_slice()
+            && self.is_scala_trait_declaration(target)
+        {
+            true
+        } else {
+            false
+        };
+        if trait_first {
+            parents
+                .iter_mut()
+                .filter(|parent| parent.kind == Some(ResolutionSupertypeKind::Superclass))
+                .min_by_key(|parent| parent.ordinal)
+                .expect("trait first parent exists")
+                .kind = Some(ResolutionSupertypeKind::Interface);
+        }
+        if (trait_first || no_written_parent)
+            && !parents.iter().any(|parent| {
+                parent
+                    .intrinsic_root
+                    .as_ref()
+                    .is_some_and(|owner| owner.owner_fqn.as_ref() == "scala.AnyRef")
+            })
+        {
+            parents.push(crate::analyzer::jvm::native_hierarchy::MappedParent {
+                kind: Some(ResolutionSupertypeKind::ImplicitSuperclass),
+                ordinal: 0,
+                targets: Vec::new(),
+                // Like the native Java implicit Object root, this intrinsic
+                // superclass has no source edge and does not open the answer.
+                unread: Vec::new(),
+                intrinsic_root: Some(
+                    brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::jvm_intrinsic_parent(
+                        brokk_bifrost_core::analyzer::model::Language::Scala,
+                        Some(ResolutionSupertypeKind::ImplicitSuperclass),
+                    ).expect("Scala's language-defined implicit superclass is intrinsic"),
+                ),
+                alternatives: 1,
+                complete: true,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1031,6 +1148,32 @@ mod tests {
         let fixture = AnalyzerFixture::new_for_language(Language::Scala, files);
         let analyzer = ScalaAnalyzer::from_project(fixture.test_project().clone());
         (fixture, analyzer)
+    }
+
+    #[test]
+    fn retained_ancestors_read_inputs_instead_of_partial_lazy_contexts() {
+        let (fixture, scala) = analyzer_with_files(&[
+            ("Base.scala", "class Base"),
+            ("Child.scala", "class Child extends Base"),
+        ]);
+        let child = scala
+            .declarations(&ProjectFile::new(
+                fixture.test_project().root(),
+                "Child.scala",
+            ))
+            .into_iter()
+            .find(|unit| unit.is_class())
+            .unwrap();
+        let mut index = scala.build_lazy_hierarchy_index();
+        // A partial bulk pass may lack an owner's context. That caller-local
+        // candidate filter must not become a retained complete ancestor answer.
+        assert!(index.contexts.remove(&child).is_some());
+        let scope = AnalyzerQueryScope::new(&scala);
+        let ancestors = index.ancestors_of(scope.token(), &scala, &child);
+        assert!(
+            ancestors.iter().any(|unit| unit.identifier() == "Base"),
+            "{ancestors:?}"
+        );
     }
 
     #[test]
@@ -1212,7 +1355,20 @@ trait External
 
         let mut agreements = 0usize;
         for unit in &all_classes {
-            let lazy = sorted_fq_names(&analyzer.get_direct_descendants(unit).edges);
+            let index = analyzer.build_lazy_hierarchy_index();
+            let token = brokk_bifrost_core::cancellation::CancellationToken::default();
+            let scope =
+                brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope::whole_workspace(
+                    &token,
+                );
+            let query = AnalyzerQueryScope::new(&analyzer);
+            let lazy = sorted_fq_names(
+                &index
+                    .direct_descendants_while(query.token(), &analyzer, unit, &scope)
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            );
             let reference =
                 sorted_fq_names(&eager.descendants(unit).into_iter().collect::<Vec<_>>());
             assert_eq!(

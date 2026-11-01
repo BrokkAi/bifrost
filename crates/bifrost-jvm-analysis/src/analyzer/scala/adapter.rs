@@ -88,6 +88,13 @@ impl LanguageAdapter for ScalaAdapter {
     }
 }
 impl StoreLanguageAdapter for ScalaAdapter {
+    // #8580: Scala lowering reads inputs outside the file, so parse-time publication is unavailable.
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        None
+    }
+
     fn source_fact_storage(
         &self,
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>

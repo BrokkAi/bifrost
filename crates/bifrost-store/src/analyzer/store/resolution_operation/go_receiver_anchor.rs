@@ -819,6 +819,24 @@ impl SelectedResolutionOperation<'_, '_> {
         )))
     }
 
+    /// Export all result scalars together so a consumer lowers a callable once.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn go_selected_callable_result_types(
+        &self,
+        member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(
+            Vec<Option<crate::analyzer::resolution::CanonicalTypeIdentity>>,
+            usize,
+        )>,
+    > {
+        self.ready
+            .typed_source()
+            .selected_go_callable_result_types(member, cancellation)
+    }
+
     #[doc(hidden)]
     pub fn go_point_callable_result_slot(
         &self,

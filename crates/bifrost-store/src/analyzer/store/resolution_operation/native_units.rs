@@ -30,6 +30,74 @@ pub enum SelectedNativeDefinitions {
     Cancelled,
 }
 
+/// Ownership of one reason in the final native binding completion.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct NativeCompletionReasonOwnership {
+    pub kind: &'static str,
+    pub name: Option<&'static str>,
+    pub context_owned: bool,
+    pub operation_local: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static NATIVE_COMPLETION_REASON_PROBE: std::cell::RefCell<Option<Vec<NativeCompletionReasonOwnership>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn start_native_completion_reason_probe_for_test() {
+    NATIVE_COMPLETION_REASON_PROBE.with(|probe| *probe.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_native_completion_reason_probe_for_test() -> Vec<NativeCompletionReasonOwnership> {
+    NATIVE_COMPLETION_REASON_PROBE.with(|probe| {
+        probe
+            .borrow_mut()
+            .take()
+            .expect("native completion reason probe started")
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn record_native_completion_reason_ownership(
+    ready: &ReadySelectedResolution<'_, '_>,
+    completion: &ResolutionCompletion,
+) {
+    NATIVE_COMPLETION_REASON_PROBE.with(|probe| {
+        let mut probe = probe.borrow_mut();
+        let Some(records) = probe.as_mut() else {
+            return;
+        };
+        let ResolutionCompletion::Incomplete(reasons) = completion else {
+            return;
+        };
+        for reason in reasons.iter() {
+            let (kind, Some(semantic)) = public_reason_details(reason) else {
+                continue;
+            };
+            let key = crate::analyzer::resolution::ResolutionIdentityDigestKey::from(semantic);
+            records.push(NativeCompletionReasonOwnership {
+                kind,
+                name: ready
+                    .context_identities
+                    .named_reason(semantic)
+                    .map(|(name, _)| name),
+                context_owned: key
+                    .context_number()
+                    .and_then(|number| ready.context_identities.content_digest(number))
+                    .is_some(),
+                operation_local: semantic.is_operation_local(),
+            });
+        }
+    });
+}
+
 #[doc(hidden)]
 pub struct ProjectedNativeExternalMember {
     #[doc(hidden)]
@@ -40,6 +108,8 @@ pub struct ProjectedNativeExternalMember {
     pub member_name: String,
     #[doc(hidden)]
     pub is_static: bool,
+    #[doc(hidden)]
+    pub pack: Option<(String, String)>,
 }
 
 /// Stable coordinates and shape facts projected from one reached native
@@ -67,12 +137,80 @@ pub struct ProjectedNativeModelMember {
     pub rejected: bool,
 }
 
+/// Native's invocation verdict, independently of family completeness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeInvocationOutcome {
+    NoApplicable,
+    Ambiguous,
+    Unproven(NativeInvocationContentCause),
+}
+
+/// Open argument/formal types, incomplete shapes, or the deterministic syntax
+/// depth cap. Dynamic budget/cancellation stops never become this cause: Java's
+/// argument collector propagates JavaNativePointStop from the nested
+/// BoundedResolution::Exceeded/Cancelled arms before invocation selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeInvocationContentCause {
+    OpenEvidence,
+}
+
+/// An inventory overload without a model identity still competes for a layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeInvocationShape {
+    pub parameter_count: usize,
+    pub variadic: bool,
+}
+
+impl ProjectedNativeModelMember {
+    /// Stable reached-record projection. Language adapters add only independently
+    /// proven receiver and route facts to this initially unselected record.
+    pub fn reached(
+        declaration: crate::analyzer::semantic_model::overlay::SemanticModelSymbol,
+        member: crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        owner: crate::analyzer::resolution::ExternalOwnerIdentity,
+    ) -> Self {
+        Self {
+            declaration,
+            member,
+            owner,
+            owner_path: Box::new([]),
+            receiver_owner: None,
+            receiver_pointer_depth: 0,
+            receiver_addressable: None,
+            receiver_runtime: false,
+            receiver_proven: false,
+            selected: false,
+            selection_complete: false,
+            interface: false,
+            route_exact: false,
+            receiver_route_proven: false,
+            complete: false,
+            incomplete_reasons: Vec::new(),
+            rejected: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct ProjectedNativeModelMemberSelection {
+    pub outcome: Option<NativeInvocationOutcome>,
+    pub identityless_shapes: Vec<NativeInvocationShape>,
     pub native_target_count: usize,
     pub candidates: Vec<ProjectedNativeModelMember>,
     pub complete: bool,
+}
+
+impl ProjectedNativeModelMemberSelection {
+    /// A diagnostic family never supplies an executable candidate.
+    pub fn selected_candidate(&self) -> Option<&ProjectedNativeModelMember> {
+        if self.outcome.is_some() {
+            return None;
+        }
+        let mut selected = self.candidates.iter().filter(|c| c.selected && !c.rejected);
+        let candidate = selected.next()?;
+        selected.next().is_none().then_some(candidate)
+    }
 }
 
 #[doc(hidden)]
@@ -86,9 +224,6 @@ pub fn project_native_model_member_selection(
             return None;
         }
         candidates.push(ProjectedNativeModelMember {
-            member: candidate.member.clone(),
-            declaration: candidate.declaration.clone(),
-            owner: candidate.owner.clone(),
             owner_path: candidate.owner_coordinates.clone(),
             receiver_owner: candidate.receiver_owner.clone(),
             receiver_pointer_depth: candidate.receiver.ty().indirection(),
@@ -106,9 +241,16 @@ pub fn project_native_model_member_selection(
             complete: candidate.completion == ResolutionCompletion::Complete,
             incomplete_reasons: candidate.incomplete_reasons.clone(),
             rejected: candidate.rejected,
+            ..ProjectedNativeModelMember::reached(
+                candidate.declaration.clone(),
+                candidate.member.clone(),
+                candidate.owner.clone(),
+            )
         });
     }
     Some(Box::new(ProjectedNativeModelMemberSelection {
+        outcome: None,
+        identityless_shapes: Vec::new(),
         native_target_count: selection.native_target_count,
         candidates,
         complete: selection.completion == ResolutionCompletion::Complete,
@@ -1219,8 +1361,13 @@ impl SelectedResolutionOperation<'_, '_> {
                             |row| Ok((row.get(0)?,row.get(1)?)))? };
                         external_members.push(ProjectedNativeExternalMember {
                             coordinate: crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(ordinal),
-                            identity: crate::analyzer::resolution::ExternalMemberIdentity { owner, ordinal },
+                            identity: crate::analyzer::resolution::ExternalMemberIdentity { owner: owner.clone(), ordinal },
                             member_name, is_static,
+                            pack: ready.context_identities.is_jvm_package_member_target(target).then(|| {
+                                let shards = ready.model_authority().and_then(|authority| authority.active_models()).expect("selected package member has an active pack").shards();
+                                let shard = shards.iter().find(|shard| shard.manifest.semantic_sha256 == owner.provider_id.as_ref()).expect("member provider is active");
+                                (shard.manifest.pack_id.clone(), shard.manifest.version.clone())
+                            }),
                         });
                     }
                 }
@@ -1301,6 +1448,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 let direct_target = selected_external_member_target(ready, &answer, cancellation)?;
                 // Unit targets are already projected above. Only unresolved
                 // identities need to consult source/content evidence again.
+                #[cfg(any(test, feature = "test-support"))]
+                record_native_completion_reason_ownership(ready, answer.binding().completion());
                 let mut diagnostic_semantics = Vec::new();
                 if answer.binding().targets().len() > 1 || matches!(answer.binding().completion(), ResolutionCompletion::Incomplete(reasons) if reasons.iter().any(|reason| matches!(reason, ResolutionIncompleteReason::InconsistentPrecedence(_)))) {
                     diagnostic_semantics.extend(answer.binding().targets().iter().copied());
@@ -2326,10 +2475,70 @@ pub fn project_native_definition_units(
             }
         }
     }
-    let Some(mut rows) = read_fragment_definition_rows(ready, &coordinates, cancellation)? else {
+    match project_source_definition_coordinates(
+        ready,
+        &source_definitions,
+        &coordinates,
+        cancellation,
+        session,
+    )? {
+        SelectedNativeDefinitions::Ready(source) => {
+            projected.extend(source);
+            Ok(SelectedNativeDefinitions::Ready(projected))
+        }
+        stopped => Ok(stopped),
+    }
+}
+
+/// The reverse candidate reader constructed these IDs from complete selected
+/// rows, so their mount/local-key coordinates already have source authority.
+/// Do not rediscover that provenance once per candidate.
+pub(super) fn project_hydrated_source_definition_units(
+    ready: &ReadySelectedResolution<'_, '_>,
+    definitions: &[SemanticId],
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<SelectedNativeDefinitions> {
+    let coordinates = definitions
+        .iter()
+        .map(|definition| {
+            (
+                SelectedResolutionMountOrdinal::new(
+                    definition
+                        .ordinal()
+                        .expect("hydrated source definition has a mount"),
+                ),
+                ResolutionLocalKey::new(i64::from(
+                    definition
+                        .local_key()
+                        .expect("hydrated source definition has a local key"),
+                )),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mounts = coordinates
+        .iter()
+        .map(|(mount, _)| *mount)
+        .collect::<Vec<_>>();
+    ready
+        .inventory
+        .requested_mount_rows()
+        .prefetch_ordinals(ready.inventory.connection(), &mounts)?;
+    project_source_definition_coordinates(ready, definitions, &coordinates, cancellation, session)
+}
+
+fn project_source_definition_coordinates(
+    ready: &ReadySelectedResolution<'_, '_>,
+    source_definitions: &[SemanticId],
+    coordinates: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<SelectedNativeDefinitions> {
+    let mut projected = Vec::with_capacity(source_definitions.len());
+    let Some(mut rows) = read_fragment_definition_rows(ready, coordinates, cancellation)? else {
         return Ok(SelectedNativeDefinitions::Cancelled);
     };
-    for (&definition, coordinate) in source_definitions.iter().zip(coordinates) {
+    for (&definition, coordinate) in source_definitions.iter().zip(coordinates.iter().copied()) {
         if cancellation.is_cancelled() || !session.scope_step() {
             return Ok(SelectedNativeDefinitions::Cancelled);
         }
@@ -3052,4 +3261,81 @@ fn project_native_import_binder(
         name,
         target_segments: segments,
     }))
+}
+
+impl SelectedResolutionOperation<'_, '_> {
+    /// Map only the identities returned by the current hierarchy request.
+    pub fn selected_hierarchy_definition_units(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<SelectedNativeDefinitions> {
+        native_units::project_native_definition_units(
+            &self.ready,
+            definitions,
+            cancellation,
+            session,
+        )
+    }
+}
+
+impl SelectedResolutionOperation<'_, '_> {
+    /// Locate a source unit through the selected definition crosswalk. A unit's
+    /// declaration extent is not its identifier span, so it is not a locator.
+    pub fn selected_hierarchy_definition(
+        &self,
+        target: &CodeUnit,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<LocatedSemantic> {
+        let language = brokk_bifrost_core::analyzer::common::language_for_file(target.source());
+        let path = crate::path_utils::rel_path_string(target.source());
+        let Some(mount) = self
+            .mount_table()
+            .mount_for_path(language.config_label(), &path)?
+        else {
+            return Ok(LocatedSemantic::Missing);
+        };
+        let super::super::selected_definition::SelectedDefinitionSemanticReadOutcome::Ready(rows) =
+            self.ready
+                .inventory
+                .hierarchy_definition_semantics_for_mount(mount.ordinal(), cancellation)?
+        else {
+            return Ok(LocatedSemantic::Cancelled);
+        };
+        let mut definitions = rows
+            .iter()
+            .map(|(key, _)| {
+                let key = u32::try_from(key.get()).map_err(|_| {
+                    StoreError::new(format!("selected definition key does not fit u32: {key:?}"))
+                })?;
+                Ok(SemanticId::local(mount.ordinal().get(), key))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        definitions.sort_unstable();
+        definitions.dedup();
+        match self.selected_hierarchy_definition_units(&definitions, cancellation, session)? {
+            SelectedNativeDefinitions::Ready(units) => {
+                let found = units
+                    .iter()
+                    .filter_map(|(id, definition)| match definition {
+                        SelectedNativeDefinition::Unit(unit) if unit == target => Some(*id),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                match found.as_slice() {
+                    [] => Err(StoreError::new(format!(
+                        "selected JVM definition crosswalk does not contain {target:?}: {units:?}"
+                    ))),
+                    [definition] => Ok(LocatedSemantic::Found(*definition)),
+                    _ => Err(StoreError::new(format!(
+                        "selected JVM unit has several definition identities: {target:?}, {found:?}"
+                    ))),
+                }
+            }
+            SelectedNativeDefinitions::Cancelled => Ok(LocatedSemantic::Cancelled),
+            SelectedNativeDefinitions::Unavailable => Ok(LocatedSemantic::Missing),
+        }
+    }
 }

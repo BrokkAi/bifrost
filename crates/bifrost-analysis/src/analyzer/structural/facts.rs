@@ -425,6 +425,17 @@ impl FileFacts {
         )
     }
 
+    /// Bind source-local rows to the exact selected parse before publication.
+    pub fn with_parse_identity(
+        mut self,
+        language: crate::analyzer::Language,
+        variant: brokk_bifrost_core::gitblob::ParseVariant,
+    ) -> Self {
+        self.source_identity =
+            ContentIdentity::from_source_bytes(self.source.as_bytes(), language, variant);
+        self
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }

@@ -247,6 +247,14 @@ bifrost --root /path/to/project --policy-file policies/security.rqlp --sources s
 to non-negative integer milliseconds. Parallel batches start unknown policies
 first, then hinted policies from longest to shortest; hints never change the report.
 
+`--policy-deadlines-ms <path>` reads a JSON object mapping non-empty policy IDs
+to integer milliseconds of at least 1, at most 256 entries; a relative path is
+read from the current directory. Each listed policy
+stops at its own deadline, counted from when its evaluation starts: it ends
+`inconclusive` with reason `rule_deadline_exceeded`, the exit status is 2, and
+`execution.timed_out_policy_ids` lists it, while the other policies keep
+running. A policy without an entry runs until the batch finishes.
+
 `--policy-timings` adds each policy's elapsed time to the report's work
 metrics.
 

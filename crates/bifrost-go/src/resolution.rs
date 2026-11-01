@@ -964,7 +964,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         }
         let scope = self.scope_for_source_range(node.start_byte(), node.end_byte());
         let declaration = self.add_site_in_scope(node, ResolutionSiteKind::TypeDeclaration, scope);
-        let synthetic_name = format!("$anon${}", node.start_byte());
+        let synthetic_name = crate::declarations::go_synthetic_name(node);
         let name = self.intern_name(&synthetic_name);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site: declaration,
@@ -1811,6 +1811,22 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         self.declaration_owners.push(Some(declaration));
         let syntax = self.lower_type(target);
         assert_eq!(self.declaration_owners.pop(), Some(Some(declaration)));
+        let mut terminal = target;
+        while let Some(inner) = match terminal.kind() {
+            "generic_type" => terminal.child_by_field_name("type"),
+            "pointer_type" | "parenthesized_type" => {
+                first_named_child_matching(terminal, |child| !child.is_extra())
+            }
+            _ => None,
+        } {
+            terminal = inner;
+        }
+        if matches!(terminal.kind(), "type_identifier" | "qualified_type") {
+            self.facts.name_lookups.push(ResolutionNameLookupFact {
+                site: self.slot(syntax.input).site,
+                kind: ResolutionNameLookupKind::AliasTarget,
+            });
+        }
         self.publish_function_type_signature(declaration, syntax.input);
         self.add_transfer(
             syntax.input,
@@ -4096,7 +4112,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         }
         let scope = self.scope_for_source_range(node.start_byte(), node.end_byte());
         let declaration = self.add_site_in_scope(node, ResolutionSiteKind::TypeDeclaration, scope);
-        let synthetic_name = format!("$anon$interface${}", node.start_byte());
+        let synthetic_name = crate::declarations::go_synthetic_name(node);
         let name = self.intern_name(&synthetic_name);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site: declaration,

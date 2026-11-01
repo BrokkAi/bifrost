@@ -398,7 +398,7 @@ impl<'a, 'store, 'input> DemandRules for RustRules<'a, 'store, 'input> {
         scopes: &'b crate::analyzer::store::resolution_lexical::NodeSourceScopes,
         lexical: &'b dyn super::super::demand_closure::HalfSource,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-    ) -> Result<Option<Self::Half<'b>>> {
+    ) -> Result<super::super::demand_closure::HalfRowsOutcome<Self::Half<'b>>> {
         super::rows::EndpointRows {
             ready: self.prepared.ready,
             base: self.prepared.base,
@@ -407,7 +407,7 @@ impl<'a, 'store, 'input> DemandRules for RustRules<'a, 'store, 'input> {
             topologies: &self.prepared.demand.topologies,
         }
         .half(source, frame, scopes, lexical, inputs)
-        .map(Some)
+        .map(super::super::demand_closure::HalfRowsOutcome::Rows)
     }
     type PreparationKey = ();
     type Certificate = ();

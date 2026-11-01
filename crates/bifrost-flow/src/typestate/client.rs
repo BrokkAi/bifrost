@@ -1217,6 +1217,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                         ProtocolUncertaintyCause::ExternalCall
                     }
                     crate::analyzer::semantic::DispatchBoundaryKind::Unresolved
+                    | crate::analyzer::semantic::DispatchBoundaryKind::HierarchyUnenumerated
                     | crate::analyzer::semantic::DispatchBoundaryKind::Truncated => {
                         ProtocolUncertaintyCause::UnknownCall
                     }

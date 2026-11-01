@@ -2813,6 +2813,160 @@ func use() {
     }
 
     #[test]
+    fn caller_inventory_function_value_escape() {
+        use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+            CallRelationLimits, CallerInventoryCoverage,
+        };
+        let (fixture, analyzer) = go_fixture(
+            "example.test/escape",
+            &[(
+                "main.go",
+                concat!(
+                    "package escape\n",
+                    "func Target() {}\nfunc Direct() {}\n",
+                    "func Invoke(f func()) { f() }\n",
+                    "func Caller() { f := Target; f(); Invoke(Target); Direct() }\n",
+                    "type Box struct{}\n",
+                    "func (Box) Method() {}\nfunc (Box) Expression() {}\n",
+                    "func Methods() { m := Box{}.Method; m(); e := Box.Expression; e(Box{}) }\n",
+                ),
+            )],
+        );
+        // A method value and a method expression escape the same way.
+        for (name, expected) in [
+            ("Target", CallerInventoryCoverage::Incomplete),
+            ("Method", CallerInventoryCoverage::Incomplete),
+            ("Expression", CallerInventoryCoverage::Incomplete),
+            ("Direct", CallerInventoryCoverage::Complete),
+        ] {
+            let target = target_at(&analyzer, &fixture, "main.go", name);
+            let result = crate::analyzer::go::native_call_relations::go_native_incoming_calls(
+                &analyzer,
+                &target,
+                CallRelationLimits {
+                    max_files: 64,
+                    max_source_bytes: 1024 * 1024,
+                    max_candidates: 256,
+                },
+                None,
+            );
+            assert_eq!(result.caller_inventory, expected, "{name}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn caller_inventory_method_reached_through_interface() {
+        use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+            CallRelationLimits, CallerInventoryCoverage,
+        };
+        let (fixture, analyzer) = go_fixture(
+            "example.test/dispatch",
+            &[
+                (
+                    "handler/handler.go",
+                    concat!(
+                        "package handler\n",
+                        "import \"net/http\"\n",
+                        "type H struct{}\n",
+                        "func (H) ServeHTTP(w http.ResponseWriter, r *http.Request) {}\n",
+                        "func Register() { http.Handle(\"/\", H{}) }\n",
+                    ),
+                ),
+                (
+                    "runner/runner.go",
+                    "package runner\ntype Runner interface{ Run() }\nfunc Do(r Runner) { r.Run() }\n",
+                ),
+                (
+                    "main.go",
+                    concat!(
+                        "package dispatch\n",
+                        "import \"example.test/dispatch/runner\"\n",
+                        "type T struct{}\n",
+                        "func (T) Run() {}\n",
+                        "func helper() {}\n",
+                        "func Main() { runner.Do(T{}); helper() }\n",
+                    ),
+                ),
+            ],
+        );
+        for (path, name, expected) in [
+            (
+                "handler/handler.go",
+                "ServeHTTP",
+                CallerInventoryCoverage::Incomplete,
+            ),
+            ("main.go", "Run", CallerInventoryCoverage::Incomplete),
+            ("main.go", "helper", CallerInventoryCoverage::Complete),
+            // The interface's own declaration is named by `r.Run()`.
+            ("runner/runner.go", "Run", CallerInventoryCoverage::Complete),
+        ] {
+            let target = target_at(&analyzer, &fixture, path, name);
+            let result = crate::analyzer::go::native_call_relations::go_native_incoming_calls(
+                &analyzer,
+                &target,
+                CallRelationLimits {
+                    max_files: 64,
+                    max_source_bytes: 1024 * 1024,
+                    max_candidates: 256,
+                },
+                None,
+            );
+            assert_eq!(result.caller_inventory, expected, "{name}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn caller_inventory_empty_cancelled_and_truncated() {
+        use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+            CallRelationLimits, CallerInventoryCoverage,
+        };
+        let (fixture, analyzer) = go_fixture(
+            "example.test/inventory",
+            &[(
+                "main.go",
+                "package inventory\nfunc Unused() {}\nfunc Target() {}\nfunc Caller() { Target() }\n",
+            )],
+        );
+        let unused = target_at(&analyzer, &fixture, "main.go", "Unused");
+        let target = target_at(&analyzer, &fixture, "main.go", "Target");
+        let limits = CallRelationLimits {
+            max_files: 64,
+            max_source_bytes: 1024 * 1024,
+            max_candidates: 256,
+        };
+        let query = |target, limits, token| {
+            crate::analyzer::go::native_call_relations::go_native_incoming_calls(
+                &analyzer, target, limits, token,
+            )
+        };
+        let empty = query(&unused, limits, None);
+        assert!(empty.sites.is_empty(), "{empty:?}");
+        assert_eq!(
+            empty.caller_inventory,
+            CallerInventoryCoverage::Complete,
+            "{empty:?}"
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            query(&target, limits, Some(&cancelled)).caller_inventory,
+            CallerInventoryCoverage::Incomplete
+        );
+        assert_eq!(
+            query(
+                &target,
+                CallRelationLimits {
+                    max_candidates: 0,
+                    ..limits
+                },
+                None
+            )
+            .caller_inventory,
+            CallerInventoryCoverage::Incomplete
+        );
+    }
+
+    #[test]
     fn selected_go_native_incoming_calls_are_exactly_inverse_call_sites() {
         use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
@@ -2857,6 +3011,36 @@ func use() {
         let native = crate::analyzer::go::native_call_relations::go_native_incoming_calls(
             &analyzer, &target, limits, None,
         );
+        assert_eq!(native.caller_inventory,
+            brokk_bifrost_analysis::analyzer::usages::call_relations::CallerInventoryCoverage::Complete,
+            "{native:#?}");
+        // Membership proof does not weaken an exhaustive candidate inventory.
+        let mut ambiguous = selected.clone();
+        ambiguous.completeness = EdgeCompleteness::Complete;
+        for edge in &mut ambiguous.edges {
+            edge.proof = brokk_bifrost_core::analyzer::usages::model::UsageProof::Unproven;
+        }
+        let ambiguous = crate::analyzer::go::native_call_relations::project_incoming_calls(
+            &analyzer,
+            &target,
+            ambiguous,
+            limits,
+            &CancellationToken::new(),
+        );
+        assert_eq!(ambiguous.caller_inventory, brokk_bifrost_analysis::analyzer::usages::call_relations::CallerInventoryCoverage::Complete);
+        assert!(!ambiguous.sites.is_empty());
+        let mut stale = selected.clone();
+        stale.completeness = EdgeCompleteness::Incomplete {
+            reasons: vec![EdgeIncompleteReason::InverseIndexResolutionIncomplete],
+        };
+        let stale = crate::analyzer::go::native_call_relations::project_incoming_calls(
+            &analyzer,
+            &target,
+            stale,
+            limits,
+            &CancellationToken::new(),
+        );
+        assert_eq!(stale.caller_inventory, brokk_bifrost_analysis::analyzer::usages::call_relations::CallerInventoryCoverage::Incomplete);
         assert_eq!(native.proof_authority, UsageProofAuthority::Native);
         assert!(!native.cancelled && !native.truncated, "{native:#?}");
         assert_eq!(

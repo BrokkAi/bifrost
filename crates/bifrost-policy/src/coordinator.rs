@@ -1047,6 +1047,9 @@ pub fn evaluate_policy_source(
 /// can return a bounded canonical report immediately. Callers that continue to
 /// evaluation should move the returned preflight into the analyzer-backed
 /// evaluation entry point rather than reading the sources again.
+/// Conventional sources are loaded in default, private, then local order.
+/// Preflight records every load failure in that order; the canonical failure
+/// report names the first failed source.
 pub fn preflight_policy_suppressions(
     root: impl AsRef<Path>,
     options: &PolicyEvaluationOptions,
@@ -1623,6 +1626,8 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "canonical-external-dispatch",
     "class-set-type-flow",
     "conditional-result-contracts",
+    "configuration-absence",
+    "configuration-code",
     "configuration-facts",
     "declaration-attributes",
     "declaration-bounded-containment",
@@ -1637,6 +1642,7 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "external-api-identity",
     "failure-edge-control",
     "failure-handler-state",
+    "field-write-value",
     "flow",
     "guard-dominance",
     "interprocedural-transfer",
@@ -1666,6 +1672,7 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "reaching-binding-assertion",
     "reaching-definitions",
     "resolved-call-target",
+    "resolved-value",
     "result-contract-failure-uses",
     "result-contract-operation-uses",
     "reviewed-csharp-bcl-result-obligation",
@@ -3578,7 +3585,11 @@ fn evaluate_prepared_policy_inputs(
     // explicitly widened caller budget survives and an explicitly narrowed one
     // is raised back to the fixed defaults.
     let root_memo = brokk_bifrost_rql::TypeFlowRootMemo::default();
-    let per_policy_budget = policy_budget_for_workspace(*batch_budget.per_policy(), workspace);
+    let batch_budget = batch_budget.with_scaled_per_policy(policy_budget_for_workspace(
+        *batch_budget.per_policy(),
+        workspace,
+    ));
+    let per_policy_budget = *batch_budget.per_policy();
     let activation_for_report = workspace_activation
         .as_ref()
         .and_then(Option::as_ref)
@@ -6892,6 +6903,45 @@ fn safe_report_text(value: String) -> String {
 }
 
 #[cfg(test)]
+#[path = "coordinator/request_boundaries_tests.rs"]
+mod request_boundaries_tests;
+
+#[cfg(test)]
+#[path = "coordinator/activation_failure_tests.rs"]
+mod activation_failure_tests;
+
+#[cfg(test)]
+#[path = "coordinator/workspace_budget_tests.rs"]
+mod workspace_budget_tests;
+
+#[cfg(test)]
+#[path = "coordinator/suppression_preflight_tests.rs"]
+mod suppression_preflight_tests;
+
+#[cfg(test)]
+#[path = "coordinator/preparation_timing_tests.rs"]
+mod preparation_timing_tests;
+
+#[cfg(test)]
+#[path = "coordinator/model_persistence_tests.rs"]
+mod model_persistence_tests;
+
+#[cfg(test)]
+#[path = "coordinator/incomplete_model_tests.rs"]
+mod incomplete_model_tests;
+
+#[cfg(test)]
+#[path = "coordinator/policy_source_identity_tests.rs"]
+mod policy_source_identity_tests;
+
+#[cfg(test)]
+#[path = "coordinator_input_tests.rs"]
+mod coordinator_input_tests;
+#[cfg(test)]
+#[path = "coordinator/procedure_summary_fallback_tests.rs"]
+mod procedure_summary_fallback_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::PolicyRunScopeKind;
     use brokk_bifrost_test_macros::hardwon;
@@ -6918,6 +6968,55 @@ mod tests {
         PRIVATE_POLICY_SUPPRESSION_PATH,
     };
     use crate::write_policy_json;
+
+    #[test]
+    #[hardwon("0d34b2a1f2e2: report retention used the unscaled per-policy findings cap")]
+    fn audited_files_retain_scaled_findings_cold_and_warm() {
+        let project = tempfile::tempdir().expect("workspace");
+        // Each of two files contributes K findings: scaling must retain all 2K.
+        let findings_per_file = crate::budget::SCALED_FINDINGS_PER_FILE;
+        let source = (0..findings_per_file)
+            .map(|index| format!("namespace N{index} {{ export function target() {{}} }}\n"))
+            .collect::<String>();
+        for name in ["first.ts", "second.ts"] {
+            std::fs::write(project.path().join(name), &source).expect("source file");
+        }
+        let policy = r#"(policy
+  :schema-version 1
+  :id "test.audited-files"
+  :name "Audited files"
+  :message "Avoid target"
+  :severity warning
+  :analysis (analysis :type match
+    :selector (rql :schema-version 1
+      (language typescript (function :name "target")))))"#;
+        std::fs::write(project.path().join("policy.rqlp"), policy).expect("policy file");
+        let narrow = PolicyBudget::builder()
+            .with_max_findings(1)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = PolicyBatchBudget::builder()
+            .with_per_policy(narrow)
+            .unwrap()
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let outcome = evaluate_policy_files_with_limits(
+                project.path(),
+                &[std::path::PathBuf::from("policy.rqlp")],
+                &crate::test_support::evaluation_options("2026-07-27"),
+                batch,
+                PolicyRegistryLimits::default(),
+            )
+            .expect("canonical policy report");
+            let [run] = outcome.report().runs() else {
+                panic!("one policy run: {:?}", outcome.report().runs());
+            };
+            assert!(run.completion().is_complete(), "{run:?}");
+            assert_eq!(run.findings().len(), 2 * findings_per_file);
+        }
+    }
 
     fn evaluation_options() -> PolicyEvaluationOptions {
         crate::test_support::evaluation_options("2026-07-27")
@@ -9682,9 +9781,14 @@ pub fn run() {
     fn mixed_diff_base_reuses_only_complete_policy_evidence() {
         let workspace = tempfile::tempdir().expect("workspace");
         init_git_workspace(workspace.path());
+        // One file scales to K findings; K + 1 "over" matches must leave
+        // exactly one beyond that allowance while "target" stays complete.
         fs::write(
             workspace.path().join("app.ts"),
-            "export function target() {}\nexport function over() {}\nexport function over() {}\n",
+            format!(
+                "export function target() {{}}\n{}",
+                "export function over() {}\n".repeat(crate::budget::SCALED_FINDINGS_PER_FILE + 1)
+            ),
         )
         .expect("source fixture");
         write_policy(

@@ -58,8 +58,6 @@ use brokk_bifrost_analysis::analyzer::usages::workspace_graph::WorkspaceUsageNod
 
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::is_graph_declaration;
 
-use brokk_bifrost_core::analyzer::usages::model::CONFIDENCE_THRESHOLD;
-
 use brokk_bifrost_analysis::analyzer::usages::traits::CandidateFileProvider;
 
 use brokk_bifrost_analysis::analyzer::usages::finder::DEFAULT_MAX_FILES;
@@ -173,6 +171,8 @@ use std::sync::{Arc, OnceLock};
 
 mod definitions;
 pub(crate) mod navigation;
+#[cfg(test)]
+mod navigation_schema_tests;
 pub(crate) mod scan_usages;
 pub(crate) mod selectors;
 pub(crate) mod sources;
@@ -690,7 +690,11 @@ pub struct RefreshResult {
 pub enum SemanticModelOverlayStatus {
     Ready,
     NoModels,
-    Pending,
+    Pending {
+        stage: SemanticModelWarmStage,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pending_acquisitions: Vec<PendingSemanticPackAcquisition>,
+    },
     Partial {
         reasons: Vec<String>,
     },
@@ -701,6 +705,20 @@ pub enum SemanticModelOverlayStatus {
             brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayBudgetExceeded,
         >,
     },
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticModelWarmStage {
+    ActivatingInstalledPacks,
+    ActivatingConfiguredPacks,
+    AcquisitionPending,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct PendingSemanticPackAcquisition {
+    pub ecosystem: String,
+    pub dependency_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]

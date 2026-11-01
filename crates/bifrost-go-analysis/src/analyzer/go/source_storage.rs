@@ -372,7 +372,8 @@ impl<A: LanguageAdapter> CanonicalGoSourceFacts for TreeSitterAnalyzer<A> {
     ) -> Option<Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>> {
         let generation = self.language_generation("go")?;
         let oid = self.resolve_live_oid_for_file(file)?;
-        let file_key = self.file_read_key(file, oid);
+        let file_key =
+            self.file_read_key(file, oid, brokk_bifrost_core::gitblob::ParseVariant::Empty);
         self.record_read_key(file_key.clone());
         debug_assert!(
             brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers(
@@ -398,36 +399,47 @@ impl<A: LanguageAdapter> CanonicalGoSourceFacts for TreeSitterAnalyzer<A> {
             brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
             file.clone(),
         );
-        let value =
-            cache
-                .read(&memo_attribution(self), |cache, capture| {
-                    if let Some(facts) = cache.get(&cache_key) {
-                        return Ok(facts);
-                    }
-                    let entry =
-                        Arc::new(capture.try_build_weighted(|| {
-                            // Capture the original module receipt even when the caller
-                            // has no capture. A later probe can describe a different
-                            // module namespace than the one mounted into this value.
-                            self.record_read_key(self.file_read_key(file, oid));
-                            let facts = self.store_query_or_record(
-                        |sink| sink.push(self.file_read_key(file, oid)),
-                        self.store_context.store.go_source_facts(
-                            oid,
-                            generation,
-                            self.adapter.as_ref(),
-                            file,
-                            &|| true,
-                        ),
-                        format!("reading canonical Go declaration facts for {file:?} ({oid})"),
-                    ).flatten().ok_or(())?;
-                            let bytes = facts.estimated_retained_bytes();
-                            Ok::<_, ()>((Arc::new(facts), bytes))
-                        })?);
-                    cache.insert(cache_key, Arc::clone(&entry));
-                    Ok::<_, ()>(entry)
-                })
-                .ok()?;
+        let value = cache
+            .read(&memo_attribution(self), |cache, capture| {
+                if let Some(facts) = cache.get(&cache_key) {
+                    return Ok(facts);
+                }
+                let entry = Arc::new(capture.try_build_weighted(|| {
+                    // Capture the original module receipt even when the caller
+                    // has no capture. A later probe can describe a different
+                    // module namespace than the one mounted into this value.
+                    self.record_read_key(self.file_read_key(
+                        file,
+                        oid,
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                    ));
+                    let facts = self
+                        .store_query_or_record(
+                            |sink| {
+                                sink.push(self.file_read_key(
+                                    file,
+                                    oid,
+                                    brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                                ))
+                            },
+                            self.store_context.store.go_source_facts(
+                                oid,
+                                generation,
+                                self.adapter.as_ref(),
+                                file,
+                                &|| true,
+                            ),
+                            format!("reading canonical Go declaration facts for {file:?} ({oid})"),
+                        )
+                        .flatten()
+                        .ok_or(())?;
+                    let bytes = facts.estimated_retained_bytes();
+                    Ok::<_, ()>((Arc::new(facts), bytes))
+                })?);
+                cache.insert(cache_key, Arc::clone(&entry));
+                Ok::<_, ()>(entry)
+            })
+            .ok()?;
         Some(Arc::clone(&value))
     }
 }

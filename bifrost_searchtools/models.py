@@ -5647,6 +5647,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     MISSING_STRUCTURAL_ADAPTER = "missing_structural_adapter"
     RECOVERED_SYNTAX_INCOMPLETE = "recovered_syntax_incomplete"
     UNSUPPORTED_IMPORT_ANALYSIS = "unsupported_import_analysis"
+    HIERARCHY_INCOMPLETE = "hierarchy_incomplete"
     SEMANTIC_RESULTS_OMITTED = "semantic_results_omitted"
     SEMANTIC_WORKSPACE_REQUIRED = "semantic_workspace_required"
     NO_ENCLOSING_PROCEDURE = "no_enclosing_procedure"
@@ -5659,6 +5660,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
     SEMANTIC_PROVIDER_FAILED = "semantic_provider_failed"
     SEMANTIC_PACK_ACQUISITION_PENDING = "semantic_pack_acquisition_pending"
+    WORKSPACE_SEMANTIC_MODELS_NOT_LOADED = "workspace_semantic_models_not_loaded"
     UNRESOLVED_PROTOCOL_REFERENCE = "unresolved_protocol_reference"
     TYPESTATE_REGISTRATION_STALE = "typestate_registration_stale"
     TYPESTATE_HANDLE_STALE = "typestate_handle_stale"
@@ -7101,18 +7103,29 @@ class SymbolLocationsResult:
 class SymbolAncestors:
     symbol: str
     ancestors: list[str]
+    complete: bool = True
+    incomplete_reasons: list[str] = field(default_factory=list)
+    alternatives: list[list[str]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> SymbolAncestors:
         return cls(
             symbol=data["symbol"],
             ancestors=list(data["ancestors"]),
+            complete=data.get("complete", True),
+            incomplete_reasons=list(data.get("incomplete_reasons", [])),
+            alternatives=[list(group) for group in data.get("alternatives", [])],
         )
 
     def render_text(self) -> str:
-        if not self.ancestors:
+        if not self.ancestors and self.complete:
             return f"{self.symbol}: <none>"
-        return "\n".join([self.symbol, *[f"  - {ancestor}" for ancestor in self.ancestors]])
+        lines = [self.symbol, *[f"  - {ancestor}" for ancestor in self.ancestors]]
+        if not self.complete:
+            if self.incomplete_reasons:
+                lines.append("Incomplete: " + ", ".join(self.incomplete_reasons))
+            lines.extend("One of: " + " | ".join(group) for group in self.alternatives)
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -7781,6 +7794,8 @@ class SymbolSummariesResult:
     too_broad: list[TooBroadScope] = field(default_factory=list)
     render_line_numbers: bool = True
     rendered_text: str | None = None
+    complete: bool = True
+    incomplete_reason: str | None = None
 
     @classmethod
     def from_dict(
@@ -7808,6 +7823,8 @@ class SymbolSummariesResult:
             too_broad=[TooBroadScope.from_dict(item) for item in data.get("too_broad", [])],
             render_line_numbers=render_line_numbers,
             rendered_text=rendered_text,
+            complete=data.get("complete", True),
+            incomplete_reason=data.get("incomplete_reason"),
         )
 
     @property
@@ -7823,13 +7840,29 @@ class SymbolSummariesResult:
         blocks.extend(listing.render_text() for listing in self.listings)
         if self.compact_symbols is not None:
             blocks.append(self.compact_symbols.render_text())
-        return _render_symbol_result_sections(
+        rendered = _render_symbol_result_sections(
             blocks,
             self.not_found,
             [*self.ambiguous, *self.ambiguous_paths],
             "No matching summaries found.",
             [scope.render_text() for scope in self.too_broad],
         )
+        if self.complete:
+            return rendered
+        notices = {
+            "cancelled": "summary lookup was cancelled before all selectors reached a verdict",
+            "time_budget": "summary lookup exceeded its time budget",
+            "structure_unavailable": "indexed syntax was unavailable",
+            "semantic_evidence_unavailable": "structured semantic evidence was unavailable",
+            "artifact_unavailable": "a required artifact was unavailable",
+            "semantic_evidence_gap": "structured semantic evidence was incomplete",
+            "store_failure": "indexed reads failed",
+            "source_unavailable": "source content was unavailable",
+        }
+        notice = notices.get(self.incomplete_reason, "summary lookup was incomplete")
+        if rendered == "No matching summaries found.":
+            return f"Incomplete: {notice}."
+        return f"{rendered}\n\nIncomplete: {notice}."
 
 
 FileSummariesResult = SymbolSummariesResult
@@ -8364,6 +8397,29 @@ class UsageGraphTruncatedSymbol:
 
 
 @dataclass(frozen=True)
+class UsageGraphCSharpCompilation:
+    """One selected C# project or loose compilation in a usage graph."""
+
+    project_path: str | None
+    configuration: str
+    target_framework: str | None
+    defined_symbols: list[str]
+    closed: bool
+    open_reason: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UsageGraphCSharpCompilation:
+        return cls(
+            project_path=data["project_path"],
+            configuration=data["configuration"],
+            target_framework=data["target_framework"],
+            defined_symbols=data["defined_symbols"],
+            closed=data["closed"],
+            open_reason=data.get("open_reason"),
+        )
+
+
+@dataclass(frozen=True)
 class UsageGraphResult:
     """The whole-workspace resolved usage graph.
 
@@ -8375,6 +8431,7 @@ class UsageGraphResult:
     edges: list[UsageGraphEdge]
     truncated_symbols: list[UsageGraphTruncatedSymbol]
     session_subset: SessionSubset | None = None
+    csharp_compilations: list[UsageGraphCSharpCompilation] = field(default_factory=list)
     rendered_text: str | None = None
 
     @classmethod
@@ -8389,6 +8446,10 @@ class UsageGraphResult:
                 for item in data.get("truncated_symbols", [])
             ],
             session_subset=_session_subset(data),
+            csharp_compilations=[
+                UsageGraphCSharpCompilation.from_dict(item)
+                for item in data.get("csharp_compilations", [])
+            ],
             rendered_text=rendered_text,
         )
 
@@ -9526,6 +9587,7 @@ class SearchFileContentsResult:
     truncated: bool
     invalid_patterns: list[str]
     ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
+    incomplete_reasons: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> SearchFileContentsResult:
@@ -9536,6 +9598,7 @@ class SearchFileContentsResult:
             truncated=bool(data.get("truncated", False)),
             invalid_patterns=list(data.get("invalid_patterns", [])),
             ambiguous_paths=_ambiguous_paths(data),
+            incomplete_reasons=list(data.get("incomplete_reasons", [])),
         )
 
     @property
@@ -9548,6 +9611,7 @@ class FindFilesContainingResult:
     files: list[str]
     truncated: bool
     invalid_patterns: list[str]
+    incomplete_reasons: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> FindFilesContainingResult:
@@ -9555,6 +9619,7 @@ class FindFilesContainingResult:
             files=list(data.get("files", [])),
             truncated=bool(data.get("truncated", False)),
             invalid_patterns=list(data.get("invalid_patterns", [])),
+            incomplete_reasons=list(data.get("incomplete_reasons", [])),
         )
 
     @property

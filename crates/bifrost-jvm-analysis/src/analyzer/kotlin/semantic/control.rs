@@ -50,6 +50,7 @@ pub(in crate::analyzer::kotlin::semantic) fn lower_procedure<'tree, 'targets>(
         locals: HashMap::default(),
         scalar_types: HashMap::default(),
         mutable_locals: HashSet::default(),
+        shared_binding_locations: HashMap::default(),
         delegated_locals: HashSet::default(),
         local_callables: HashMap::default(),
         constructible_types,
@@ -71,6 +72,17 @@ pub(in crate::analyzer::kotlin::semantic) fn lower_procedure<'tree, 'targets>(
     context.bind_receiver_carrier(spec.callable);
     context.emit_capture_inputs(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, spec.body.scan_root())?;
+    context.emit_shared_binding_cells(&mut builder, entry, spec)?;
+    if spec.ancestor_capture_gap {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::Captures,
+            SemanticGapKind::Unsupported,
+            "a nested Kotlin closure reads a local outside its direct lexical parent",
+        )?;
+    }
 
     if spec.kind == ProcedureKind::Initializer {
         // One scoped fact per procedure: a delegated property is an initializer
@@ -1157,7 +1169,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let mut calls_gap_recorded = false;
                 if let Some(text) = node_text(self.prepared.source(), name) {
                     let local = self.local_at(text, name.start_byte());
-                    let target = local.or_else(|| self.parameters.get(text).copied());
+                    let target = local
+                        .or_else(|| self.parameters.get(text).copied())
+                        .or_else(|| self.captured_bindings.get(text).copied());
                     if let Some(target) = target {
                         if self.delegated_locals.contains(&target) {
                             let detail = if compound_gap {
@@ -1175,7 +1189,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             )?;
                             calls_gap_recorded = true;
                         }
-                        let kind = if local.is_some() {
+                        let kind = if local.is_some() || self.captured_bindings.contains_key(text) {
                             ValueFlowKind::Local
                         } else {
                             ValueFlowKind::Parameter
@@ -2068,6 +2082,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 target,
             },
         )?;
+        if let Some((location, kind)) = self.shared_binding_locations.get(&target).copied() {
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind,
+                    location,
+                    value: computed,
+                },
+            )?;
+        }
         self.edge(builder, operation, EdgeTarget::normal(terminal))?;
         self.edge(builder, terminal, next)?;
         self.schedule_expressions(
@@ -2692,27 +2717,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             },
         )?;
-        let writes_captured_mutable = target.as_ref().is_some_and(|target| {
-            target.captures.iter().any(|capture| {
-                self.local_declaration_value(&capture.name, capture.declaration_start)
-                    .is_some_and(|value| {
-                        self.mutable_locals.contains(&value)
-                            && lambda_writes_name(node, &capture.name, self.prepared.source())
-                    })
-            })
-        });
-        // The inventory currently publishes only immutable `val` capture
-        // slots. A closure write to an outer `var` therefore has no capture
-        // row to match; recover that missing alias fact from the structured
-        // assignment target and the parent lexical binding.
-        if writes_captured_mutable
-            || lambda_writes_mutable_local(
-                node,
-                &self.locals,
-                &self.mutable_locals,
-                self.prepared.source(),
-            )
-        {
+        if lambda_writes_mutable_local(
+            node,
+            &self.locals,
+            &self.mutable_locals,
+            self.prepared.source(),
+            target.as_ref().map(|target| target.captures.as_ref()),
+        ) {
             self.add_gap(
                 builder,
                 entry,
@@ -2751,6 +2762,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             capture.name
                         ))
                     })?;
+                if self.delegated_locals.contains(&source) {
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Captures,
+                        SemanticGapKind::Unsupported,
+                        "captured delegated local reads and writes through getValue/setValue",
+                    )?;
+                }
                 let destination = lexical_capture_destination(
                     target.receiver_capture_destination.is_some(),
                     index,
@@ -2761,9 +2782,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     result,
                     target.id,
                     environment,
-                    CaptureSource::Value(source),
+                    if capture.mutable {
+                        let (location, _) = self
+                            .shared_binding_locations
+                            .get(&source)
+                            .copied()
+                            .expect("captured Kotlin var has a parent lexical cell");
+                        CaptureSource::Location(location)
+                    } else {
+                        CaptureSource::Value(source)
+                    },
                     destination,
-                    CaptureMode::Value,
+                    if capture.mutable {
+                        CaptureMode::MutableCell
+                    } else {
+                        CaptureMode::Value
+                    },
                 )?;
             }
         }
@@ -3199,31 +3233,12 @@ fn is_kotlin_integral_type(scalar: KotlinScalarType) -> bool {
     )
 }
 
-fn lambda_writes_name(lambda: Node<'_>, name: &str, source: &str) -> bool {
-    let mut stack = vec![lambda];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "assignment"
-            && let Some((target, _)) = assignment_parts(node)
-            && let AssignmentTarget::Name(target) = assignment_target(target)
-            && node_text(source, target) == Some(name)
-        {
-            return true;
-        }
-        if is_integer_update(node)
-            && unary_operand(node).and_then(|operand| node_text(source, operand)) == Some(name)
-        {
-            return true;
-        }
-        stack.extend(named_children(node));
-    }
-    false
-}
-
 fn lambda_writes_mutable_local(
     lambda: Node<'_>,
     locals: &HashMap<Box<str>, Vec<LocalBinding>>,
     mutable_locals: &HashSet<ValueId>,
     source: &str,
+    published: Option<&[LexicalCaptureSource]>,
 ) -> bool {
     let mut stack = vec![lambda];
     while let Some(node) = stack.pop() {
@@ -3244,6 +3259,14 @@ fn lambda_writes_mutable_local(
                         && binding.scope_start <= lambda.start_byte()
                         && lambda.start_byte() < binding.scope_end
                         && mutable_locals.contains(&binding.value)
+                        && (is_integer_update(node)
+                            || is_compound_assignment(node)
+                            || !published.is_some_and(|captures| {
+                                captures.iter().any(|capture| {
+                                    capture.mutable
+                                        && capture.declaration_start == binding.declaration_start
+                                })
+                            }))
                 })
             })
         {

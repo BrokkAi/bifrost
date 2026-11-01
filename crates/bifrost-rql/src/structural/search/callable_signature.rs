@@ -73,6 +73,9 @@ pub(super) fn callable_signature_expansions_for_declaration(
     // Overloads with the same displayed name remain distinct because the
     // analyzer declaration identity includes their structured signature. The
     // source span then distinguishes multiple indexed sites of that identity.
+    // These public rows include declaration-site IDs and parameter byte bounds.
+    // Their locations are separate from the semantic signature certificate.
+    crate::analyzer::record_position_read(analyzer, declaration.unit.source());
     let declaration_site_id = declaration.site_id();
     let special_method_context = python_special_method_context(analyzer, declaration);
     let python_receiver = super::python_method_receiver::receiver_evidence(

@@ -256,6 +256,7 @@ from .models import (
     TypeListingEntry,
     TestScope,
     UsageGraphCallSite,
+    UsageGraphCSharpCompilation,
     UsageGraphEdge,
     UsageGraphNode,
     UsageGraphResult,
@@ -523,6 +524,7 @@ __all__ = [
     "TypeListingEntry",
     "TestScope",
     "UsageGraphCallSite",
+    "UsageGraphCSharpCompilation",
     "UsageGraphEdge",
     "UsageGraphNode",
     "UsageGraphResult",
@@ -533,3 +535,14 @@ __all__ = [
     "XmlSkimFile",
     "parse_code_query_response",
 ]
+
+
+def __getattr__(name: str):
+    # A release wheel carries the extension module compressed (#8288), so
+    # `from bifrost_searchtools import _native` cannot find a file to import;
+    # the client's loader unpacks and loads it instead.
+    if name == "_native":
+        from .client import _load_native_module
+
+        return _load_native_module(None)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

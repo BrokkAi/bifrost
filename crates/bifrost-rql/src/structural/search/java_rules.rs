@@ -218,6 +218,7 @@ fn javadoc_matches(
                         .map(|report| LanguageRuleMatch {
                             select: node_range(node),
                             report,
+                            heuristic: None,
                         }),
                 );
             }
@@ -240,7 +241,11 @@ fn javadoc_matches(
                         tag_matches.extend(
                             callable_unknown_parameter_tags(&sites, node, &source)
                                 .into_iter()
-                                .map(|report| LanguageRuleMatch { select, report }),
+                                .map(|report| LanguageRuleMatch {
+                                    select,
+                                    report,
+                                    heuristic: None,
+                                }),
                         );
                     }
                     JavaRule::InconsistentJavadocThrows => {
@@ -250,7 +255,11 @@ fn javadoc_matches(
                         tag_matches.extend(
                             reports
                                 .into_iter()
-                                .map(|report| LanguageRuleMatch { select, report }),
+                                .map(|report| LanguageRuleMatch {
+                                    select,
+                                    report,
+                                    heuristic: None,
+                                }),
                         );
                     }
                     _ => record_decision(

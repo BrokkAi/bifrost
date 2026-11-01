@@ -220,6 +220,7 @@ pub(crate) mod jvm_extraction_tests {
                 "java",
                 java_generation,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: java_path.to_owned(),
                     blob_oid: java_oid,
                 }],
@@ -242,6 +243,7 @@ pub(crate) mod jvm_extraction_tests {
                 "scala",
                 scala_generation,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: scala_path.to_owned(),
                     blob_oid: scala_oid,
                 }],
@@ -712,6 +714,7 @@ pub(crate) mod jvm_extraction_tests {
                 "java",
                 java_generation,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: java_path.to_owned(),
                     blob_oid: java_oid,
                 }],
@@ -734,6 +737,7 @@ pub(crate) mod jvm_extraction_tests {
                 peer_storage_language,
                 peer_generation,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: peer_path.to_owned(),
                     blob_oid: peer_oid,
                 }],
@@ -908,6 +912,7 @@ pub(crate) mod jvm_extraction_tests {
                 storage,
                 generation,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: path.to_owned(),
                     blob_oid: oid,
                 }],

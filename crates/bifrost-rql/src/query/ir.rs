@@ -1804,6 +1804,9 @@ pub struct QueryRowProjectionColumn {
 pub enum CallArgumentSelector {
     FormalName(String),
     FormalIndex(usize),
+    /// The qualified name of a Java annotation or C# attribute that the bound
+    /// formal carries in the callee's own declaration.
+    FormalAnnotationType(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

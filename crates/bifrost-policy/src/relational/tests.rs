@@ -1897,3 +1897,7 @@ fn unavailable_conversion_inputs_survive_join_without_a_definite_assertion() {
         "{result:?}"
     );
 }
+
+#[path = "assertion_coverage_tests.rs"]
+mod assertion_coverage_tests;
+mod authoring_contract;

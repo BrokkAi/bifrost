@@ -62,6 +62,13 @@ impl LanguageAdapter for PhpAdapter {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PhpAdapter {
+    // This legacy engine does not produce parse-time semantic IR.
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        None
+    }
+
     fn source_fact_storage(
         &self,
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>

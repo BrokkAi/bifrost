@@ -22,6 +22,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::analyzer::semantic::AsyncResumeKind;
+
 use crate::analyzer::semantic::workspace_oracle::common::Interruption;
 
 use crate::analyzer::semantic::workspace_oracle::common::WorkStager;
@@ -4360,6 +4362,18 @@ pub fn project_procedure_relations(
                         ..SemanticWork::default()
                     })
                 }
+                SemanticEffect::AsyncResume {
+                    suspend,
+                    kind: AsyncResumeKind::Normal,
+                    result: Some(_),
+                } if procedure.semantics().awaited_value(*suspend).is_some() => {
+                    Some(SemanticWork {
+                        values: 2,
+                        evidence: 1,
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    })
+                }
                 SemanticEffect::Allocation { .. } => Some(SemanticWork {
                     values: 1,
                     allocations: 1,
@@ -4975,6 +4989,26 @@ pub fn project_procedure_relations(
                         false,
                     )
                 }
+                // The value a normal resume produces is computed from the
+                // value the matching suspend awaited: a task's or promise's
+                // completion, a future's output. It is a different object, so
+                // the dependence is language-defined, not an alias.
+                SemanticEffect::AsyncResume {
+                    suspend,
+                    result: Some(result),
+                    ..
+                } => (
+                    ValueFlowRelationKind::LanguageDefined,
+                    ValueFlowEndpoint::for_value(value_handle(
+                        procedure,
+                        procedure
+                            .semantics()
+                            .awaited_value(*suspend)
+                            .expect("a resume relation was classified with its awaited value"),
+                    )?),
+                    ValueFlowEndpoint::for_value(value_handle(procedure, *result)?),
+                    false,
+                ),
                 _ => unreachable!("relation-producing effects were classified above"),
             };
             if summary {

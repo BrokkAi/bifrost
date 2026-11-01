@@ -5,6 +5,10 @@ pub(super) struct NfaState {
     pub(super) epsilon: Vec<usize>,
     pub(super) transitions: Vec<(CharacterSet, usize)>,
     pub(super) capture_ends: Vec<usize>,
+    /// Possessive exit: the first character consumed after leaving this state
+    /// through epsilon edges is outside this set. Only the builder sets it, on
+    /// states without transitions; `compile` lowers it before returning.
+    pub(super) guard: Option<CharacterSet>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,7 @@ impl RegexNfa {
             }
         }
         let fragment = fragments[root].take().ok_or(NfaError::Unsupported)?;
+        builder.lower_possessive_guards(fragment.end)?;
         Ok(Self {
             states: builder.states,
             start: fragment.start,
@@ -345,6 +350,9 @@ impl RegexNfa {
         Ok(false)
     }
 
+    /// Repeats the automaton one or more times. Possessive guards were lowered
+    /// against the old end, so a guard does not constrain the next repetition:
+    /// the closure may accept more ambiguous paths than the dialect does.
     pub(super) fn positive_closure(mut self) -> Result<Self, NfaError> {
         if self.states.len().saturating_add(2) > MAX_NFA_STATES {
             return Err(NfaError::Budget);
@@ -505,6 +513,26 @@ impl NfaBuilder<'_> {
         {
             return Err(NfaError::Budget);
         }
+        // A possessive repetition never gives back what it consumed, so it
+        // stops early only where the next character cannot repeat it. That is
+        // a character-set guard when one repetition consumes one character
+        // from a known set; other possessive bodies are not modeled.
+        let guard = if quantifier.possessive {
+            let body = &self.facts[id];
+            if !matches!(
+                body.kind,
+                NormalizedKind::RegexLiteral
+                    | NormalizedKind::RegexWildcard
+                    | NormalizedKind::RegexCharacterClass
+                    | NormalizedKind::RegexCharacterRange
+                    | NormalizedKind::RegexEscape
+            ) {
+                return Err(NfaError::Unsupported);
+            }
+            Some(body.first_set.clone().ok_or(NfaError::Unsupported)?)
+        } else {
+            None
+        };
         let mut result = if quantifier.minimum == 0 {
             self.empty_fragment()?
         } else {
@@ -518,13 +546,13 @@ impl NfaBuilder<'_> {
             Some(maximum) => {
                 for _ in quantifier.minimum..maximum {
                     let clone = self.clone_fragment(&base)?;
-                    copies.push(self.optional(clone)?);
+                    copies.push(self.optional(clone, guard.clone())?);
                 }
                 None
             }
             None => {
                 let clone = self.clone_fragment(&base)?;
-                Some(self.star(clone)?)
+                Some(self.star(clone, guard)?)
             }
         };
         for copy in copies {
@@ -534,6 +562,71 @@ impl NfaBuilder<'_> {
             result = self.concatenate(vec![result, unbounded])?;
         }
         Ok(result)
+    }
+
+    /// Replaces each guarded state's epsilon edges with copies of the states
+    /// they reach, whose transitions exclude the guard. A copy accumulates
+    /// the guards of guarded states it passes, and `end` stands for whatever
+    /// follows the compiled root, which a guard here cannot see.
+    fn lower_possessive_guards(&mut self, end: usize) -> Result<(), NfaError> {
+        debug_assert!(
+            self.states[end].epsilon.is_empty() && self.states[end].transitions.is_empty(),
+            "the root end has no successors while compiling"
+        );
+        let guarded = (0..self.states.len())
+            .filter(|&state| self.states[state].guard.is_some())
+            .collect::<Vec<_>>();
+        let mut copies = HashMap::new();
+        let mut pending = Vec::new();
+        for state in guarded {
+            let guard = self.states[state].guard.take().expect("state is guarded");
+            debug_assert!(self.states[state].transitions.is_empty());
+            let successors = std::mem::take(&mut self.states[state].epsilon);
+            for successor in successors {
+                let copy = self.guarded_copy(successor, &guard, end, &mut copies, &mut pending)?;
+                self.states[state].epsilon.push(copy);
+            }
+            while let Some((original, copy, exclusion)) = pending.pop() {
+                let original = self.states[original].clone();
+                let mut after = exclusion.clone();
+                if let Some(guard) = &original.guard {
+                    after.union_with(guard);
+                }
+                for (set, target) in original.transitions {
+                    let allowed = set.difference(&exclusion);
+                    if !allowed.ranges.is_empty() {
+                        self.states[copy].transitions.push((allowed, target));
+                    }
+                }
+                self.states[copy].capture_ends = original.capture_ends;
+                for successor in original.epsilon {
+                    let successor =
+                        self.guarded_copy(successor, &after, end, &mut copies, &mut pending)?;
+                    self.states[copy].epsilon.push(successor);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn guarded_copy(
+        &mut self,
+        original: usize,
+        exclusion: &CharacterSet,
+        end: usize,
+        copies: &mut HashMap<(usize, CharacterSet), usize>,
+        pending: &mut Vec<(usize, usize, CharacterSet)>,
+    ) -> Result<usize, NfaError> {
+        if original == end {
+            return Ok(end);
+        }
+        if let Some(&copy) = copies.get(&(original, exclusion.clone())) {
+            return Ok(copy);
+        }
+        let copy = self.new_state()?;
+        copies.insert((original, exclusion.clone()), copy);
+        pending.push((original, copy, exclusion.clone()));
+        Ok(copy)
     }
 
     pub(super) fn new_state(&mut self) -> Result<usize, NfaError> {
@@ -597,24 +690,54 @@ impl NfaBuilder<'_> {
         Ok(NfaFragment { start, end, states })
     }
 
-    fn optional(&mut self, inner: NfaFragment) -> Result<NfaFragment, NfaError> {
+    /// `guard` constrains the skip edge of a possessive optional copy.
+    fn optional(
+        &mut self,
+        inner: NfaFragment,
+        guard: Option<CharacterSet>,
+    ) -> Result<NfaFragment, NfaError> {
         let start = self.new_state()?;
         let end = self.new_state()?;
-        self.states[start].epsilon.extend([end, inner.start]);
-        self.states[inner.end].epsilon.push(end);
         let mut states = vec![start, end];
+        let skip = self.exit(end, guard, &mut states)?;
+        self.states[start].epsilon.extend([skip, inner.start]);
+        self.states[inner.end].epsilon.push(end);
         states.extend(inner.states);
         Ok(NfaFragment { start, end, states })
     }
 
-    fn star(&mut self, inner: NfaFragment) -> Result<NfaFragment, NfaError> {
+    /// `guard` constrains the exit edges of a possessive loop.
+    fn star(
+        &mut self,
+        inner: NfaFragment,
+        guard: Option<CharacterSet>,
+    ) -> Result<NfaFragment, NfaError> {
         let start = self.new_state()?;
         let end = self.new_state()?;
-        self.states[start].epsilon.extend([end, inner.start]);
-        self.states[inner.end].epsilon.extend([end, inner.start]);
         let mut states = vec![start, end];
+        let exit = self.exit(end, guard, &mut states)?;
+        self.states[start].epsilon.extend([exit, inner.start]);
+        self.states[inner.end].epsilon.extend([exit, inner.start]);
         states.extend(inner.states);
         Ok(NfaFragment { start, end, states })
+    }
+
+    /// The state an exit edge targets: `end` itself, or a guarded state
+    /// leading to it.
+    fn exit(
+        &mut self,
+        end: usize,
+        guard: Option<CharacterSet>,
+        states: &mut Vec<usize>,
+    ) -> Result<usize, NfaError> {
+        let Some(guard) = guard else {
+            return Ok(end);
+        };
+        let exit = self.new_state()?;
+        self.states[exit].guard = Some(guard);
+        self.states[exit].epsilon.push(end);
+        states.push(exit);
+        Ok(exit)
     }
 
     fn clone_fragment(&mut self, fragment: &NfaFragment) -> Result<NfaFragment, NfaError> {
@@ -626,6 +749,7 @@ impl NfaBuilder<'_> {
             let new = remap[old];
             let old_state = self.states[old].clone();
             self.states[new].capture_ends = old_state.capture_ends;
+            self.states[new].guard = old_state.guard;
             for target in old_state.epsilon {
                 let Some(mapped) = remap
                     .get(target)

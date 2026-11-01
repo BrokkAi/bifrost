@@ -487,7 +487,7 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
             else {
                 return Ok(PreparedParsedBlobPreparation::Cancelled);
             };
-            Some(prepared)
+            Some(prepared.rows)
         }
         _ => None,
     };
@@ -981,6 +981,10 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     });
     Ok(PreparedParsedBlobPreparation::Prepared(Box::new(
         PreparedParsedBlob {
+            // M4b-B2: attach producer symbols with with_condition_symbols before persistence.
+            csharp_condition_symbols: Vec::new(),
+            // The language producer attaches variant-specific chains before persistence.
+            csharp_undecided_chains: Vec::new(),
             key: key.clone(),
             generation,
             state,
@@ -1077,6 +1081,7 @@ impl PythonEnvironmentPublicationEngineExt for PythonEnvironmentPublication {
         for file in files {
             let source = project.read_source(file)?;
             members.push(WorkspaceFileRow {
+                decision: None,
                 rel_path: portable(file.rel_path()),
                 blob_oid: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())?,
             });

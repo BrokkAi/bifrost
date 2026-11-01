@@ -31,7 +31,8 @@ use crate::syntax::{
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    FileEdgeScanInput, JsTsScopedNodeStatus, NodeKey, PerFileEdges, UsageNodeKey,
+    FileEdgeScanInput, JsTsScopedNodeStatus, NodeKey, PerFileEdges, RelativeImportGap,
+    RelativeImportGapKind, UsageNodeKey,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
@@ -116,6 +117,8 @@ pub fn scan_file(
 
     with_usage_definitions(host, token, |definitions| {
         let mut ctx = TsScan {
+            host,
+            file,
             source,
             import_binder: binder.clone(),
             receiver_provider: JsTsReceiverFactProvider::new(
@@ -230,6 +233,8 @@ pub fn scan_scoped_file(
         );
     with_usage_definitions(host, token, |definitions| {
         let mut ctx = ScopedTsScan {
+            host,
+            file,
             source: input.source,
             import_binder: receiver_binder.clone(),
             receiver_provider: JsTsReceiverFactProvider::new(
@@ -264,6 +269,8 @@ struct ScopedImportBindings {
 }
 
 struct ScopedTsScan<'a> {
+    host: &'a dyn JsTsSource,
+    file: &'a ProjectFile,
     import_binder: JsTsImportBinder,
     source: &'a str,
     receiver_provider: JsTsReceiverFactProvider<'a, 'a>,
@@ -343,6 +350,8 @@ impl<'a> ScopedTsScan<'a> {
 }
 
 struct TsScan<'a> {
+    host: &'a dyn JsTsSource,
+    file: &'a ProjectFile,
     import_binder: JsTsImportBinder,
     source: &'a str,
     receiver_provider: JsTsReceiverFactProvider<'a, 'a>,
@@ -406,6 +415,49 @@ fn bare_callee<T: Clone>(
         return Some(key);
     }
     same_file(text)
+}
+
+fn missing_relative_module(
+    host: &dyn JsTsSource,
+    file: &ProjectFile,
+    binding: &crate::syntax::JsTsImportBinding,
+) -> Option<RelativeImportGap> {
+    let specifier = &binding.binding.module_specifier;
+    if !binding.is_static || !specifier.starts_with('.') {
+        return None;
+    }
+    let outside = brokk_bifrost_core::path_utils::normalize_relative_path_from(
+        &file.parent(),
+        std::path::Path::new(specifier),
+    )
+    .is_none();
+    let candidate = ProjectFile::new(file.root(), file.parent().join(specifier));
+    // Source changes start a new generation; non-source assets may retain a stale
+    // reason until the next generation. Creation fails closed; deletion had no code edge.
+    let absent = !host.project().has_overlay(&candidate) && !candidate.exists();
+    (outside || absent)
+        .then_some(())
+        .filter(|_| {
+            [Language::JavaScript, Language::TypeScript]
+                .into_iter()
+                .all(|language| {
+                    crate::imports::resolve_js_ts_module_specifier(
+                        file,
+                        specifier,
+                        language,
+                        Some(host.alias_resolver()),
+                    )
+                    .is_empty()
+                })
+        })
+        .map(|_| RelativeImportGap {
+            target: specifier.clone(),
+            kind: if outside {
+                RelativeImportGapKind::OutsideWorkspace
+            } else {
+                RelativeImportGapKind::Absent
+            },
+        })
 }
 
 fn unshadowed_browser_global<T: Clone>(
@@ -1130,6 +1182,18 @@ fn handle_identifier(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferen
             .record_unproven_name_at_node(ctx.input, text, node);
         return;
     }
+    if let crate::syntax::JsTsImportBindingResolution::Exact(binding) =
+        ctx.import_binder.binding_at(text, node.start_byte())
+        && ctx.edges.record_missing_relative_import_site(
+            ctx.input,
+            text,
+            binding,
+            node,
+            |binding| missing_relative_module(ctx.host, ctx.file, binding),
+        )
+    {
+        return;
+    }
     if let Some(callee) = ctx.bare_callee(text, node.start_byte()) {
         ctx.record(callee, node);
     }
@@ -1151,6 +1215,18 @@ fn handle_scoped_identifier(
     ) {
         ctx.edges
             .record_unproven_name_at_node(ctx.input, text, node);
+        return;
+    }
+    if let crate::syntax::JsTsImportBindingResolution::Exact(binding) =
+        ctx.import_binder.binding_at(text, node.start_byte())
+        && ctx.edges.record_missing_relative_import_site(
+            ctx.input,
+            text,
+            binding,
+            node,
+            |binding| missing_relative_module(ctx.host, ctx.file, binding),
+        )
+    {
         return;
     }
     if let Some(callee) = ctx.bare_callee(text, node.start_byte()) {

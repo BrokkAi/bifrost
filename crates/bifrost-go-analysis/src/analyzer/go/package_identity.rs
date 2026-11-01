@@ -12,7 +12,7 @@
 //! Every method reads retained overlay state. None of them starts dependency
 //! discovery, runs the Go toolchain, or touches a module cache.
 
-use brokk_bifrost_analysis::analyzer::semantic::{IndexedLocationIdentity, MemoryValueCopy};
+use brokk_bifrost_analysis::analyzer::semantic::MemoryValueCopy;
 use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
 use std::sync::Arc;
 
@@ -28,53 +28,12 @@ use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::Signature;
 
-use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
-
 use brokk_bifrost_analysis::analyzer::semantic_model::Visibility;
 use brokk_bifrost_go::diagnostics::GoPackageSurface;
 
 use crate::analyzer::go::GoOuterTypeShape;
 
 use crate::analyzer::go::GoStructFieldIdentity;
-
-/// One exact nominal Go result type published by declaration facts.
-///
-/// This is intentionally not a general type expression. The caller can use it
-/// only as the direct receiver of another modeled call; containers, aliases
-/// that would need textual interpretation, and other wrappers never enter the
-/// result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[doc(hidden)]
-pub struct GoModeledNominalType {
-    #[doc(hidden)]
-    pub declaration_id: String,
-    #[doc(hidden)]
-    pub qualified_name: String,
-    #[doc(hidden)]
-    pub pointer: bool,
-}
-
-/// Resolve the one exact nominal return type of an authored Go declaration.
-/// This is shared with semantic consumers that follow a modeled result across
-/// an open interface call; it never infers a type from source spelling.
-pub fn modeled_go_callable_result_nominal_type(
-    overlay: &SemanticModelOverlay,
-    owner_fqn: &str,
-    member: &str,
-    has_receiver: bool,
-    parameter_count: usize,
-    result_ordinal: usize,
-) -> Option<String> {
-    GoOverlayPackages::new(Some(overlay))
-        .callable_result_nominal_type(
-            owner_fqn,
-            member,
-            has_receiver,
-            parameter_count,
-            result_ordinal,
-        )
-        .map(|nominal| nominal.qualified_name)
-}
 
 /// What one activated declaration fact proves about a package-qualified Go
 /// expression used as a call target.
@@ -97,39 +56,6 @@ enum GoSignatureApplicability {
     Applicable,
     NotApplicable,
     Unproven,
-}
-
-fn go_declared_type_kind(kind: SemanticModelSymbolKind) -> bool {
-    matches!(
-        kind,
-        SemanticModelSymbolKind::Class
-            | SemanticModelSymbolKind::Interface
-            | SemanticModelSymbolKind::Struct
-            | SemanticModelSymbolKind::TypeAlias
-    )
-}
-
-fn modeled_signature_result_count(signature: &Signature) -> usize {
-    match signature.returns.as_ref() {
-        None => 0,
-        Some(TypeRef::Tuple { elements }) => elements.len(),
-        Some(_) => 1,
-    }
-}
-
-fn public_instance_method_applies(
-    method: &SemanticModelSymbol,
-    owner_id: &str,
-    parameter_count: usize,
-) -> bool {
-    method.owner_id.as_deref() == Some(owner_id)
-        && method.kind == SemanticModelSymbolKind::Method
-        && method.visibility == Visibility::Public
-        && !method.is_static()
-        && method.structured_signature().is_some_and(|signature| {
-            go_signature_applicability(signature, parameter_count)
-                == GoSignatureApplicability::Applicable
-        })
 }
 
 fn go_signature_applicability(
@@ -271,58 +197,12 @@ impl<'a> GoOverlayPackages<'a> {
         self.overlay?.symbols_named(qualified_name).unique()
     }
 
-    /// The sole active Go member with this exact direct owner and name.
-    ///
-    /// Validate uniqueness before interpreting kind, visibility, receiver, or
-    /// signature. Go has no overload sets, so a competing wrong-shape record is
-    /// a declaration conflict rather than something a caller may filter away.
-    fn unique_go_owner_member(
-        &self,
-        owner: &SemanticModelSymbol,
-        member: &str,
-    ) -> Option<Arc<SemanticModelSymbol>> {
-        let mut candidates = self
-            .overlay?
-            .members_of(&owner.id)
-            .records
-            .into_iter()
-            .filter(|candidate| {
-                candidate.language == "go"
-                    && candidate.owner_id.as_deref() == Some(owner.id.as_str())
-                    && candidate.name == member
-            });
-        let candidate = candidates.next()?;
-        (candidates.next().is_none() && !candidate.provenance.ambiguous).then_some(candidate)
-    }
-
     /// The unique symbol a Go reference may resolve to: one visible, public Go
     /// declaration. A name several packs publish, or one whose only records
     /// are unexported, resolves to nothing.
     #[doc(hidden)]
     pub fn visible_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
         self.overlay?.visible_public_symbol(qualified_name, "go")
-    }
-
-    /// The exact public Go type published under one declaration id.
-    ///
-    /// Both the id and qualified-name indexes must select the same record.
-    /// This prevents a conflicting pack from turning a structured Declared
-    /// result reference into an arbitrary source type identity.
-    #[doc(hidden)]
-    pub fn declared_type_qualified_name(&self, id: &str) -> Option<String> {
-        let matched = self.overlay?.symbols_with_id(id);
-        if matched.disposition != SemanticModelOverlayDisposition::Unique {
-            return None;
-        }
-        let declared = matched.records.first().cloned()?;
-        let named = self.unique_symbol(&declared.qualified_name)?;
-        (named.id == declared.id
-            && declared.language == "go"
-            && declared.owner_id.is_none()
-            && go_declared_type_kind(declared.kind)
-            && declared.visibility == Visibility::Public
-            && !declared.provenance.ambiguous)
-            .then(|| declared.qualified_name.clone())
     }
 
     /// The `package` clause name an exact API pack records for `import_path`.
@@ -453,27 +333,6 @@ impl<'a> GoOverlayPackages<'a> {
         )
     }
 
-    /// Exact normal-result arity for one applicable modeled package call.
-    ///
-    /// This is intentionally positive-only. It lets a caller adjudicate Go's
-    /// sole-call argument expansion only when the inner package function and
-    /// its structured signature are both exact. Missing, conflicting, spread,
-    /// or otherwise unsupported inner calls remain unknown.
-    pub(crate) fn package_call_result_count(
-        &self,
-        import_path: &str,
-        member: &str,
-        parameter_count: usize,
-    ) -> Option<usize> {
-        let symbol = self.package_function_symbol(import_path, member)?.ok()?;
-        let signature = symbol
-            .structured_signature()
-            .expect("package_function_symbol retains a structured signature");
-        (go_signature_applicability(signature, parameter_count)
-            == GoSignatureApplicability::Applicable)
-            .then_some(modeled_signature_result_count(signature))
-    }
-
     fn package_function_symbol(
         &self,
         import_path: &str,
@@ -512,294 +371,6 @@ impl<'a> GoOverlayPackages<'a> {
             return Some(Err(GoModeledPackageCallResolution::Unproven));
         }
         Some(Ok(Arc::clone(symbol)))
-    }
-
-    /// The unique modeled method selected by one exact concrete Go receiver.
-    ///
-    /// A positive declaration fact remains useful when its pack is partial:
-    /// partiality prevents absence claims, but does not make a published type
-    /// or method speculative. The owner must nevertheless be a concrete public
-    /// struct, and the method must be a direct public instance member with an
-    /// explicit receiver fact. Interfaces, promoted wrapper surfaces, missing
-    /// receiver metadata, and competing packs all fail closed.
-    pub(crate) fn concrete_receiver_method(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        pointer_receivers: bool,
-        parameter_count: usize,
-    ) -> Option<Arc<SemanticModelSymbol>> {
-        let owner = self.unique_symbol(owner_fqn)?;
-        if owner.language != "go"
-            || owner.owner_id.is_some()
-            || owner.kind != SemanticModelSymbolKind::Struct
-            || owner.visibility != Visibility::Public
-        {
-            return None;
-        }
-
-        let method = self.unique_symbol(&format!("{owner_fqn}.{member}"))?;
-        let receiver = method.receiver?;
-        (method.language == "go"
-            && public_instance_method_applies(&method, &owner.id, parameter_count)
-            && (!receiver.pointer || pointer_receivers))
-            .then_some(method)
-    }
-
-    /// The unique public method contract on one modeled external Go
-    /// interface. The selected declaration names the interface member only;
-    /// callers still need receiver provenance before applying its effects.
-    pub(crate) fn interface_receiver_method(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        parameter_count: usize,
-    ) -> Option<Arc<SemanticModelSymbol>> {
-        let owner = self.unique_symbol(owner_fqn)?;
-        if owner.language != "go"
-            || owner.owner_id.is_some()
-            || owner.kind != SemanticModelSymbolKind::Interface
-            || owner.visibility != Visibility::Public
-        {
-            return None;
-        }
-        let method = self.unique_go_owner_member(&owner, member)?;
-        public_instance_method_applies(&method, &owner.id, parameter_count).then_some(method)
-    }
-
-    /// The unique public field published directly on one concrete Go struct.
-    ///
-    /// This is a positive-only lookup. A partial pack may prove a field it
-    /// publishes, but a missing field in that pack proves nothing. Competing
-    /// declarations, aliases that do not resolve to one nominal owner, and a
-    /// method or property with the same spelling all make the lookup abstain.
-    pub(crate) fn concrete_receiver_field(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-    ) -> Option<Arc<SemanticModelSymbol>> {
-        let owner = self.unique_symbol(owner_fqn)?;
-        if owner.language != "go"
-            || owner.owner_id.is_some()
-            || owner.kind != SemanticModelSymbolKind::Struct
-            || owner.visibility != Visibility::Public
-            || owner.provenance.ambiguous
-        {
-            return None;
-        }
-
-        let field = self.unique_go_owner_member(&owner, member)?;
-        (field.kind == SemanticModelSymbolKind::Field
-            && field.visibility == Visibility::Public
-            && !field.is_static()
-            && !field.has_receiver())
-        .then_some(field)
-    }
-
-    /// The value-copy behavior represented by one exact public field's
-    /// structured Go type, or `Unknown` when the declaration does not carry a
-    /// supported type shape. The field symbol itself remains the identity
-    /// carrier for its model location and activation provenance.
-    pub(crate) fn concrete_receiver_field_value_copy(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-    ) -> MemoryValueCopy {
-        let Some(field) = self.concrete_receiver_field(owner_fqn, member) else {
-            return MemoryValueCopy::Unknown;
-        };
-        let Some(signature) = field.structured_signature() else {
-            return MemoryValueCopy::Unknown;
-        };
-        if !signature.parameters.is_empty() {
-            return MemoryValueCopy::Unknown;
-        }
-        let Some(field_type) = signature.returns.as_ref() else {
-            return MemoryValueCopy::Unknown;
-        };
-        go_field_value_copy(
-            field_type,
-            self.overlay.expect("resolved field has an overlay"),
-        )
-    }
-
-    /// The exact nominal result selected from one exact modeled Go callable.
-    ///
-    /// This is a positive-only declaration-fact lookup. A partial pack may
-    /// prove a declaration it publishes, while any missing, competing, or
-    /// structurally incomplete fact makes the lookup abstain. Go's multi-value
-    /// result is retained as a structured tuple, so `result_ordinal` selects
-    /// one exact element rather than conflating the first and later results.
-    #[doc(hidden)]
-    pub fn callable_result_nominal_type(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        has_receiver: bool,
-        parameter_count: usize,
-        result_ordinal: usize,
-    ) -> Option<GoModeledNominalType> {
-        let overlay = self.overlay?;
-        let result = self.callable_result_type_ref(
-            owner_fqn,
-            member,
-            has_receiver,
-            parameter_count,
-            result_ordinal,
-        )?;
-        let (declared_id, pointer) = match &result {
-            TypeRef::Declared {
-                id,
-                arguments,
-                nullable,
-            } if arguments.is_empty() && !*nullable => (id, false),
-            TypeRef::Pointer { element } => match element.as_ref() {
-                TypeRef::Declared {
-                    id,
-                    arguments,
-                    nullable,
-                } if arguments.is_empty() && !*nullable => (id, true),
-                _ => return None,
-            },
-            _ => return None,
-        };
-        let matched = overlay.symbols_with_id(declared_id);
-        if matched.disposition != SemanticModelOverlayDisposition::Unique {
-            return None;
-        }
-        let declared = matched.records.first().cloned()?;
-        if self
-            .unique_symbol(&declared.qualified_name)
-            .is_none_or(|named| named.id != declared.id)
-        {
-            return None;
-        }
-        (declared.language == "go"
-            && declared.owner_id.is_none()
-            && go_declared_type_kind(declared.kind)
-            && declared.visibility == Visibility::Public)
-            .then(|| GoModeledNominalType {
-                declaration_id: declared.id.clone(),
-                qualified_name: declared.qualified_name.clone(),
-                pointer,
-            })
-    }
-
-    /// Exact result arity of a uniquely selected external callable signature.
-    pub(crate) fn callable_result_count(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        has_receiver: bool,
-        parameter_count: usize,
-    ) -> Option<usize> {
-        let callable =
-            self.applicable_callable(owner_fqn, member, has_receiver, parameter_count)?;
-        Some(modeled_signature_result_count(
-            callable.structured_signature()?,
-        ))
-    }
-
-    fn applicable_callable(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        has_receiver: bool,
-        parameter_count: usize,
-    ) -> Option<Arc<SemanticModelSymbol>> {
-        let owner = self.unique_symbol(owner_fqn)?;
-        if owner.language != "go"
-            || owner.owner_id.is_some()
-            || owner.provenance.ambiguous
-            || (has_receiver && owner.kind == SemanticModelSymbolKind::Module)
-            || (!has_receiver && owner.kind != SemanticModelSymbolKind::Module)
-        {
-            return None;
-        }
-
-        let callable = self.unique_go_owner_member(&owner, member)?;
-        if callable.visibility != Visibility::Public
-            || callable.has_receiver() != has_receiver
-            || callable.is_static() == has_receiver
-            || !matches!(
-                (has_receiver, callable.kind),
-                (true, SemanticModelSymbolKind::Method)
-                    | (false, SemanticModelSymbolKind::Function)
-            )
-            || callable.structured_signature().is_none_or(|signature| {
-                go_signature_applicability(signature, parameter_count)
-                    != GoSignatureApplicability::Applicable
-            })
-        {
-            return None;
-        }
-        Some(callable)
-    }
-
-    /// The exact result type selected from one positive modeled Go callable.
-    ///
-    /// A partial package may still prove a member it publishes. Selection
-    /// therefore rejects conflicts, ambiguous records, missing structure, and
-    /// inapplicable signatures without interpreting absence from the package
-    /// as a negative fact. The returned reference remains tied to the retained
-    /// overlay and preserves every structured wrapper for identity consumers.
-    #[doc(hidden)]
-    pub fn callable_result_type_ref(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        has_receiver: bool,
-        parameter_count: usize,
-        result_ordinal: usize,
-    ) -> Option<TypeRef> {
-        let callable =
-            self.applicable_callable(owner_fqn, member, has_receiver, parameter_count)?;
-        let signature = callable.structured_signature()?;
-        Some(
-            match signature.returns.as_ref()? {
-                TypeRef::Tuple { elements } => elements.get(result_ordinal)?,
-                result if result_ordinal == 0 => result,
-                _ => return None,
-            }
-            .clone(),
-        )
-    }
-}
-
-fn go_field_value_copy(field_type: &TypeRef, overlay: &SemanticModelOverlay) -> MemoryValueCopy {
-    match field_type {
-        TypeRef::Function { .. } | TypeRef::Pointer { .. } | TypeRef::Channel { .. } => {
-            MemoryValueCopy::Reference
-        }
-        TypeRef::Slice { .. } => MemoryValueCopy::BackingStore {
-            identity: IndexedLocationIdentity::Element,
-        },
-        TypeRef::Map { .. } => MemoryValueCopy::BackingStore {
-            identity: IndexedLocationIdentity::Aggregate,
-        },
-        TypeRef::FixedArray { .. } => MemoryValueCopy::Value,
-        TypeRef::Declared { id, .. } => {
-            let matched = overlay.symbols_with_id(id);
-            if matched.disposition != SemanticModelOverlayDisposition::Unique {
-                return MemoryValueCopy::Unknown;
-            }
-            let Some(symbol) = matched.records.first().cloned() else {
-                return MemoryValueCopy::Unknown;
-            };
-            if symbol.language == "go"
-                && symbol.owner_id.is_none()
-                && symbol.kind == SemanticModelSymbolKind::Struct
-                && !symbol.provenance.ambiguous
-            {
-                MemoryValueCopy::Value
-            } else {
-                MemoryValueCopy::Unknown
-            }
-        }
-        // A `Named` spelling can denote a package-local alias, a predeclared
-        // scalar, or an unresolved imported type. Do not infer storage from
-        // that display name; the producer must supply a structured identity.
-        _ => MemoryValueCopy::Unknown,
     }
 }
 

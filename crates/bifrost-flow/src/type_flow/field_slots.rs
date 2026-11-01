@@ -308,7 +308,8 @@ impl FieldStoreSurvey {
 
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 30;
+    // #8385: semantic read digests omit source positions; old stored checksums miss.
+    const ALGORITHM_VERSION: u32 = 31;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -806,8 +807,9 @@ impl FieldSlotIndex {
         let store_survey = FieldStoreSurvey::from_collected(&collected);
         // Every way the caller's budget can change this value leaves one of
         // the flags below, so an index without them is a complete value of
-        // its memory key. `UnknownReason::Truncated` is admitted because its
-        // only budget-dependent producer, a refused execution-traversal
+        // its memory key. `UnknownReason::Truncated` from an unenumerated
+        // workspace hierarchy is content-stable and is admitted. Its only
+        // budget-dependent producer, a refused execution-traversal
         // charge during dispatch, cannot fire here: the build's requests
         // carry no execution budget. If one is ever attached, `Truncated`
         // joins the excluded reasons.
@@ -1310,6 +1312,7 @@ impl FieldSlotIndex {
             if !write.global || !matches!(&write.names, DynamicFieldNameSet::Any) {
                 return None;
             }
+            crate::analyzer::record_position_read(workspace.analyzer(), &write.evidence.site.file);
             evidence.push(write.evidence.clone());
         }
         if evidence.is_empty() {
@@ -1358,7 +1361,13 @@ impl FieldSlotIndex {
             .dynamic_effects
             .iter()
             .filter(move |write| !closed && write.affects(class, &hierarchy, member))
-            .map(|write| &write.evidence)
+            .map(move |write| {
+                crate::analyzer::record_position_read(
+                    workspace.analyzer(),
+                    &write.evidence.site.file,
+                );
+                &write.evidence
+            })
     }
 
     pub fn slot(
@@ -1373,6 +1382,11 @@ impl FieldSlotIndex {
             .get(class)?
             .get(member)
             .map(|index| &self.slots[*index])
+            .inspect(|slot| {
+                for (_, site) in &slot.atoms {
+                    crate::analyzer::record_position_read(workspace.analyzer(), &site.file);
+                }
+            })
     }
 
     pub(super) fn atom_is_open_bound(
@@ -2473,10 +2487,19 @@ fn digest_dynamic_field_names(digest: &mut LengthDelimitedDigest, names: &Dynami
 
 fn push_survey_effects(digest: &mut LengthDelimitedDigest, survey: &FieldStoreSurvey) {
     digest.push(&[u8::from(survey.unknown_members)]);
-    for write in &survey.dynamic_effects {
-        digest.push(write.evidence.origin().as_bytes());
-        digest.push(&write.evidence.site.span.start_byte().to_le_bytes());
-        digest.push(&write.evidence.site.span.end_byte().to_le_bytes());
+    for (rank, write) in survey.dynamic_effects.iter().enumerate() {
+        digest.push(crate::path_utils::rel_path_string(&write.evidence.site.file).as_bytes());
+        digest.push(&rank.to_le_bytes());
+        digest.push(
+            write
+                .evidence
+                .reason
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("bounded")
+                .as_bytes(),
+        );
         digest.push(source_kind_label(write.evidence.site.kind).as_bytes());
         digest.push(&[u8::from(write.evidence.reason.is_some())]);
         digest.push(&[u8::from(write.global)]);
@@ -2547,8 +2570,7 @@ fn push_slot(
             }
         }
         digest.push(site.file.rel_path().to_string_lossy().as_bytes());
-        digest.push(&site.span.start_byte().to_le_bytes());
-        digest.push(&site.span.end_byte().to_le_bytes());
+        digest.push(&atom_index.to_le_bytes());
         digest.push(source_kind_label(site.kind).as_bytes());
         digest.push(&[u8::from(
             open_bound_class_sources.contains(&(slot_index, atom_index)),
@@ -4064,7 +4086,10 @@ mod tests {
         .expect("the durable index remains available after the operational failure");
         assert_eq!(recovered.kind, FieldSlotIndexAcquisitionKind::PersistentHit);
         assert_eq!(recovered.miss_reason, None);
-        // The store-error fallback may have incomplete descendant reads; #8185 tracks request-memo-owned reasons to avoid unrelated degradation.
+        // The fallback caller still carries StoreError. Isolated descendant
+        // fills can be retained, but complete_descendant_query refuses to
+        // certify this caller, leaving FieldSlotIncomplete in its index.
+        // Recovery reads the durable index under a clean query instead.
         assert_eq!(recovered.index.digest(), cold.index.digest());
     }
 

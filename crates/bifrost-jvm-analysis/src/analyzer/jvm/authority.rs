@@ -25,7 +25,7 @@ pub(crate) fn retained_external_index(
             std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
         >,
     >,
-    memo: &super::hierarchy::DerivedMemo<(), ()>,
+    memo: &super::hierarchy::RawDerivedMemo<(), ()>,
 ) -> JvmRetainedExternalIndex {
     external_read(analyzer, index, memo);
     super::retained_external_index_state(index.get().map(|entry| entry.replay().as_ref()))
@@ -40,7 +40,7 @@ pub(crate) fn external_read(
             std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
         >,
     >,
-    memo: &super::hierarchy::DerivedMemo<(), ()>,
+    memo: &super::hierarchy::RawDerivedMemo<(), ()>,
 ) {
     if index.get().is_none() {
         return; // A retained-only peek has not consumed an external index.
@@ -67,7 +67,7 @@ pub(crate) fn initialize_external_index(
             std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
         >,
     >,
-    memo: &super::hierarchy::DerivedMemo<(), ()>,
+    memo: &super::hierarchy::RawDerivedMemo<(), ()>,
     build: impl FnOnce() -> std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
 ) -> std::sync::Arc<super::external::JvmExternalDeclarationIndex> {
     let mut result = None;
@@ -418,7 +418,7 @@ pub(crate) fn assert_receipt_loss_refuses_live_index(
             std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
         >,
     >,
-    memo: &super::hierarchy::DerivedMemo<(), ()>,
+    memo: &super::hierarchy::RawDerivedMemo<(), ()>,
     read: impl Fn(),
 ) {
     use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};

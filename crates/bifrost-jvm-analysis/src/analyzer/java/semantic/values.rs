@@ -579,6 +579,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> bool {
         match node.kind() {
             "object_creation_expression" | "array_creation_expression" => true,
+            "field_access" if is_qualified_this(node) => true,
             "identifier" => node_text(self.prepared.source(), node).is_some_and(|name| {
                 self.local_at(name, node.start_byte())
                     .is_some_and(|value| self.non_null_values.contains(&value))

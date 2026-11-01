@@ -1,8 +1,8 @@
 //! Shared snapshot, publication, and complete-cache mechanics for language lowerers.
 
-use crate::analyzer::QueryScope;
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValuePermit};
-use brokk_bifrost_core::gitblob::BlobKey;
+use crate::analyzer::{IAnalyzer, QueryScope};
+use brokk_bifrost_core::gitblob::{BlobKey, ParseVariant};
 
 use crate::analyzer::semantic::partial_flow::ProcedurePartialFlows;
 use crate::analyzer::semantic::{
@@ -84,20 +84,27 @@ pub fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
     // dispatch oracle resolves, and re-hashing a file it has already hashed is
     // the residual #2295 named.
     let digests = analyzer.semantic_source_digests();
-    let content = match digests.get(BlobKey::unvaried(
-        source_identity,
-        analyzer.adapter().storage_language_key_for_file(file),
-    )) {
+    let blob_key = BlobKey {
+        oid: source_identity,
+        lang: analyzer
+            .adapter()
+            .storage_language_key_for_file(file)
+            .into(),
+        variant: analyzer.selected_parse_variant(file).ok_or_else(|| {
+            SemanticProviderError::internal(format!(
+                "selected parse variant unreadable for {file:?}"
+            ))
+        })?,
+    };
+    let content = match digests.get(blob_key.clone()) {
         Some(content) => content,
         None => {
-            let content = ContentIdentity::hash_bytes(source.as_bytes());
-            digests.record(
-                BlobKey::unvaried(
-                    source_identity,
-                    analyzer.adapter().storage_language_key_for_file(file),
-                ),
-                content,
+            let content = ContentIdentity::from_source_bytes(
+                source.as_bytes(),
+                analyzer.adapter().language(),
+                blob_key.variant,
             );
+            digests.record(blob_key, content);
             content
         }
     };
@@ -189,7 +196,17 @@ pub(crate) fn materialize_with_lowerer_inner<A: LanguageAdapter>(
     // A blob whose complete semantic IR rows the store holds is served from
     // those rows: its source is neither read nor parsed.
     if let Some(oid) = analyzer.reusable_live_oid(file) {
-        let Some(publication) = complete_semantic_ir_publication(analyzer, file, oid)? else {
+        let Some(publication) = complete_semantic_ir_publication(
+            analyzer,
+            file,
+            oid,
+            analyzer.selected_parse_variant(file).ok_or_else(|| {
+                SemanticProviderError::internal(format!(
+                    "selected parse variant unreadable for {file:?}"
+                ))
+            })?,
+        )?
+        else {
             note_serve(
                 &SERVE_COUNTS.rows_misses,
                 "rows_miss",
@@ -211,7 +228,18 @@ pub(crate) fn materialize_with_lowerer_inner<A: LanguageAdapter>(
         );
         let content = publication.content;
         analyzer.semantic_source_digests().record(
-            BlobKey::unvaried(oid, analyzer.adapter().storage_language_key_for_file(file)),
+            BlobKey {
+                oid,
+                lang: analyzer
+                    .adapter()
+                    .storage_language_key_for_file(file)
+                    .into(),
+                variant: analyzer.selected_parse_variant(file).ok_or_else(|| {
+                    SemanticProviderError::internal(format!(
+                        "selected parse variant unreadable for {file:?}"
+                    ))
+                })?,
+            },
             content,
         );
         let key = semantic_artifact_key_from_content(
@@ -266,7 +294,8 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     request: &mut SemanticRequest<'_>,
     started_work: SemanticWork,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-    let max_source_bytes = request.budget.remaining().source_bytes;
+    let mut producer_budget = crate::analyzer::semantic::SemanticBudget::producer();
+    let max_source_bytes = producer_budget.remaining().source_bytes;
     let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let (source_identity, prepared) = match analyzer.prepared_syntax_limited_cancellable(
         scope.token(),
@@ -297,11 +326,11 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
                 source_bytes: limit.minimum_source_bytes(),
                 ..SemanticWork::default()
             };
-            let exceeded = request.budget.check_admission(work).map_or_else(
+            let exceeded = producer_budget.check_admission(work).map_or_else(
                 |exceeded| exceeded,
                 |_| {
                     unreachable!(
-                        "a source snapshot larger than the remaining source budget must exceed it"
+                        "a source snapshot larger than the producer source budget must exceed it"
                     )
                 },
             );
@@ -318,29 +347,40 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     };
 
     if request.cancellation.is_cancelled() {
+        request.budget.record_performed_work(source_work);
         return Ok(SemanticOutcome::Cancelled {
             partial: None,
             work: source_work,
         });
     }
-    let mut staged_budget = request.budget.clone();
-    if let Err(exceeded) = staged_budget.admit(source_work) {
-        return Ok(SemanticOutcome::ExceededBudget {
-            partial: None,
-            exceeded,
-            work: source_work,
-        });
-    }
+    let staged_budget = request.budget.clone();
 
     let identity = lowerer.identity();
     // Reuse the prepared snapshot's digest. Recording it against the blob
     // identity also lets the next touch skip source preparation entirely.
-    let content = ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
+    let content = ContentIdentity::from_source_digest(
+        StableDigest::from_array(prepared.source_sha256()),
+        prepared.dialect().language(),
+        prepared.parse_variant(),
+    );
+    debug_assert_eq!(
+        analyzer
+            .selected_parse_variant(file)
+            .ok_or_else(|| SemanticProviderError::internal(format!(
+                "selected parse variant unreadable for {file:?}"
+            )))?,
+        prepared.parse_variant(),
+        "prepared source and served source must select the same parse variant"
+    );
     analyzer.semantic_source_digests().record(
-        BlobKey::unvaried(
-            source_identity,
-            analyzer.adapter().storage_language_key_for_file(file),
-        ),
+        BlobKey {
+            oid: source_identity,
+            lang: analyzer
+                .adapter()
+                .storage_language_key_for_file(file)
+                .into(),
+            variant: prepared.parse_variant(),
+        },
         content,
     );
     let key = semantic_artifact_key_for_prepared(file, &prepared, content, identity)?;
@@ -356,8 +396,8 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     let permit = match acquisition {
         CompleteValueAcquisition::Cached { value: artifact } => {
             drop(prepared);
-            staged_budget.release_admission(source_work);
             let outcome = publish_cached(cache, artifact, source_work, staged_budget, request);
+            request.budget.record_performed_work(source_work);
             observe_complete_artifact(file, &outcome, request);
             return outcome;
         }
@@ -374,6 +414,7 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     };
 
     if request.cancellation.is_cancelled() {
+        request.budget.record_performed_work(source_work);
         return Ok(SemanticOutcome::Cancelled {
             partial: None,
             work: source_work,
@@ -384,8 +425,12 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     // have complete rows, which serve the artifact without lowering.
     if analyzer.reusable_live_oid(file).is_none()
         && matches!(prepared.origin(), PreparedSourceOrigin::Disk)
-        && let Some(publication) =
-            complete_semantic_ir_publication(analyzer, file, source_identity)?
+        && let Some(publication) = complete_semantic_ir_publication(
+            analyzer,
+            file,
+            source_identity,
+            prepared.parse_variant(),
+        )?
     {
         assert_eq!(
             publication.content, content,
@@ -396,6 +441,9 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
             "rows_hit",
             file.rel_path().display(),
         );
+        drop(prepared);
+        let mut staged_budget = staged_budget;
+        staged_budget.record_performed_work(source_work);
         let outcome = publish_from_semantic_ir_rows(
             analyzer,
             lowerer,
@@ -411,18 +459,21 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
         return outcome;
     }
 
+    producer_budget
+        .admit(source_work)
+        .expect("prepared source fits the producer source limit");
     note_serve(&SERVE_COUNTS.lowerings, "lowering", key.path().as_str());
     #[cfg(any(test, feature = "test-support"))]
     cache.record_lowering(key.path());
-    let repeat = crate::profiling::enabled() && staged_budget.record_lowering(key.fingerprint());
+    let repeat = crate::profiling::enabled() && producer_budget.record_lowering(key.fingerprint());
     let lowerer_started = std::time::Instant::now();
-    staged_budget.start_lowering_work();
+    producer_budget.start_lowering_work();
     let lowered = if let Some(primary_lowerer) = lowerer.primary_declaration_lowerer() {
         lower_with_primary_declarations(
             primary_lowerer,
             file,
             &prepared,
-            &staged_budget,
+            &producer_budget,
             request.cancellation,
             || {
                 analyzer
@@ -437,7 +488,7 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
             },
         )
     } else {
-        lowerer.lower(file, &prepared, &staged_budget, request.cancellation)
+        lowerer.lower(file, &prepared, &producer_budget, request.cancellation)
     };
     let lowerer_ns = u64::try_from(lowerer_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     SERVE_COUNTS
@@ -457,14 +508,21 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
         )
     });
     drop(prepared);
-    staged_budget.release_admission(source_work);
     // Source and builder allocations close on every exit, while accepted
     // binding traversal survives cancellation, a partial result, and errors.
-    staged_budget.finish_lowering_work();
+    producer_budget.finish_lowering_work();
+    let producer_work = producer_budget.performed();
+    let produced_source = SemanticWork {
+        source_bytes: producer_work.source_bytes,
+        ..SemanticWork::default()
+    };
+    request.budget.record_performed_work(produced_source);
+    request
+        .budget
+        .charge_work(producer_work.saturating_sub(produced_source));
     let lowered = match lowered {
         Ok(lowered) => lowered,
         Err(error) => {
-            *request.budget = staged_budget;
             return Err(error);
         }
     };
@@ -477,7 +535,6 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
             // below before it can be retained by a cancelled outcome.
         } else {
             let work = source_work.component_max(lowered.work());
-            *request.budget = staged_budget;
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
                 work,
@@ -485,18 +542,39 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
         }
     }
 
-    let outcome = publish_lowered(
-        key,
-        lowerer.capabilities(),
-        lowered,
-        source_work,
-        started_work,
-        staged_budget,
-        request,
-    );
-    if let Ok(SemanticOutcome::Complete { value, .. }) = &outcome {
-        permit.publish_complete(Arc::clone(value));
-    }
+    let produced = {
+        let mut producer_request = SemanticRequest::new(&mut producer_budget, request.cancellation);
+        publish_lowered(
+            key,
+            lowerer.capabilities(),
+            lowered,
+            source_work,
+            SemanticWork::default(),
+            crate::analyzer::semantic::SemanticBudget::producer(),
+            &mut producer_request,
+        )?
+    };
+    let outcome = match produced {
+        SemanticOutcome::Complete { value, work } => {
+            permit.publish_complete(Arc::clone(&value));
+            let census = value.work();
+            request
+                .budget
+                .charge_work(work.saturating_sub(census).saturating_sub(producer_work));
+            match publish_cached(cache, value, source_work, request.budget.clone(), request) {
+                Ok(SemanticOutcome::Complete { value, .. }) => {
+                    Ok(SemanticOutcome::Complete { value, work })
+                }
+                other => other,
+            }
+        }
+        other => {
+            request
+                .budget
+                .charge_work(other.work().saturating_sub(producer_work));
+            Ok(other)
+        }
+    };
     observe_complete_artifact(file, &outcome, request);
     outcome
 }
@@ -528,10 +606,18 @@ pub(crate) fn served_from_unchanged_source<A: LanguageAdapter>(
     let Some(source_identity) = analyzer.reusable_live_oid(file) else {
         return Ok(None);
     };
-    let Some(content) = analyzer.semantic_source_digests().get(BlobKey::unvaried(
-        source_identity,
-        analyzer.adapter().storage_language_key_for_file(file),
-    )) else {
+    let Some(content) = analyzer.semantic_source_digests().get(BlobKey {
+        oid: source_identity,
+        lang: analyzer
+            .adapter()
+            .storage_language_key_for_file(file)
+            .into(),
+        variant: analyzer.selected_parse_variant(file).ok_or_else(|| {
+            SemanticProviderError::internal(format!(
+                "selected parse variant unreadable for {file:?}"
+            ))
+        })?,
+    }) else {
         return Ok(None);
     };
     let key = semantic_artifact_key_from_content(
@@ -550,11 +636,16 @@ pub(crate) fn complete_semantic_ir_publication<A: LanguageAdapter>(
     analyzer: &TreeSitterAnalyzer<A>,
     file: &ProjectFile,
     oid: Oid,
+    variant: ParseVariant,
 ) -> Result<Option<SemanticIrPublication>, SemanticProviderError> {
     let storage_language = analyzer.adapter().storage_language_key_for_file(file);
     let publication = analyzer
         .analyzer_store()
-        .semantic_ir_publication(&BlobKey::unvaried(oid, storage_language))
+        .semantic_ir_publication(&BlobKey {
+            oid,
+            lang: storage_language.into(),
+            variant,
+        })
         .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
     Ok(publication.filter(|publication| {
         matches!(publication.outcome, SemanticIrPublicationOutcome::Complete)
@@ -574,7 +665,17 @@ pub(crate) fn stored_partial_flows<A: LanguageAdapter>(
     let Some(oid) = analyzer.reusable_live_oid(file) else {
         return Ok(None);
     };
-    let Some(publication) = complete_semantic_ir_publication(analyzer, file, oid)? else {
+    let Some(publication) = complete_semantic_ir_publication(
+        analyzer,
+        file,
+        oid,
+        analyzer.selected_parse_variant(file).ok_or_else(|| {
+            SemanticProviderError::internal(format!(
+                "selected parse variant unreadable for {file:?}"
+            ))
+        })?,
+    )?
+    else {
         return Ok(None);
     };
     if publication.content != key.revision().content() {
@@ -602,7 +703,17 @@ pub(crate) fn has_complete_semantic_ir_rows<A: LanguageAdapter>(
     let Some(oid) = analyzer.reusable_live_oid(file) else {
         return Ok(false);
     };
-    let Some(publication) = complete_semantic_ir_publication(analyzer, file, oid)? else {
+    let Some(publication) = complete_semantic_ir_publication(
+        analyzer,
+        file,
+        oid,
+        analyzer.selected_parse_variant(file).ok_or_else(|| {
+            SemanticProviderError::internal(format!(
+                "selected parse variant unreadable for {file:?}"
+            ))
+        })?,
+    )?
+    else {
         return Ok(false);
     };
     Ok(publication.content == key.revision().content())

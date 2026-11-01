@@ -25,13 +25,16 @@ FROM selected_workspace_revisions;
 CREATE TEMP VIEW IF NOT EXISTS selected_workspace_file_versions AS
 SELECT selected.workspace_id, selected.revision,
        versions.file_version_id, versions.lang, versions.generation,
-       versions.rel_path, versions.blob_oid, x'' AS parse_variant, versions.projection_digest,
+       versions.rel_path, versions.blob_oid, COALESCE(decisions.decision_digest, x'') AS parse_variant, versions.projection_digest,
        versions.valid_from
 FROM main.workspace_file_versions AS versions
 JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = versions.workspace_id
  AND selected.lang = versions.lang
  AND selected.generation = versions.generation
+-- Publication asserts every current C# source version has a decision; COALESCE
+-- to x'' therefore applies only to other languages.
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = versions.file_version_id
 WHERE versions.input_kind = 'source'
   AND versions.valid_from <= selected.revision
   AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until);
@@ -106,12 +109,14 @@ CROSS JOIN main.workspace_file_versions AS files
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = blobs.blob_oid
- AND blobs.parse_variant = x''
+
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
 LEFT JOIN main.analysis_epochs AS epochs
   ON epochs.lang = files.lang
 LEFT JOIN main.source_fact_readiness AS visibility
   ON visibility.blob_id = units.blob_id
-WHERE units.fq_anchor_kind IS NULL
+WHERE blobs.parse_variant = COALESCE(decisions.decision_digest, x'')
+  AND units.fq_anchor_kind IS NULL
   AND units.exact_fqn_tail IS NOT NULL
   AND units.exact_parent_fqn_tail IS NOT NULL
   AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
@@ -131,12 +136,16 @@ FROM main.workspace_file_anchor_rows AS anchors
 CROSS JOIN main.workspace_file_versions AS files
   ON files.input_kind = 'source'
  AND files.file_version_id = anchors.file_version_id
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
 CROSS JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = files.workspace_id
  AND selected.lang = files.lang
  AND selected.generation = files.generation
-CROSS JOIN main.blobs AS blobs
-  ON blobs.lang = files.lang AND blobs.blob_oid = files.blob_oid AND blobs.parse_variant = x''
+-- Keep representative statistics from choosing the generation index, which
+-- cannot seek the published variant as part of the blob key.
+CROSS JOIN main.blobs AS blobs INDEXED BY sqlite_autoindex_blobs_1
+  ON blobs.lang = files.lang AND blobs.blob_oid = files.blob_oid
+ AND blobs.parse_variant = COALESCE(decisions.decision_digest, x'')
 CROSS JOIN main.blob_meta AS meta
   ON meta.blob_id = blobs.id
 CROSS JOIN main.code_units AS units INDEXED BY idx_code_units_anchored_parent_identifier
@@ -464,7 +473,9 @@ CROSS JOIN main.workspace_file_versions AS files
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = live.blob_oid
-WHERE units.fq_anchor_kind IS NULL
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+WHERE live.parse_variant = COALESCE(decisions.decision_digest, x'')
+  AND units.fq_anchor_kind IS NULL
   AND units.exact_parent_fqn_tail IS NOT NULL
   AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
   AND files.valid_from <= selected.revision
@@ -485,12 +496,19 @@ FROM main.workspace_file_anchor_rows AS anchors
 CROSS JOIN main.workspace_file_versions AS files
   ON files.input_kind = 'source'
  AND files.file_version_id = anchors.file_version_id
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
 CROSS JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = files.workspace_id
  AND selected.lang = files.lang
  AND selected.generation = files.generation
+-- Pin the full key before expanding the readiness view; statistics can
+-- otherwise choose the language/generation index and filter variants later.
+CROSS JOIN main.blobs AS selected_blob INDEXED BY sqlite_autoindex_blobs_1
+  ON selected_blob.blob_oid = files.blob_oid AND selected_blob.lang = files.lang
+ AND selected_blob.parse_variant = COALESCE(decisions.decision_digest, x'')
 CROSS JOIN main.live_parsed_blobs AS live
-  ON live.blob_oid = files.blob_oid AND live.lang = files.lang
+  ON live.blob_id = selected_blob.id
+ AND live.parse_variant = COALESCE(decisions.decision_digest, x'')
 CROSS JOIN main.code_units AS units INDEXED BY idx_code_units_anchored_parent_identifier
   ON units.blob_id = live.blob_id
  AND units.fq_anchor_kind = anchors.anchor_kind
@@ -524,7 +542,9 @@ CROSS JOIN main.workspace_file_versions AS files
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = live.blob_oid
-WHERE units.fq_anchor_kind IS NULL
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+WHERE live.parse_variant = COALESCE(decisions.decision_digest, x'')
+  AND units.fq_anchor_kind IS NULL
   AND units.normalized_fqn_tail IS NOT NULL
   AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
   AND files.valid_from <= selected.revision
@@ -546,12 +566,19 @@ FROM main.workspace_file_anchor_rows AS anchors
 CROSS JOIN main.workspace_file_versions AS files
   ON files.input_kind = 'source'
  AND files.file_version_id = anchors.file_version_id
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
 CROSS JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = files.workspace_id
  AND selected.lang = files.lang
  AND selected.generation = files.generation
+-- Pin the full key before expanding the readiness view; statistics can
+-- otherwise choose the language/generation index and filter variants later.
+CROSS JOIN main.blobs AS selected_blob INDEXED BY sqlite_autoindex_blobs_1
+  ON selected_blob.blob_oid = files.blob_oid AND selected_blob.lang = files.lang
+ AND selected_blob.parse_variant = COALESCE(decisions.decision_digest, x'')
 CROSS JOIN main.live_parsed_blobs AS live
-  ON live.blob_oid = files.blob_oid AND live.lang = files.lang
+  ON live.blob_id = selected_blob.id
+ AND live.parse_variant = COALESCE(decisions.decision_digest, x'')
 CROSS JOIN main.code_units AS units INDEXED BY idx_code_units_anchored_normalized_tail
   ON units.blob_id = live.blob_id
  AND units.fq_anchor_kind = anchors.anchor_kind
@@ -581,7 +608,9 @@ CROSS JOIN main.workspace_file_versions AS files
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = live.blob_oid
-WHERE units.fq_anchor_kind IS NULL
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+WHERE live.parse_variant = COALESCE(decisions.decision_digest, x'')
+  AND units.fq_anchor_kind IS NULL
   AND units.exact_fqn_tail IS NOT NULL
   AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
   AND files.valid_from <= selected.revision
@@ -606,11 +635,13 @@ CROSS JOIN main.workspace_file_versions AS files
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = live.blob_oid
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
 CROSS JOIN main.workspace_file_anchor_rows AS anchors
   ON anchors.file_version_id = files.file_version_id
  AND anchors.anchor_kind = units.fq_anchor_kind
  AND anchors.anchor_pop = units.fq_anchor_pop
-WHERE units.fq_anchor_kind IS NOT NULL
+WHERE live.parse_variant = COALESCE(decisions.decision_digest, x'')
+  AND units.fq_anchor_kind IS NOT NULL
   AND units.exact_fqn_tail IS NOT NULL
   AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
   AND files.valid_from <= selected.revision
@@ -664,12 +695,19 @@ FROM main.workspace_file_anchor_rows AS anchors
 CROSS JOIN main.workspace_file_versions AS files
   ON files.input_kind = 'source'
  AND files.file_version_id = anchors.file_version_id
+LEFT JOIN main.csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
 CROSS JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = files.workspace_id
  AND selected.lang = files.lang
  AND selected.generation = files.generation
+-- Pin the full key before expanding the readiness view; statistics can
+-- otherwise choose the language/generation index and filter variants later.
+CROSS JOIN main.blobs AS selected_blob INDEXED BY sqlite_autoindex_blobs_1
+  ON selected_blob.blob_oid = files.blob_oid AND selected_blob.lang = files.lang
+ AND selected_blob.parse_variant = COALESCE(decisions.decision_digest, x'')
 CROSS JOIN main.live_parsed_blobs AS live
-  ON live.blob_oid = files.blob_oid AND live.lang = files.lang
+  ON live.blob_id = selected_blob.id
+ AND live.parse_variant = COALESCE(decisions.decision_digest, x'')
 CROSS JOIN main.code_units AS units INDEXED BY idx_code_units_anchored_package_type
   ON units.blob_id = live.blob_id
  AND units.fq_anchor_kind = anchors.anchor_kind

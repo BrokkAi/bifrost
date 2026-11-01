@@ -178,23 +178,26 @@ fn resolve_java_definition_with_evidence_uncached(
             reference_namespace,
             batch,
             |operation, path, cancellation| {
-                Ok(match operation.java_import_context(path, cancellation)? {
-                    JavaImportContext::Ready {
-                        context,
-                        external_static_imports: boundaries,
-                        open_jvm_alias_imports: open_aliases,
-                        ..
-                    } => {
-                        external_static_imports = boundaries;
-                        open_jvm_alias_imports = open_aliases;
-                        NativePointContext::Ready {
+                Ok(
+                    match java_import_context(java, query.analyzer, operation, path, cancellation)?
+                    {
+                        JavaImportContext::Ready {
                             context,
-                            selected_import_model: None,
+                            external_static_imports: boundaries,
+                            open_jvm_alias_imports: open_aliases,
+                            ..
+                        } => {
+                            external_static_imports = boundaries;
+                            open_jvm_alias_imports = open_aliases;
+                            NativePointContext::Ready {
+                                context,
+                                selected_import_model: None,
+                            }
                         }
-                    }
-                    JavaImportContext::Unavailable => NativePointContext::Unavailable,
-                    JavaImportContext::Cancelled => NativePointContext::Cancelled,
-                })
+                        JavaImportContext::Unavailable => NativePointContext::Unavailable,
+                        JavaImportContext::Cancelled => NativePointContext::Cancelled,
+                    },
+                )
             },
             after_open,
         );
@@ -775,8 +778,10 @@ fn java_native_call_evidence(
                 owner,
                 member,
                 invocation,
+                model_member_selection,
             }) = external_call
             {
+                evidence.model_member_selection = model_member_selection;
                 match invocation {
                     JavaNativeExternalInvocation::Selected {
                         proof,
@@ -1378,6 +1383,7 @@ enum JavaNativeExternalInvocation {
 }
 
 struct JavaNativeExternalMethodResolution {
+    model_member_selection: Option<Box<brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>>,
     owner: String,
     member: String,
     invocation: JavaNativeExternalInvocation,
@@ -1426,8 +1432,8 @@ fn java_native_external_method_resolution(
             .active_semantic_model_snapshot()
             .map(|snapshot| std::sync::Arc::clone(snapshot.active_models())),
     );
-    let selection =
-        resolved.invocation_parameter_count(bound_receiver, actual_types, Some(&surface));
+    let (selection, model_member_selection) =
+        resolved.invocation_with_diagnostics(bound_receiver, actual_types, Some(&surface));
     record_external_invocation(
         query.site.focus_start_byte,
         owner,
@@ -1438,6 +1444,7 @@ fn java_native_external_method_resolution(
         Ok(count) => count,
         Err(cause) => {
             return Some(JavaNativeExternalMethodResolution {
+                model_member_selection,
                 owner: owner.to_owned(),
                 member: member.to_owned(),
                 invocation: match cause {
@@ -1488,6 +1495,7 @@ fn java_native_external_method_resolution(
         .non_overridable_for_argument_types(bound_receiver, actual_types, Some(&surface))
         .is_some();
     Some(JavaNativeExternalMethodResolution {
+        model_member_selection: None,
         owner: owner.to_owned(),
         member: member.to_owned(),
         invocation: JavaNativeExternalInvocation::Selected {
@@ -1723,7 +1731,9 @@ fn java_native_argument_type(
             argument_query,
             ordinal,
             batch,
-            prepare_context,
+            |operation, path, cancellation| {
+                prepare_context(_java, query.analyzer, operation, path, cancellation)
+            },
             || {},
         )
             };
@@ -2008,7 +2018,14 @@ pub(crate) fn resolve_java_type_bounded(
             work: ReceiverAnalysisWork::default(),
         };
     };
-    resolve_native_type_bounded(&java.inner, query, prepare_context, after_open)
+    resolve_native_type_bounded(
+        &java.inner,
+        query,
+        |operation, path, cancellation| {
+            prepare_context(java, query.analyzer, operation, path, cancellation)
+        },
+        after_open,
+    )
 }
 
 fn resolve_java_expression_value_type_in_batch(
@@ -2029,7 +2046,15 @@ fn resolve_java_expression_value_type_in_batch(
             work: ReceiverAnalysisWork::default(),
         };
     };
-    brokk_bifrost_analysis::analyzer::native_points::resolve_native_expression_value_type_bounded_in_batch(&java.inner, query, batch, prepare_context, after_open)
+    brokk_bifrost_analysis::analyzer::native_points::resolve_native_expression_value_type_bounded_in_batch(
+        &java.inner,
+        query,
+        batch,
+        |operation, path, cancellation| {
+            prepare_context(java, query.analyzer, operation, path, cancellation)
+        },
+        after_open,
+    )
 }
 
 /// Translate a carrier only after the shared public-frontier agreement proof.
@@ -2239,7 +2264,9 @@ pub(super) fn observed_value_type(
                 budget: Default::default(),
                 cancellation: Some(request.cancellation),
             },
-            prepare_context,
+            |operation, path, cancellation| {
+                prepare_context(java, analyzer, operation, path, cancellation)
+            },
             java_observed_value_type,
         );
     let work = match &result {
@@ -2261,19 +2288,129 @@ pub(super) fn observed_value_type(
     })
 }
 
+/// Base Java import contexts that this request's point operations built.
+/// Every point opens its own selected operation, so without reuse a policy run
+/// rebuilt one file's base context once per point (#8127). The memo is
+/// request-scoped (it dies with the analyzer's query read cache) and bounded by
+/// retained bytes, so it never grows with the workspace.
+struct JavaImportContextSnapshots {
+    #[cfg(test)]
+    restores: std::sync::atomic::AtomicUsize,
+    entries: moka::sync::Cache<
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContextSnapshotKey,
+        std::sync::Arc<PublishedJavaImportContext>,
+    >,
+}
+
+/// A published snapshot with the read receipt of the cold build that made it.
+struct PublishedJavaImportContext {
+    snapshot:
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContextSnapshot,
+    receipt: brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt,
+}
+
+impl PublishedJavaImportContext {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.snapshot.retained_bytes()
+            + std::mem::size_of_val(&self.receipt)
+    }
+}
+
+/// Retained bytes per request. One base context retains roughly tens to a few
+/// hundred KiB, and a policy run demands about one per Java file it reads.
+const JAVA_IMPORT_CONTEXT_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+
+impl Default for JavaImportContextSnapshots {
+    fn default() -> Self {
+        Self {
+            #[cfg(test)]
+            restores: std::sync::atomic::AtomicUsize::new(0),
+            entries: moka::sync::Cache::builder()
+                .max_capacity(JAVA_IMPORT_CONTEXT_SNAPSHOT_BYTES)
+                .weigher(
+                    |key: &brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContextSnapshotKey,
+                     published: &std::sync::Arc<PublishedJavaImportContext>| {
+                    u32::try_from(key.retained_bytes() + published.retained_bytes())
+                        .unwrap_or(u32::MAX)
+                })
+                .build(),
+        }
+    }
+}
+
+/// One file's base Java import context. When another point operation of this
+/// request already built it, restore that build and replay its read receipt,
+/// so the caller's ledger records the same reads as a cold build; otherwise
+/// build it cold and publish it. Every refusal falls back to the cold build.
+fn java_import_context(
+    java: &JavaAnalyzer,
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+    path: &str,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> brokk_bifrost_analysis::analyzer::store::Result<JavaImportContext> {
+    let Some(snapshots) = java
+        .inner
+        .active_query_request_memo::<JavaImportContextSnapshots>()
+    else {
+        return operation.java_import_context(path, cancellation);
+    };
+    let key = operation.jvm_import_context_snapshot_key(Language::Java, path);
+    if let Some(published) = snapshots.entries.get(&key) {
+        match operation.restore_jvm_import_context_snapshot(&published.snapshot)? {
+            Ok(context) => {
+                #[cfg(test)]
+                snapshots
+                    .restores
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                published.receipt.replay();
+                operation.profile_jvm_import_context_snapshot("restored");
+                return Ok(context);
+            }
+            Err(refusal) => operation.profile_jvm_import_context_snapshot(("restore", refusal)),
+        }
+    }
+    let (built, receipt) =
+        brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(analyzer, || {
+            operation.jvm_import_context_with_snapshot(Language::Java, path, cancellation)
+        });
+    let (context, snapshot) = built?;
+    match snapshot {
+        // A build that depended on budget, cancellation or a provider failure
+        // is never retained (#8184).
+        Ok(_) if receipt.has_execution_dependences() => {
+            operation.profile_jvm_import_context_snapshot(("publish", "execution_dependent"));
+        }
+        Ok(snapshot) => {
+            snapshots.entries.insert(
+                key,
+                std::sync::Arc::new(PublishedJavaImportContext { snapshot, receipt }),
+            );
+            operation.profile_jvm_import_context_snapshot("published");
+        }
+        Err(refusal) => operation.profile_jvm_import_context_snapshot(("publish", refusal)),
+    }
+    Ok(context)
+}
+
 fn prepare_context(
+    java: &JavaAnalyzer,
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
     operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
     path: &str,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> brokk_bifrost_analysis::analyzer::store::Result<NativePointContext> {
-    Ok(match operation.java_import_context(path, cancellation)? {
-        JavaImportContext::Ready { context, .. } => NativePointContext::Ready {
-            context,
-            selected_import_model: None,
+    Ok(
+        match java_import_context(java, analyzer, operation, path, cancellation)? {
+            JavaImportContext::Ready { context, .. } => NativePointContext::Ready {
+                context,
+                selected_import_model: None,
+            },
+            JavaImportContext::Unavailable => NativePointContext::Unavailable,
+            JavaImportContext::Cancelled => NativePointContext::Cancelled,
         },
-        JavaImportContext::Unavailable => NativePointContext::Unavailable,
-        JavaImportContext::Cancelled => NativePointContext::Cancelled,
-    })
+    )
 }
 
 #[cfg(test)]

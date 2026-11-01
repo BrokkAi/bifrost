@@ -1322,6 +1322,9 @@ fn query_step_to_json(step: &QueryStep) -> Value {
             CallArgumentSelector::FormalIndex(index) => {
                 object.insert("formal_index".to_string(), json!(index));
             }
+            CallArgumentSelector::FormalAnnotationType(name) => {
+                object.insert("formal_annotation_type".to_string(), json!(name));
+            }
         },
         QueryStep::JsxAttributeValue(traversal) => {
             if let Some(identity) = traversal.identity {

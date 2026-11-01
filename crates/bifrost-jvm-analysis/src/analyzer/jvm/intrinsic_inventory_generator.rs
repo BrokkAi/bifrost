@@ -768,6 +768,7 @@ fn read_java_closures(path: &std::path::Path, limits: &ArtifactProducerLimits) -
     use std::io::Read;
     let artifact = read_exact_artifact_while(path, limits, || false).unwrap();
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(artifact.bytes())).unwrap();
+    let mut enclosing_scopes = super::java_artifact::EnclosingScopeResolver::default();
     let entries = (0..archive.len())
         .filter_map(|i| {
             let entry = archive.by_index(i).unwrap();
@@ -795,6 +796,12 @@ fn read_java_closures(path: &std::path::Path, limits: &ArtifactProducerLimits) -
         let name = entry.name().expect("archive entry name").into_owned();
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
+        drop(entry);
+        let prefix = if name.starts_with("classes/") {
+            "classes/"
+        } else {
+            ""
+        };
         let mut remaining = limits.max_records;
         let mut hit = false;
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
@@ -802,6 +809,9 @@ fn read_java_closures(path: &std::path::Path, limits: &ArtifactProducerLimits) -
             "inventory",
             &name,
             &bytes,
+            &mut |outer| {
+                enclosing_scopes.parameters(outer, &mut archive, prefix, limits.max_signature_depth)
+            },
             limits.max_signature_depth,
             &mut remaining,
             &mut hit,

@@ -139,6 +139,7 @@ fn lower_joins(
         }
         let kind = match join.kind {
             RowJoinKind::Inner => IrJoinKind::Inner,
+            RowJoinKind::Left => IrJoinKind::Left,
             RowJoinKind::Semi => IrJoinKind::Semi,
             RowJoinKind::Anti => IrJoinKind::Anti,
         };

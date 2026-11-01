@@ -22,13 +22,15 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationProvider;
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationResult, CallerInventoryCoverage,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::native_incoming_preflight;
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSiteSyntax;
 
-use brokk_bifrost_core::analyzer::model::CodeUnit;
+use brokk_bifrost_core::analyzer::model::{CodeUnit, DispatchExtensibility};
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
@@ -68,6 +70,7 @@ impl CallRelationProvider for GoNativeCallRelations {
                     target.fq_name()
                 ),
                 context: target.fq_name().to_string(),
+                semantic_count: None,
                 reason_kind: None,
             })
         {
@@ -90,6 +93,7 @@ impl CallRelationProvider for GoNativeCallRelations {
             }
             GoSelectedReverseOutcome::Cancelled => {
                 return CallRelationResult {
+                    caller_inventory: CallerInventoryCoverage::Incomplete,
                     cancelled: true,
                     proof_authority: UsageProofAuthority::Native,
                     ..CallRelationResult::default()
@@ -112,6 +116,7 @@ impl CallRelationProvider for GoNativeCallRelations {
         let cancellation = cancellation.cloned().unwrap_or_default();
         if cancellation.is_cancelled() {
             return CallRelationResult {
+                caller_inventory: CallerInventoryCoverage::Incomplete,
                 cancelled: true,
                 proof_authority: UsageProofAuthority::Native,
                 ..CallRelationResult::default()
@@ -142,7 +147,7 @@ pub fn go_native_incoming_calls(
     GoNativeCallRelations.incoming(analyzer, target, limits, cancellation)
 }
 
-fn project_incoming_calls(
+pub(crate) fn project_incoming_calls(
     go: &GoAnalyzer,
     target: &CodeUnit,
     mut selected: EdgeDerivationResult,
@@ -151,6 +156,11 @@ fn project_incoming_calls(
 ) -> CallRelationResult {
     let mut result = CallRelationResult {
         proof_authority: UsageProofAuthority::Native,
+        caller_inventory: if matches!(selected.completeness, EdgeCompleteness::Complete) {
+            CallerInventoryCoverage::Complete
+        } else {
+            CallerInventoryCoverage::Incomplete
+        },
         diagnostics: incomplete_diagnostics(&selected, target),
         ..CallRelationResult::default()
     };
@@ -244,6 +254,21 @@ impl IncomingCallProjection for GoIncomingProjection<'_> {
         Ok(IncomingFile::Loaded(facts))
     }
 
+    /// Go types satisfy interfaces implicitly, and the store has no record of
+    /// where a receiver value converts to an interface type (#8484). So any
+    /// concrete method can be called through an interface value, by std or by
+    /// a dependency, from a site no reverse row names. An interface's own
+    /// method declaration (open dispatch) is named at every call through the
+    /// interface, so, like a free function, it keeps the coverage of its
+    /// reverse inventory. Missing signature metadata counts as concrete.
+    fn unenumerable_dispatch(&mut self, target: &CodeUnit) -> Result<bool, Self::Error> {
+        Ok(target.is_function()
+            && target.owner_is_type_scope()
+            && !self.go.signature_metadata(target).iter().any(|metadata| {
+                metadata.dispatch_extensibility() == Some(DispatchExtensibility::Open)
+            }))
+    }
+
     fn caller(&self, edge: &ReferenceEdgeRow, syntax: &CallSiteSyntax) -> Option<CodeUnit> {
         structural_incoming_caller(self.go.structural_fact_providers(), edge, syntax)
     }
@@ -288,6 +313,7 @@ fn incomplete_diagnostics(
 
 fn unavailable(message: impl Into<String>, target: &CodeUnit) -> CallRelationResult {
     CallRelationResult {
+        caller_inventory: CallerInventoryCoverage::Incomplete,
         proof_authority: UsageProofAuthority::Native,
         diagnostics: vec![diagnostic(
             message.into(),

@@ -489,6 +489,40 @@ pub type AssignmentValueTypeSpelling = fn(
 
 #[doc(hidden)]
 pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send + Sync {
+    /// Proven language intrinsics. None leaves the ordinary unresolved boundary intact.
+    fn intrinsic_call(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _call: &crate::analyzer::semantic::ir::CallSiteHandle,
+    ) -> Result<
+        Option<crate::analyzer::semantic::IntrinsicCall>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        Ok(None)
+    }
+
+    /// Whether an exact external identity denotes an intrinsic format result.
+    fn intrinsic_format_result(
+        &self,
+        _identity: &crate::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity,
+    ) -> bool {
+        false
+    }
+
+    /// Whether an exact external identity is a builtin whose proven boundary
+    /// completes call-target coverage without a body to analyze.
+    fn intrinsic_complete_target(
+        &self,
+        _identity: &crate::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity,
+    ) -> bool {
+        false
+    }
+
+    /// Present unresolved calls using exact call-site evidence.
+    fn taint_uses_call_site_evidence(&self) -> bool {
+        false
+    }
+
     /// Whether shared lexical discovery may answer a local definition before
     /// the language's authoritative definition operation runs.
     fn lexical_definitions_are_authoritative(&self) -> bool {

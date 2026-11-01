@@ -133,17 +133,11 @@ use brokk_bifrost_core::analyzer::model::CodeUnit;
 
 use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
 
-use brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant;
-
-use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
-
 use brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::ForwardQueryProvider;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
-
-use brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo;
 
 use brokk_bifrost_core::analyzer::model::Language;
 
@@ -230,15 +224,10 @@ pub struct PhpAnalyzer {
         Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>,
     >,
     direct_ancestors: BoundedMemo<CodeUnit, Arc<Vec<CodeUnit>>>,
-    /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
-    /// from rayon workers during cold scans, and a blocking `get_or_init` parks
-    /// every one of them behind the single initializer for its full duration.
-    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
-    /// gets an index that was never built over them (issue #1748). Two cells at
-    /// most, because the exclusion verdict is a pure function of the analyzer
-    /// and the file.
+    /// Byte-bounded outcomes and read receipts, separated by test-filter
+    /// variant (#1748). Cold builds do not wait behind another query's deadline.
     direct_descendant_index: Arc<
-        WorkspaceAuthorityMemo<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+        WorkspaceAuthorityMemo<brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo>,
     >,
     /// The declarations of other files that one file's persisted import names
     /// resolve to, keyed by file because the persisted names are. An entry
@@ -369,7 +358,7 @@ impl PhpAnalyzer {
             ))),
             direct_descendant_index: Arc::new(WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::PhpDirectDescendants,
-                KeyedPoolSafeMemo::new(),
+                brokk_bifrost_analysis::analyzer::common::new_replayable_descendant_memo(),
             )),
             imported_code_units: Arc::new(ReplayingMemo::new(build_weighted_cache(
                 memo_budget / 8,

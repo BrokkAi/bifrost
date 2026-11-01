@@ -1193,6 +1193,25 @@ fn hold_to_compilation_membership(
     file: &ProjectFile,
     mut outcome: DefinitionLookupOutcome,
 ) -> DefinitionLookupOutcome {
+    let inventory = definitions
+        .csharp
+        .compilation_inventory_obligations(file)
+        .unwrap_or_else(|| vec!["C# compilation inventory could not be read".into()]);
+    if !inventory.is_empty() {
+        if matches!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved
+                | DefinitionLookupStatus::NoDefinition
+                | DefinitionLookupStatus::NotFound
+        ) {
+            outcome.status = DefinitionLookupStatus::Incomplete;
+        }
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "csharp_compilation_usings_incomplete".into(),
+            message: inventory.join("; "),
+        });
+    }
     let mut doubt = Vec::new();
     let root = analyzer.project().root();
     let mut removed = Vec::new();

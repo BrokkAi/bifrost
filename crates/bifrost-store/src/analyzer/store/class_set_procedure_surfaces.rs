@@ -6,6 +6,7 @@
 //! recursive call graphs while still letting a reader traverse and replay the
 //! exact graph under its own bounds.
 
+use brokk_bifrost_core::gitblob::ParseVariant;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::Sha256;
 use std::sync::LazyLock;
@@ -88,6 +89,8 @@ pub struct ClassSetProcedureSurfaceCallRow {
 pub struct ClassSetProcedureSurfaceHeaderRow {
     pub key: ClassSetProcedureSurfaceKey,
     pub owner_blob_oid: String,
+    /// Write-time owner identity, recovered through the owner blob FK on load.
+    pub owner_parse_variant: ParseVariant,
     pub artifact_public_identity: ClassSetSummaryDigest,
     pub artifact_content_identity: ClassSetSummaryDigest,
     /// Exact provider behavior that produced this certificate. This is replay
@@ -220,7 +223,7 @@ impl ClassSetProcedureSurfaceRow {
                 read,
                 ReadKey::Lookup {
                     kind: LookupKind::ProcedureDispatch,
-                    question: LookupQuestion::ProcedureCallSite { .. },
+                    question: LookupQuestion::CallSite { .. },
                     ..
                 }
             ) {
@@ -502,7 +505,7 @@ fn surface_select_sql(predicate: &str, require_complete: bool) -> String {
                 surfaces.direct_calls_digest,
                 surfaces.call_count, surfaces.binding_count, surfaces.entered_count,
                 surfaces.lexical_child_count,
-                surfaces.read_count
+                surfaces.read_count, blobs.parse_variant
          FROM class_set_procedure_surfaces AS surfaces
          JOIN blobs ON blobs.id=surfaces.owner_blob_id
          {meta_join}
@@ -654,6 +657,7 @@ fn surface_candidate(raw: RawSurface) -> Result<ClassSetProcedureSurfaceCandidat
         entered_count,
         lexical_child_count,
         read_count,
+        owner_parse_variant,
     ) = raw;
     validate_counts(
         call_count,
@@ -676,6 +680,7 @@ fn surface_candidate(raw: RawSurface) -> Result<ClassSetProcedureSurfaceCandidat
             local_structure_digest: local_structure,
             behavior_read_digest: behavior,
             owner_blob_oid: blob_oid,
+            owner_parse_variant,
             artifact_public_identity: artifact_public,
             artifact_content_identity: artifact_content,
             exact_behavior_digest: exact_behavior,
@@ -721,10 +726,11 @@ fn live_owner_blob_id(
     let key = &surface.header.key;
     super::live_class_set_owner_blob_id(
         conn,
-        &super::BlobKey::unvaried(
-            git2::Oid::from_str(&surface.header.owner_blob_oid)?,
-            key.owner_storage_language_key.as_str(),
-        ),
+        &super::BlobKey {
+            oid: git2::Oid::from_str(&surface.header.owner_blob_oid)?,
+            lang: key.owner_storage_language_key.as_str().to_owned(),
+            variant: surface.header.owner_parse_variant,
+        },
     )?
     .ok_or_else(|| StoreError::new("class-set procedure surface owner blob is absent"))
 }
@@ -782,6 +788,7 @@ type RawSurface = (
     usize,
     usize,
     usize,
+    ParseVariant,
 );
 
 struct SurfaceHeaderFields {
@@ -793,6 +800,7 @@ struct SurfaceHeaderFields {
     local_structure_digest: Vec<u8>,
     behavior_read_digest: Vec<u8>,
     owner_blob_oid: String,
+    owner_parse_variant: ParseVariant,
     artifact_public_identity: Vec<u8>,
     artifact_content_identity: Vec<u8>,
     exact_behavior_digest: Vec<u8>,
@@ -815,6 +823,7 @@ fn surface_header(fields: SurfaceHeaderFields) -> Result<ClassSetProcedureSurfac
             behavior_read_digest: digest(fields.behavior_read_digest, "behavior read digest")?,
         },
         owner_blob_oid: fields.owner_blob_oid,
+        owner_parse_variant: fields.owner_parse_variant,
         artifact_public_identity: digest(
             fields.artifact_public_identity,
             "artifact public identity",
@@ -865,6 +874,7 @@ fn raw_surface_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSurface>
         row.get(18)?,
         row.get(19)?,
         row.get(20)?,
+        row.get(21)?,
     ))
 }
 
@@ -894,6 +904,7 @@ fn load_surface(
         entered_count,
         lexical_count,
         read_count,
+        owner_parse_variant,
     ) = raw;
     validate_counts(
         call_count,
@@ -979,6 +990,7 @@ fn load_surface(
             local_structure_digest: local_structure,
             behavior_read_digest: behavior,
             owner_blob_oid: blob_oid,
+            owner_parse_variant,
             artifact_public_identity: artifact_public,
             artifact_content_identity: artifact_content,
             exact_behavior_digest: exact_behavior,
@@ -1539,7 +1551,7 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
-    use crate::analyzer::read_ledger::ProcedureCallSiteLocator;
+    use crate::analyzer::read_ledger::CallSiteLocator;
     use crate::analyzer::semantic::ids::StableDigest;
     use crate::analyzer::store::planner_statistics::tests::assert_pinned_query_uses_index;
     use crate::analyzer::store::test_adapters::{
@@ -1636,6 +1648,7 @@ mod tests {
                     behavior_read_digest: bytes(3),
                 },
                 owner_blob_oid: BLOB_A.to_string(),
+                owner_parse_variant: ParseVariant::Empty,
                 artifact_public_identity: bytes(4),
                 artifact_content_identity: bytes(5),
                 exact_behavior_digest: bytes(18),
@@ -1660,14 +1673,10 @@ mod tests {
             vec![identity(12, 13, 14, 15)],
             vec![ReadKey::Lookup {
                 kind: LookupKind::ProcedureDispatch,
-                question: LookupQuestion::ProcedureCallSite {
+                question: LookupQuestion::CallSite {
                     rel_path: Box::from("src/app.py"),
                     procedure: StableDigest::sha256(b"caller"),
-                    site: ProcedureCallSiteLocator {
-                        start_byte: 12,
-                        end_byte: 18,
-                        ordinal: 1,
-                    },
+                    site: CallSiteLocator { ordinal: 1 },
                 },
                 digest: StableDigest::sha256(b"dispatch"),
             }],

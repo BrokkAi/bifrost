@@ -196,7 +196,7 @@ some ecosystems, can run a build tool; the next table lists those files.
 | `php` | The root `composer.json` (`autoload` and `autoload-dev`, `psr-4` entries) | A declaration under a PSR-4 root is treated as visible from every PHP file when Bifrost searches for usages |
 | `ruby` | The root `Gemfile` or `Gemfile.lock` | If either names the gem `rails` or `zeitwerk`, `.rb` files under `app/<dir>/` are visible to every Ruby file without a `require`. `app/assets`, `app/javascript`, and `app/views` are excluded |
 | `cpp` | The root `compile_commands.json` (`directory`, `file`, and `arguments` or `command`) | Include search roots (`-I`, `/I`, `-iquote`, `-isystem`, `/external:I`, `/imsvc`), forced includes (`-include`), macro definitions (`-D`, `-U`), and the translation-unit language (`-x`, `/TC`, `/TP`, `-std`). Bifrost uses them for include resolution and semantic diagnostics. It never runs the recorded commands |
-| `csharp` | Every `.csproj` file (`Compile` items with `Include` and `Remove`, `EnableDefaultItems`, `EnableDefaultCompileItems`) | Which `.cs` files form one compilation, so that a `global using` applies only to files of its own project. Without a `.csproj`, all `.cs` files form one compilation. MSBuild is not run. `Directory.Build.props` and `Directory.Build.targets` are not interpreted; their presence marks the membership as incomplete |
+| `csharp` | Every `.csproj` file; for an SDK project, the nearest `Directory.Build.props`, `Directory.Packages.props` and `Directory.Build.targets` above it; workspace files that these import by a static path; each project's restore files in its intermediate output directory (`obj/` by default): `project.assets.json`, `<project>.nuget.g.props` and `<project>.nuget.g.targets` | Which `.cs` files form one compilation (`Compile` items with `Include` and `Remove`, `EnableDefaultItems`, `EnableDefaultCompileItems`), so that a `global using` applies only to files of its own project; and each project's selected configuration, which decides `#if` chains (see [C#](#c)). Without a `.csproj`, all `.cs` files form one compilation. MSBuild is not run, so membership that Bifrost cannot evaluate statically is marked incomplete |
 
 ### Dependency discovery inputs
 
@@ -457,16 +457,48 @@ TypeScript and JavaScript share the `js-ts` adapter. C and C++ share the
 
 ### C#
 
-- Bifrost hides preprocessor directive lines from the parser. In each `#if`,
-  `#elif`, `#else` chain, the first branch is active, unless its condition is
-  the literal `false`; then the next branch is tried.
-- Bifrost does not model defined symbols. It does not read `DefineConstants`
-  or `#define`. Declarations in the inactive branches are not indexed, so
-  code that differs by target framework (`#if NET...`) can lose
-  declarations.
-- Semantic diagnostics for a file with inactive branches are marked
-  incomplete with the detail
-  `conditional compilation: inactive branches excluded from the index`.
+- Bifrost reads each C# file under one selected configuration for each
+  project that compiles it: `Debug`, the first target framework that the
+  restore recorded (`originalTargetFrameworks` in `project.assets.json`), the
+  SDK's implicit symbols for that framework, and the project's
+  `DefineConstants`. It reads these without running MSBuild. `#define` and
+  `#undef` in the file also apply. Preprocessor directive lines are hidden
+  from the parser.
+- A chain is one `#if` with its `#elif` and `#else` branches. When every
+  project that compiles the file selects the same branch, Bifrost parses that
+  branch, as the compiler would. A condition can have a known value even when
+  it names an unknown symbol, for example `true || FEATURE`.
+- Otherwise the chain is undecided: a deciding condition depends on a symbol
+  whose value is unknown, cannot be parsed, or selects different branches in
+  different projects. Bifrost then parses the earliest branch not proven
+  false and skips the others. If the skipped text holds anything other than
+  whitespace and comments, a read of the file records the reason
+  `csharp_conditional_branch_unseen`, which names the chain and the cause, and
+  the answer is incomplete. Reads that list C# declarations across files, such
+  as a definition lookup by name, record the same reason when any file in the
+  workspace has such a chain. File outlines and direct RQL queries do not
+  report it yet (#8723).
+- A project's symbol set is closed only when Bifrost can read it completely.
+  An open set lists no symbols, so every symbol in it is unknown, and never
+  assumed undefined. The open reasons are:
+  - `loose_files`: the files belong to no project;
+  - `unrestored`: the restore files are missing or unreadable;
+  - `condition`: an MSBuild `Condition` that Bifrost cannot evaluate;
+  - `dynamic_property`: a property function or a property that Bifrost
+    cannot expand;
+  - `unevaluated_import`: an import that Bifrost does not evaluate, such as
+    one with an `Sdk`, `Version` or `MinimumVersion` attribute, a dynamic or
+    rooted path, or a path outside the workspace;
+  - `package_build_import`: the generated restore files import build files
+    from the NuGet package cache;
+  - `unsupported_framework`: the built-in table of implicit symbols does not
+    cover the target framework.
+- Semantic diagnostics for a file in which an undecided chain left text
+  unparsed are marked incomplete with the detail
+  `conditional compilation: inactive branches excluded from the index`. A
+  branch excluded by a decided chain does not mark the file.
+- Usage graphs list each selected compilation in `csharp_compilations`. See
+  [usage_graph](/reference/mcp-tools/#usage_graph).
 - `global using` directives apply only to the files of the same `.csproj`
   compilation. See [Project and build inputs](#project-and-build-inputs).
 

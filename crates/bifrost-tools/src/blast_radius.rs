@@ -50,6 +50,8 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::path::{Component, Path};
 use std::sync::Arc;
 
+#[cfg(test)]
+mod coverage_tests;
 mod missing_tests;
 
 pub use crate::blast_radius::missing_tests::*;

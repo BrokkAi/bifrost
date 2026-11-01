@@ -59,13 +59,21 @@ use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
 // The lowerer reaches the changed import-binder and structural-index code.
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v34";
+// #8306: await binds its operand and result values in the shared scaffold.
+// #7960: a call's thrown value binds the catch parameter that handles it.
+// #8025: namespace import reads are static loads rooted at the import binder.
+// #8836: revert #7960; calls no longer bind the catch parameter. v37 is held by #8827.
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v38";
 // Bumping this rotates every public wire id hashed from the adapter
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
 // The lowerer reaches the changed import-binder and structural-index code.
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v39";
+// #8306: await binds its operand and result values in the shared scaffold.
+// #7960: a call's thrown value binds the catch parameter that handles it.
+// #8025: namespace import reads are static loads rooted at the import binder.
+// #8836: revert #7960; calls no longer bind the catch parameter. v42 is held by #8827.
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v43";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -353,6 +361,9 @@ fn js_ts_capabilities() -> SemanticCapabilities {
     for capability in [
         SemanticCapability::GeneratorSuspension,
         SemanticCapability::AsyncSuspendResume,
+        // Partial: only reads of namespace import bindings lower as static
+        // loads; other module-scope names stay producer-less values.
+        SemanticCapability::StaticMemory,
     ] {
         builder = builder.partial(capability);
     }
@@ -483,6 +494,9 @@ struct LoweringContext<'tree, 'targets> {
     /// literal. The outer key is the allocation root so declaration aliases
     /// retain the same element identity.
     array_element_fields: HashMap<ValueId, ArrayElementFields>,
+    /// The static location each namespace import binding read in this
+    /// procedure loads, keyed by the import binder's range.
+    namespace_import_locations: HashMap<Range, MemoryLocationId>,
 }
 
 struct LocalBinding {

@@ -521,6 +521,22 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 225,
         sql: include_str!("../migrations/cache/0225-blob-parse-variant.sql"),
     },
+    CacheMigration {
+        version: 226,
+        sql: include_str!("../migrations/cache/0226-csharp-compilation-using-extent.sql"),
+    },
+    CacheMigration {
+        version: 227,
+        sql: include_str!("../migrations/cache/0227-csharp-open-membership.sql"),
+    },
+    CacheMigration {
+        version: 228,
+        sql: include_str!("../migrations/cache/0228-csharp-file-version-decisions.sql"),
+    },
+    CacheMigration {
+        version: 229,
+        sql: include_str!("../migrations/cache/0229-csharp-undecided-chains.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -546,8 +562,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    14, 148, 100, 134, 47, 165, 2, 230, 28, 119, 76, 156, 104, 53, 82, 168, 77, 220, 151, 196, 70,
-    17, 233, 149, 40, 105, 76, 233, 55, 119, 174, 139,
+    220, 196, 246, 172, 223, 162, 45, 231, 23, 142, 53, 69, 107, 33, 116, 237, 167, 128, 207, 196,
+    57, 137, 117, 113, 88, 59, 139, 177, 225, 173, 189, 121,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -6759,6 +6775,44 @@ mod tests {
             );
             assert!(current_schema_is_valid(&conn).unwrap());
         }
+    }
+
+    #[test]
+    fn csharp_open_membership_migration_preserves_populated_compilations() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 227) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 226).unwrap();
+        conn.execute_batch("INSERT INTO csharp_compilation_sets(set_id,workspace_id,lang,generation,derivation_version,input_digest,output_digest,membership_complete,gaps)
+         VALUES(1,'workspace','csharp',1,4,zeroblob(32),zeroblob(32),0,jsonb('[[\"old_gap\",\"App/App.csproj\",\"unknown\"]]'));
+         INSERT INTO csharp_compilations(compilation_id,set_id,project_path,references_complete,transitive_flow,global_usings_complete,internals_visible_to_complete,global_usings,internals_visible_to)
+         VALUES(1,1,'App/App.csproj',1,1,1,1,jsonb('[]'),jsonb('[]')),(2,1,'Lib/Lib.csproj',1,1,1,1,jsonb('[]'),jsonb('[]'));
+         INSERT INTO csharp_compilation_items(compilation_id,ordinal,set_id,kind,rel_path,excluded_trees) VALUES(1,0,1,'default_tree','App',jsonb('[\"App/obj\"]'));
+         INSERT INTO csharp_project_references VALUES(1,2);
+         INSERT INTO csharp_compilation_symbols VALUES(1,'DEBUG','sdk');").unwrap();
+        migrate(&mut conn).unwrap();
+        for (table, expected) in [
+            ("csharp_compilations", 2),
+            ("csharp_compilation_items", 1),
+            ("csharp_project_references", 1),
+            ("csharp_compilation_symbols", 1),
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('csharp_compilation_sets') WHERE name='membership_complete'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        conn.execute_batch("INSERT INTO csharp_compilation_items(compilation_id,ordinal,set_id,kind,rel_path,excluded_trees,gap_indices)
+            VALUES(1,1,1,'open_tree','App/Generated',jsonb('[]'),jsonb('[0]'));").unwrap();
+        assert!(!conn.query_row("SELECT membership_complete FROM csharp_compilation_membership_coverage WHERE compilation_id=1",[],|r|r.get::<_,bool>(0)).unwrap());
+        assert!(conn.execute("INSERT INTO csharp_compilation_items(compilation_id,ordinal,set_id,kind,rel_path) VALUES(1,2,1,'open','App/X.cs')",[]).is_err());
+        assert!(conn.execute("UPDATE csharp_compilations SET inventory_open=0, inventory_gap_indices=jsonb('[0]') WHERE compilation_id=1", []).is_err());
+        validate_foreign_keys(&conn).unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]

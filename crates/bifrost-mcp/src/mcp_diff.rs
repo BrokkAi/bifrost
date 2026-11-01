@@ -1,6 +1,5 @@
-use crate::mcp_common::{McpRenderOptions, run_named_stdio_server, tool_descriptor};
+use crate::mcp_common::tool_descriptor;
 use serde_json::{Value, json};
-use std::path::PathBuf;
 
 pub const DIFF_TOOL_NAMES: &[&str] = &[
     "analyze_diff",
@@ -10,13 +9,6 @@ pub const DIFF_TOOL_NAMES: &[&str] = &[
     "missing_tests",
     "score_diff",
 ];
-
-pub fn run_diff_stdio_server(
-    root: PathBuf,
-    render_options: McpRenderOptions,
-) -> Result<(), String> {
-    run_named_stdio_server(root, render_options, "diff")
-}
 
 pub(crate) fn diff_tool_descriptors() -> Vec<Value> {
     vec![

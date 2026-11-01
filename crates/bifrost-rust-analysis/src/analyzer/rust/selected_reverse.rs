@@ -96,6 +96,7 @@ pub struct RustSelectedReverseWork {
 }
 
 pub trait RustSelectedReverseQueries {
+    fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>>;
     /// The project's analysis generation, as this selected operation captured
     /// it when it opened.
     fn analysis_generation(&self) -> u64;
@@ -165,6 +166,9 @@ struct RustReverseProjection<'query, 'analyzer> {
 }
 
 impl RustSelectedReverseQueries for RustReverseProjection<'_, '_> {
+    fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>> {
+        self.queries.unenumerable_member_dispatch(target)
+    }
     fn analysis_generation(&self) -> u64 {
         self.queries.analysis_generation()
     }

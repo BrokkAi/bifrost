@@ -230,9 +230,7 @@ pub(crate) use brokk_bifrost_jvm::scala::supertypes::ScalaSupertypeLookupPath;
 use brokk_bifrost_jvm::scala::test_detection::detect_scala_test_assertion_smells;
 #[doc = " Scala's pure name, signature and delimiter helpers. They read and produce"]
 #[doc = " strings only, so they moved with the language knowledge they serve."]
-pub(crate) use brokk_bifrost_jvm::scala::{
-    scala_default_type_name, scala_normalize_full_name, scala_package_fq_name,
-};
+pub(crate) use brokk_bifrost_jvm::scala::{scala_normalize_full_name, scala_package_fq_name};
 
 use crate::analyzer::scala::clones::build_scala_clone_candidate_data;
 
@@ -947,7 +945,7 @@ pub struct ScalaAnalyzer {
             >,
         >,
     >,
-    external_inputs: crate::analyzer::jvm::hierarchy::DerivedMemo<(), ()>,
+    external_inputs: crate::analyzer::jvm::hierarchy::RawDerivedMemo<(), ()>,
     memo_budget: u64,
     imported_code_units:
         crate::analyzer::jvm::hierarchy::DerivedMemo<ProjectFile, HashSet<CodeUnit>>,
@@ -1124,6 +1122,12 @@ fn new_scala_dead_code_authority(memo_budget: u64) -> WorkspaceAuthorityMemo<Usa
 }
 
 impl ScalaAnalyzer {
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inner(&self) -> &TreeSitterAnalyzer<ScalaAdapter> {
+        &self.inner
+    }
+
     pub(crate) fn tree_sitter_analyzer(&self) -> &TreeSitterAnalyzer<ScalaAdapter> {
         &self.inner
     }
@@ -1359,7 +1363,8 @@ impl ScalaAnalyzer {
         clone.inner = clone.inner.clone_with_project(project);
         clone.external_index =
             Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new());
-        clone.external_inputs = crate::analyzer::jvm::hierarchy::derived_memo(self.memo_budget / 8);
+        clone.external_inputs =
+            crate::analyzer::jvm::hierarchy::raw_derived_memo(self.memo_budget / 8);
         clone.file_dependency_index = new_scala_file_dependency_authority();
         clone.project_types = new_scala_project_types_authority();
         clone.resolved_query_seed = new_scala_resolved_seed_authority();
@@ -1408,7 +1413,7 @@ impl ScalaAnalyzer {
             external_index: Arc::new(
                 brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
             ),
-            external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
+            external_inputs: crate::analyzer::jvm::hierarchy::raw_derived_memo(memo_budget / 8),
             memo_budget,
             imported_code_units: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 4),
             referencing_files: new_scala_referencing_files_authority(memo_budget / 8),
@@ -1597,8 +1602,8 @@ impl ScalaAnalyzer {
     /// The JVM half of boundary refinement, mirroring
     /// `JavaAnalyzer::external_boundary_evidence`. The tiers are the external
     /// tiers of [`ScalaSource::simple_type_proof`] -- a written qualified name,
-    /// `java.lang`, the file's explicit and wildcard imports, the file's own
-    /// package -- read against the built index rather than a peek, because the
+    /// explicit imports, wildcard imports, package members, then implicit
+    /// roots -- read against the built index rather than a peek, because the
     /// trace runs on the resolver path where building is permitted. A hit is
     /// [`BoundaryStatus::ExternalIndexed`] with the resolved external type; a
     /// miss against an index whose producers reported truncation is
@@ -1666,8 +1671,8 @@ impl ScalaAnalyzer {
 
     /// The external type a written Scala type spelling names, read through the
     /// external tiers of [`ScalaSource::simple_type_proof`]: a written
-    /// qualified name, `java.lang`, the file's explicit and wildcard imports,
-    /// and the file's own package, in that order.
+    /// qualified name, explicit imports, wildcard imports, package members,
+    /// then ordered implicit roots (SCALA_PRECEDENCE_RULES, SLS chapter 2).
     ///
     /// Kept as one function because both the trace's boundary evidence and the
     /// resolver's own member gate must reach a type spelling the same way; two
@@ -1681,7 +1686,15 @@ impl ScalaAnalyzer {
         spelling: &str,
     ) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
         let imports = self.inner.import_info_of(token, file);
-        Self::external_type_spelling_in(external, package_name, spelling, &imports)
+        if self
+            .inner
+            .declarations(file)
+            .iter()
+            .any(|unit| unit.is_class() && unit.short_name().trim_end_matches('$') == spelling)
+        {
+            return None;
+        }
+        self.external_type_spelling_in(external, package_name, spelling, &imports)
     }
 
     /// [`Self::external_type_spelling`] over a caller-supplied import set.
@@ -1691,6 +1704,7 @@ impl ScalaAnalyzer {
     /// the file, so the one ladder is spelled once and both callers agree
     /// about which declaration a spelling names.
     fn external_type_spelling_in(
+        &self,
         external: &JvmExternalDeclarations<'_>,
         package_name: &str,
         spelling: &str,
@@ -1701,24 +1715,45 @@ impl ScalaAnalyzer {
         {
             return Some(ty);
         }
-        if let Some(ty) = external.resolve_java_lang(spelling) {
-            return Some(ty);
+        // SLS chapter 2; SCALA_PRECEDENCE_RULES ranks same-file definitions,
+        // explicit imports, wildcards, other-file package members, then defaults.
+        for import in imports.iter().filter(|import| !import.is_wildcard) {
+            if import.local_name() == Some(spelling) {
+                let path = scala_import_path(import)?;
+                return external.resolve_explicit_import(&path, package_name);
+            }
         }
-        for import in imports {
-            let Some(path) = scala_import_path(import) else {
-                continue;
-            };
-            if import.is_wildcard {
-                if let Some(ty) = external.resolve_wildcard_import(&path, spelling, package_name) {
-                    return Some(ty);
-                }
-            } else if import.local_name() == Some(spelling)
-                && let Some(ty) = external.resolve_explicit_import(&path, package_name)
-            {
+        for import in imports.iter().filter(|import| import.is_wildcard) {
+            let path = scala_import_path(import)?;
+            if let Some(ty) = external.resolve_wildcard_import(&path, spelling, package_name) {
                 return Some(ty);
             }
         }
-        external.resolve_same_package(package_name, spelling)
+        if self.declares_package_type(package_name, spelling) {
+            return None;
+        }
+        external
+            .resolve_same_package(package_name, spelling)
+            .or_else(|| {
+                brokk_bifrost_jvm::intrinsics::ordered_implicit_root(
+                    Language::Scala,
+                    spelling,
+                    |root| {
+                        if let Some(target) =
+                            brokk_bifrost_jvm::intrinsics::implicit_root_type_alias(
+                                Language::Scala,
+                                root,
+                                spelling,
+                            )
+                        {
+                            external.resolve_qualified_name(target, package_name)
+                        } else {
+                            external.resolve_wildcard_import(root, spelling, package_name)
+                        }
+                    },
+                )
+                .into_answer()
+            })
     }
 
     /// Resolve `raw_name` in `file` as a member spelling -- a written
@@ -1793,6 +1828,12 @@ impl ScalaAnalyzer {
         if self.inner.declarations(file).iter().any(matches_name) {
             return true;
         }
+        self.declares_package_type(package_name, name)
+    }
+
+    fn declares_package_type(&self, package_name: &str, name: &str) -> bool {
+        let matches_name =
+            |unit: &CodeUnit| unit.is_class() && unit.short_name().trim_end_matches('$') == name;
         brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::AnalyzerDefinitionLookup::new(
             self,
             Language::Scala,
@@ -2006,9 +2047,9 @@ impl ScalaSource for ScalaAnalyzer {
     /// and a diagnostic request may not. An unbuilt index simply cannot answer,
     /// which is `Incomplete`, never `Absent`.
     ///
-    /// The tiers are, in order: `scala_default_type_name`, this file's and this
-    /// package's declarations, `java.lang`, the file's imports, and finally the
-    /// package projection of the external surfaces. An import that cannot be
+    /// The tiers match SCALA_PRECEDENCE_RULES: this compilation unit,
+    /// explicit imports, wildcard imports, other-file package declarations,
+    /// then implicit roots. An import that cannot be
     /// followed to a declaration set stops the ladder with the exact import
     /// spelling, because that import may be what binds the name.
     fn simple_type_proof(
@@ -2019,14 +2060,18 @@ impl ScalaSource for ScalaAnalyzer {
     ) -> ScalaNameProof {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        if name.is_empty() || scala_default_type_name(name) {
-            // A name on Scala's built-in list is known by construction. It
-            // denotes a stdlib declaration, so the boundary is external.
+        if name.is_empty() {
             return ScalaNameProof::ExternalIndexed;
         }
-
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        if self.declares_simple_type(file, &package_name, name) {
+        // SCALA_PRECEDENCE_RULES (SLS chapter 2): same compilation unit wins
+        // over every import; other compilation units are checked after imports.
+        if self
+            .inner
+            .declarations(file)
+            .iter()
+            .any(|unit| unit.is_class() && unit.short_name().trim_end_matches('$') == name)
+        {
             return ScalaNameProof::Workspace;
         }
 
@@ -2036,10 +2081,11 @@ impl ScalaSource for ScalaAnalyzer {
         let declares_name = |declaration: &CodeUnit| {
             declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
         };
-        if retained.is_some_and(|external| external.resolve_java_lang(name).is_some()) {
-            return ScalaNameProof::ExternalIndexed;
-        }
-        for import in &imports {
+        for import in imports
+            .iter()
+            .filter(|import| !import.is_wildcard)
+            .chain(imports.iter().filter(|import| import.is_wildcard))
+        {
             let Some(path) = scala_import_path(import) else {
                 return unfollowable_scala_import("an import with no structured path");
             };
@@ -2084,17 +2130,60 @@ impl ScalaSource for ScalaAnalyzer {
             return unfollowable_scala_import(&format!("import `{path}`"));
         }
 
+        if self.declares_package_type(&package_name, name) {
+            return ScalaNameProof::Workspace;
+        }
         if retained
             .is_some_and(|external| external.resolve_same_package(&package_name, name).is_some())
         {
             return ScalaNameProof::ExternalIndexed;
         }
-        let spellings = [
-            qualify_scala_name(&package_name, name),
-            format!("java.lang.{name}"),
-        ];
+        // These are the intrinsic value types in the native Scala universe,
+        // independent of an acquired scala-library declaration surface.
+        if name == "Null"
+            || brokk_bifrost_jvm::scala::graph::resolver::scala_builtin_type_name(name).is_some()
+        {
+            return ScalaNameProof::ExternalIndexed;
+        }
+        if let Some(proof) = model_proof(model, &qualify_scala_name(&package_name, name)) {
+            return proof;
+        }
+        if let Some(proof) =
+            brokk_bifrost_jvm::intrinsics::ordered_implicit_root(Language::Scala, name, |root| {
+                let alias_target = brokk_bifrost_jvm::intrinsics::implicit_root_type_alias(
+                    Language::Scala,
+                    root,
+                    name,
+                );
+                let fqn = alias_target.map_or_else(|| format!("{root}.{name}"), str::to_owned);
+                if retained.is_some_and(|external| {
+                    external
+                        .resolve_qualified_name(&fqn, &package_name)
+                        .is_some()
+                }) {
+                    return Some(ScalaNameProof::ExternalIndexed);
+                }
+                model_proof(model, &fqn).or_else(|| {
+                    if alias_target.is_some() {
+                        return Some(ScalaNameProof::Incomplete(JvmProofGap::ExternalBoundary {
+                            boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+                        }));
+                    }
+                    (!brokk_bifrost_jvm::intrinsics::default_provider_excludes_name(
+                        Language::Scala,
+                        root,
+                        name,
+                    ))
+                    .then(|| unfollowable_scala_import(&format!("implicit root `{root}`")))
+                })
+            })
+            .into_answer()
+        {
+            return proof;
+        }
+        let spelling = qualify_scala_name(&package_name, name);
         prove_against_active_model(retained_external_index_state(retained), model, || {
-            model_disposition_over_tiers(model, spellings.iter().map(String::as_str))
+            model_disposition_over_tiers(model, std::iter::once(spelling.as_str()))
         })
     }
 
@@ -3437,6 +3526,9 @@ class Use(api: Api) { def call(): Int = api.choose(1) }
             .into_iter()
             .next()
             .expect("disk target");
+        // This test exercises the legacy project-types cache across overlays.
+        // Native hierarchy routing does not promise to warm that cache.
+        disk.project_types();
         let disk_hits = UsageFinder::new()
             .find_usages_default(&disk, std::slice::from_ref(&disk_target))
             .into_either()

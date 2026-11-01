@@ -4589,6 +4589,7 @@ impl ValueFlowPlan {
             DispatchBoundaryKind::External(None)
             | DispatchBoundaryKind::Deferred { .. }
             | DispatchBoundaryKind::Unresolved
+            | DispatchBoundaryKind::HierarchyUnenumerated
             | DispatchBoundaryKind::Truncated => None,
         }
     }

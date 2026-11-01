@@ -515,11 +515,18 @@ pub struct EmptyAnalyzer {
     project: Arc<dyn Project>,
     build_context: Option<Arc<WorkspaceBuildContext>>,
     project_reads: super::tree_sitter_analyzer::ProjectReadRegistry,
+    // Fixed snapshot value for persisted C# receipt verification tests.
+    #[cfg(test)]
+    csharp_parse_variant_for_test: brokk_bifrost_core::gitblob::ParseVariant,
 }
 impl Clone for EmptyAnalyzer {
     fn clone(&self) -> Self {
         let mut clone = Self::new(Arc::clone(&self.project));
         clone.build_context = self.build_context.clone();
+        #[cfg(test)]
+        {
+            clone.csharp_parse_variant_for_test = self.csharp_parse_variant_for_test;
+        }
         clone
     }
 }
@@ -531,8 +538,19 @@ impl EmptyAnalyzer {
             project,
             project_reads,
             build_context: None,
+            #[cfg(test)]
+            csharp_parse_variant_for_test: brokk_bifrost_core::gitblob::ParseVariant::Empty,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn with_csharp_parse_variant_for_test(
+        mut self,
+        variant: brokk_bifrost_core::gitblob::ParseVariant,
+    ) -> Self {
+        self.csharp_parse_variant_for_test = variant;
+        self
+    }
+
     fn new_for_workspace(build_context: Arc<WorkspaceBuildContext>) -> Self {
         let mut analyzer = Self::new(Arc::clone(build_context.project()));
         analyzer.build_context = Some(build_context);
@@ -551,6 +569,8 @@ impl EmptyAnalyzer {
             project: Arc::clone(&self.project),
             build_context: self.build_context.clone(),
             project_reads: self.project_reads.clone(),
+            #[cfg(test)]
+            csharp_parse_variant_for_test: self.csharp_parse_variant_for_test,
         }
     }
 }
@@ -636,6 +656,19 @@ impl CodeUnitIndex for EmptyAnalyzer {
 }
 
 impl IAnalyzer for EmptyAnalyzer {
+    #[cfg(test)]
+    fn selected_parse_variant(
+        &self,
+        _file: &brokk_bifrost_core::analyzer::ProjectFile,
+    ) -> Option<brokk_bifrost_core::gitblob::ParseVariant> {
+        #[cfg(test)]
+        if _file.language() == Language::CSharp {
+            return Some(self.csharp_parse_variant_for_test);
+        }
+        // Only C# carries parse variants.
+        Some(brokk_bifrost_core::gitblob::ParseVariant::Empty)
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.project_reads.begin_query(context);
     }
@@ -651,6 +684,7 @@ impl IAnalyzer for EmptyAnalyzer {
     fn record_read_capture(&self, reads: &crate::analyzer::ReadLedger) {
         super::i_analyzer::record_capture_on_active_ledgers(&self.project_reads.contexts(), reads);
     }
+    #[track_caller]
     fn record_unattributed_reads(&self, count: usize) {
         self.project_reads.record_unattributed_reads(count);
     }
@@ -2102,6 +2136,17 @@ impl WorkspaceAnalyzer {
             crate::analyzer::store::class_set_summaries::ClassSetSummaryAttachment {
                 rel_path: key.path().as_str().to_owned(),
                 blob_oid: blob_oid.to_string(),
+                // The attachment names the served bytes' OID and variant.
+                // When no complete blob row exists for that key (for example,
+                // overlay bytes never persisted), the product is stored unattached.
+                parse_variant: self
+                    .analyzer()
+                    .selected_parse_variant(&file)
+                    .ok_or_else(|| {
+                        crate::analyzer::semantic::SemanticProviderError::internal(
+                            "selected parse variant unreadable",
+                        )
+                    })?,
                 storage_language_key,
                 language: key.language().language(),
             },

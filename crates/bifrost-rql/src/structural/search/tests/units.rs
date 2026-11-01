@@ -190,27 +190,199 @@ fn merged_nested_union_units_reproduce_full_branch_paths() {
     assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
 }
 
-#[test]
-fn union_merge_widens_when_the_conservative_fair_cap_is_reached() {
-    let project = eight_file_project();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let query = overlapping_union_query();
-    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
-    let merged = merged(&workspace, &query, &files);
-    let limits = CodeQueryExecutionLimits {
-        max_scanned_files: usize::try_from(
-            merged.work.scanned_files + merged.budgeted_work.import_files_resolved,
-        )
-        .expect("fixture scan count fits usize")
-            + 1,
-        ..CodeQueryExecutionLimits::default()
-    };
+/// Seven TypeScript files under `big/` and one under `small/`, so a branch's
+/// seed path scope sets its scanned-file charge (7, 1, or 8 for both), and a
+/// branch over a language the project lacks charges nothing.
+fn split_charge_project() -> BuiltInlineTestProject {
+    let mut project = InlineTestProject::with_language(Language::TypeScript);
+    for (dir, count) in [("big", 7), ("small", 1)] {
+        for index in 0..count {
+            project = project.file(
+                format!("{dir}/mod{index}.ts"),
+                format!("export function {dir}{index}() {{\n  return {index};\n}}\n"),
+            );
+        }
+    }
+    project.build()
+}
 
-    assert_eq!(
-        merged.reached_limit(&limits, query.limit),
-        Some(crate::structural::search::units::MergedLimit::ScannedFiles),
-        "a root union's physical budget is divided by its branch count"
+/// Capped partitions return a defensible subset and report omitted rows.
+#[test]
+#[hardwon("#8287: merged-limit check summed every union branch against cap/max-divisor")]
+fn union_merge_admission_is_sound_against_the_whole_executor() {
+    let project = split_charge_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let branch = |languages: &str, path: Option<&str>| {
+        let mut seed = json!({"languages": [languages], "match": {"kind": "function"}});
+        if let Some(path) = path {
+            seed["where"] = json!([path]);
+        }
+        seed
+    };
+    let big = branch("typescript", Some("big/*.ts"));
+    let small = branch("typescript", Some("small/*.ts"));
+    let all = branch("typescript", None);
+    let none = |language: &str| branch(language, None);
+    let union = |branches: Vec<serde_json::Value>| json!({"union": branches});
+    let flask_shape = union(vec![
+        none("python"),
+        all.clone(),
+        none("go"),
+        none("java"),
+        none("rust"),
+        none("cpp"),
+        none("csharp"),
+        none("php"),
+        none("ruby"),
+    ]);
+    // Exercise empty, dominant, overlapping and nested branch layouts.
+    let cases = [
+        (
+            "union leaf exhausts allowance",
+            union(vec![all.clone(), all.clone()]),
+            1,
+        ),
+        (
+            "late single branch",
+            union(vec![none("python"), all.clone()]),
+            9,
+        ),
+        ("equal branches", union(vec![all.clone(), all.clone()]), 17),
+        (
+            "equal branches at the cap",
+            union(vec![all.clone(), all.clone()]),
+            16,
+        ),
+        (
+            "dominant first branch",
+            union(vec![big.clone(), small.clone()]),
+            12,
+        ),
+        (
+            "dominant late branch",
+            union(vec![small.clone(), big.clone()]),
+            12,
+        ),
+        ("flask shape", flask_shape, 72),
+        (
+            "nested smaller cap",
+            union(vec![union(vec![big.clone(), small.clone()]), none("go")]),
+            24,
+        ),
+        (
+            "nested larger cap",
+            union(vec![union(vec![big.clone(), small.clone()]), none("go")]),
+            30,
+        ),
+    ];
+    for (layout, plan, cap) in cases {
+        let mut json = plan;
+        json["limit"] = json!(500);
+        json["result_detail"] = json!("full");
+        let query = CodeQuery::from_json(&json).expect("union layout query");
+        let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+        let limits = CodeQueryExecutionLimits {
+            max_scanned_files: cap,
+            ..Default::default()
+        };
+        for result_limit in [500, 3] {
+            let mut query = query.clone();
+            query.limit = result_limit;
+            let products = files.iter().map(|file| {
+                execute_code_query_unit(
+                    workspace.analyzer(),
+                    &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    None,
+                    &query,
+                    limits,
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+                )
+            });
+            let mut merged = merge_unit_rows(&query, products);
+            merged.apply_result_limit(query.limit);
+            let mut complete_query = query.clone();
+            complete_query.limit = 500;
+            let whole = whole_execution(&workspace, &complete_query);
+            let complete = projected(&whole.result.results);
+            assert!(
+                merged
+                    .items
+                    .iter()
+                    .all(|row| complete.iter().any(|candidate| {
+                        let mut row = row.clone();
+                        let mut candidate = candidate.clone();
+                        row.provenance.clear();
+                        candidate.provenance.clear();
+                        row == candidate
+                    })),
+                "{layout}"
+            );
+            if !merged.truncated {
+                assert_eq!(merged.items, complete, "{layout}");
+            } else {
+                assert!(
+                    !merged.diagnostics.is_empty(),
+                    "{layout}: truncation must be reported"
+                );
+            }
+            assert!(merged.items.len() <= result_limit);
+        }
+    }
+
+    // Both units cut, then the merged root can cut again. Even a root with
+    // enough headroom must deduplicate diagnostics inherited from its units.
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("a.rs", "pub fn a() {} pub fn aa() {} pub fn aaa() {}")
+        .file("b.rs", "pub fn b() {} pub fn bb() {} pub fn bbb() {}")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["rust"], "match": {"kind": "function"}, "limit": 1,
+    }))
+    .unwrap();
+    let products: Vec<_> = files
+        .iter()
+        .map(|file| {
+            execute_code_query_unit(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                Some(&workspace),
+                &query,
+                Default::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+            )
+        })
+        .collect();
+    assert_eq!(products.len(), 2);
+    assert!(
+        products
+            .iter()
+            .all(|unit| unit.truncated && unit.rows.len() == 1)
     );
+    for limit in [10, 1] {
+        let mut merged = merge_unit_rows(&query, products.clone());
+        assert_eq!(
+            merged
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == CodeQueryDiagnosticCode::ResultLimitReached)
+                .count(),
+            2
+        );
+        merged.apply_result_limit(limit);
+        assert_eq!(
+            merged
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == CodeQueryDiagnosticCode::ResultLimitReached)
+                .count(),
+            1
+        );
+        assert_eq!(merged.items.len(), 2.min(limit));
+    }
 }
 
 /// Isolate output headroom from independently charged work: counts are a
@@ -219,7 +391,7 @@ fn union_merge_widens_when_the_conservative_fair_cap_is_reached() {
 #[hardwon(
     "#2445: the merge proof compared intermediate step outputs with the findings cap, so complete policies ran in full"
 )]
-fn intermediate_step_outputs_still_widen_at_the_pipeline_cap() {
+fn intermediate_step_outputs_report_truncation_at_the_pipeline_cap() {
     let query = CodeQuery::from_json(&json!({
         "schema_version": 1,
         "match": { "kind": "function" },
@@ -230,27 +402,39 @@ fn intermediate_step_outputs_still_widen_at_the_pipeline_cap() {
         "limit": 3
     }))
     .expect("inventory followed by empty filter");
-    let plan = select_physical_plan(&query, UnionExecutionStrategy::Sequential, 1, 0)
-        .expect("physical query plan");
-    let final_step = plan.node(plan.root()).dependencies()[0];
-    let intermediate = plan.node(final_step).dependencies()[0];
-    let mut merged = merge_unit_rows(&query, []);
-    merged.budgeted_work.step_outputs = vec![0; plan.node_count()];
-    let limits = CodeQueryExecutionLimits {
-        max_pipeline_rows: 20,
-        ..CodeQueryExecutionLimits::default()
-    };
-    for (count, expected) in [
-        (19, None),
-        (20, Some(MergedLimit::StepOutputs)),
-        (21, Some(MergedLimit::StepOutputs)),
-    ] {
-        merged.budgeted_work.step_outputs[intermediate.index()] = count;
-        assert_eq!(
-            merged.reached_limit(&limits, query.limit),
-            expected,
-            "intermediate output count {count}"
-        );
+    let project = eight_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = workspace.analyzer().analyzed_files();
+    for cap in [1, 20] {
+        let limits = CodeQueryExecutionLimits {
+            max_pipeline_rows: cap,
+            ..Default::default()
+        };
+        let products = files.iter().map(|file| {
+            execute_code_query_unit(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                None,
+                &query,
+                limits,
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+            )
+        });
+        let merged = merge_unit_rows(&query, products);
+        assert!(merged.items.is_empty());
+        if cap == 1 {
+            assert!(merged.truncated);
+            assert!(
+                merged
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code.is_execution_state())
+            );
+        } else {
+            assert!(!merged.truncated);
+            assert_eq!(merged.completion(), CodeQueryCompletion::Complete);
+        }
     }
 }
 

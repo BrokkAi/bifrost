@@ -115,7 +115,7 @@ test("uv CLI package exposes bifrost through its package name", () => {
     /^targets = \[\{ name = "bifrost", kind = "bin" \}\]$/mu,
   );
   // The bifrost and brokk-bifrost commands come from the launcher that
-  // compress-cli-wheel.py adds (#8288), not from maturin's data scripts.
+  // compress-python-wheel.py adds (#8288), not from maturin's data scripts.
   assert.doesNotMatch(uvCliManifest, /^data = /mu);
   assert.match(uvCliManifest, /^license-files = \["\.generated-licenses\/\*"\]$/mu);
   for (const license of [
@@ -699,7 +699,7 @@ readinessTest("release readiness reuses compatibility-keyed Cargo state across c
 });
 
 const compressCliWheel =
-  "python scripts/public/compress-cli-wheel.py packaging/bifrost-cli/wheelhouse packaging/bifrost-cli/dist/*.whl";
+  "python scripts/public/compress-python-wheel.py packaging/bifrost-cli/wheelhouse packaging/bifrost-cli/dist/*.whl";
 
 // The raw binary deflates to about 95 MB against PyPI's 100 MiB limit (#8288),
 // so every later step must read the compressed wheel. On Linux, maturin-action
@@ -726,6 +726,30 @@ readinessTest("the uv CLI wheel is compressed before it is smoked and uploaded",
   );
   assert.ok(after.includes("--wheel-directory packaging/bifrost-cli/wheelhouse --kind cli"), "smoke the compressed wheel");
   assert.match(after, /lipo -archs "\$unpacked\/bifrost"/u, "check the decompressed binary's architecture");
+});
+
+const compressClientWheel =
+  "python scripts/public/compress-python-wheel.py dist dist/brokk_bifrost_searchtools-*.whl";
+
+// The extension module deflates to 85-94 MB against PyPI's 100 MiB limit
+// (#8288). The wheel is rewritten in place, after maturin builds it and before
+// anything smokes or uploads it.
+function assertClientWheelCompressed(job, build, consumer) {
+  const compress = job.indexOf(compressClientWheel);
+  assert.ok(compress > job.indexOf(build), "compress after maturin builds the wheel");
+  assert.ok(compress < job.indexOf(consumer), `compress before ${consumer}`);
+}
+
+test("the searchtools wheel build uploads the compressed wheel", () => {
+  assertClientWheelCompressed(jobBlock(wheelBuilder, "build"), "name: Build wheels", "name: Upload wheel artifact");
+});
+
+readinessTest("the searchtools wheel is compressed before it is smoked and uploaded", () => {
+  assertClientWheelCompressed(
+    jobBlock(readiness, "python-wheels"),
+    "name: Build Python wheel",
+    "--wheel-directory dist --kind client",
+  );
 });
 
 readinessTest("release wheels compress at deflate level 9 for PyPI headroom", () => {

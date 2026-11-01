@@ -1,6 +1,9 @@
 #[cfg(test)]
 pub(crate) mod rust_departing_root_tests {
+    use crate::analyzer::semantic::SemanticWork;
     use brokk_bifrost_analysis::analyzer::LanguageAdapter;
+    use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
+    use brokk_bifrost_semantic::analyzer::semantic::service::primary_declarations::lower_with_primary_declarations;
 
     use brokk_bifrost_analysis::analyzer::semantic::service::ProgramSemanticsLowerer;
 
@@ -19,6 +22,7 @@ pub(crate) mod rust_departing_root_tests {
 
     use brokk_bifrost_analysis::analyzer::store::semantic_ir::insert_semantic_ir_tx;
 
+    use brokk_bifrost_analysis::analyzer::store::prepare_parse_time_semantic_ir;
     use brokk_bifrost_analysis::analyzer::store::semantic_ir::semantic_ir_producer_epoch;
 
     use brokk_bifrost_core::cancellation::CancellationToken;
@@ -70,8 +74,8 @@ pub(crate) mod rust_departing_root_tests {
     use brokk_bifrost_core::analyzer::model::ProjectFile;
 
     use brokk_bifrost_core::text_utils::compute_line_starts;
-    /// Every `*.rs` file under `root`, sorted, found without recursion.
-    pub(crate) fn rust_files(root: &Path) -> Vec<PathBuf> {
+    /// Every file with `extension` under `root`, sorted, found without recursion.
+    pub(crate) fn source_files(root: &Path, extension: &str) -> Vec<PathBuf> {
         let mut files = Vec::new();
         let mut directories = vec![root.to_path_buf()];
         while let Some(directory) = directories.pop() {
@@ -79,7 +83,7 @@ pub(crate) mod rust_departing_root_tests {
                 let path = entry.expect("read source directory entry").path();
                 if path.is_dir() {
                     directories.push(path);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                } else if path.extension().is_some_and(|suffix| suffix == extension) {
                     files.push(path);
                 }
             }
@@ -120,12 +124,14 @@ pub(crate) mod rust_departing_root_tests {
         files: usize,
         round_tripped: usize,
         /// Files whose lowering did not complete, with the outcome label.
-        not_lowered: Vec<(PathBuf, &'static str)>,
+        not_lowered: Vec<(PathBuf, String)>,
         duplicate_content: usize,
         /// Files whose lowering fails or whose lowered parts the artifact
         /// rejects, with the error. The write path stores these as an `Error`
         /// outcome, so they have no rows.
         invalid_lowering: Vec<(PathBuf, String)>,
+        parse_failures: Vec<(PathBuf, String)>,
+        publication_failures: Vec<(PathBuf, String)>,
         /// The largest round-tripped file: its source bytes, its rows and
         /// estimated payload bytes per table, and its total logical rows and
         /// payload bytes.
@@ -141,13 +147,18 @@ pub(crate) mod rust_departing_root_tests {
         payload_bytes: usize,
     }
 
-    /// Lower, store, read and decode every Rust file under `root` on `workers`
-    /// threads, each with its own store, asserting that each decoded artifact
-    /// has the lowered artifact's materialization id and work. Workers take the
+    /// Lower, store, read and decode every matching file under `root` on
+    /// `workers` threads, each with its own store. Compare the decoded IR and
+    /// partial flows with the materialization path's results. Workers take the
     /// largest remaining file first, so the slowest lowerings start at once.
-    pub(crate) fn round_trip_tree(root: &Path, workers: usize) -> RoundTripReport {
+    pub(crate) fn round_trip_tree<A: LanguageAdapter + StoreLanguageAdapter>(
+        root: &Path,
+        workers: usize,
+        adapter: &A,
+        extension: &str,
+    ) -> RoundTripReport {
         let root = root.canonicalize().expect("source root exists");
-        let mut files = rust_files(&root)
+        let mut files = source_files(&root, extension)
             .into_iter()
             .map(|path| {
                 let bytes = std::fs::metadata(&path).expect("source metadata").len();
@@ -167,7 +178,7 @@ pub(crate) mod rust_departing_root_tests {
                             let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             files.get(index).map(|(_, path)| path)
                         });
-                        round_trip_files(root, queue)
+                        round_trip_files(root, queue, adapter)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -187,6 +198,10 @@ pub(crate) mod rust_departing_root_tests {
             merged.not_lowered.extend(report.not_lowered);
             merged.duplicate_content += report.duplicate_content;
             merged.invalid_lowering.extend(report.invalid_lowering);
+            merged.parse_failures.extend(report.parse_failures);
+            merged
+                .publication_failures
+                .extend(report.publication_failures);
             if let Some(largest) = report.largest
                 && merged
                     .largest
@@ -199,24 +214,29 @@ pub(crate) mod rust_departing_root_tests {
         merged
     }
 
-    pub(crate) fn round_trip_files<'a>(
+    pub(crate) fn round_trip_files<'a, A: LanguageAdapter + StoreLanguageAdapter>(
         root: &Path,
         files: impl Iterator<Item = &'a PathBuf>,
+        adapter: &A,
     ) -> RoundTripReport {
         let root = root.to_path_buf();
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
-        let lowerer = RustSemanticLowerer;
+        let lowerer = adapter
+            .parse_time_semantic_lowerer()
+            .expect("native lowerer");
+        let lowerer = lowerer.lowerer();
         let identity = lowerer.identity();
         let capabilities = lowerer.capabilities();
         let epoch = semantic_ir_producer_epoch(&identity);
+        let storage_language = adapter.language().config_label();
         assert!(
             store
-                .ensure_semantic_ir_producer_epoch("rust", &epoch)
+                .ensure_semantic_ir_producer_epoch(storage_language, &epoch)
                 .unwrap()
         );
         assert!(
             !store
-                .ensure_semantic_ir_producer_epoch("rust", &epoch)
+                .ensure_semantic_ir_producer_epoch(storage_language, &epoch)
                 .unwrap()
         );
         let mut seen = std::collections::HashSet::new();
@@ -229,68 +249,156 @@ pub(crate) mod rust_departing_root_tests {
             let source: Arc<str> = Arc::from(source);
             let rel_path = path.strip_prefix(&root).expect("file under root");
             let file = ProjectFile::new(root.clone(), rel_path);
-            let prepared = prepare(&file, &source);
-            let parts = match lowerer.lower(
+            let prepared = match prepare_exact_syntax_tree(
+                adapter,
                 &file,
-                &prepared,
-                &SemanticBudget::default(),
-                &CancellationToken::default(),
+                PreparedSyntaxSource::Exact(Arc::clone(&source)),
+                PreparedSourceOrigin::Disk,
+                None,
+                None,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
             ) {
-                Ok(SemanticOutcome::Complete { value, .. }) => value,
-                Err(error) => {
+                PreparedSyntaxPreparation::Complete(Some(prepared)) => prepared,
+                PreparedSyntaxPreparation::Complete(None) => {
                     report
-                        .invalid_lowering
-                        .push((path.clone(), error.to_string()));
+                        .parse_failures
+                        .push((path.clone(), "no syntax tree".into()));
                     continue;
                 }
-                Ok(other) => {
-                    report.not_lowered.push((path.clone(), other.label()));
+                PreparedSyntaxPreparation::Refused(reason) => {
+                    report
+                        .parse_failures
+                        .push((path.clone(), format!("refused: {reason:?}")));
+                    continue;
+                }
+                PreparedSyntaxPreparation::TimedOut => {
+                    report
+                        .parse_failures
+                        .push((path.clone(), "timed out".into()));
+                    continue;
+                }
+                PreparedSyntaxPreparation::Cancelled => {
+                    report
+                        .parse_failures
+                        .push((path.clone(), "cancelled".into()));
                     continue;
                 }
             };
+            if prepared.tree().root_node().has_error() {
+                report
+                    .parse_failures
+                    .push((path.clone(), "tree-sitter ERROR node".into()));
+            }
             let oid = Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap();
             if !seen.insert(oid) {
                 report.duplicate_content += 1;
                 continue;
             }
-            let content =
-                ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
-            assert_eq!(content, ContentIdentity::hash_bytes(source.as_bytes()));
-            let path_identity = WorkspaceRelativePath::try_from_path(file.rel_path()).unwrap();
-            let language = LanguageDialect::for_path(Language::Rust, file.rel_path());
-            let key = SemanticArtifactKey::new(
-                WorkspaceMountId::from_root(file.root()),
-                path_identity.clone(),
-                language,
-                SourceRevision::Disk { content },
-                identity.adapter.clone(),
-                SemanticIrVersion::current(),
-                identity.configuration,
-                identity.dependencies,
+            assert_eq!(
+                ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256())),
+                ContentIdentity::hash_bytes(source.as_bytes())
             );
-            let lowered =
-                match SemanticArtifact::try_new(key.clone(), capabilities.clone(), parts.clone()) {
-                    Ok(lowered) => lowered,
+            // C# content identity is scoped by the selected parse variant (#8147),
+            // exactly as parse-time preparation derives it.
+            let content = ContentIdentity::from_source_digest(
+                StableDigest::from_array(prepared.source_sha256()),
+                prepared.dialect().language(),
+                prepared.parse_variant(),
+            );
+            let path_identity = WorkspaceRelativePath::try_from_path(file.rel_path()).unwrap();
+            let language = LanguageDialect::for_path(adapter.language(), file.rel_path());
+            let cancellation = CancellationToken::default();
+            let blob_key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, storage_language);
+            let produced =
+                prepare_parse_time_semantic_ir(lowerer, &file, &prepared, &blob_key, &cancellation)
+                    .unwrap()
+                    .expect("parse-time preparation completes");
+            // A lowerer with a primary-declaration path (C#) materializes through
+            // that path, so its lowering and partial flows are the oracle the
+            // parse-time rows must equal. Any other lowerer materializes with the
+            // same `lower` call the producer makes, so the producer's own artifact
+            // and partial flows are the oracle. Lowering and solving partial flows
+            // a second time would only repeat the most expensive work of the
+            // full-corpus walk, which then exceeds its time limit (#8739).
+            let comparison = if let Some(primary_lowerer) = lowerer.primary_declaration_lowerer() {
+                let mut budget = SemanticBudget::default();
+                budget
+                    .admit(SemanticWork {
+                        source_bytes: source.len(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let outcome = lower_with_primary_declarations(
+                    primary_lowerer,
+                    &file,
+                    &prepared,
+                    &budget,
+                    &cancellation,
+                    || {
+                        adapter
+                            .parse_file_preprocessed(
+                                &file,
+                                prepared.source(),
+                                prepared.tree(),
+                                prepared.preprocessor().map(|p| p.as_ref()),
+                            )
+                            .0
+                    },
+                );
+                let parts = match outcome {
+                    Ok(SemanticOutcome::Complete { value, .. }) => value,
                     Err(error) => {
                         report
                             .invalid_lowering
                             .push((path.clone(), error.to_string()));
                         continue;
                     }
+                    Ok(other) => {
+                        report
+                            .not_lowered
+                            .push((path.clone(), other.label().to_owned()));
+                        continue;
+                    }
                 };
-
-            let prepared_rows = PreparedSemanticIr::prepare(
-                SemanticIrLoweringOutcome::Complete { parts },
-                None,
-                &epoch,
-                content,
-                source.len(),
-            );
+                let key = SemanticArtifactKey::new(
+                    WorkspaceMountId::from_root(file.root()),
+                    path_identity.clone(),
+                    language,
+                    SourceRevision::Disk { content },
+                    identity.adapter.clone(),
+                    SemanticIrVersion::current(),
+                    identity.configuration,
+                    identity.dependencies,
+                );
+                let lowered =
+                    match SemanticArtifact::try_new(key, capabilities.clone(), parts.clone()) {
+                        Ok(lowered) => Arc::new(lowered),
+                        Err(error) => {
+                            report
+                                .invalid_lowering
+                                .push((path.clone(), error.to_string()));
+                            continue;
+                        }
+                    };
+                let flows = parse_time_partial_flows(&lowered, &prepared, &cancellation)
+                    .expect("partial flows");
+                let expected_rows = PreparedSemanticIr::prepare(
+                    SemanticIrLoweringOutcome::Complete { parts },
+                    Some(&flows),
+                    &epoch,
+                    content,
+                    source.len(),
+                );
+                Some((lowered, flows, expected_rows))
+            } else {
+                None
+            };
+            let prepared_rows = produced.rows;
             let blob_id = {
                 let mut conn = store.conn.lock().unwrap();
                 conn.execute(
-                    "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 1)",
-                    [oid.to_string()],
+                    "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, 1)",
+                    rusqlite::params![oid.to_string(), storage_language],
                 )
                 .unwrap();
                 let blob_id = conn.last_insert_rowid();
@@ -299,7 +407,7 @@ pub(crate) mod rust_departing_root_tests {
                     insert_semantic_ir_tx(
                         &tx,
                         blob_id,
-                        "rust",
+                        storage_language,
                         &prepared_rows,
                         &CancellationToken::default()
                     )
@@ -310,15 +418,46 @@ pub(crate) mod rust_departing_root_tests {
             };
 
             let publication = store
-                .semantic_ir_publication(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
-                    oid, "rust",
-                ))
+                .semantic_ir_publication(&blob_key)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{}: no valid publication", path.display()));
+            let (lowered, flows) = match (comparison, publication.outcome) {
+                (Some((lowered, flows, expected_rows)), SemanticIrPublicationOutcome::Complete) => {
+                    assert_eq!(
+                        prepared_rows,
+                        expected_rows,
+                        "{}: parse-time and primary lowering differ",
+                        path.display()
+                    );
+                    (lowered, flows)
+                }
+                (None, SemanticIrPublicationOutcome::Complete) => produced
+                    .lowered
+                    .expect("a complete publication has a lowered artifact"),
+                (Some(_), outcome) => {
+                    report
+                        .publication_failures
+                        .push((path.clone(), format!("{outcome:?}")));
+                    continue;
+                }
+                (
+                    None,
+                    SemanticIrPublicationOutcome::Error(error)
+                    | SemanticIrPublicationOutcome::Panicked(error),
+                ) => {
+                    report.invalid_lowering.push((path.clone(), error));
+                    continue;
+                }
+                (None, outcome) => {
+                    report
+                        .not_lowered
+                        .push((path.clone(), format!("{outcome:?}")));
+                    continue;
+                }
+            };
             assert_eq!(publication.blob_id, blob_id);
             assert_eq!(publication.content, content);
             assert_eq!(publication.source_bytes, source.len());
-            assert_eq!(publication.outcome, SemanticIrPublicationOutcome::Complete);
             let scope = SemanticIrMountScope::new(
                 WorkspaceMountId::from_root(file.root()),
                 path_identity,
@@ -326,10 +465,11 @@ pub(crate) mod rust_departing_root_tests {
                 content,
             );
             let decoded = store.read_semantic_ir(blob_id, &scope).unwrap();
-            let rebuilt = SemanticArtifact::try_new(key, capabilities.clone(), decoded)
-                .unwrap_or_else(|error| {
-                    panic!("{}: decoded parts are invalid: {error}", path.display())
-                });
+            let rebuilt =
+                SemanticArtifact::try_new(lowered.key().clone(), capabilities.clone(), decoded)
+                    .unwrap_or_else(|error| {
+                        panic!("{}: decoded parts are invalid: {error}", path.display())
+                    });
             assert_eq!(
                 rebuilt.materialization_id(),
                 lowered.materialization_id(),
@@ -337,6 +477,33 @@ pub(crate) mod rust_departing_root_tests {
                 path.display()
             );
             assert_eq!(rebuilt.work(), lowered.work(), "{}", path.display());
+            assert_eq!(
+                flows.len(),
+                rebuilt.procedures().len(),
+                "{}",
+                path.display()
+            );
+            // One read for the whole blob: a read per procedure decodes the
+            // blob's identities each time, which is quadratic in the file.
+            let stored = store.read_blob_partial_flows(blob_id, &scope).unwrap();
+            assert_eq!(stored.len(), flows.len(), "{}", path.display());
+            for ((stored_procedure, stored), (procedure, direct_flow)) in
+                stored.iter().zip(rebuilt.procedures().iter().zip(&flows))
+            {
+                assert_eq!(*stored_procedure, procedure.id(), "{}", path.display());
+                assert_eq!(stored, direct_flow, "{}", path.display());
+            }
+            if let Some((procedure, stored)) = stored.first() {
+                assert_eq!(
+                    store
+                        .read_partial_flows(blob_id, *procedure, &scope)
+                        .unwrap()
+                        .as_ref(),
+                    Some(stored),
+                    "{}: the one-procedure read differs",
+                    path.display()
+                );
+            }
             report.round_tripped += 1;
             if report
                 .largest
@@ -357,13 +524,15 @@ pub(crate) mod rust_departing_root_tests {
 
     pub(crate) fn print_report(report: &RoundTripReport) {
         println!(
-            "{} Rust files, {} round-tripped, {} duplicate contents, not lowered: {:?}, \
-         invalid lowering: {:?}",
+            "{} files, {} round-tripped, {} duplicate contents, not lowered: {:?}, \
+         invalid lowering: {:?}, parse failures: {:?}, publication failures: {:?}",
             report.files,
             report.round_tripped,
             report.duplicate_content,
             report.not_lowered,
-            report.invalid_lowering
+            report.invalid_lowering,
+            report.parse_failures,
+            report.publication_failures
         );
         if let Some(largest) = &report.largest {
             println!(
@@ -385,7 +554,7 @@ pub(crate) mod rust_departing_root_tests {
     pub(crate) fn semantic_ir_rows_round_trip_every_workspace_crate_source() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let workers = std::thread::available_parallelism().map_or(1, usize::from);
-        let report = round_trip_tree(&root, workers);
+        let report = round_trip_tree(&root, workers, &RustAdapter, "rs");
         print_report(&report);
         assert!(report.round_tripped > 0, "{report:?}");
     }

@@ -188,6 +188,113 @@ impl Validator {
                 ),
             );
         }
+        let types = pack
+            .shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types.as_slice(),
+                _ => &[],
+            })
+            .collect::<Vec<_>>();
+        let types_by_name = types
+            .iter()
+            .map(|fact| (fact.name.as_str(), *fact))
+            .collect::<HashMap<_, _>>();
+        let enclosing_types = types
+            .iter()
+            .flat_map(|outer| {
+                outer.jvm_inventory.iter().flat_map(move |inventory| {
+                    inventory.nested_types.iter().map(move |nested| {
+                        (
+                            nested.owner_fqn.as_str(),
+                            (outer.name.as_str(), nested.is_static),
+                        )
+                    })
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        for owner in &types {
+            let Some(inventory) = &owner.jvm_inventory else {
+                continue;
+            };
+            if inventory.enclosing_type_parameters.is_empty() {
+                continue;
+            }
+            if self.predates_schema(21) {
+                self.error(
+                    "jvm_inventory.schema_version",
+                    format!(
+                        "$.types[{}].jvm_inventory.enclosing_type_parameters",
+                        owner.id
+                    ),
+                    "enclosing type parameters require schema 21",
+                );
+            }
+            self.unique_names(
+                &format!(
+                    "$.types[{}].jvm_inventory.enclosing_type_parameters",
+                    owner.id
+                ),
+                &inventory.enclosing_type_parameters,
+            );
+            let mut declared = HashSet::new();
+            let mut current = owner.name.as_str();
+            let mut visited = HashSet::new();
+            while let Some((outer_name, is_static)) = enclosing_types.get(current) {
+                let Some(outer) = types_by_name.get(outer_name) else {
+                    break;
+                };
+                if !visited.insert(outer.id.as_str()) {
+                    break;
+                }
+                let non_static = !is_static;
+                if !non_static {
+                    if current != owner.name {
+                        break;
+                    }
+                    self.error(
+                        "jvm_inventory.invalid_enclosing_type",
+                        format!(
+                            "$.types[{}].jvm_inventory.enclosing_type_parameters",
+                            owner.id
+                        ),
+                        format!("{current} is not a non-static nested type of {outer_name}"),
+                    );
+                    break;
+                }
+                declared.extend(outer.type_parameters.iter().map(String::as_str));
+                current = outer_name;
+            }
+            // A split archive may omit the enclosing type. Cross-check when
+            // that type is present in this model. This is sound for the JVM
+            // producer because it retains a nested type only with its whole
+            // enclosing chain (apply_enclosing_visibility). The model records
+            // no outer link of its own, so it cannot tell a chain that ended at
+            // a top-level type from an omitted outer. One residual case: an
+            // outer skipped by the producer's byte or record budget but read
+            // by its enclosing-scope resolver leaves a parameter this pack
+            // cannot account for, and the pack is rejected here.
+            if enclosing_types
+                .get(owner.name.as_str())
+                .is_some_and(|(outer, _)| types_by_name.contains_key(outer))
+            {
+                for parameter in &inventory.enclosing_type_parameters {
+                    if !declared.contains(parameter.as_str()) {
+                        self.error(
+                            "jvm_inventory.unknown_enclosing_parameter",
+                            format!(
+                                "$.types[{}].jvm_inventory.enclosing_type_parameters",
+                                owner.id
+                            ),
+                            format!(
+                                "enclosing chain of {} does not declare {parameter}",
+                                owner.name
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         if let Some(extraction) = &pack.extraction {
             if self.predates_schema(19) {
                 self.error(
@@ -331,11 +438,13 @@ impl Validator {
                         .iter()
                         .map(|fact| (fact.id.clone(), fact.implicit_operation.clone())),
                 );
-                self.type_parameters_by_id.extend(
-                    types
-                        .iter()
-                        .map(|fact| (fact.id.clone(), fact.type_parameters.clone())),
-                );
+                self.type_parameters_by_id.extend(types.iter().map(|fact| {
+                    let mut parameters = fact.type_parameters.clone();
+                    if let Some(inventory) = &fact.jvm_inventory {
+                        parameters.extend(inventory.enclosing_type_parameters.iter().cloned());
+                    }
+                    (fact.id.clone(), parameters)
+                }));
             }
             if let AuthoredPayload::ProcedureSummaries { summaries } = &shard.payload {
                 self.procedure_ids
@@ -1538,6 +1647,29 @@ impl Validator {
                         &format!("{fact_path}.type_parameters"),
                         &fact.type_parameters,
                     );
+                    if let Some(inventory) = fact
+                        .jvm_inventory
+                        .as_ref()
+                        .filter(|inventory| !inventory.enclosing_type_parameters.is_empty())
+                    {
+                        let scope = self
+                            .type_parameters_by_id
+                            .get(&fact.id)
+                            .cloned()
+                            .unwrap_or_default();
+                        for (index, relation) in inventory.supertypes.iter().enumerate() {
+                            self.type_ref(
+                                &format!("{fact_path}.jvm_inventory.supertypes[{index}].target"),
+                                &relation.target,
+                                &scope,
+                            );
+                        }
+                        for (index, member) in inventory.additional_members.iter().enumerate() {
+                            if let Some(signature) = &member.signature {
+                                self.signature(&format!("{fact_path}.jvm_inventory.additional_members[{index}].signature"), signature, &scope);
+                            }
+                        }
+                    }
                     let mut constrained_parameters = HashSet::new();
                     for (constraint_index, constraint) in
                         fact.type_parameter_constraints.iter().enumerate()
@@ -1647,7 +1779,11 @@ impl Validator {
                         self.type_ref(
                             &hierarchy_target_path,
                             &hierarchy.target,
-                            &fact.type_parameters,
+                            &self
+                                .type_parameters_by_id
+                                .get(&fact.id)
+                                .cloned()
+                                .unwrap_or_else(|| fact.type_parameters.clone()),
                         );
                     }
                     if !fact.type_parameter_defaults.is_empty()

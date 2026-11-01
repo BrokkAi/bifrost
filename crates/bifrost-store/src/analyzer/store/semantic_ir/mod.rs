@@ -436,6 +436,26 @@ impl AnalyzerStore {
         Ok(flows)
     }
 
+    /// Every procedure's partial flows of one blob in procedure order, read in
+    /// one transaction. Use it to read a whole blob's flows: unlike one
+    /// [`Self::read_partial_flows`] call per procedure, it decodes the blob's
+    /// identities once.
+    #[doc(hidden)]
+    pub fn read_blob_partial_flows(
+        &self,
+        blob_id: i64,
+        scope: &SemanticIrMountScope,
+    ) -> Result<Vec<(ProcedureId, ProcedurePartialFlows)>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let flows = decode::read_blob_partial_flows(&tx, blob_id, scope)?;
+        tx.commit()?;
+        Ok(flows
+            .into_iter()
+            .map(|(procedure, flows)| (ProcedureId::new(procedure), flows))
+            .collect())
+    }
+
     /// Every row of one blob, read in one transaction and decoded into the
     /// procedures the lowerer produced. Go builtin assumptions are restored
     /// onto procedure 0.

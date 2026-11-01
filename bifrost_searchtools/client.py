@@ -1,3 +1,5 @@
+"""The in-process searchtools client and the loader for its native extension module."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -49,6 +51,7 @@ class SearchToolsError(RuntimeError):
 
 
 _NATIVE_MODULE_NAME = "bifrost_searchtools._native"
+_PACKAGE = Path(__file__).resolve().parent
 _NATIVE_MODULE_LOCK = threading.Lock()
 _EXPLICIT_NATIVE_MODULE: ModuleType | None = None
 _EXPLICIT_NATIVE_PATH: Path | None = None
@@ -1178,6 +1181,15 @@ class SearchToolsClient:
 
 
 def _load_native_module(library_path: Path | None) -> ModuleType:
+    if library_path is None and (_PACKAGE / "payload.json").exists():
+        # A release wheel ships the extension module xz-compressed, because it
+        # is about 300 MB and PyPI caps a file at 100 MiB (#8288).
+        # scripts/public/compress-python-wheel.py adds the payload and the
+        # _xz_payload module; a build from source has neither and imports the
+        # module below.
+        from . import _xz_payload
+
+        library_path = _xz_payload.unpacked_file(_PACKAGE, "brokk-bifrost-searchtools")
     if library_path is None:
         try:
             return importlib.import_module(_NATIVE_MODULE_NAME)

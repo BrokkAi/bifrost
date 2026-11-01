@@ -1,8 +1,11 @@
 //! Go selected-context point resolver used by production queries.
 
 use crate::analyzer::go::GoAnalyzer;
+use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::resolution::SemanticId;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeTypes;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedLocalDeclarationOutcome;
+use brokk_bifrost_core::analyzer::model::Language;
 
 use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -175,8 +178,8 @@ pub(crate) fn declared_external_receiver_call(
                 &session,
                 query.analyzer.semantic_model_overlay(),
             );
-        let parameter_count =
-            crate::analyzer::usages::get_definition::go::go_callable_modeled_argument_count(
+        let (parameter_count, spread) =
+            crate::analyzer::usages::get_definition::go::go_selected_receiver_argument_shape(
                 &support,
                 scope.token(),
                 go,
@@ -184,6 +187,9 @@ pub(crate) fn declared_external_receiver_call(
                 query.source,
                 function,
             )?;
+        if spread {
+            return None;
+        }
         Some((
             selector,
             u32::try_from(parameter_count).expect("Go argument count fits call schema"),
@@ -2036,6 +2042,239 @@ impl<'a> GoNativePointRequest<'a> {
             &query.cancellation.cloned().unwrap_or_default(),
             |kind, message| unavailable_type(query.site, kind, message),
         )
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn selected_callable_result_type_identities(
+        &self,
+        member: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::ModelSymbolRef,
+        cancellation: &CancellationToken,
+    ) -> Option<(
+        Vec<Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>>,
+        usize,
+    )> {
+        match self
+            .operation
+            .go_selected_callable_result_types(member, cancellation)
+        {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.go.record_query_failure(error);
+                None
+            }
+        }
+    }
+
+    /// Resolve the static type of an explicitly typed binding identifier.
+    /// Syntax establishes eligibility only; native resolution owns all names.
+    pub fn explicit_binding_type(
+        &mut self,
+        query: BoundedReceiverQuery<'_>,
+        binding: brokk_bifrost_core::analyzer::model::Range,
+    ) -> BoundedResolution<
+        Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
+    > {
+        let cancellation = query.cancellation.cloned().unwrap_or_default();
+        let unknown = || BoundedResolution::Complete {
+            value: None,
+            work: Default::default(),
+        };
+        if cancellation.is_cancelled() {
+            return BoundedResolution::Cancelled {
+                work: Default::default(),
+            };
+        }
+        let Some(tree) = query.tree else {
+            return unknown();
+        };
+        use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+        let syntax_session = ResolutionSession::bounded(query.budget, Some(&cancellation));
+        let eligible = !tree.root_node().has_error()
+            && super::type_identity_proof::explicit_binding_type_node(
+                tree.root_node(),
+                binding,
+                || syntax_session.scope_step(),
+            )
+            .is_some();
+        let syntax_work = match syntax_session.finish(eligible) {
+            BoundedResolution::Complete { value: true, work } => work,
+            BoundedResolution::Complete { value: false, work } => {
+                return BoundedResolution::Complete { value: None, work };
+            }
+            BoundedResolution::Exceeded { limit, work } => {
+                return BoundedResolution::Exceeded { limit, work };
+            }
+            BoundedResolution::Cancelled { work } => return BoundedResolution::Cancelled { work },
+        };
+        let query = BoundedReceiverQuery {
+            budget:
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+                    max_scope_nodes: query
+                        .budget
+                        .max_scope_nodes
+                        .saturating_sub(syntax_work.scope_nodes),
+                    ..query.budget
+                },
+            ..query
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::{
+            SelectedNativeDefinition, SelectedNativeDefinitions, project_native_definition_units,
+        };
+        let locator = SelectedSemanticLocator::for_declaration_range(
+            "go",
+            brokk_bifrost_core::path_utils::rel_path_string(query.file),
+            binding.start_byte,
+            binding.end_byte,
+        );
+        let lookup = match self.operation.declaration_at_range_bounded(
+            &locator,
+            query.budget,
+            &cancellation,
+            project_native_definition_units,
+            SelectedNativeDefinitions::Cancelled,
+        ) {
+            Ok(Some(lookup)) => lookup,
+            Ok(None) => {
+                return BoundedResolution::Complete {
+                    value: None,
+                    work: syntax_work,
+                };
+            }
+            Err(error) => {
+                query.analyzer.record_query_failure(error);
+                return BoundedResolution::Complete {
+                    value: None,
+                    work: syntax_work,
+                };
+            }
+        };
+        let (identity, work) = match lookup {
+            BoundedResolution::Complete {
+                value:
+                    SelectedResolutionOperationOutcome::Native(SelectedNativeDefinitions::Ready(
+                        definitions,
+                    )),
+                work,
+            } => {
+                let [(identity, definition)] = definitions.as_slice() else {
+                    return BoundedResolution::Complete {
+                        value: None,
+                        work: syntax_work.saturating_add(work),
+                    };
+                };
+                // The declaration route selected this exact name range. Global
+                // variables have parser units; locals have lexical metadata.
+                let exact = match definition {
+                    SelectedNativeDefinition::Lexical(lexical) => {
+                        lexical.source_file.as_ref() == Some(query.file)
+                            && lexical.name_range.start_byte == binding.start_byte
+                            && lexical.name_range.end_byte == binding.end_byte
+                    }
+                    SelectedNativeDefinition::Unit(unit) => {
+                        let ranges = self.go.ranges_limited(unit, 2);
+                        unit.source() == query.file
+                            && ranges.complete
+                            // Parser-unit ranges cover the whole var_spec,
+                            // including all names in `var a, b T`. The syntax
+                            // check above selected an exact identifier; pair
+                            // that identifier with this unit, not its sibling.
+                            && query.source.get(binding.start_byte..binding.end_byte)
+                                == Some(unit.terminal_name())
+                            && ranges.rows.iter().any(|range| {
+                                range.start_byte <= binding.start_byte
+                                    && binding.end_byte <= range.end_byte
+                            })
+                    }
+                    SelectedNativeDefinition::Intrinsic { .. } => false,
+                };
+                if !exact {
+                    return BoundedResolution::Complete {
+                        value: None,
+                        work: syntax_work.saturating_add(work),
+                    };
+                }
+                (*identity, work)
+            }
+            BoundedResolution::Exceeded { limit, work } => {
+                return BoundedResolution::Exceeded {
+                    limit,
+                    work: syntax_work.saturating_add(work),
+                };
+            }
+            BoundedResolution::Cancelled { work } => {
+                return BoundedResolution::Cancelled {
+                    work: syntax_work.saturating_add(work),
+                };
+            }
+            BoundedResolution::Complete { work, .. } => {
+                return BoundedResolution::Complete {
+                    value: None,
+                    work: syntax_work.saturating_add(work),
+                };
+            }
+        };
+        let mut evidence = None;
+        let remaining = BoundedReceiverQuery {
+            budget:
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+                    max_scope_nodes: query
+                        .budget
+                        .max_scope_nodes
+                        .saturating_sub(work.scope_nodes),
+                    max_summary_expansions: query
+                        .budget
+                        .max_summary_expansions
+                        .saturating_sub(work.summary_expansions),
+                    ..query.budget
+                },
+            ..query
+        };
+        let work = syntax_work.saturating_add(work);
+        let answer = self.resolve_declared_type_with_evidence(remaining, identity, |answer| {
+            if let SelectedNativeTypes::Ready {
+                intrinsic,
+                external_owners,
+                ..
+            } = &answer.value_types
+            {
+                evidence = answer
+                    .query_result_slot
+                    .and_then(|slot| {
+                        answer
+                            .answer
+                            .projected_type_shapes()
+                            .iter()
+                            .find(|shape| shape.output_slot() == slot)
+                    })
+                    .map(|shape| (shape.clone(), intrinsic.clone(), external_owners.clone()));
+            }
+        });
+        use brokk_bifrost_analysis::analyzer::resolution::{
+            canonical_projected_type_identity, local_identity::SharedNameInterner,
+        };
+        let selected = evidence.and_then(|(shape, intrinsic, external_owners)| {
+            let names = self.operation.ready().shared_names();
+            canonical_projected_type_identity(&shape, |identity| {
+                let name = identity.shared_name_id()?;
+                let digest = names.digest_for_id(name)?;
+                if external_owners.iter().any(|(owner, _)| *owner == identity) { return Some(digest); }
+                let universe = intrinsic.iter().find(|descriptor| descriptor.identity() == identity)
+                    .and_then(|descriptor| brokk_bifrost_analysis::analyzer::resolution::universe::lookup(
+                        Language::Go, brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+                        descriptor.spelling(),
+                    ))?;
+                (brokk_bifrost_analysis::analyzer::resolution::universe::identity_digest(universe) == digest).then_some(digest)
+            })
+        });
+        match answer {
+            BoundedResolution::Complete { value, work: type_work } => BoundedResolution::Complete {
+                value: (value.status == brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Resolved)
+                    .then_some(selected).flatten(),
+                work: work.saturating_add(type_work),
+            },
+            BoundedResolution::Exceeded { limit, work: type_work } => BoundedResolution::Exceeded { limit, work: work.saturating_add(type_work) },
+            BoundedResolution::Cancelled { work: type_work } => BoundedResolution::Cancelled { work: work.saturating_add(type_work) },
+        }
     }
 
     pub(crate) fn resolve_declared_type_with_evidence(

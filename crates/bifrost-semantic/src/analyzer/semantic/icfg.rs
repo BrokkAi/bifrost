@@ -202,14 +202,78 @@ pub const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // #7509 G1b-2: native Go modeled callable results replace the legacy receiver answer.
 // #6945: curated Python star imports can bind placed child modules and their calls.
 // #7240: imported constructor receiver proofs change dispatch answers.
+// #2445: an unsupported or incomplete external member family is an open
+// hierarchy_unenumerated boundary, not a budget truncation, which changes dispatch boundary answers.
 // #8264: predeclared Go modeled result types gain universe type identities.
 // #7509 G1b-3 B: the Go pointer result-field proof reads the selected model callable;
 // promoted fields and owners with unidentified promotion copies stay open.
 // #8147 M4a: C# chains decided by file-local assignments or literal expressions change declarations and sites.
 // #8290: a repeated read through one forward operation keeps the closed root's
 // closure discharges, so warm binding answers become complete.
+// #8167 S2/S5: authored supertype edges of a type without an owner declaration
+// become positive widening witnesses, so overload applicability, selection and
+// dispatch change on both routes.
+// #8222: the Scala external-type ladder follows Scala's binding order and implicit
+// roots, so legacy Scala type and boundary answers change.
+// #8403: Rust reverse inventories ignore unrelated same-named calls of a different arity, so
+// caller completeness and dispatch openness change.
+// #8193: classify unenumerated dispatch separately from budget exhaustion.
+// #8385: same-priority definition candidates in different files tie-break by source path, not absolute start byte.
+// #7509 G1b-3 A: Go exact-binding result identity compares canonical native type digests.
+// #8184/#8126: retained fills replay only their own reasons, so descendant fills no longer
+// carry an enclosing query's gap and dispatch openness changes for unchanged bytes.
+// #8191: retained fills in one request share one isolated cache domain.
+// #8415: preserve enclosing JVM type parameters in external signatures.
+// #8388: composition stops trusting Native caller authority; caller sets need complete inventory coverage.
+// #8457: Rust trait-impl members reached through dispatch no named reverse row lists have open caller inventories.
+// #8453: Go concrete methods reached through interface values have open caller inventories.
+// #8546: a nested diff base could build its ICFG under the head's model hash; discard that window.
+// #8402: Go artifacts come from parse-time rows, which can complete under a finite budget
+// where on-demand lowering exceeded it.
+// #8418/#8333: preserve positive external nominal closure targets (rung v288, above master v275 after batch #8529).
+// #8579: Java, Kotlin and C# artifacts also come from parse-time rows.
+// Batch 49878eab: combine #8579 with master (v303 vs v304); the two halves move together.
+// #7750: Java procedures with a guarded switch lower instead of failing the switch contract.
+// Batch 082b6a23: combine #8589 with the batch (v305 vs v306); the two halves move together.
+// #8283: structural Go result proofs change exact-binding ICFG answers.
+// Batch 082b6a23: combine #8594 with the batch (v307 vs v314); the two halves move together.
+// #7509 G1b-3 F: Go nested-call result counts come from the native selected callable.
+// Batch d1bb2a8e: combine #8517 with the batch (v315 vs v312); the two halves move together.
+// #8602: relation axes and overwrite proofs discharge observer-free exceptional exits.
+// Batch 1648c5ee: combine #8653 with the batch (v316 vs v318); the two halves move together.
+// #8586: on-demand artifacts are lowered under the producer budget and admitted by census, so a
+// finite request budget no longer decides completion differently by materialization route.
+// Batch 1648c5ee: combine #8692 with the batch (v319 vs v322); the two halves move together.
+// #8665: retain nonlocal Scala import qualifier boundaries in query-time ICFG answers.
+// Batch 8efa980f: combine #8712 with the batch (v323 vs v330); the two halves move together.
+// #7027 S2b-0: implicit JVM supertypes and closed intrinsic member inventories for
+// kotlin.Any, kotlin.Annotation and Scala AnyRef change hierarchy and member answers (rung v308).
+// #7027 S2b-0 r3: reserve v332 above master v315 for the validated root-owner read repair.
+// #7027 S2b-0 merge2: coordinator reassigned v352 above master v331 and queued #8727 v333.
+// #8516: package member provider targets change selected ICFG bindings; assigned above master v316/v315.
+// Batch cb42f2c0: combine #8531 with the batch (v331 vs v338); the two halves move together.
+// #8705: a Scala implicit root's own positive binding no longer discharges its open gap.
+// Merge #8705 with master after #8712 (v332 vs v331); the two halves move together.
+// Batch cb42f2c0: combine #8727 with the batch (v339 vs v333); the two halves move together.
+// #8667: Go nested-call result counts that are unknown for a deterministic reason now carry a
+// SemanticEvidenceGap, so call-shape completion changes; assigned above master v340/v339.
+// #7509 G1b-3 G: a nested Go selector call whose receiver the source inference cannot type now
+// takes its result count from the native selected callable; assigned above master v340/v339.
+// Batch c1b44b74: combine #8667 (v364) with #7509 G1b-3 G (v366); the two halves move together.
+// Batch 676be8c9: combine #7027 S2b-0 (v352) with master (v367); the two halves move together.
+// #7960: a JavaScript call's thrown value now binds the enclosing catch parameter, so
+// interprocedural exceptional flow changes; assigned above master v368/v367.
+// #8792: explicit Kotlin lambda parameters now publish lexical binders.
+// Coordinator reassigned this pair to v402/v401 above master v376/v375.
+// Batch 30414977: combine #8820 (v402) with master (v376); the two halves move together.
+// #8836: revert #7960, so JavaScript call throws no longer bind catch parameters;
+// assigned above master v376/v375 and every open pull request's pair (up to v388/v387).
+// Batch 30414977: combine #8844 (v394) with #8820 (v403); the two halves move together.
+// #8872: preserve proven JS/TS package-module receiver identities across the
+// available neutral gate; coordinator assigned v428/v427 above master v404/v403.
 pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v213";
+    b"bifrost-icfg-provider/workspace-behavior/v428";
+
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
@@ -250,12 +314,60 @@ pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // #7509 G1b-2: rotate read-side reuse with native Go modeled callable results.
 // #6945: invalidate read-side reuse for curated Python star child bindings.
 // #7240: invalidate read-side reuse for imported constructor receiver proofs.
+// #2445: rotate read-side reuse with hierarchy_unenumerated external member-family boundaries.
 // #8264: rotate read-side reuse with predeclared Go modeled result types.
 // #7509 G1b-3 B: rotate read-side reuse with the selected-callable pointer-field proof.
 // #8147 M4a: rotate read-side reuse with C# preprocessor decisions.
 // #8290: invalidate read reuse taken from warm reads that lost closure discharges.
+// #8167 S2/S5: invalidate read reuse for widening-driven applicability answers.
+// #8222: invalidate read reuse for Scala implicit-root order and alias answers.
+// #8403: rotate read-side reuse with the Rust reverse applicability gaps.
+// #8193: classify unenumerated dispatch separately from budget exhaustion.
+// #8385: same-priority definition candidates in different files tie-break by source path, not absolute start byte.
+// #7509 G1b-3 A: rotate read-side reuse with native exact-binding result identity.
+// #8184/#8126: rotate read-side reuse with retained fills that record only their own reasons.
+// #8191: rotate read-side reuse with the shared retained-fill domain.
+// #8415: invalidate read reuse for enclosing JVM signature scopes.
+// #8388: rotate read-side reuse with caller-inventory coverage.
+// #8457: rotate read-side reuse with Rust trait-impl dispatch openness.
+// #8453: rotate read-side reuse with Go method dispatch openness.
+// #8546: rotate read-side reuse built while model overrides ignored their analyzer.
+// #8402: rotate read-side reuse with Go artifacts served from parse-time rows.
+// #8418/#8333: replay corrected external nominal closure selection (rung v287).
+// #8579: rotate read-side reuse with Java, Kotlin and C# artifacts served from parse-time rows.
+// Batch 49878eab: combine #8579 with master (v302 vs v303); the two halves move together.
+// #7750: rotate read-side reuse with Java guarded-switch lowering.
+// Batch 082b6a23: combine #8589 with the batch (v304 vs v305); the two halves move together.
+// #8283: rotate read reuse with structural Go result proofs.
+// Batch 082b6a23: combine #8594 with the batch (v306 vs v313); the two halves move together.
+// #7509 G1b-3 F: rotate read-side reuse with native nested-call result counts.
+// Batch d1bb2a8e: combine #8517 with the batch (v314 vs v311); the two halves move together.
+// #8602: rotate read reuse for observer-free exceptional exits.
+// Batch 1648c5ee: combine #8653 with the batch (v315 vs v317); the two halves move together.
+// #8586: rotate read-side reuse built when on-demand completion followed the request budget.
+// Batch 1648c5ee: combine #8692 with the batch (v318 vs v321); the two halves move together.
+// #8665: invalidate reads made without the Scala import bridge boundaries.
+// Batch 8efa980f: combine #8712 with the batch (v322 vs v329); the two halves move together.
+// #7027 S2b-0: invalidate read reuse for implicit-root hierarchy and member answers (rung v307).
+// #7027 S2b-0 r3: reserve v331 above master v314 with the behavior-domain rung.
+// #7027 S2b-0 merge2: coordinator reassigned v351 above master v330 and queued #8727 v332.
+// #8516: package member provider reads change query-time answers; assigned above master v316/v315.
+// Batch cb42f2c0: combine #8531 with the batch (v330 vs v337); the two halves move together.
+// #8705: rotate read-side reuse with open Scala implicit-root gaps.
+// Merge #8705 with master after #8712 (v331 vs v330); the two halves move together.
+// Batch cb42f2c0: combine #8727 with the batch (v338 vs v332); the two halves move together.
+// #8667: rotate read-side reuse built before deterministic Go nested-call arity gaps.
+// #7509 G1b-3 G: rotate read-side reuse built when untyped nested selector receivers stayed open.
+// Batch c1b44b74: combine #8667 (v363) with #7509 G1b-3 G (v365); the two halves move together.
+// Batch 676be8c9: combine #7027 S2b-0 (v351) with master (v366); the two halves move together.
+// #7960: rotate read-side reuse built before JavaScript call throws reached catch binders.
+// #8792: rotate read-side reuse for the Kotlin lambda binder facts.
+// Batch 30414977: combine #8820 (v402) with master (v376); the two halves move together.
+// #8836: rotate read-side reuse built while JavaScript call throws reached catch binders.
+// Batch 30414977: combine #8844 (v394) with #8820 (v403); the two halves move together.
+// #8872: rotate read-side reuse that discarded proven package-module receivers.
 pub const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v212";
+    b"bifrost-icfg-provider/workspace-read-behavior/v427";
 
 #[cfg(test)]
 mod domain_tests {

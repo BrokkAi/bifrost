@@ -387,6 +387,44 @@ impl ResolutionSession {
         })
     }
 
+    /// Charge work completed by a nested bounded resolver to this request.
+    pub fn charge_work(&self, work: ReceiverAnalysisWork) -> bool {
+        if !self.observe_cancellation() {
+            return false;
+        }
+        let Some(budget) = self.budget else {
+            return true;
+        };
+        let mut state = self.state.borrow_mut();
+        state.work = state.work.saturating_add(work);
+        let limit = if self
+            .total_work_limit
+            .is_some_and(|maximum| total_work(&state.work) > maximum)
+        {
+            Some(ReceiverBudgetLimit::TotalWork)
+        } else if state.work.scope_nodes > budget.max_scope_nodes {
+            Some(ReceiverBudgetLimit::ScopeNodes)
+        } else if state.work.summary_expansions > budget.max_summary_expansions {
+            Some(ReceiverBudgetLimit::SummaryExpansions)
+        } else if state.work.resolution_rounds > budget.max_resolution_rounds {
+            Some(ReceiverBudgetLimit::ResolutionRounds)
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(limit) = limit {
+            self.mark_exceeded(limit);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Preserve a nested resolver's terminal budget reason in this request.
+    pub fn mark_exceeded(&self, limit: ReceiverBudgetLimit) {
+        self.stop(ResolutionStop::Exceeded(limit));
+    }
+
     /// Maximum provider rows needed to either consume the remaining scope
     /// budget or observe the first row that proves exhaustion.
     pub fn scope_lookahead_limit(&self) -> usize {

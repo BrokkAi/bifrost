@@ -132,6 +132,10 @@ pub(crate) struct FactMatch {
     /// relational semantics; this optional span is only its reported source
     /// location.
     pub reported_range: Option<Range>,
+    /// Set when the language relation that selected this match is a
+    /// heuristic: the reason it may not hold. Never part of the match's
+    /// identity.
+    pub heuristic: Option<&'static str>,
 }
 
 impl FactMatch {
@@ -340,6 +344,7 @@ pub(crate) fn match_query_candidates(
             node: id,
             captures,
             reported_range: None,
+            heuristic: None,
         });
     }
     matches

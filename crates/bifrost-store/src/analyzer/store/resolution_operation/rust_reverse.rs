@@ -54,6 +54,8 @@ pub enum ReferenceOmission {
 /// selected operation can authorize publication after its final authority check.
 #[doc(hidden)]
 pub trait SelectedRustReverseQueries {
+    /// Whether an implementation member has callers outside the named inverse.
+    fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>>;
     /// The project's analysis generation, as this operation captured it when
     /// it opened. `finish` checks it again before authorizing publication.
     fn analysis_generation(&self) -> u64;

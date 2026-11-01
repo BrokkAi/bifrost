@@ -157,7 +157,8 @@ impl RegexParser<'_> {
                                     .and_then(|suffix| width.checked_add(suffix))
                             });
                         }
-                        if suffix_width.is_some_and(|width| width > 0)
+                        if (suffix_width.is_some_and(|width| width > 0)
+                            && !self.may_match_final_line_terminator(&branch[index + 1..]))
                             || branch[index + 1..].iter().any(|&suffix| {
                                 self.facts[suffix].construct.as_deref()
                                     == Some("lookahead-positive")
@@ -182,6 +183,83 @@ impl RegexParser<'_> {
                 }
             }
         }
+    }
+
+    /// Whether the terms after a `$` can match exactly one of the dialect's
+    /// final line terminators, which `$` without MULTILINE may precede. This
+    /// over-approximates: a term other than a single-character atom matches
+    /// any string of its minimum width or longer that starts in its first set,
+    /// and a term after the enclosing sequence is not considered.
+    fn may_match_final_line_terminator(&self, suffix: &[usize]) -> bool {
+        self.syntax
+            .final_line_terminators(self.flags)
+            .iter()
+            .any(|terminator| {
+                let terminator = terminator.chars().collect::<Vec<_>>();
+                // `reachable[p]`: the terms so far can match `terminator[..p]`.
+                let mut reachable = vec![false; terminator.len() + 1];
+                reachable[0] = true;
+                for &id in suffix {
+                    let fact = &self.facts[id];
+                    if fact.kind == NormalizedKind::RegexAnchor
+                        || (fact.kind == NormalizedKind::RegexGroup
+                            && fact.construct.as_deref().is_some_and(|construct| {
+                                construct == "comment" || construct.starts_with("look")
+                            }))
+                    {
+                        // Zero-width terms consume nothing.
+                        continue;
+                    }
+                    let Some(minimum_width) = fact.minimum_width else {
+                        return true;
+                    };
+                    let single_character = matches!(
+                        fact.kind,
+                        NormalizedKind::RegexLiteral
+                            | NormalizedKind::RegexEscape
+                            | NormalizedKind::RegexCharacterClass
+                            | NormalizedKind::RegexWildcard
+                    );
+                    let maximum_width = if single_character {
+                        self.facts
+                            .iter()
+                            .find(|quantifier| {
+                                quantifier.kind == NormalizedKind::RegexQuantifier
+                                    && quantifier.parent == Some(id)
+                            })
+                            .map_or(Some(1), |quantifier| {
+                                quantifier
+                                    .quantifier
+                                    .and_then(|quantifier| quantifier.maximum)
+                            })
+                    } else {
+                        None
+                    };
+                    let mut next = vec![false; reachable.len()];
+                    for from in (0..reachable.len()).filter(|&from| reachable[from]) {
+                        for to in from + minimum_width as usize..reachable.len() {
+                            if maximum_width.is_some_and(|maximum| to - from > maximum as usize) {
+                                break;
+                            }
+                            let consumed = &terminator[from..to];
+                            let accepted = match &fact.first_set {
+                                Some(set) if single_character => {
+                                    consumed.iter().all(|&character| set.contains(character))
+                                }
+                                Some(set) => consumed
+                                    .first()
+                                    .is_none_or(|&character| set.contains(character)),
+                                None => true,
+                            };
+                            if accepted {
+                                next[to] = true;
+                            }
+                        }
+                    }
+                    reachable = next;
+                }
+                reachable[terminator.len()]
+            })
     }
 
     pub(super) fn classify_hostname(&mut self) {

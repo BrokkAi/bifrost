@@ -50,15 +50,19 @@ const DELETE_ANALYZER_CANDIDATE_SQL: &str = "DELETE FROM blobs
          SELECT 1
          FROM workspace_file_versions AS versions
            INDEXED BY idx_workspace_file_versions_blob_root
+         LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = versions.file_version_id
          WHERE versions.input_kind = 'source' AND versions.blob_oid = ?1
-           AND blobs.parse_variant = x''
+           AND blobs.parse_variant = COALESCE(decisions.decision_digest, x'')
            AND versions.lang = ?2
            AND versions.generation = ?3
        )
        AND NOT EXISTS (
          SELECT 1 FROM workspace_resolution_content_roots AS roots
          WHERE roots.blob_id = blobs.id
-       )";
+       )
+       AND NOT EXISTS (SELECT 1 FROM csharp_global_using_extent e
+         INDEXED BY idx_csharp_globals_import WHERE e.blob_id = blobs.id)
+       AND NOT EXISTS (SELECT 1 FROM csharp_using_publications p WHERE p.blob_id = blobs.id)";
 
 // Deterministic test rendezvous after the real candidate snapshot and before
 // its deletion transaction. The hook belongs only to its collector test thread.
@@ -853,6 +857,7 @@ fn sweep_with_claim(
         }
     });
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    collect_superseded_csharp_sets(&tx)?;
     // Retained versions pin exact identities in the deletion SQL. Their OIDs
     // must not enter the Git bloom and retain another language or variant.
     let dead_analyzer = {
@@ -969,9 +974,24 @@ fn delete_analyzer_candidates(
     tx: &rusqlite::Transaction<'_>,
     candidates: &[(BlobKey, i64)],
 ) -> Result<usize, GcStopped> {
+    // Use the parent's exact liveness predicate before removing its children.
+    let predicate = DELETE_ANALYZER_CANDIDATE_SQL
+        .strip_prefix("DELETE FROM blobs")
+        .expect("analyzer deletion names blobs");
+    let mut symbols = tx.prepare(&format!(
+        "DELETE FROM csharp_source_condition_symbols WHERE blob_id IN (SELECT id FROM blobs {predicate})"
+    ))?;
+    let mut chains = tx.prepare(&format!(
+        "DELETE FROM csharp_undecided_chains WHERE blob_id IN (SELECT id FROM blobs {predicate})"
+    ))?;
     let mut delete = tx.prepare(DELETE_ANALYZER_CANDIDATE_SQL)?;
     let mut dropped = 0usize;
     for (key, generation) in candidates {
+        // Only C# blobs carry condition symbols.
+        if key.lang == "csharp" {
+            symbols.execute((key.oid.to_string(), &key.lang, generation, key.variant))?;
+            chains.execute((key.oid.to_string(), &key.lang, generation, key.variant))?;
+        }
         dropped += delete.execute((key.oid.to_string(), &key.lang, generation, key.variant))?;
     }
     Ok(dropped)
@@ -1028,6 +1048,25 @@ fn ignored_workspace_file_oids(
         }
     }
     Ok(out)
+}
+
+// Selection-free derivations have no selection deletion trigger to reclaim them.
+// Retain the newest set in each derivation domain as well as every selected set.
+fn collect_superseded_csharp_sets(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch("CREATE TEMP TABLE gc_csharp_sets(set_id INTEGER PRIMARY KEY);
+        INSERT INTO gc_csharp_sets
+        SELECT old.set_id FROM csharp_compilation_sets AS old
+        WHERE NOT EXISTS (SELECT 1 FROM csharp_compilation_selections AS selected WHERE selected.set_id = old.set_id)
+          AND EXISTS (SELECT 1 FROM csharp_compilation_sets AS newer
+              WHERE newer.workspace_id = old.workspace_id AND newer.lang = old.lang
+                AND newer.generation = old.generation AND newer.derivation_version = old.derivation_version
+                AND newer.set_id > old.set_id);
+        DELETE FROM csharp_compilation_symbols WHERE compilation_id IN
+            (SELECT compilation_id FROM csharp_compilations WHERE set_id IN (SELECT set_id FROM gc_csharp_sets));
+        DELETE FROM csharp_compilation_items WHERE set_id IN (SELECT set_id FROM gc_csharp_sets);
+        DELETE FROM csharp_compilations WHERE set_id IN (SELECT set_id FROM gc_csharp_sets);
+        DELETE FROM csharp_compilation_sets WHERE set_id IN (SELECT set_id FROM gc_csharp_sets);
+        DROP TABLE gc_csharp_sets;")
 }
 
 fn claim_gc(db_path: &Path, collection: Collection) -> Result<Option<GcClaim>, GcStopped> {
@@ -1176,7 +1215,7 @@ pub fn total_blob_count_for_test(db_path: &Path) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use brokk_bifrost_test_macros::hardwon;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OptionalExtension};
 
     use super::*;
 
@@ -1885,6 +1924,38 @@ mod tests {
     /// A collection records when it ran and how many blobs it left, and the
     /// store becomes due again once it grows past that count.
     #[test]
+    fn superseded_never_selected_csharp_sets_are_collected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let db = store_with_one_collectable_blob(&root);
+        let mut conn = cache_db::open_unified_connection(&db).unwrap();
+        conn.execute_batch("INSERT INTO csharp_compilation_sets(set_id, workspace_id, lang, generation, derivation_version, input_digest, output_digest, gaps)
+            VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'csharp', 0, 1, zeroblob(32), zeroblob(32), jsonb('[]')),
+                   (2, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'csharp', 0, 1, randomblob(32), zeroblob(32), jsonb('[]')),
+                   (3, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, 1, randomblob(32), zeroblob(32), jsonb('[]')),
+                   (4, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, 1, randomblob(32), zeroblob(32), jsonb('[]'));
+            INSERT INTO workspace_revisions(workspace_id, lang, generation, revision) VALUES('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, 1);
+            INSERT INTO csharp_compilation_selections(workspace_id, lang, generation, revision, set_id) VALUES('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, 1, 3);").unwrap();
+        let tx = conn.transaction().unwrap();
+        collect_superseded_csharp_sets(&tx).unwrap();
+        let ids = tx
+            .prepare("SELECT set_id FROM csharp_compilation_sets ORDER BY set_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ids, [2, 3, 4]);
+        tx.commit().unwrap();
+        assert!(
+            conn.query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+                .optional()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn collection_records_its_accounting_and_becomes_due_after_growth() {
         let _tuning = set_tuning_for_test(0, i64::MAX);
         let temp = tempfile::tempdir().unwrap();
@@ -2386,6 +2457,82 @@ mod tests {
             )
             .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn forced_gc_preserves_using_publication_until_accounting_withdraws_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&root);
+        let db = gitblob::cache_db_path(&root);
+        {
+            let conn = cache_db::open_unified_connection(&db).unwrap();
+            conn.execute(
+                "INSERT INTO analysis_epochs(lang,epoch,generation) VALUES('csharp','active',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(1,?1,'csharp',1)",
+                ["5555555555555555555555555555555555555555"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO csharp_using_publications VALUES(1,'active')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(2,'6666666666666666666666666666666666666666','csharp',1);
+                INSERT INTO workspace_revisions VALUES(printf('%064d',0),'csharp',1,1);
+                INSERT INTO csharp_compilation_sets(set_id,workspace_id,lang,generation,derivation_version,input_digest,output_digest,gaps)
+                VALUES(1,printf('%064d',0),'csharp',1,4,zeroblob(32),zeroblob(32),jsonb('[]'));
+                INSERT INTO csharp_compilations(compilation_id,set_id,project_path,references_complete,transitive_flow,global_usings_complete,internals_visible_to_complete,global_usings,internals_visible_to)
+                VALUES(1,1,'App.csproj',1,1,1,1,jsonb('[]'),jsonb('[]'));
+                INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state)
+                VALUES(2,'csharp','csharp','active',zeroblob(32),0,1,0,'building');
+                INSERT INTO resolution_root_imports(blob_id,import_site,root_scope,anchor,kind) VALUES(2,1,0,'lexical','glob');
+                INSERT INTO csharp_global_using_extent VALUES(printf('%064d',0),'csharp',1,1,'Unrooted.cs',2,1,1,NULL);").unwrap();
+        }
+        force_gc(&db, &repo, &root).unwrap();
+        {
+            let conn = cache_db::open_unified_connection(&db).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM blobs WHERE id=1", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert!(
+                conn.execute("DELETE FROM blobs WHERE id=1", []).is_err(),
+                "marker FK blocks bypasses"
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM blobs WHERE id=2", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "extent outlives every file version"
+            );
+            conn.execute("DELETE FROM csharp_global_using_extent WHERE blob_id=2", [])
+                .unwrap();
+            // No membership/certificate exists for this orphan: withdrawing its zero delta is exact.
+            conn.execute("DELETE FROM csharp_using_publications WHERE blob_id=1", [])
+                .unwrap();
+        }
+        force_gc(&db, &repo, &root).unwrap();
+        let conn = cache_db::open_unified_connection(&db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM blobs WHERE id=1", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM blobs WHERE id=2", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 

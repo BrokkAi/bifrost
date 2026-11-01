@@ -24,6 +24,10 @@ pub(crate) trait RetainedSize {
     }
 }
 
+#[cfg(test)]
+#[path = "retained/accounting_tests.rs"]
+mod accounting_tests;
+
 pub(crate) fn ensure_truncation_consistency<E>(
     truncated: bool,
     omitted_lower_bound: u64,

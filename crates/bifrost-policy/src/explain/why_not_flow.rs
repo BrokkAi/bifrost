@@ -637,6 +637,12 @@ fn reported_origin(finding: &PolicyFinding) -> Option<&ResolvedEndpointIdentity>
 
 /// Which declared kill blocks the candidate, decided by the same production
 /// route over the policy with its kills removed.
+///
+/// A flow candidate explanation uses one prefix execution for the authored
+/// policy. Kill attribution needs a second execution of that candidate with
+/// the declared kills removed, then checks its counterfactual paths against
+/// the kills retained by the authored pass. A limit of one leaves attribution
+/// unknown; a limit of two permits attribution when the paths are complete.
 #[allow(clippy::too_many_arguments)]
 fn attribution_stage(
     policy: &LoadedPolicy,
@@ -752,7 +758,11 @@ fn attribution_stage(
         .witnesses
         .len()
         .saturating_sub(budget.max_witnesses_per_finding());
-    let attributed = unattributed == 0 && !kills.is_empty();
+    let attributed = unattributed == 0 && omitted_paths == 0 && !kills.is_empty();
+    let retained_paths = relaxed_solve
+        .witnesses
+        .len()
+        .min(budget.max_witnesses_per_finding());
     let mut node = RawNode::new(
         ExplanationNodeKind::Derivation,
         if attributed {
@@ -767,12 +777,15 @@ fn attribution_stage(
         format!(
             "with the {}s removed the same route reaches the {}; each of {} retained path(s) \
              passes a {} the policy declares",
+            vocabulary.kill, vocabulary.observation, retained_paths, vocabulary.kill
+        )
+    } else if omitted_paths > 0 {
+        format!(
+            "with the {}s removed the same route reaches the {}; {} of {retained_paths} retained \
+             path(s) pass a declared {}, but {omitted_paths} path(s) were omitted and not checked",
             vocabulary.kill,
             vocabulary.observation,
-            relaxed_solve
-                .witnesses
-                .len()
-                .min(budget.max_witnesses_per_finding()),
+            retained_paths.saturating_sub(unattributed),
             vocabulary.kill
         )
     } else {

@@ -31,6 +31,18 @@ use std::hash::Hash;
 use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RelativeImportGapKind {
+    Absent,
+    OutsideWorkspace,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RelativeImportGap {
+    pub target: String,
+    pub kind: RelativeImportGapKind,
+}
+
 /// The precise binding for `name`. Shared by the per-language receiver typing.
 ///
 /// Every caller reads an engine that seeds one target per symbol
@@ -450,6 +462,8 @@ pub struct UsageEdges<K = String> {
     /// Drawn edges instead cap by callee across callers. Native routes have no
     /// numeric call-site cap.
     pub unproven_sites_complete: bool,
+    /// Missing local import targets observed at admitted reference sites.
+    pub unresolved_relative_imports: BTreeMap<String, Vec<RelativeImportGap>>,
 }
 
 // Hand-written so the bound is `K: Ord` (BTreeMap), not `K: Default` that
@@ -462,6 +476,7 @@ impl<K: Ord> Default for UsageEdges<K> {
             unproven_inbound: BTreeMap::new(),
             unproven_sites: BTreeMap::new(),
             unproven_sites_complete: true,
+            unresolved_relative_imports: BTreeMap::new(),
         }
     }
 }
@@ -763,6 +778,7 @@ pub struct PerFileEdges<K = String> {
     pub unproven_inbound: BTreeMap<K, HashSet<usize>>,
     /// `(optional enclosing caller, terminal name) -> unresolved structured ranges`.
     pub unproven_sites: BTreeMap<(Option<K>, String), BTreeMap<Range, UnprovenSiteEvidence>>,
+    pub unresolved_relative_imports: HashSet<RelativeImportGap>,
 }
 
 impl<K: Ord> Default for PerFileEdges<K> {
@@ -773,6 +789,7 @@ impl<K: Ord> Default for PerFileEdges<K> {
             callsites: BTreeMap::new(),
             unproven_inbound: BTreeMap::new(),
             unproven_sites: BTreeMap::new(),
+            unresolved_relative_imports: HashSet::default(),
         }
     }
 }
@@ -934,6 +951,33 @@ impl<K: NodeKey> PerFileEdges<K> {
         node: Node<'_>,
     ) {
         self.record_unproven_name(input, name, node.start_byte(), node.end_byte());
+    }
+
+    /// The binding was selected lexically, but its local module target is absent
+    /// or leaves the workspace. The hook returns a gap only when normal language
+    /// resolution finds no target.
+    pub fn record_missing_relative_import_site<B>(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        name: &str,
+        binding: &B,
+        node: Node<'_>,
+        missing: impl FnOnce(&B) -> Option<RelativeImportGap>,
+    ) -> bool {
+        let Some(target) = missing(binding) else {
+            return false;
+        };
+        let start = node.start_byte();
+        let end = node.end_byte();
+        if input
+            .enclosing_entry(start, end)
+            .is_some_and(|(_, _, caller)| !input.is_caller(caller))
+        {
+            return false;
+        }
+        self.record_unproven_site(input, name, CodeUnitType::Function, start, end);
+        self.unresolved_relative_imports.insert(target);
+        true
     }
 
     /// Record that a structured call/member site matched `callee` exactly but

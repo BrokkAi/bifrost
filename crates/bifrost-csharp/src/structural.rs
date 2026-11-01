@@ -5,7 +5,8 @@ use crate::syntax::{
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     CalleeSpineStep, attach_decorators_under, attach_role_with_derived_name,
-    attach_terminal_callee, csharp_integer_literal_value, first_named_child, terminal_callee_leaf,
+    attach_terminal_callee, csharp_integer_literal_value, field_name_in_parent, first_named_child,
+    terminal_callee_leaf,
 };
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallSiteContext, CallSiteFacts,
@@ -192,7 +193,9 @@ impl CSharpCallResultUseIndex {
 
 static CSHARP_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
     .supported(OccurrenceRole::MemberPosition)
-    .supported(OccurrenceRole::Binder);
+    .supported(OccurrenceRole::Binder)
+    .supported(OccurrenceRole::ReceiverPosition)
+    .supported(OccurrenceRole::ValueReference);
 
 pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("binary_expression", NormalizedKind::BinaryExpression),
@@ -216,6 +219,7 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("as_expression", NormalizedKind::Cast),
     ("is_expression", NormalizedKind::InstanceOf),
     ("lock_statement", NormalizedKind::Lock),
+    ("typeof_expression", NormalizedKind::TypeLiteral),
     ("comment", NormalizedKind::Comment),
     ("invocation_expression", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
@@ -564,6 +568,143 @@ fn csharp_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
     csharp_member_name(member_name)
         .is_some_and(|member| member.identifier.id() == node.id())
         .then_some(OccurrenceRole::MemberPosition)
+}
+
+/// Parents whose identifier slots never hold an expression: declaration and
+/// binder names, type syntax, qualified and namespace names, patterns,
+/// labels and preprocessor symbols. Read from the grammar's node types, where
+/// these are the parents that admit `identifier` only outside the
+/// `expression` supertype.
+const CSHARP_NON_EXPRESSION_IDENTIFIER_PARENTS: &[&str] = &[
+    "accessor_declaration",
+    "alias_qualified_name",
+    "array_type",
+    "attribute",
+    "bracketed_parameter_list",
+    "calling_convention",
+    "catch_declaration",
+    "constant_pattern",
+    "declaration_expression",
+    "declaration_pattern",
+    "explicit_interface_specifier",
+    "extern_alias_directive",
+    "file_scoped_namespace_declaration",
+    "function_pointer_parameter",
+    "generic_name",
+    "join_into_clause",
+    "labeled_statement",
+    "list_pattern",
+    "member_binding_expression",
+    "namespace_declaration",
+    "nullable_type",
+    "parameter_list",
+    "parenthesized_variable_designation",
+    "pointer_type",
+    "preproc_elif",
+    "preproc_if",
+    "preproc_if_in_attribute_list",
+    "preproc_pragma",
+    "primary_constructor_base_type",
+    "qualified_name",
+    "query_expression",
+    "receiver_parameter",
+    "recursive_pattern",
+    "scoped_type",
+    "subpattern",
+    "tuple_element",
+    "tuple_pattern",
+    "type_parameter",
+    "type_parameter_constraints_clause",
+    "unary_expression",
+    "using_directive",
+    "var_pattern",
+];
+
+/// Classify an identifier that reads a name in an expression slot.
+///
+/// The receiver of a member access or conditional access is a
+/// `ReceiverPosition`; every other expression identifier is a
+/// `ValueReference`. Names in a non-expression slot (see
+/// [`CSHARP_NON_EXPRESSION_IDENTIFIER_PARENTS`]), the `name`, `type`,
+/// `returns`, `alias` and `qualifier` fields, type positions, statement
+/// labels, named-argument labels, initializer member labels and preprocessor
+/// symbols are not references to a value and get no reference role. Member
+/// names and binders are classified before this runs.
+fn csharp_reference_position(node: Node<'_>) -> Option<OccurrenceRole> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let parent = node.parent()?;
+    if parent.is_error()
+        || CSHARP_NON_EXPRESSION_IDENTIFIER_PARENTS.contains(&parent.kind())
+        || matches!(
+            field_name_in_parent(parent, node),
+            Some("name" | "type" | "returns" | "alias" | "qualifier")
+        )
+        || crate::syntax::csharp_is_type_position(node)
+        || crate::graph::extractor::is_declaration_name(node)
+        || crate::graph::extractor::is_statement_label(node)
+        || csharp_initializer_member_label(parent, node)
+        || csharp_in_preprocessor_condition(parent)
+    {
+        return None;
+    }
+    let receiver_field = match parent.kind() {
+        "member_access_expression" => "expression",
+        "conditional_access_expression" => "condition",
+        _ => return Some(OccurrenceRole::ValueReference),
+    };
+    Some(
+        if parent.child_by_field_name(receiver_field) == Some(node) {
+            OccurrenceRole::ReceiverPosition
+        } else {
+            OccurrenceRole::ValueReference
+        },
+    )
+}
+
+/// Whether `node` names the member an initializer sets: the left side of an
+/// assignment in an object initializer (`new T { Name = value }`, nested
+/// `Inner = { Name = value }` included) or the label of a `with` initializer.
+/// An array initializer's assignment reads and writes an ordinary value.
+fn csharp_initializer_member_label(parent: Node<'_>, node: Node<'_>) -> bool {
+    if parent.kind() == "with_initializer" {
+        return parent.named_child(0) == Some(node);
+    }
+    if parent.kind() != "assignment_expression" || parent.child_by_field_name("left") != Some(node)
+    {
+        return false;
+    }
+    parent
+        .parent()
+        .filter(|initializer| initializer.kind() == "initializer_expression")
+        .and_then(|initializer| initializer.parent())
+        .is_some_and(|owner| {
+            matches!(
+                owner.kind(),
+                "object_creation_expression"
+                    | "implicit_object_creation_expression"
+                    | "assignment_expression"
+            )
+        })
+}
+
+/// Whether an expression built from `parent` upward is a preprocessor
+/// condition, whose identifiers are conditional-compilation symbols.
+fn csharp_in_preprocessor_condition(parent: Node<'_>) -> bool {
+    std::iter::successors(Some(parent), |node| node.parent())
+        .find(|node| {
+            !matches!(
+                node.kind(),
+                "binary_expression" | "prefix_unary_expression" | "parenthesized_expression"
+            )
+        })
+        .is_some_and(|owner| {
+            matches!(
+                owner.kind(),
+                "preproc_if" | "preproc_elif" | "preproc_if_in_attribute_list"
+            )
+        })
 }
 
 /// C# derives its scope tree from the callable, class-like, loop, catch and
@@ -1018,6 +1159,8 @@ impl StructuralSpec for CSharpStructuralSpec {
             sink.occurrence_role(node, role);
         } else if csharp_is_binder(node) {
             sink.occurrence_role(node, OccurrenceRole::Binder);
+        } else if let Some(role) = csharp_reference_position(node) {
+            sink.occurrence_role(node, role);
         }
 
         match kind {
@@ -1152,6 +1295,14 @@ impl StructuralSpec for CSharpStructuralSpec {
                     sink,
                     node,
                     fields,
+                    expression_name_node,
+                );
+            }
+            NormalizedKind::TypeLiteral => {
+                brokk_bifrost_core::analyzer::structural::adapter_helpers::attach_field_roles(
+                    sink,
+                    node,
+                    &[(Role::Type, "type")],
                     expression_name_node,
                 );
             }

@@ -2193,6 +2193,7 @@ impl std::error::Error for ProjectionAuthorityError {}
 
 #[cfg(test)]
 mod tests {
+    mod contract_tests;
     use super::*;
     use crate::definition::{
         PolicySemanticEvent, TaintLabel, TypestateExitScope, TypestateExpectationId,

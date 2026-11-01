@@ -653,6 +653,11 @@ jobs:
         with:
           python-version: '3.12'
           architecture: ${{ matrix.python_architecture }}
+      # The extension module deflates to 85-94 MB against PyPI's 100 MiB
+      # per-file limit; the wheel ships it xz-compressed (#8288).
+      - name: Compress the searchtools wheel's extension module
+        shell: bash
+        run: python scripts/public/compress-python-wheel.py dist dist/brokk_bifrost_searchtools-*.whl
       - name: Install and exercise exact Python wheel
         shell: bash
         env:
@@ -746,7 +751,7 @@ jobs:
       # limit; the wheel ships it xz-compressed behind a launcher (#8288).
       - name: Compress the CLI wheel's binary
         shell: bash
-        run: python scripts/public/compress-cli-wheel.py packaging/bifrost-cli/wheelhouse packaging/bifrost-cli/dist/*.whl
+        run: python scripts/public/compress-python-wheel.py packaging/bifrost-cli/wheelhouse packaging/bifrost-cli/dist/*.whl
       - name: Install and exercise exact CLI wheel
         shell: bash
         env:

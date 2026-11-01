@@ -97,3 +97,11 @@ Current history:
   identities and nested type-forward rows, and widens the payload-family CHECK
   without invalidating old publications. Historical packs have no identity row.
   Target matching is restricted to the caller's selected providers.
+
+- `0029-open-schema-version-bound.sql`: admits schema 21 (#8415) by removing the
+  upper bound of the `catalog_packs` schema-version CHECK. The lower bound and
+  the compatibility shape partitioned at schema 8 stay. The validator already
+  rejects unsupported versions before any insert, so later schema versions
+  need no rebuild of this table. The table, its indexes, the
+  generated-production view and the mutation triggers are rebuilt as 0028 left
+  them; every row is preserved.

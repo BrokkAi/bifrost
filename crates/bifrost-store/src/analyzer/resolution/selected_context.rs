@@ -162,6 +162,9 @@ pub trait SelectedContextPathSource {
 pub enum SelectedRootPathHalf {
     Import {
         identity: CandidatePathIdentity,
+        /// Binding endpoint: the import checkpoint, or the scope head for a
+        /// scope-wide import. This is distinct from the original scope head.
+        source_start: BindingNodeId,
         source_scope_head: BindingNodeId,
         route: Box<[SemanticId]>,
         /// The source position at which a positional import takes effect
@@ -389,6 +392,7 @@ pub fn classify_selected_root_path_half(
         };
         return Ok(Some(SelectedRootPathHalf::Import {
             identity,
+            source_start: path.start().node(),
             source_scope_head,
             route: end[1..end.len() - 2]
                 .iter()
@@ -1031,9 +1035,11 @@ enum JvmExternalTypeIdentityClaim {
 #[derive(Clone, Debug, Default)]
 struct SelectedJvmContextIdentities {
     jvm_supertype_names: Arc<std::sync::Mutex<HashMap<SemanticId, Arc<str>>>>,
-    jvm_external_members:
-        Arc<std::sync::Mutex<HashMap<SemanticId, (super::ExternalOwnerIdentity, u32)>>>,
+    jvm_external_members: Arc<std::sync::Mutex<JvmExternalMemberMap>>,
 }
+
+type JvmExternalMemberMap =
+    HashMap<SemanticId, (super::ExternalOwnerIdentity, u32, HashMap<SemanticId, bool>)>;
 
 /// A named incompleteness reason's stable name and its evidence.
 type NamedReason = (&'static str, Arc<str>);
@@ -1044,6 +1050,110 @@ type NamedReason = (&'static str, Arc<str>);
 struct NamedReasonEntry {
     reason: NamedReason,
     lookup: Option<(BindingFragmentId, SemanticId)>,
+}
+
+/// Identity fields whose snapshot policy is supplied by each language.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum PreparedContextIdentityField {
+    UnindexedGoImports,
+    Numbers,
+    NamedReasons,
+    RustPreludeReferences,
+    ExternalTypeImportPaths,
+    JavaImportRouteGapReasons,
+    JvmExternalTypeIdentities,
+    JvmExternalTypeIdentitiesByReference,
+    JvmExternalTypeBoundaries,
+    JvmExternalOwners,
+    ModelMembers,
+    JvmSupertypeNames,
+    JvmExternalMembers,
+}
+
+/// Allowed fields contain stable values or context-local numbers. Remapped
+/// fields also contain shared-name IDs and must be enumerated by the payload
+/// hook. Refused fields must be empty, including in optimized builds.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedContextIdentityPolicy {
+    Allow,
+    Remap,
+    Refuse,
+}
+
+/// Language-owned frozen data. The clone hook must isolate interior mutation;
+/// remapping enumerates every shared-name field in the payload and table.
+pub(crate) trait PreparedContextPayload: Sized {
+    fn identity_space(&self) -> SelectedContextIdentities;
+    fn isolated_payload(&self, identities: SelectedContextIdentities) -> Self;
+    fn with_identity_space(self, identities: SelectedContextIdentities) -> Self;
+    fn assert_snapshot_safe(&self);
+    fn remap_shared_names(
+        &mut self,
+        remap: &mut dyn FnMut(SemanticId) -> StoreResult<SemanticId>,
+    ) -> StoreResult<()>;
+}
+
+/// Storage-independent prepared-context envelope. Callers retain entries under
+/// their own byte budget and replay receipts at their owning layer. The frozen
+/// payload owns the isolated identity table exposed by its identity-space hook.
+#[derive(Clone)]
+pub(crate) struct PreparedContextSnapshot<P> {
+    pub(crate) payload: P,
+    pub(crate) shared_names: HashMap<SemanticId, [u8; 32]>,
+}
+
+impl<P: PreparedContextPayload> PreparedContextSnapshot<P> {
+    pub(crate) fn capture(
+        payload: &P,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Self>> {
+        payload.assert_snapshot_safe();
+        let identities = payload.identity_space().isolated_clone();
+        let mut payload = payload.isolated_payload(identities);
+        let mut shared_names = HashMap::default();
+        payload.remap_shared_names(&mut |identity| {
+            if let Some(digest) = source.shared_name_digest_for_identity(identity, cancellation)? {
+                shared_names.insert(identity, digest);
+            }
+            Ok(identity)
+        })?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            payload,
+            shared_names,
+        }))
+    }
+
+    pub(crate) fn restore(
+        &self,
+        identities: &SelectedContextIdentities,
+        names: &dyn super::SharedNameInterner,
+        replay_side_effects: impl FnOnce(&P) -> StoreResult<()>,
+    ) -> StoreResult<P> {
+        self.payload.assert_snapshot_safe();
+        assert!(
+            identities.is_empty(),
+            "cached context identities restore only into an unused request"
+        );
+        let restored = self.payload.identity_space().isolated_clone();
+        let mut payload = self.payload.isolated_payload(restored.clone());
+        payload.remap_shared_names(&mut |identity| {
+            let digest = self
+                .shared_names
+                .get(&identity)
+                .expect("a cached context retains every referenced shared-name digest");
+            Ok(SemanticId::shared_name(names.intern(*digest)))
+        })?;
+        identities.copy_from_empty(&restored);
+        let payload = payload.with_identity_space(identities.clone());
+        replay_side_effects(&payload)?;
+        Ok(payload)
+    }
 }
 
 impl SelectedContextIdentities {
@@ -1719,17 +1829,66 @@ impl SelectedContextIdentities {
         hash.field("member-ordinal", &ordinal.to_be_bytes());
         let semantic = SemanticId::shared_name(names.intern(hash.finish()));
         let coordinates = (owner.clone(), ordinal);
-        let previous = self
+        let mut members = self
             .jvm
             .jvm_external_members
             .lock()
-            .expect("external member coordinates are not poisoned")
-            .insert(semantic, coordinates.clone());
-        assert!(
-            previous.is_none_or(|previous| previous == coordinates),
+            .expect("external member coordinates are not poisoned");
+        let stored = members
+            .entry(semantic)
+            .or_insert_with(|| (owner.clone(), ordinal, HashMap::default()));
+        assert_eq!(
+            (&stored.0, stored.1),
+            (&coordinates.0, coordinates.1),
             "one external member semantic has one inventory row"
         );
         semantic
+    }
+
+    pub(crate) fn record_jvm_package_member_gap(
+        &self,
+        target: SemanticId,
+        reason: SemanticId,
+        complete: bool,
+    ) {
+        let mut members = self
+            .jvm
+            .jvm_external_members
+            .lock()
+            .expect("external member coordinates are not poisoned");
+        members
+            .get_mut(&target)
+            .expect("package member is registered")
+            .2
+            .insert(reason, complete);
+    }
+
+    pub(crate) fn jvm_package_member_gap_matches(
+        &self,
+        target: SemanticId,
+        reason: SemanticId,
+    ) -> bool {
+        self.jvm
+            .jvm_external_members
+            .lock()
+            .expect("external member coordinates are not poisoned")
+            .get(&target)
+            .is_some_and(|member| member.2.contains_key(&reason))
+    }
+
+    pub(crate) fn jvm_package_member_gap_is_complete(
+        &self,
+        target: SemanticId,
+        reason: SemanticId,
+    ) -> bool {
+        self.jvm
+            .jvm_external_members
+            .lock()
+            .expect("external member coordinates are not poisoned")
+            .get(&target)
+            .and_then(|member| member.2.get(&reason))
+            .copied()
+            .unwrap_or(false)
     }
 
     pub(crate) fn external_member_identity(
@@ -1741,7 +1900,16 @@ impl SelectedContextIdentities {
             .lock()
             .expect("external member coordinates are not poisoned")
             .get(&semantic)
-            .cloned()
+            .map(|(owner, ordinal, _)| (owner.clone(), *ordinal))
+    }
+
+    pub(crate) fn is_jvm_package_member_target(&self, semantic: SemanticId) -> bool {
+        self.jvm
+            .jvm_external_members
+            .lock()
+            .expect("external member coordinates are not poisoned")
+            .get(&semantic)
+            .is_some_and(|member| !member.2.is_empty())
     }
 
     pub(crate) fn record_jvm_external_provider_type_identity(
@@ -1968,17 +2136,16 @@ impl SelectedContextIdentities {
             .unwrap_or_default()
     }
 
-    /// Prepared Go snapshots are published to the store cache and restored
-    /// into later requests, so only selected Go import bridges and their
-    /// canonical numbers and named reasons may cross the request boundary. A
-    /// request-minted identity of any other kind would replay into a request
-    /// that never minted it, so the check runs in release builds. Every
-    /// identity field is destructured, so a new kind must be classified here.
-    pub(crate) fn assert_go_snapshot_safe(&self) {
+    /// Exhaustive identity-field census. Languages classify each field; a new
+    /// table field must acquire a policy before it can enter any snapshot.
+    pub(crate) fn assert_snapshot_fields(
+        &self,
+        classify: impl Fn(PreparedContextIdentityField) -> PreparedContextIdentityPolicy,
+    ) {
         let Self {
-            unindexed_go_imports: _,
-            numbers: _,
-            named_reasons: _,
+            unindexed_go_imports,
+            numbers,
+            named_reasons,
             rust_prelude_references,
             external_type_import_paths,
             java_import_route_gap_reasons,
@@ -1993,32 +2160,69 @@ impl SelectedContextIdentities {
             jvm_supertype_names,
             jvm_external_members,
         } = &**jvm;
-        macro_rules! refuse_any {
-            ($field:expr, $kind:literal) => {{
-                let values = $field.lock().expect(concat!($kind, " are not poisoned"));
-                assert!(
-                    values.is_empty(),
-                    concat!($kind, " cannot enter a prepared-context snapshot: {:?}"),
-                    *values
-                );
-            }};
+        macro_rules! classify_field {
+            ($field:ident, $variant:ident, $label:literal) => {
+                if classify(PreparedContextIdentityField::$variant)
+                    == PreparedContextIdentityPolicy::Refuse
+                {
+                    let values = $field.lock().expect(concat!($label, " are not poisoned"));
+                    assert!(
+                        values.is_empty(),
+                        concat!($label, " cannot enter a prepared-context snapshot: {:?}"),
+                        *values
+                    );
+                }
+            };
         }
-        refuse_any!(
+        classify_field!(
+            unindexed_go_imports,
+            UnindexedGoImports,
+            "unindexed Go imports"
+        );
+        classify_field!(numbers, Numbers, "canonical numbers");
+        classify_field!(named_reasons, NamedReasons, "named reasons");
+        classify_field!(
+            rust_prelude_references,
+            RustPreludeReferences,
+            "Rust prelude references"
+        );
+        classify_field!(
+            external_type_import_paths,
+            ExternalTypeImportPaths,
+            "external type import paths"
+        );
+        classify_field!(
+            java_import_route_gap_reasons,
+            JavaImportRouteGapReasons,
+            "Java import route reasons"
+        );
+        classify_field!(
             jvm_external_type_identities,
+            JvmExternalTypeIdentities,
             "external provider type identities"
         );
-        refuse_any!(rust_prelude_references, "Rust prelude references");
-        refuse_any!(external_type_import_paths, "external type import paths");
-        refuse_any!(java_import_route_gap_reasons, "Java import route reasons");
-        refuse_any!(
+        classify_field!(
             jvm_external_type_identities_by_reference,
+            JvmExternalTypeIdentitiesByReference,
             "external type references"
         );
-        refuse_any!(jvm_external_type_boundaries, "external type boundaries");
-        refuse_any!(jvm_external_owners, "external owners");
-        refuse_any!(model_members, "model member tokens");
-        refuse_any!(jvm_supertype_names, "JVM supertype names");
-        refuse_any!(jvm_external_members, "JVM external members");
+        classify_field!(
+            jvm_external_type_boundaries,
+            JvmExternalTypeBoundaries,
+            "external type boundaries"
+        );
+        classify_field!(jvm_external_owners, JvmExternalOwners, "external owners");
+        classify_field!(model_members, ModelMembers, "model member tokens");
+        classify_field!(
+            jvm_supertype_names,
+            JvmSupertypeNames,
+            "JVM supertype names"
+        );
+        classify_field!(
+            jvm_external_members,
+            JvmExternalMembers,
+            "JVM external members"
+        );
     }
 
     /// Request-only token, never a source definition or durable inventory ordinal.
@@ -2204,7 +2408,167 @@ impl SelectedResolutionContextInputs {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn java_snapshot_completion(
+    completion: &ResolutionCompletion,
+    canonical: &impl Fn(String) -> String,
+) -> serde_json::Value {
+    match completion {
+        ResolutionCompletion::Complete => serde_json::json!("Complete"),
+        ResolutionCompletion::Incomplete(reasons) => {
+            let mut reasons = reasons
+                .iter()
+                .map(|reason| canonical(format!("{reason:?}")))
+                .collect::<Vec<_>>();
+            reasons.sort();
+            serde_json::json!({"set": reasons})
+        }
+    }
+}
+
 impl SelectedResolutionContextSet {
+    // Temporary M1f equality surface. Sequences retain order; maps and sets
+    // compare canonical contents, never their runtime allocation order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn java_assembly_snapshot(
+        &self,
+        canonical: &impl Fn(String) -> String,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        use serde_json::json;
+        let mut fields = std::collections::BTreeMap::new();
+        macro_rules! sequence {
+            ($name:ident) => {
+                fields.insert(
+                    stringify!($name).into(),
+                    json!(
+                        self.$name
+                            .iter()
+                            .map(|value| canonical(format!("{value:?}")))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+            };
+        }
+        sequence!(root_bridges);
+        sequence!(package_bridges);
+        sequence!(go_import_bindings);
+        fields.insert(
+            "selected_mount_count".into(),
+            json!(self.selected_mount_count),
+        );
+        fields.insert(
+            "mounts".into(),
+            json!(
+                self.mounts
+                    .iter()
+                    .map(|mount| {
+                        json!([
+                            canonical(format!("{:?}", mount.fragment)),
+                            mount.semantic_language.config_label(),
+                            mount
+                                .root_bridges
+                                .iter()
+                                .map(|value| canonical(format!("{value:?}")))
+                                .collect::<Vec<_>>(),
+                            mount
+                                .package_bridges
+                                .iter()
+                                .map(|value| canonical(format!("{value:?}")))
+                                .collect::<Vec<_>>(),
+                            mount
+                                .go_import_bindings
+                                .iter()
+                                .map(|value| canonical(format!("{value:?}")))
+                                .collect::<Vec<_>>(),
+                            java_snapshot_completion(
+                                &mount.root_reverse_inventory_completion,
+                                canonical
+                            )
+                        ])
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
+        macro_rules! set { ($name:ident) => {
+            let mut entries = self.$name.iter().map(|value| canonical(format!("{value:?}"))).collect::<Vec<_>>();
+            entries.sort(); fields.insert(stringify!($name).into(), json!({"set": entries}));
+        }; }
+        set!(callable_import_boundaries);
+        set!(context_owned_gap_identities);
+        fields.insert(
+            "root_reverse_inventory_completion".into(),
+            java_snapshot_completion(&self.root_reverse_inventory_completion, canonical),
+        );
+        fields.insert(
+            "declaration_access".into(),
+            json!(
+                self.declaration_access_source
+                    .as_ref()
+                    .map(|source| canonical(format!("{:?}", source.identity())))
+            ),
+        );
+        macro_rules! map { ($($part:ident).+) => {
+            let mut entries = self.identities.$($part).+.lock().expect("identity map not poisoned").iter()
+                .map(|(key, value)| (canonical(format!("{key:?}")), canonical(format!("{value:?}")))).collect::<Vec<_>>();
+            entries.sort(); fields.insert(stringify!($($part).+).into(), json!({"map": entries}));
+        }; }
+        map!(unindexed_go_imports);
+        map!(rust_prelude_references);
+        map!(external_type_import_paths);
+        map!(jvm_external_type_identities);
+        map!(jvm_external_type_identities_by_reference);
+        map!(jvm_external_type_boundaries);
+        map!(jvm_external_owners);
+        map!(model_members);
+        map!(jvm.jvm_supertype_names);
+        map!(jvm.jvm_external_members);
+        let digests = {
+            let numbers = self
+                .identities
+                .numbers
+                .lock()
+                .expect("identity numbers not poisoned");
+            (0..)
+                .map_while(|index| numbers.digest(index))
+                .collect::<Vec<_>>()
+        };
+        let digest_text = |number: usize| {
+            format!(
+                "digest:{}",
+                brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digests[number])
+            )
+        };
+        let mut reasons = self
+            .identities
+            .named_reasons
+            .lock()
+            .expect("named reasons not poisoned")
+            .iter()
+            .map(|(number, reason)| {
+                (
+                    digest_text(usize::try_from(*number).unwrap()),
+                    canonical(format!("{reason:?}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        reasons.sort();
+        fields.insert("named_reasons".into(), json!({"map": reasons}));
+        let mut digests = (0..digests.len()).map(digest_text).collect::<Vec<_>>();
+        digests.sort();
+        fields.insert("zz_canonical_identities".into(), json!({"set": digests}));
+        let mut gaps = self
+            .identities
+            .java_import_route_gap_reasons
+            .lock()
+            .expect("identity set not poisoned")
+            .iter()
+            .map(|value| canonical(format!("{value:?}")))
+            .collect::<Vec<_>>();
+        gaps.sort();
+        fields.insert("java_import_route_gap_reasons".into(), json!({"set": gaps}));
+        fields
+    }
+
     /// Publish all authored import binders before lazy member closure begins.
     pub(crate) fn with_callable_imports<'a>(
         mut self,
@@ -2245,6 +2609,30 @@ impl SelectedResolutionContextSet {
 
     /// Rebind a cached immutable context to one request's restored identity
     /// table. Cached snapshots preserve the original numeric assignments.
+    /// Every field, with the access policy rendered by its identity, so a test
+    /// can compare two contexts whole.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn describe_for_test(&self) -> String {
+        format!(
+            "{:?}",
+            (
+                &self.mounts,
+                self.selected_mount_count,
+                &self.root_bridges,
+                &self.callable_import_boundaries,
+                &self.package_bridges,
+                &self.go_import_bindings,
+                &self.root_reverse_inventory_completion,
+                &self.context_owned_gap_identities,
+                &self.identities,
+                self.declaration_access_source
+                    .as_ref()
+                    .map(|source| source.identity()),
+            )
+        )
+    }
+
     pub(crate) fn with_identity_space(mut self, identities: SelectedContextIdentities) -> Self {
         self.identities = identities;
         self
@@ -5322,6 +5710,7 @@ mod tests {
         let SelectedRootPathHalf::Import {
             activation,
             route,
+            source_start,
             source_scope_head,
             anchor,
             precedence,
@@ -5344,6 +5733,7 @@ mod tests {
             )]
         );
         assert_eq!(*source_scope_head, scope_head_node(fragment, root_scope));
+        assert_eq!(*source_start, *source_scope_head);
         assert_eq!(*anchor, ResolutionRootImportAnchor::Lexical);
         assert_eq!(
             precedence
@@ -5603,7 +5993,10 @@ pub mod go_global_support_1 {
 }
 
 impl SelectedRootBridgeDescriptor {
-    fn charge_retained(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+    pub(crate) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
         heap.slice(&self.route);
         for recipe in &self.route {
             heap.add(recipe.owned_bytes());
@@ -5618,9 +6011,12 @@ impl SelectedResolutionContextSet {
         &self,
         heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
     ) {
-        // Only Go snapshots currently call this census. They have no retained
-        // declaration-access policy; a new consumer must weigh its policy.
-        assert!(self.declaration_access_source.is_none());
+        // Go contexts carry no declaration-access policy. JVM policies are
+        // stateless values shared by every context of one operation, so their
+        // inline size is their whole cost.
+        if let Some(source) = &self.declaration_access_source {
+            heap.arc(source, |_, _| {});
+        }
         heap.slice(&self.mounts);
         for mount in &self.mounts {
             heap.slice(&mount.root_bridges);
@@ -5652,13 +6048,17 @@ impl SelectedResolutionContextSet {
             binding.charge_retained(heap);
         }
         self.root_reverse_inventory_completion.charge_retained(heap);
+        heap.btree_set(&self.callable_import_boundaries);
         heap.btree_set(&self.context_owned_gap_identities);
         self.identities.charge_retained(heap);
     }
 }
 
 impl SelectedContextIdentities {
-    fn charge_retained(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+    pub(crate) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
         heap.arc(&self.numbers, |numbers, heap| {
             numbers
                 .lock()
@@ -5754,9 +6154,10 @@ impl SelectedContextIdentities {
         heap.arc(&jvm.jvm_external_members, |values, heap| {
             let values = values.lock().expect("external members are not poisoned");
             heap.map(&values);
-            for (value, _) in values.values() {
+            for (value, _, reasons) in values.values() {
                 heap.arc(&value.provider_id, |_, _| {});
                 heap.arc(&value.owner_fqn, |_, _| {});
+                heap.map(reasons);
             }
         });
     }

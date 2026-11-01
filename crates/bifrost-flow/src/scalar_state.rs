@@ -20,6 +20,7 @@ use brokk_bifrost_analysis::analyzer::java_integral_parameter::{
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// A signed integer that can represent `-u128::MAX` through `u128::MAX`
 /// without host-language casts or overflow.
@@ -937,12 +938,175 @@ impl ScalarFact {
 /// as a wide switch, at the same place.
 const POINT_JOIN_WIDENING_LIMIT: usize = 16;
 
+const SCALAR_LEAF_WIDTH: usize = 16;
+const SCALAR_BRANCH_WIDTH: usize = 32;
+
+#[derive(Debug, Clone)]
+enum ScalarNode {
+    Leaf(Box<[ScalarFact]>),
+    Branch(Box<[Arc<ScalarNode>]>),
+}
+
+#[derive(Debug, Clone)]
+struct ScalarState {
+    root: Arc<ScalarNode>,
+    len: usize,
+    height: usize,
+}
+
+impl ScalarState {
+    fn from_vec(facts: Vec<ScalarFact>) -> Self {
+        let len = facts.len();
+        let mut nodes: Vec<_> = facts
+            .chunks(SCALAR_LEAF_WIDTH)
+            .map(|chunk| Arc::new(ScalarNode::Leaf(chunk.into())))
+            .collect();
+        if nodes.is_empty() {
+            nodes.push(Arc::new(ScalarNode::Leaf(Box::new([]))));
+        }
+        let mut height = 0_usize;
+        while nodes.len() > 1 {
+            nodes = nodes
+                .chunks(SCALAR_BRANCH_WIDTH)
+                .map(|chunk| Arc::new(ScalarNode::Branch(chunk.into())))
+                .collect();
+            height += 1;
+        }
+        assert!(
+            SCALAR_BRANCH_WIDTH
+                .checked_pow(height.saturating_sub(1) as u32)
+                .and_then(|branches| SCALAR_LEAF_WIDTH.checked_mul(branches))
+                .is_some(),
+            "scalar tree branch span fits usize"
+        );
+        Self {
+            root: nodes.pop().unwrap(),
+            len,
+            height,
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<ScalarFact> {
+        (index < self.len).then(|| self[index])
+    }
+
+    fn set(&mut self, index: usize, fact: ScalarFact) {
+        assert!(index < self.len);
+        if self[index] == fact {
+            return;
+        }
+        let mut span =
+            SCALAR_LEAF_WIDTH * SCALAR_BRANCH_WIDTH.pow(self.height.saturating_sub(1) as u32);
+        let mut node = &mut self.root;
+        for _ in 0..self.height {
+            let ScalarNode::Branch(children) = Arc::make_mut(node) else {
+                unreachable!()
+            };
+            node = &mut children[index / span % SCALAR_BRANCH_WIDTH];
+            span /= SCALAR_BRANCH_WIDTH;
+        }
+        let ScalarNode::Leaf(facts) = Arc::make_mut(node) else {
+            unreachable!()
+        };
+        facts[index % SCALAR_LEAF_WIDTH] = fact;
+    }
+
+    fn merge(&mut self, incoming: &Self, step: fn(ScalarFact, ScalarFact) -> ScalarFact) -> bool {
+        assert_eq!(self.len, incoming.len);
+        fn merge_node(
+            dst: &mut Arc<ScalarNode>,
+            src: &Arc<ScalarNode>,
+            step: fn(ScalarFact, ScalarFact) -> ScalarFact,
+        ) -> bool {
+            // Join and widen are idempotent: step(a, a) == a. That makes this
+            // pointer shortcut and the unchanged-state equality fast path exact.
+            if Arc::ptr_eq(dst, src) {
+                return false;
+            }
+            match (&**dst, &**src) {
+                (ScalarNode::Leaf(left), ScalarNode::Leaf(right)) => {
+                    let changed = left
+                        .iter()
+                        .zip(right.iter())
+                        .any(|(&a, &b)| step(a, b) != a);
+                    if changed {
+                        let ScalarNode::Leaf(left) = Arc::make_mut(dst) else {
+                            unreachable!()
+                        };
+                        for (a, &b) in left.iter_mut().zip(right.iter()) {
+                            *a = step(*a, b);
+                        }
+                    }
+                    changed
+                }
+                (ScalarNode::Branch(left), ScalarNode::Branch(right)) => {
+                    let changed = left
+                        .iter()
+                        .zip(right.iter())
+                        .any(|(a, b)| !Arc::ptr_eq(a, b));
+                    if !changed {
+                        return false;
+                    }
+                    let ScalarNode::Branch(left) = Arc::make_mut(dst) else {
+                        unreachable!()
+                    };
+                    left.iter_mut()
+                        .zip(right.iter())
+                        .fold(false, |changed, (a, b)| merge_node(a, b, step) | changed)
+                }
+                _ => unreachable!(),
+            }
+        }
+        merge_node(&mut self.root, &incoming.root, step)
+    }
+}
+
+impl std::ops::Index<usize> for ScalarState {
+    type Output = ScalarFact;
+    fn index(&self, index: usize) -> &Self::Output {
+        assert!(index < self.len);
+        let mut node = &*self.root;
+        let mut span =
+            SCALAR_LEAF_WIDTH * SCALAR_BRANCH_WIDTH.pow(self.height.saturating_sub(1) as u32);
+        for _ in 0..self.height {
+            let ScalarNode::Branch(children) = node else {
+                unreachable!()
+            };
+            node = &children[index / span % SCALAR_BRANCH_WIDTH];
+            span /= SCALAR_BRANCH_WIDTH;
+        }
+        let ScalarNode::Leaf(facts) = node else {
+            unreachable!()
+        };
+        &facts[index % SCALAR_LEAF_WIDTH]
+    }
+}
+
+impl PartialEq for ScalarState {
+    fn eq(&self, other: &Self) -> bool {
+        fn equal(a: &Arc<ScalarNode>, b: &Arc<ScalarNode>) -> bool {
+            if Arc::ptr_eq(a, b) {
+                return true;
+            }
+            match (&**a, &**b) {
+                (ScalarNode::Leaf(a), ScalarNode::Leaf(b)) => a == b,
+                (ScalarNode::Branch(a), ScalarNode::Branch(b)) => {
+                    a.iter().zip(b.iter()).all(|(a, b)| equal(a, b))
+                }
+                _ => false,
+            }
+        }
+        self.len == other.len && equal(&self.root, &other.root)
+    }
+}
+impl Eq for ScalarState {}
+
 /// A complete procedure-local scalar solution. Point states describe values
 /// after the ordered effects at that point have executed.
 #[derive(Debug, Clone)]
 pub struct ScalarStateDerivation {
     procedure: ProcedureId,
-    states: Box<[Option<Box<[ScalarFact]>>]>,
+    states: Box<[Option<ScalarState>]>,
     feasible_edges: HashSet<ControlEdgeId>,
     /// Per guard, the value whose fact its refinement reads and narrows.
     guard_operands: Box<[Option<GuardOperand>]>,
@@ -1160,8 +1324,8 @@ impl ScalarStateDerivation {
                 .collect(),
             typing,
         };
-        let mut states = vec![None::<Box<[ScalarFact]>>; point_count];
-        let mut incoming = vec![None::<Box<[ScalarFact]>>; point_count];
+        let mut states = vec![None::<ScalarState>; point_count];
+        let mut incoming = vec![None::<ScalarState>; point_count];
         let mut entry = vec![ScalarFact::Unreachable; value_count];
         for value in semantics.values() {
             entry[value.id.index()] = match value.kind {
@@ -1188,7 +1352,7 @@ impl ScalarStateDerivation {
             );
             entry[seed.target.index()] = seed.fact;
         }
-        incoming[semantics.entry_point().index()] = Some(entry.into_boxed_slice());
+        incoming[semantics.entry_point().index()] = Some(ScalarState::from_vec(entry));
 
         let GuardRefinements {
             by_edge: guards_by_edge,
@@ -1239,7 +1403,7 @@ impl ScalarStateDerivation {
                     .iter()
                     .filter(|write| write.edge == edge_id)
                 {
-                    successor[write.target.index()] = write.fact;
+                    successor.set(write.target.index(), write.fact);
                 }
                 let target = edge.target_point.index();
                 joins[target] = joins[target].saturating_add(1);
@@ -1274,12 +1438,32 @@ impl ScalarStateDerivation {
         self.procedure
     }
 
+    #[cfg(test)]
+    fn distinct_leaf_count(&self) -> usize {
+        fn visit(node: &Arc<ScalarNode>, seen: &mut HashSet<usize>) {
+            match &**node {
+                ScalarNode::Leaf(_) => {
+                    seen.insert(Arc::as_ptr(node) as usize);
+                }
+                ScalarNode::Branch(children) => {
+                    for child in children {
+                        visit(child, seen);
+                    }
+                }
+            }
+        }
+        let mut seen = HashSet::default();
+        for state in self.states.iter().flatten() {
+            visit(&state.root, &mut seen);
+        }
+        seen.len()
+    }
+
     pub fn fact_at(&self, point: ProgramPointId, value: ValueId) -> ScalarFact {
         self.states
             .get(point.index())
-            .and_then(Option::as_deref)
+            .and_then(Option::as_ref)
             .and_then(|state| state.get(value.index()))
-            .copied()
             .unwrap_or(ScalarFact::Unreachable)
     }
 
@@ -1306,7 +1490,7 @@ impl ScalarStateDerivation {
             "guard belongs to the derived procedure"
         );
         let operand = self.guard_operands[guard.id.index()]?;
-        let state = self.states[guard.point.index()].as_deref()?;
+        let state = self.states[guard.point.index()].as_ref()?;
         Some(operand.fact(fact_of(procedure.semantics(), state, operand.binding)))
     }
 }
@@ -1636,7 +1820,7 @@ struct ScalarTransferContext<'procedure, 'calls, 'typing> {
 fn transfer_point(
     context: &ScalarTransferContext<'_, '_, '_>,
     point: ProgramPointId,
-    state: &mut [ScalarFact],
+    state: &mut ScalarState,
 ) {
     let procedure = context.procedure;
     let binding_origins = &context.binding_origins;
@@ -1649,23 +1833,23 @@ fn transfer_point(
     let typing = context.typing;
     let semantics = procedure.semantics();
     // Calls and suspensions can run closures or retained address writers.
-    let release_external_writers = |state: &mut [ScalarFact]| {
+    let release_external_writers = |state: &mut ScalarState| {
         for binding in shared_captures {
-            state[binding.index()] = ScalarFact::Unknown;
+            state.set(binding.index(), ScalarFact::Unknown);
         }
         for binding in escaped_address_bindings {
-            state[binding.index()] = ScalarFact::Unknown;
+            state.set(binding.index(), ScalarFact::Unknown);
         }
     };
-    let write = |state: &mut [ScalarFact], target: ValueId, fact: ScalarFact| {
-        state[target.index()] = typing.store(semantics, target, fact);
+    let write = |state: &mut ScalarState, target: ValueId, fact: ScalarFact| {
+        state.set(target.index(), typing.store(semantics, target, fact));
     };
     let point = semantics
         .point(point)
         .expect("scalar worklist point belongs to its procedure");
     if let Some(bindings) = address_escape_bindings_by_point.get(&point.id) {
         for binding in bindings {
-            state[binding.index()] = ScalarFact::Unknown;
+            state.set(binding.index(), ScalarFact::Unknown);
         }
     }
     for event in &point.events {
@@ -1747,7 +1931,7 @@ fn transfer_point(
                     transferred_scalar_fact(fact_of(semantics, state, source), transfer);
                 write(state, target, target_fact);
                 if invalidates_source {
-                    state[source.index()] = ScalarFact::Unknown;
+                    state.set(source.index(), ScalarFact::Unknown);
                 }
             }
             SemanticEffect::ValueFlow {
@@ -1764,7 +1948,7 @@ fn transfer_point(
                 ..
             } => {
                 release_external_writers(state);
-                state[target.index()] = ScalarFact::Unknown;
+                state.set(target.index(), ScalarFact::Unknown);
             }
             SemanticEffect::MemoryLoad {
                 location, result, ..
@@ -1811,11 +1995,11 @@ fn transfer_point(
                             } else {
                                 if origins.is_complete() {
                                     for &binding in origins.bindings() {
-                                        state[binding.index()] = ScalarFact::Unknown;
+                                        state.set(binding.index(), ScalarFact::Unknown);
                                     }
                                 } else {
                                     for binding in address_taken_bindings {
-                                        state[binding.index()] = ScalarFact::Unknown;
+                                        state.set(binding.index(), ScalarFact::Unknown);
                                     }
                                 }
                             }
@@ -1828,18 +2012,21 @@ fn transfer_point(
                 let allocation = semantics
                     .allocation(allocation)
                     .expect("validated allocation effect resolves");
-                state[allocation.result.index()] = ScalarFact::NonNil;
+                state.set(allocation.result.index(), ScalarFact::NonNil);
             }
             SemanticEffect::CallableCreation { result, .. } => {
-                state[result.index()] = ScalarFact::NonNil;
+                state.set(result.index(), ScalarFact::NonNil);
             }
             SemanticEffect::CallableReference { result, .. } => {
                 // An open member can be a nil function-valued field.
-                state[result.index()] = if context.pending_member_callees.contains(&result) {
-                    ScalarFact::Unknown
-                } else {
-                    ScalarFact::NonNil
-                };
+                state.set(
+                    result.index(),
+                    if context.pending_member_callees.contains(&result) {
+                        ScalarFact::Unknown
+                    } else {
+                        ScalarFact::NonNil
+                    },
+                );
             }
             SemanticEffect::Invoke { call_site } => {
                 release_external_writers(state);
@@ -1850,7 +2037,7 @@ fn transfer_point(
                     && let Some(binding) =
                         deferred_member_borrowed_binding(procedure, call, binding_origins)
                 {
-                    state[binding.index()] = ScalarFact::Unknown;
+                    state.set(binding.index(), ScalarFact::Unknown);
                 }
                 // #6409: autoref can write a Rust local without a recorded
                 // assignment, including an untyped literal-initialized local.
@@ -1869,7 +2056,7 @@ fn transfer_point(
                         )
                     })
                 {
-                    state[binding.index()] = ScalarFact::Unknown;
+                    state.set(binding.index(), ScalarFact::Unknown);
                 }
                 if modeled_address_calls.contains(&call_site) {
                     continue;
@@ -1880,7 +2067,7 @@ fn transfer_point(
                         .is_some_and(|value| matches!(value.kind, SemanticValueKind::Address))
                         && let Some(binding) = unique_binding_origin(procedure, argument.value)
                     {
-                        state[binding.index()] = ScalarFact::Unknown;
+                        state.set(binding.index(), ScalarFact::Unknown);
                     }
                 }
             }
@@ -1891,7 +2078,7 @@ fn transfer_point(
                 if gap.impacts.contains(SemanticGapImpact::ValueFlow)
                     && let SemanticGapSubject::Value(value) = gap.subject
                 {
-                    state[value.index()] = ScalarFact::Unknown;
+                    state.set(value.index(), ScalarFact::Unknown);
                 }
                 // #6409: hidden calls release the same retained writers as Invoke.
                 // This suffices only when address-taking for everything the
@@ -1950,7 +2137,7 @@ fn transferred_scalar_fact(source: ScalarFact, transfer: ValueTransfer) -> (Scal
     (target, matches!(transfer.kind, TransferKind::Move { .. }))
 }
 
-fn fact_of(semantics: &ProcedureSemantics, state: &[ScalarFact], value: ValueId) -> ScalarFact {
+fn fact_of(semantics: &ProcedureSemantics, state: &ScalarState, value: ValueId) -> ScalarFact {
     let intrinsic = intrinsic_fact(semantics, value);
     if intrinsic != ScalarFact::Unreachable {
         intrinsic
@@ -2012,38 +2199,31 @@ fn intrinsic_fact(semantics: &ProcedureSemantics, value: ValueId) -> ScalarFact 
     }
 }
 
-fn join_into(slot: &mut Option<Box<[ScalarFact]>>, incoming: &[ScalarFact]) -> bool {
+fn join_into(slot: &mut Option<ScalarState>, incoming: &ScalarState) -> bool {
     merge_into(slot, incoming, ScalarFact::join)
 }
 
-fn widen_into(slot: &mut Option<Box<[ScalarFact]>>, incoming: &[ScalarFact]) -> bool {
+fn widen_into(slot: &mut Option<ScalarState>, incoming: &ScalarState) -> bool {
     merge_into(slot, incoming, ScalarFact::widen)
 }
 
 fn merge_into(
-    slot: &mut Option<Box<[ScalarFact]>>,
-    incoming: &[ScalarFact],
+    slot: &mut Option<ScalarState>,
+    incoming: &ScalarState,
     step: fn(ScalarFact, ScalarFact) -> ScalarFact,
 ) -> bool {
     let Some(current) = slot else {
-        *slot = Some(incoming.to_vec().into_boxed_slice());
+        *slot = Some(incoming.clone());
         return true;
     };
-    assert_eq!(current.len(), incoming.len());
-    let mut changed = false;
-    for (current, incoming) in current.iter_mut().zip(incoming) {
-        let merged = step(*current, *incoming);
-        changed |= merged != *current;
-        *current = merged;
-    }
-    changed
+    current.merge(incoming, step)
 }
 
 fn apply_guard_refinement(
     semantics: &ProcedureSemantics,
     refinement: &EdgeRefinement,
     typing: &ScalarTyping,
-    state: &mut [ScalarFact],
+    state: &mut ScalarState,
 ) -> bool {
     let current = refinement
         .guard
@@ -2075,7 +2255,7 @@ fn apply_guard_refinement(
             },
         };
     for target in [refinement.operand, refinement.guard.binding] {
-        state[target.index()] = typing.store(semantics, target, refined);
+        state.set(target.index(), typing.store(semantics, target, refined));
     }
     true
 }
@@ -2645,6 +2825,27 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    #[hardwon("#8412: a generated table initializer made scalar states points x values")]
+    fn long_straight_line_shares_scalar_leaves() {
+        let mut source = String::from("package main\nfunc run() {\nvar x int\n");
+        for n in 0..1024 {
+            source.push_str(&format!("x = {n}\n"));
+        }
+        source.push_str("_ = x\n}\n");
+        let fixture = Fixture::go(&source, "run");
+        let derivation = ScalarStateDerivation::derive(&fixture.procedure);
+        let points = derivation.states.iter().flatten().count();
+        let values = fixture.procedure.semantics().values().len();
+        assert!(
+            points > 1000 && values > 1000,
+            "{points} points, {values} values"
+        );
+        assert!(
+            derivation.distinct_leaf_count() <= values.div_ceil(SCALAR_LEAF_WIDTH) + points * 4
+        );
     }
 
     fn assert_equality_keeps_both_arms(fixture: &Fixture, constant: u128) {
@@ -3939,3 +4140,7 @@ func run() {
 #[cfg(test)]
 #[path = "scalar_join_properties.rs"]
 mod scalar_join_properties;
+
+#[cfg(test)]
+#[path = "scalar_state_properties.rs"]
+mod scalar_state_properties;

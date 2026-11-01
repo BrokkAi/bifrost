@@ -1,5 +1,6 @@
 //! On-demand, typed Python rule facts projected from one exact query input.
 
+use super::procedure_return_profile::reachable_points;
 use super::python_class_hierarchy::{
     HierarchyDecision, hierarchy_premise, member_premise, override_premise,
 };
@@ -159,6 +160,8 @@ pub(super) fn make_row(
             explicit_return_statements: None,
             fallthrough_none_returns: None,
             mixed_returns: None,
+            normal_returns: None,
+            return_constant: None,
             is_async: None,
             is_generator: None,
             test_scope: None,
@@ -3222,24 +3225,6 @@ fn callable_return_nodes(callable: Node<'_>) -> (Vec<Node<'_>>, bool) {
     (returns, has_boundary)
 }
 
-fn reachable_points(procedure: &SemanticProcedureValue) -> Vec<bool> {
-    let semantics = procedure.handle.semantics();
-    let mut reachable = vec![false; semantics.points().len()];
-    let mut stack = vec![semantics.entry_point()];
-    while let Some(point) = stack.pop() {
-        let index = point.index();
-        if std::mem::replace(&mut reachable[index], true) {
-            continue;
-        }
-        stack.extend(
-            semantics
-                .successor_edges(point)
-                .map(|(_, edge)| edge.target_point),
-        );
-    }
-    reachable
-}
-
 fn syntax_return_observation(
     source: &str,
     callable: Node<'_>,
@@ -3641,9 +3626,7 @@ pub(super) fn procedure_return_profile_expansions(
     traversal: &mut EnvironmentTraversalCache,
     procedure: &SemanticProcedureValue,
 ) -> Vec<PipelineExpansion> {
-    if !is_python_procedure(procedure) {
-        return Vec::new();
-    }
+    debug_assert!(is_python_procedure(procedure));
     let public = procedure.public();
     let span = procedure.byte_span();
     let mut value = make_row(

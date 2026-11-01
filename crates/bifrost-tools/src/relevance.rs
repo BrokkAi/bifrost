@@ -2065,12 +2065,12 @@ fn related_files_by_git(
         let _scope = profiling::scope("relevance::git.discover");
         GitProjectContext::discover(analyzer.project().root())
     }) else {
-        return Ok((Vec::new(), HistoryRankingStatus::Complete));
+        return Ok((Vec::new(), HistoryRankingStatus::HistoryUnavailable));
     };
     // Peel HEAD to a tree once for the whole call rather than once per seed (see the matching
     // comment in `most_important_project_files`).
     let Some(head_tree) = repo.head_tree() else {
-        return Ok((Vec::new(), HistoryRankingStatus::Complete));
+        return Ok((Vec::new(), HistoryRankingStatus::HistoryUnavailable));
     };
     if !any_file_tracked_in_tree(&repo, &head_tree, seed_weights.keys()) {
         return Ok((Vec::new(), HistoryRankingStatus::Complete));
@@ -2534,27 +2534,22 @@ struct MissingCommitRange {
     end: usize,
 }
 
-fn repo_commit_change_caches() -> &'static Mutex<HashMap<PathBuf, Arc<RepoCommitChangeCache>>> {
-    static CACHES: OnceLock<Mutex<HashMap<PathBuf, Arc<RepoCommitChangeCache>>>> = OnceLock::new();
-    CACHES.get_or_init(|| Mutex::new(HashMap::default()))
+fn repo_commit_change_caches() -> &'static Cache<PathBuf, Arc<RepoCommitChangeCache>> {
+    // Eight active repositories retain at most eight bounded commit windows; evicted
+    // repositories can rebuild their history when next requested.
+    static CACHES: OnceLock<Cache<PathBuf, Arc<RepoCommitChangeCache>>> = OnceLock::new();
+    CACHES.get_or_init(|| Cache::new(8))
 }
 
 fn repo_commit_change_cache(repo_root: &Path) -> Arc<RepoCommitChangeCache> {
-    let mut caches = repo_commit_change_caches()
-        .lock()
-        .expect("repo cache mutex");
-    caches
-        .entry(repo_root.to_path_buf())
-        .or_insert_with(|| Arc::new(RepoCommitChangeCache::new(COMMIT_CHANGE_CACHE_MAX_ENTRIES)))
-        .clone()
+    repo_commit_change_caches().get_with(repo_root.to_path_buf(), || {
+        Arc::new(RepoCommitChangeCache::new(COMMIT_CHANGE_CACHE_MAX_ENTRIES))
+    })
 }
 
 #[cfg(test)]
 fn clear_repo_commit_change_cache_for_root(repo_root: &Path) {
-    let mut caches = repo_commit_change_caches()
-        .lock()
-        .expect("repo cache mutex");
-    caches.remove(repo_root);
+    repo_commit_change_caches().invalidate(repo_root);
 }
 
 /// Discovered repo root cache, keyed by the caller-supplied (uncanonicalized) workspace root.
@@ -2562,17 +2557,16 @@ fn clear_repo_commit_change_cache_for_root(repo_root: &Path) {
 /// once per workspace; after that we just `Repository::open` the known path each call, which is
 /// cheap (`git2::Repository` is not `Sync`, so we cannot cache the `Repository` handle itself
 /// across calls/threads, only the path it lives at).
-fn repo_root_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::default()))
+fn repo_root_cache() -> &'static Cache<PathBuf, PathBuf> {
+    // A single session normally visits one workspace; 64 roots leave room for
+    // multiple projects while bounding process-wide path retention.
+    static CACHE: OnceLock<Cache<PathBuf, PathBuf>> = OnceLock::new();
+    CACHE.get_or_init(|| Cache::new(64))
 }
 
 #[cfg(test)]
 fn clear_repo_root_cache_for_project(project_root: &Path) {
-    repo_root_cache()
-        .lock()
-        .expect("repo root cache mutex")
-        .remove(project_root);
+    repo_root_cache().invalidate(project_root);
 }
 
 impl GitProjectContext {
@@ -2584,11 +2578,7 @@ impl GitProjectContext {
         let project_root = project_root.to_path_buf();
         let canonical_project = project_root.canonicalize().ok()?;
 
-        let cached_repo_root = repo_root_cache()
-            .lock()
-            .expect("repo root cache mutex")
-            .get(&project_root)
-            .cloned();
+        let cached_repo_root = repo_root_cache().get(&project_root);
         if let Some(cached_repo_root) = cached_repo_root
             && canonical_project.starts_with(&cached_repo_root)
             && let Ok(repo) = Repository::open(&cached_repo_root)
@@ -2614,10 +2604,7 @@ impl GitProjectContext {
             return None;
         }
 
-        repo_root_cache()
-            .lock()
-            .expect("repo root cache mutex")
-            .insert(project_root.clone(), repo_root.clone());
+        repo_root_cache().insert(project_root.clone(), repo_root.clone());
 
         let repo_prefix = canonical_project
             .strip_prefix(&repo_root)
@@ -3291,7 +3278,10 @@ fn strip_git_log_token_prefix(mut token: &[u8]) -> &[u8] {
 }
 
 fn pathbuf_from_git_log_token(token: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(strip_git_log_token_prefix(token)).into_owned())
+    // In -z name-status output the status and pathname are separate NUL tokens.
+    // The newline preceding a status is Git's record separator; a newline in
+    // this pathname token is part of the filename.
+    PathBuf::from(String::from_utf8_lossy(token).into_owned())
 }
 
 fn blob_token_set(blob: &git2::Blob<'_>) -> HashSet<String> {
@@ -3359,6 +3349,9 @@ fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::c
 mod cascade;
 
 #[cfg(test)]
+mod history_contract_tests;
+
+#[cfg(test)]
 mod tests {
 
     use crate::relevance::DEFAULT_RECENCY_HALF_LIFE;
@@ -3417,6 +3410,7 @@ mod tests {
 
     use crate::language_test_support::java_analyzer;
 
+    use brokk_bifrost_core::cancellation::CancellationToken;
     use brokk_bifrost_core::test_support::write_file;
     use git2::{Repository, Signature};
     use std::collections::BTreeMap;
@@ -3624,6 +3618,73 @@ func run() {
 
     fn git_context(root: &Path) -> GitProjectContext {
         GitProjectContext::discover(root).expect("git project context")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "488bdf93ae04: git history removed a leading newline from a pathname"
+    )]
+    fn git_history_preserves_leading_newline_in_pathname() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "Seed.java", "class Seed {}");
+        write_file(root, "\nPeer.java", "class Peer {}");
+        let repo = Repository::init(root).unwrap();
+        commit_paths(&repo, "seed and peer", &["Seed.java", "\nPeer.java"], &[]);
+
+        write_file(root, "Seed.java", "class Seed { int value = 1; }");
+        write_file(root, "\nPeer.java", "class Peer { int value = 1; }");
+        commit_paths(&repo, "second cochange", &["Seed.java", "\nPeer.java"], &[]);
+
+        let analyzer = java_analyzer(root);
+        let peer = ProjectFile::new(root.to_path_buf(), "\nPeer.java");
+        let (ranked, status) = crate::relevance::most_relevant_project_files_history_only(
+            &analyzer,
+            &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
+            5,
+            None,
+            &CancellationToken::default(),
+        );
+        assert_eq!(status, crate::relevance::HistoryRankingStatus::Complete);
+        assert!(
+            ranked.contains(&peer),
+            "history ranking lost {peer:?}: {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn git_history_ranks_cochange_inside_nested_project() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let project_root = root.join("app");
+        write_file(root, "app/Seed.java", "class Seed {}");
+        write_file(root, "app/Peer.java", "class Peer {}");
+        let repo = Repository::init(root).unwrap();
+        commit_paths(&repo, "initial", &["app/Seed.java", "app/Peer.java"], &[]);
+        write_file(root, "app/Seed.java", "class Seed { int value = 1; }");
+        write_file(root, "app/Peer.java", "class Peer { int value = 1; }");
+        commit_paths(
+            &repo,
+            "second cochange",
+            &["app/Seed.java", "app/Peer.java"],
+            &[],
+        );
+
+        let analyzer = java_analyzer(&project_root);
+        let peer = ProjectFile::new(project_root.clone(), "Peer.java");
+        let (ranked, status) = crate::relevance::most_relevant_project_files_history_only(
+            &analyzer,
+            &[(ProjectFile::new(project_root, "Seed.java"), 1.0)],
+            5,
+            None,
+            &CancellationToken::default(),
+        );
+        assert_eq!(status, crate::relevance::HistoryRankingStatus::Complete);
+        assert!(
+            ranked.contains(&peer),
+            "history ranking lost {peer:?}: {ranked:?}"
+        );
     }
 
     fn file_by_name<'a>(result: &'a [FileRelevance], file_name: &str) -> Option<&'a FileRelevance> {
@@ -4723,8 +4784,7 @@ func run() {
 
     /// M5 unit test for the discover repo-root cache's fallback path: a poisoned/stale cache
     /// entry must not be trusted blind. `discover` must detect the failed `Repository::open`,
-    /// fall back to a fresh `Repository::discover`, and refresh the cache entry so subsequent
-    /// calls take the fast path against the corrected root.
+    /// fall back to a fresh `Repository::discover`.
     #[test]
     fn discover_recovers_when_cached_repo_root_is_invalid() {
         let temp = TempDir::new().unwrap();
@@ -4734,7 +4794,7 @@ func run() {
         commit_paths_at(&repo, "initial", &["File.java"], &[], 1);
 
         clear_repo_root_cache_for_project(root);
-        repo_root_cache().lock().unwrap().insert(
+        repo_root_cache().insert(
             root.to_path_buf(),
             Path::new("/nonexistent/bifrost-relevance-test-path").to_path_buf(),
         );
@@ -4743,12 +4803,9 @@ func run() {
             .expect("fallback discover should still find the real repo");
         assert_eq!(context.repo_root, root.canonicalize().unwrap());
 
-        let cached_after = repo_root_cache().lock().unwrap().get(root).cloned();
-        assert_eq!(
-            cached_after,
-            Some(root.canonicalize().unwrap()),
-            "the fallback path must refresh the cache to the corrected root"
-        );
+        let subsequent = GitProjectContext::discover(root)
+            .expect("subsequent discovery should still find the real repo");
+        assert_eq!(subsequent.repo_root, root.canonicalize().unwrap());
     }
 
     /// A workspace with no `.git` anywhere in its ancestry keeps returning `None`, whether or not

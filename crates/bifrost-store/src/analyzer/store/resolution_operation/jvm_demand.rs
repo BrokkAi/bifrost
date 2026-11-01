@@ -34,14 +34,142 @@ pub(in crate::analyzer) fn jvm_root_import_origin(
         .root_import_origin(kind)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// JVM import order is origin rank before lexical depth.
 pub(super) struct JvmBindingPrecedence {
     pub(super) rank: u32,
     pub(super) depth: u32,
 }
 
+#[derive(Clone, Debug)]
+enum JvmBindingSourceScope {
+    Lexical(crate::analyzer::resolution::precedence::BindingScopeCoordinate),
+    ImplicitRoot,
+}
+
+#[derive(Clone, Debug)]
+struct JvmBindingCandidate {
+    precedence: JvmBindingPrecedence,
+    source_scope: Option<JvmBindingSourceScope>,
+}
+
+fn jvm_candidate_shadows(
+    language: Language,
+    left: &JvmBindingCandidate,
+    right: &JvmBindingCandidate,
+) -> bool {
+    use crate::analyzer::resolution::precedence::{BindingScopeRelation, Shadowing};
+    if language != Language::Scala {
+        return (left.precedence.rank, left.precedence.depth)
+            < (right.precedence.rank, right.precedence.depth);
+    }
+    let relation = match (&left.source_scope, &right.source_scope) {
+        (
+            Some(JvmBindingSourceScope::Lexical(left)),
+            Some(JvmBindingSourceScope::Lexical(right)),
+        ) => left.relative_to(right),
+        (Some(JvmBindingSourceScope::Lexical(_)), Some(JvmBindingSourceScope::ImplicitRoot)) => {
+            BindingScopeRelation::Inner
+        }
+        (Some(JvmBindingSourceScope::ImplicitRoot), Some(JvmBindingSourceScope::Lexical(_))) => {
+            BindingScopeRelation::Outer
+        }
+        (Some(JvmBindingSourceScope::ImplicitRoot), Some(JvmBindingSourceScope::ImplicitRoot)) => {
+            return (left.precedence.rank, left.precedence.depth)
+                < (right.precedence.rank, right.precedence.depth);
+        }
+        _ => BindingScopeRelation::Unrelated,
+    };
+    jvm_shadowing_rules(language).shadows(left.precedence.rank, right.precedence.rank, relation)
+        == Shadowing::Shadows
+}
+
+fn retain_nondominated(
+    language: Language,
+    candidates: &mut Vec<JvmBindingCandidate>,
+    candidate: JvmBindingCandidate,
+) {
+    if candidates
+        .iter()
+        .any(|other| jvm_candidate_shadows(language, other, &candidate))
+    {
+        return;
+    }
+    candidates.retain(|other| !jvm_candidate_shadows(language, &candidate, other));
+    candidates.push(candidate);
+}
+
+fn retain_source_scope_candidates(
+    language: Language,
+    candidates: &mut Vec<JvmBindingCandidate>,
+    precedence: JvmBindingPrecedence,
+    source_scopes: &[Option<JvmBindingSourceScope>],
+) {
+    if source_scopes.is_empty() {
+        retain_nondominated(
+            language,
+            candidates,
+            JvmBindingCandidate {
+                precedence,
+                source_scope: None,
+            },
+        );
+    } else {
+        for source_scope in source_scopes {
+            retain_nondominated(
+                language,
+                candidates,
+                JvmBindingCandidate {
+                    precedence,
+                    source_scope: source_scope.clone(),
+                },
+            );
+        }
+    }
+}
+
 pub(super) type JvmImportBinding = super::imports::ImportBinding<JvmBindingPrecedence>;
+
+pub(super) fn jvm_shadowing_rules(
+    language: Language,
+) -> &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules {
+    use crate::analyzer::resolution::precedence::{
+        JAVA_PRECEDENCE_RULES, KOTLIN_PRECEDENCE_RULES, SCALA_PRECEDENCE_RULES,
+    };
+    match language {
+        Language::Java => JAVA_PRECEDENCE_RULES,
+        Language::Kotlin => KOTLIN_PRECEDENCE_RULES,
+        Language::Scala => SCALA_PRECEDENCE_RULES,
+        _ => unreachable!("JVM shadowing requires a JVM language: {language:?}"),
+    }
+}
+
+pub(super) fn jvm_import_binding_shadows(
+    language: Language,
+    left: &JvmImportBinding,
+    right: &JvmImportBinding,
+) -> bool {
+    use crate::analyzer::resolution::precedence::{BindingScopeRelation, Shadowing};
+    let relation = match (&left.coordinate, &right.coordinate) {
+        (Some(left), Some(right)) => left.relative_to(right),
+        _ => BindingScopeRelation::Unrelated,
+    };
+    match jvm_shadowing_rules(language).shadows(
+        left.precedence.rank,
+        right.precedence.rank,
+        relation,
+    ) {
+        Shadowing::Shadows => true,
+        Shadowing::Shadowed => false,
+        Shadowing::Incomparable => {
+            // The default JVM policy retains its old rank-then-depth order.
+            // Scala's equal-rank scopes are a partial order instead.
+            language != Language::Scala
+                && left.precedence.rank == right.precedence.rank
+                && left.precedence.depth < right.precedence.depth
+        }
+    }
+}
 
 pub(super) struct JvmImportBindingRules<'a, 'store, 'input>(
     &'a SelectedResolutionOperation<'store, 'input>,
@@ -49,6 +177,10 @@ pub(super) struct JvmImportBindingRules<'a, 'store, 'input>(
 
 impl ImportBindingRules for JvmImportBindingRules<'_, '_, '_> {
     type Precedence = JvmBindingPrecedence;
+
+    fn competes_with_local_definition(&self, language: Language) -> bool {
+        language == Language::Scala
+    }
 
     fn token_metadata(
         &self,
@@ -115,7 +247,7 @@ mod import_precedence_tests {
     use super::*;
 
     #[test]
-    fn jvm_import_bindings_order_origin_rank_then_depth_then_token() {
+    fn jvm_import_bindings_dedup_by_source_identity() {
         let reference = SemanticId::local(0, 1);
         let named_deep = JvmBindingPrecedence { rank: 1, depth: 8 };
         let named_shallow = JvmBindingPrecedence { rank: 1, depth: 0 };
@@ -125,28 +257,37 @@ mod import_precedence_tests {
                 reference,
                 token: SemanticId::local(0, 9),
                 precedence: named_deep,
+                endpoint: BindingNodeId::local(0, 9),
+                coordinate: None,
             },
             JvmImportBinding {
                 reference,
                 token: SemanticId::local(0, 3),
                 precedence: wildcard_shallow,
+                endpoint: BindingNodeId::local(0, 3),
+                coordinate: None,
             },
             JvmImportBinding {
                 reference,
                 token: SemanticId::local(0, 5),
                 precedence: named_deep,
+                endpoint: BindingNodeId::local(0, 5),
+                coordinate: None,
             },
             JvmImportBinding {
                 reference,
                 token: SemanticId::local(0, 5),
                 precedence: named_deep,
+                endpoint: BindingNodeId::local(0, 5),
+                coordinate: None,
             },
-            // Same rank, shallower depth: sorts before both deeper bindings
-            // even though its token is larger than one of theirs.
+            // Precedence is data for selection, not a sorting key.
             JvmImportBinding {
                 reference,
                 token: SemanticId::local(0, 7),
                 precedence: named_shallow,
+                endpoint: BindingNodeId::local(0, 7),
+                coordinate: None,
             },
         ];
 
@@ -158,24 +299,37 @@ mod import_precedence_tests {
                 .map(|binding| (binding.precedence, binding.token))
                 .collect::<Vec<_>>(),
             [
-                (named_shallow, SemanticId::local(0, 7)),
-                (named_deep, SemanticId::local(0, 5)),
-                (named_deep, SemanticId::local(0, 9)),
                 (wildcard_shallow, SemanticId::local(0, 3)),
+                (named_deep, SemanticId::local(0, 5)),
+                (named_shallow, SemanticId::local(0, 7)),
+                (named_deep, SemanticId::local(0, 9)),
             ]
         );
     }
 }
 
 fn jvm_implicit_provider_gap(language: Language, gap: &JvmImportContextGap) -> bool {
-    language_implicit_root_providers(language)
+    jvm_implicit_provider_gap_precedence(language, gap).is_some()
+}
+
+/// The language-defined precedence of the implicit root whose inventory this gap leaves open.
+fn jvm_implicit_provider_gap_precedence(
+    language: Language,
+    gap: &JvmImportContextGap,
+) -> Option<u32> {
+    brokk_bifrost_jvm::intrinsics::language_implicit_roots(language)
         .iter()
-        .any(|provider| match provider {
-            JvmImplicitRootProvider::Package(package) => {
-                gap.kind == "jvm-default-import-package-open"
-                    && gap.owner.as_deref() == Some(*package)
+        .find_map(|(provider, precedence)| {
+            match provider {
+                JvmImplicitRootProvider::Package(package) => {
+                    matches!(
+                        gap.kind,
+                        "jvm-default-import-package-open" | "jvm-pack-package-member"
+                    ) && gap.owner.as_deref() == Some(*package)
+                }
+                JvmImplicitRootProvider::ScalaPredef => gap.kind == "scala-predef-route-open",
             }
-            JvmImplicitRootProvider::ScalaPredef => gap.kind == "scala-predef-route-open",
+            .then_some(*precedence)
         })
 }
 
@@ -641,18 +795,19 @@ impl JvmDemandState<'_, '_, '_> {
 
     // Compare providers only after an actual binding with complete inventory
     // has been proved. An empty provider set never shadows an unavailable one.
-    fn complete_binding_origin_rank(
+    fn complete_binding_origins(
         &self,
         context: &SelectedResolutionContextSet,
         source: &JvmSourceDemand,
         tokens: &[SemanticId],
         lookup: &ResolutionLookupSemanticRecipe,
-    ) -> Result<Option<JvmBindingPrecedence>> {
+    ) -> Result<Vec<JvmBindingCandidate>> {
         use crate::analyzer::resolution::TypedFactPageVisitor;
         let mount = self
             .operation
             .mount_table()
             .mount_by_ordinal(source.mount)?;
+        let language = mount.semantic_language();
         let (roots, packages) = context.qualified_reference_bridges(
             mount.fragment(),
             tokens,
@@ -665,20 +820,21 @@ impl JvmDemandState<'_, '_, '_> {
         );
         let Some(import_bindings) = self.jvm_import_bindings_for_lookup(source.mount, lookup)?
         else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let mut rank = None;
+        let mut candidates = Vec::new();
         // Read the selected reference/declaration packages, including staged
         // source, rather than infer a provider from a spelling or a file path.
         let mut references = Vec::new();
         let mut package_depth = u32::MAX;
+        let mut source_scopes = Vec::new();
         for &token in tokens {
             let SelectedPackageRows::Ready(rows) = self
                 .operation
                 .ready
                 .selected_package_reference_for_token(source.mount, token, self.cancellation)?
             else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
             for row in rows {
                 let Some(evidence) = authored_reference_local_path_evidence(
@@ -698,22 +854,37 @@ impl JvmDemandState<'_, '_, '_> {
                         .min()
                         .unwrap_or(u32::MAX),
                 );
+                source_scopes.push(
+                    evidence
+                        .binding_scope_coordinate(row.root_scope)
+                        .map(JvmBindingSourceScope::Lexical),
+                );
                 references.push(row.reference);
             }
         }
         references.sort_unstable();
         references.dedup();
         for reference in &references {
-            rank = rank
-                .into_iter()
-                .chain(
-                    self.operation
-                        .jvm_on_demand_type_ranks
-                        .borrow()
-                        .get(reference)
-                        .copied(),
-                )
-                .min();
+            if let Some(precedence) = self
+                .operation
+                .jvm_on_demand_type_ranks
+                .borrow()
+                .get(reference)
+                .copied()
+            {
+                let source_scope = (precedence.rank
+                    == binding_origin_rank(language, BindingOrigin::DefaultImport)
+                        .unwrap_or(u32::MAX))
+                .then_some(JvmBindingSourceScope::ImplicitRoot);
+                retain_nondominated(
+                    language,
+                    &mut candidates,
+                    JvmBindingCandidate {
+                        precedence,
+                        source_scope,
+                    },
+                );
+            }
         }
         for binding in &import_bindings {
             let selected_reference = references.contains(&binding.reference)
@@ -735,7 +906,17 @@ impl JvmDemandState<'_, '_, '_> {
                     })
                     .is_some()
             {
-                rank = rank.into_iter().chain(Some(binding.precedence)).min();
+                retain_nondominated(
+                    language,
+                    &mut candidates,
+                    JvmBindingCandidate {
+                        precedence: binding.precedence,
+                        source_scope: binding
+                            .coordinate
+                            .clone()
+                            .map(JvmBindingSourceScope::Lexical),
+                    },
+                );
             }
         }
         for bridge in &roots {
@@ -746,7 +927,17 @@ impl JvmDemandState<'_, '_, '_> {
                 binding.token == bridge.source_import_token()
                     && references.contains(&binding.reference)
             }) {
-                rank = rank.into_iter().chain(Some(binding.precedence)).min();
+                retain_nondominated(
+                    language,
+                    &mut candidates,
+                    JvmBindingCandidate {
+                        precedence: binding.precedence,
+                        source_scope: binding
+                            .coordinate
+                            .clone()
+                            .map(JvmBindingSourceScope::Lexical),
+                    },
+                );
             }
         }
         let package_bindings = packages.iter().filter(|bridge| {
@@ -755,18 +946,20 @@ impl JvmDemandState<'_, '_, '_> {
                 ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
             ) || *bridge.completion() == ResolutionCompletion::Complete
         });
-        rank = rank
-            .into_iter()
-            .chain(
-                package_bindings
-                    .clone()
-                    .filter_map(|bridge| bridge.binding_origin_rank())
-                    .map(|rank| JvmBindingPrecedence {
-                        depth: package_depth,
-                        rank,
-                    }),
-            )
-            .min();
+        for rank in package_bindings
+            .clone()
+            .filter_map(|bridge| bridge.binding_origin_rank())
+        {
+            retain_source_scope_candidates(
+                language,
+                &mut candidates,
+                JvmBindingPrecedence {
+                    depth: package_depth,
+                    rank,
+                },
+                &source_scopes,
+            );
+        }
         let mut definitions = package_bindings
             .filter_map(|bridge| bridge.binding_definition())
             .collect::<Vec<_>>();
@@ -794,7 +987,7 @@ impl JvmDemandState<'_, '_, '_> {
                     .typed_source()
                     .jvm_access_endpoints(semantics, self.cancellation)?
                 else {
-                    return Ok(None);
+                    return Ok(Vec::new());
                 };
                 endpoints.extend(rows);
             }
@@ -811,7 +1004,6 @@ impl JvmDemandState<'_, '_, '_> {
                 .iter()
                 .filter(|row| !references.contains(&row.semantic))
             {
-                let language = mount.semantic_language();
                 let same_package = source_packages
                     .iter()
                     .any(|package| **package == target.package);
@@ -829,13 +1021,31 @@ impl JvmDemandState<'_, '_, '_> {
                 } else {
                     None
                 };
-                rank = rank
-                    .into_iter()
-                    .chain(package_rank.map(|rank| JvmBindingPrecedence {
-                        depth: package_depth,
-                        rank,
-                    }))
-                    .min();
+                if let Some(rank) = package_rank {
+                    if Some(rank) == binding_origin_rank(language, BindingOrigin::DefaultImport) {
+                        retain_nondominated(
+                            language,
+                            &mut candidates,
+                            JvmBindingCandidate {
+                                precedence: JvmBindingPrecedence {
+                                    depth: package_depth,
+                                    rank,
+                                },
+                                source_scope: Some(JvmBindingSourceScope::ImplicitRoot),
+                            },
+                        );
+                    } else {
+                        retain_source_scope_candidates(
+                            language,
+                            &mut candidates,
+                            JvmBindingPrecedence {
+                                depth: package_depth,
+                                rank,
+                            },
+                            &source_scopes,
+                        );
+                    }
+                }
             }
         }
         let semantic = lookup.semantic(&self.operation.ready.shared_names());
@@ -845,20 +1055,24 @@ impl JvmDemandState<'_, '_, '_> {
             self.cancellation,
         )?
         else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         if !members.is_empty() {
             let local = binding_origin_rank(
                 mount.semantic_language(),
                 BindingOrigin::SameCompilationUnitPackage,
             );
-            rank = rank
-                .into_iter()
-                .chain(local.map(|rank| JvmBindingPrecedence {
-                    depth: package_depth,
-                    rank,
-                }))
-                .min();
+            if let Some(rank) = local {
+                retain_source_scope_candidates(
+                    language,
+                    &mut candidates,
+                    JvmBindingPrecedence {
+                        depth: package_depth,
+                        rank,
+                    },
+                    &source_scopes,
+                );
+            }
         }
         let typed = self.operation.ready.typed_source();
         let mut qualifier_slots = Vec::new();
@@ -872,7 +1086,7 @@ impl JvmDemandState<'_, '_, '_> {
                 }),
             )?;
             if !read.is_exhausted() || read.evidence() != &ResolutionCompletion::Complete {
-                return Ok(rank);
+                return Ok(candidates);
             }
         }
         qualifier_slots.sort_unstable();
@@ -893,7 +1107,7 @@ impl JvmDemandState<'_, '_, '_> {
                 }),
             )?;
             if !read.is_exhausted() || read.evidence() != &ResolutionCompletion::Complete {
-                return Ok(rank);
+                return Ok(candidates);
             }
         }
         if type_qualifier
@@ -912,16 +1126,20 @@ impl JvmDemandState<'_, '_, '_> {
             if package_present {
                 // A qualified package prefix is a positive binding in the
                 // workspace root, outside lexical scopes and before implicit imports.
-                rank = rank
-                    .into_iter()
-                    .chain(Some(JvmBindingPrecedence {
-                        depth: u32::MAX - 1,
-                        rank: origin_rank,
-                    }))
-                    .min();
+                retain_nondominated(
+                    language,
+                    &mut candidates,
+                    JvmBindingCandidate {
+                        precedence: JvmBindingPrecedence {
+                            depth: u32::MAX - 1,
+                            rank: origin_rank,
+                        },
+                        source_scope: Some(JvmBindingSourceScope::ImplicitRoot),
+                    },
+                );
             }
         }
-        Ok(rank)
+        Ok(candidates)
     }
 
     fn complete_external_type_receiver(&self, reference: SemanticId) -> Result<bool> {
@@ -1067,7 +1285,7 @@ impl JvmDemandState<'_, '_, '_> {
         gaps: &[JvmImportContextGap],
         lookup: &ResolutionLookupSemanticRecipe,
         source_tokens: &[SemanticId],
-        binding_rank: Option<JvmBindingPrecedence>,
+        complete_bindings: &[JvmBindingCandidate],
     ) -> Result<BTreeSet<SemanticId>> {
         let language = self
             .operation
@@ -1169,9 +1387,9 @@ impl JvmDemandState<'_, '_, '_> {
                 }
             }
         }
-        let Some(binding_rank) = binding_rank else {
+        if complete_bindings.is_empty() {
             return Ok(completed_provider_reasons);
-        };
+        }
         let mut source_references = BTreeSet::new();
         for &token in source_tokens {
             let SelectedPackageRows::Ready(rows) = self
@@ -1206,32 +1424,52 @@ impl JvmDemandState<'_, '_, '_> {
                 )
             })
             .filter_map(|gap| {
-                let provider_rank = if jvm_implicit_provider_gap(language, gap) {
-                    binding_origin_rank(language, BindingOrigin::DefaultImport).map(|rank| {
-                        JvmBindingPrecedence {
-                            depth: u32::MAX,
-                            rank,
-                        }
-                    })
-                } else {
-                    import_bindings
-                        .get(&gap.lookup)
-                        .into_iter()
-                        .flatten()
-                        .filter(|binding| {
-                            binding.token == gap.source_token
-                                && gap
-                                    .source_reference
-                                    .is_none_or(|reference| reference == binding.reference)
+                let providers =
+                    if let Some(depth) = jvm_implicit_provider_gap_precedence(language, gap) {
+                        // The open root keeps its own implicit-root precedence, so
+                        // only a binding from a stronger root discharges it. A
+                        // binding from the same root (Predef's `Map` alias to an
+                        // unindexed owner) or a weaker one leaves it open.
+                        binding_origin_rank(language, BindingOrigin::DefaultImport)
+                            .map(|rank| JvmBindingCandidate {
+                                precedence: JvmBindingPrecedence { depth, rank },
+                                source_scope: Some(JvmBindingSourceScope::ImplicitRoot),
+                            })
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    } else {
+                        import_bindings
+                            .get(&gap.lookup)
+                            .into_iter()
+                            .flatten()
+                            .filter(|binding| {
+                                binding.token == gap.source_token
+                                    && gap
+                                        .source_reference
+                                        .is_none_or(|reference| reference == binding.reference)
+                            })
+                            .map(|binding| JvmBindingCandidate {
+                                precedence: binding.precedence,
+                                source_scope: binding
+                                    .coordinate
+                                    .clone()
+                                    .map(JvmBindingSourceScope::Lexical),
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                // Every possible provider must be shadowed. Equal rank alone
+                // cannot prove absence from a split package.
+                (!providers.is_empty()
+                    && providers.iter().all(|provider| {
+                        complete_bindings.iter().any(|binding| {
+                            if language == Language::Scala {
+                                jvm_candidate_shadows(language, binding, provider)
+                            } else {
+                                binding.precedence.rank < provider.precedence.rank
+                            }
                         })
-                        .map(|binding| binding.precedence)
-                        .min()
-                };
-                // Provider inventories at the same origin rank remain open:
-                // lexical depth cannot prove absence from a split package.
-                provider_rank
-                    .filter(|rank| binding_rank.rank < rank.rank)
-                    .map(|_| gap.reason)
+                    }))
+                .then_some(gap.reason)
             })
             .chain(completed_provider_reasons)
             .collect())
@@ -1269,17 +1507,17 @@ impl JvmDemandState<'_, '_, '_> {
         else {
             return Ok(None);
         };
-        let binding_rank = if context_gaps.is_empty() {
-            None
+        let complete_bindings = if context_gaps.is_empty() {
+            Vec::new()
         } else {
-            self.complete_binding_origin_rank(&context, source, &[source_token], &root_lookup)?
+            self.complete_binding_origins(&context, source, &[source_token], &root_lookup)?
         };
         let shadowed = self.discharged_provider_reasons(
             self.caller,
             &context_gaps,
             &root_lookup,
             &[source_token],
-            binding_rank,
+            &complete_bindings,
         )?;
         // A local candidate is not a successful binding yet: constructor and
         // receiver refinement can still reject it. Keep its provider evidence
@@ -1345,7 +1583,7 @@ impl JvmDemandState<'_, '_, '_> {
             (
                 &root_lookup,
                 source_token,
-                binding_rank,
+                &complete_bindings,
                 &context_gaps,
                 &shadowed,
             ),
@@ -1389,12 +1627,14 @@ impl JvmDemandState<'_, '_, '_> {
                 if shadowed.contains(&gap.reason) {
                     return false;
                 }
-                if gap.kind == "jvm-default-import-package-open"
-                    && language_implicit_root_providers_in_namespace(
-                        language,
-                        gap.lookup.namespace(),
-                    )
-                    .is_empty()
+                if matches!(
+                    gap.kind,
+                    "jvm-default-import-package-open" | "jvm-pack-package-member"
+                ) && language_implicit_root_providers_in_namespace(
+                    language,
+                    gap.lookup.namespace(),
+                )
+                .is_empty()
                 {
                     return false;
                 }
@@ -1439,6 +1679,17 @@ impl JvmDemandState<'_, '_, '_> {
                 }
             })
             .collect();
+        let mut reasons: Vec<ResolutionIncompleteReason> = reasons;
+        for gap in self.caller_import_gaps().iter().filter(|gap| {
+            gap.kind == "jvm-pack-package-member"
+                && gap.source_token == source_token
+                && gap.lookup == root_lookup
+                && !shadowed.contains(&gap.reason)
+        }) {
+            if let ResolutionCompletion::Incomplete(pack_reasons) = &gap.pack_completion {
+                reasons.extend(pack_reasons.iter().copied());
+            }
+        }
         Ok(Some(reasons))
     }
 }
@@ -1472,6 +1723,40 @@ fn completion_without_unsupported_semantics(
                 ResolutionIncompleteReason::UnsupportedSemantic(semantic)
                     if retired.contains(semantic)
             )
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        ResolutionCompletion::Complete
+    } else {
+        ResolutionCompletion::incomplete(retained)
+    }
+}
+
+fn context_publishable_qualifier_completion(
+    completion: &ResolutionCompletion,
+) -> ResolutionCompletion {
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return ResolutionCompletion::Complete;
+    };
+    let retained = reasons
+        .iter()
+        .filter(|reason| match reason {
+            ResolutionIncompleteReason::OpenBoundary { semantic, .. }
+            | ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+            | ResolutionIncompleteReason::InconsistentPrecedence(semantic) => {
+                !semantic.is_operation_local()
+            }
+            ResolutionIncompleteReason::CyclicExpansion(path) => {
+                path.operation_local_number().is_none() || path.is_context_local()
+            }
+            // These describe this request's cancellation, cycle, budget, or
+            // live mount selection, not the import context's inventory.
+            ResolutionIncompleteReason::Cancelled
+            | ResolutionIncompleteReason::CyclicPrefixDependency(_)
+            | ResolutionIncompleteReason::ReceiverBudgetExhausted(_)
+            | ResolutionIncompleteReason::TimeBudgetExceeded(_)
+            | ResolutionIncompleteReason::UnmountedFile { .. } => false,
         })
         .copied()
         .collect::<Vec<_>>();
@@ -1554,6 +1839,14 @@ impl JvmDemandState<'_, '_, '_> {
             let Some(values) = self.scala_import_projected_values(qualifiers, inputs) else {
                 return Ok(None);
             };
+            let owner = values
+                .first()
+                .expect("projected values are nonempty")
+                .ty()
+                .identity();
+            if values.iter().any(|value| value.ty().identity() != owner) {
+                return Ok(None);
+            }
             for value in values {
                 if let ResolutionSlotValue::TypeObject(ty, _) = value
                     && !self.operation.jvm_scala_object_definition(ty.identity())?
@@ -1586,7 +1879,8 @@ impl JvmDemandState<'_, '_, '_> {
         source: &JvmSourceDemand,
     ) -> Result<Read<Option<DemandClosureDischarges>>> {
         let mut discharges = match source.caller_scoped_source {
-            Some(JvmCallerScopedSource::Import { token, demand }) => {
+            Some(JvmCallerScopedSource::Import { token, demand })
+            | Some(JvmCallerScopedSource::ImplicitRootReference { token, demand }) => {
                 let source_mount = self
                     .operation
                     .mount_table()
@@ -1602,22 +1896,44 @@ impl JvmDemandState<'_, '_, '_> {
                 let root_lookup = recipes
                     .pop()
                     .expect("a selected caller import demand has one lookup recipe");
-                let identities = self
+                let matching = self
                     .caller_import_gaps()
                     .iter()
                     .filter(|gap| gap.source_token == token && gap.lookup == root_lookup)
+                    .collect::<Vec<_>>();
+                let identities = matching
+                    .iter()
+                    .filter(|_| {
+                        matches!(
+                            source.caller_scoped_source,
+                            Some(JvmCallerScopedSource::Import { .. })
+                        )
+                    })
                     .filter_map(|gap| gap.nominal_type_identity)
                     .collect::<Vec<_>>();
                 assert!(
                     identities.len() <= 1,
                     "one selected JVM import token has at most one unindexed nominal type"
                 );
-                identities.first().copied().map(|identity| {
+                let mut targets = identities.into_iter().collect::<BTreeSet<_>>();
+                let positive = matching
+                    .iter()
+                    .filter(|gap| {
+                        !gap.external_member_targets.is_empty()
+                            && !source
+                                .caller_discharged_provider_reasons
+                                .contains(&gap.reason)
+                    })
+                    .collect::<Vec<_>>();
+                for gap in &positive {
+                    targets.extend(gap.external_member_targets.iter().copied());
+                }
+                (!targets.is_empty()).then(|| {
                     DemandClosureDischarges::with_operation_local_placeholders([])
-                        .with_selected_targets([identity])
+                        .with_selected_targets(targets)
                 })
             }
-            Some(JvmCallerScopedSource::ImplicitRootReference { .. }) | None => None,
+            None => None,
         };
         if !source.caller_discharged_provider_reasons.is_empty() {
             discharges
@@ -2013,10 +2329,6 @@ impl JvmDemandState<'_, '_, '_> {
         let (&qualifier, &(_, answer)) = qualifiers.first().zip(inputs.first())?;
         assert_eq!(inputs[0].0, DemandReferenceKey::caller(qualifier));
         let values = self.jvm_prefix_projected_values(qualifier, answer, Language::Scala)?;
-        let owner = values.first()?.ty().identity();
-        if values.iter().any(|value| value.ty().identity() != owner) {
-            return None;
-        }
         for (&qualifier, &(reference, answer)) in qualifiers.iter().zip(inputs).skip(1) {
             assert_eq!(reference, DemandReferenceKey::caller(qualifier));
             if self.jvm_prefix_projected_values(qualifier, answer, Language::Scala)? != values {
@@ -2454,7 +2766,9 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
     type Provider = SemanticId;
     type MemberRow = crate::analyzer::resolution::LoweredMemberOwnerProperty;
     type PlacementObservations = crate::analyzer::store::resolution_operation::demand_closure::CollectedPlacementObservations;
-    type Rank = JvmBindingPrecedence;
+    // JVM source routes never publish a ranked lexical tier; their binding
+    // candidates are compared separately by the language shadowing policy.
+    type Rank = ();
     type Half<'b>
         = JvmHalfRows<'b, 'store, 'input>
     where
@@ -2582,7 +2896,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
         _: &'b crate::analyzer::store::resolution_lexical::NodeSourceScopes,
         _: &'b dyn super::demand_closure::HalfSource,
         _: &[(DemandReferenceKey, &FactResolutionAnswer)],
-    ) -> Result<Option<Self::Half<'b>>> {
+    ) -> Result<super::demand_closure::HalfRowsOutcome<Self::Half<'b>>> {
         assert!(
             self.source_roots.contains_key(&frame.endpoint),
             "only admitted source roots enter source rows"
@@ -2591,7 +2905,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             .source_roots
             .get(&frame.endpoint)
             .expect("source state retained across waits");
-        Ok(Some(JvmHalfRows {
+        Ok(super::demand_closure::HalfRowsOutcome::Rows(JvmHalfRows {
             rules: self,
             source,
             state,
@@ -2687,12 +3001,10 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                         .collect::<BTreeSet<_>>();
                     if inputs.iter().all(|(_, answer)| {
                         answer.completion() == &ResolutionCompletion::Complete
-                            && answer
-                                .binding()
-                                .targets()
-                                .iter()
-                                .copied()
-                                .collect::<BTreeSet<_>>()
+                            // The qualifier may expose a companion class and
+                            // singleton as two exact owners. Search both only
+                            // when the binding and projection agree exactly.
+                            && answer.binding().targets().iter().copied().collect::<BTreeSet<_>>()
                                 == owners
                     }) {
                         self.state
@@ -2979,9 +3291,14 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             )?;
             let mut state = JvmSourceState::new(
                 JvmSourceStart::Unresolved(None),
-                completion.combine(&ResolutionCompletion::incomplete([
-                    ResolutionIncompleteReason::UnsupportedSemantic(reason),
-                ])),
+                // Retain the qualifier's context-owned inventory boundaries
+                // through this dead-end bridge. Its operation-local support
+                // reads remain in the operation answer, never in the context.
+                context_publishable_qualifier_completion(&completion).combine(
+                    &ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                    ]),
+                ),
                 JvmDemandState::scala_import_discharges(source),
                 reader.expect("import reader prepared"),
                 terminal_reasons,
@@ -3236,29 +3553,35 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             // A declaration-backed external package route settles Java's
             // package-or-type alternative without claiming source navigation
             // targets or closing its member inventory.
-            if complete && let Some(owner) = authority.external_nominal {
+            if complete
+                && jvm_prefix_defers_member_selection(state.reader.language)
+                && authority.external_nominal.is_some()
+            {
                 // Carry the positive declaration identity through the existing
                 // selected-route channel. A boolean nominal marker cannot
                 // authorize retiring gaps on an answer without source targets.
-                exact.merge(
-                    DemandClosureDischarges::exact(state.terminal_reasons.iter().copied())
-                        .with_selected_targets([owner]),
-                );
+                exact.merge(with_jvm_selected_targets(
+                    DemandClosureDischarges::exact(state.terminal_reasons.iter().copied()),
+                    &half.selected_targets,
+                    authority.external_nominal,
+                ));
             }
             // Java's name classification leaves terminal target and absence
             // authority to typed member resolution.
             if complete && !jvm_prefix_defers_member_selection(state.reader.language) {
                 if authority.prefix.is_none() {
-                    exact = DemandClosureDischarges::with_operation_local_placeholders([]);
+                    exact.merge(DemandClosureDischarges::with_operation_local_placeholders(
+                        [],
+                    ));
                 }
                 exact.merge(DemandClosureDischarges::with_operation_local_placeholders(
                     state.terminal_reasons.iter().copied(),
                 ));
-                exact = if half.selected_targets.is_empty() {
-                    exact.with_authoritative_empty_result()
-                } else {
-                    exact.with_selected_targets(half.selected_targets.clone())
-                };
+                exact = with_jvm_selected_targets(
+                    exact,
+                    &half.selected_targets,
+                    authority.external_nominal,
+                );
             }
             exact.merge(state.discharges.clone());
             let preserve_discharges = complete || exact != DemandClosureDischarges::default();
@@ -3445,6 +3768,29 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod shared_contract;
+
+// A nominal declaration is a positive target even without source export rows.
+// Keep selection assembly common while callers retain their own gap proof kind.
+fn with_jvm_selected_targets(
+    discharges: DemandClosureDischarges,
+    source_targets: &BTreeSet<SemanticId>,
+    external_nominal: Option<SemanticId>,
+) -> DemandClosureDischarges {
+    debug_assert!(
+        external_nominal.is_none() || source_targets.is_empty(),
+        "a package route names an external owner only when no source export matched"
+    );
+    let selected = source_targets
+        .iter()
+        .copied()
+        .chain(external_nominal)
+        .collect::<BTreeSet<_>>();
+    if selected.is_empty() {
+        discharges.with_authoritative_empty_result()
+    } else {
+        discharges.with_selected_targets(selected)
+    }
+}
 
 #[derive(Default)]
 struct JvmSourceAuthority {
@@ -3715,7 +4061,7 @@ impl super::demand_closure::RouteRules<super::demand_closure::ClosureTag>
 }
 impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
     type MemberRow = crate::analyzer::resolution::LoweredMemberOwnerProperty;
-    type Rank = JvmBindingPrecedence;
+    type Rank = ();
     type Provider = SemanticId;
     type LexicalTiers =
         std::iter::Empty<super::demand_closure::LexicalStartTier<Self::Rank, Self::Provider>>;

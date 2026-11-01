@@ -40,7 +40,7 @@ use super::{
 
 use crate::analyzer::Language;
 
-const SELECTED_RESOLUTION_INPUT_SCHEMA_SQL: &str = r#"
+pub(super) const SELECTED_RESOLUTION_INPUT_SCHEMA_SQL: &str = r#"
 CREATE TEMP TABLE IF NOT EXISTS selected_resolution_context(
   singleton    INTEGER NOT NULL PRIMARY KEY CHECK(singleton = 0),
   workspace_id TEXT NOT NULL
@@ -76,6 +76,7 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_content_mounts(
   generation               INTEGER NOT NULL CHECK(generation >= 0),
   persisted_relative_path  TEXT NOT NULL CHECK(length(persisted_relative_path) > 0),
   blob_oid                 TEXT NOT NULL,
+  parse_variant           BLOB NOT NULL DEFAULT x'',
   publication_digest      BLOB NOT NULL CHECK(length(publication_digest)=32),
   projection_digest       BLOB NOT NULL
     CHECK(typeof(projection_digest) = 'blob' AND length(projection_digest) = 32),
@@ -320,7 +321,7 @@ fn selected_mount_status_joins(mount_alias: &str, language_column: &str) -> Stri
         "LEFT JOIN main.blobs AS blobs\n\
            ON blobs.blob_oid = {mount_alias}.blob_oid\n\
           AND blobs.lang = {mount_alias}.{language_column}\n\
-          AND blobs.parse_variant = x''\n\
+          AND blobs.parse_variant = {mount_alias}.parse_variant\n\
          LEFT JOIN main.blob_meta AS meta\n\
            ON meta.blob_id = blobs.id\n\
           AND meta.lang = blobs.lang\n\
@@ -1126,6 +1127,37 @@ fn decode_selected_mount_record(row: &rusqlite::Row<'_>) -> Result<SelectedResol
 }
 
 impl RequestedResolutionMountRows {
+    /// Populate only the current query's explicitly nominated mount rows in
+    /// one read. The request-owned memo is shared with ordinary point readers.
+    pub(crate) fn prefetch_ordinals(
+        &self,
+        conn: &Connection,
+        ordinals: &[SelectedResolutionMountOrdinal],
+    ) -> Result<()> {
+        let mut missing = ordinals
+            .iter()
+            .copied()
+            .filter(|ordinal| !self.records.borrow().contains_key(ordinal))
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing.dedup();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let sql = format!(
+            "SELECT {} FROM temp.selected_resolution_mounts WHERE mount_ordinal IN (SELECT value FROM json_each(?1))",
+            selected_mount_record_columns()
+        );
+        let keys = super::resolution::json_array(missing.iter().map(|ordinal| ordinal.get()));
+        let mut statement = conn.prepare_cached(&sql)?;
+        let mut rows = statement.query([keys])?;
+        while let Some(row) = rows.next()? {
+            let record = std::sync::Arc::new(decode_selected_mount_record(row)?);
+            self.records.borrow_mut().insert(record.ordinal(), record);
+        }
+        Ok(())
+    }
+
     pub(crate) fn by_ordinal(
         &self,
         conn: &Connection,
@@ -3606,8 +3638,8 @@ pub fn insert_selection_input(
         let mut insert = tx.prepare_cached(
             "INSERT INTO temp.selected_resolution_content_mounts(
                storage_language, generation, persisted_relative_path,
-               blob_oid, projection_digest, overlay_authority_kind, overlay_authority_digest, publication_digest
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+               blob_oid, projection_digest, overlay_authority_kind, overlay_authority_digest, publication_digest, parse_variant
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         for content_mount in content_mounts {
             if cancellation.is_cancelled() {
@@ -3625,6 +3657,7 @@ pub fn insert_selection_input(
                     .1
                     .map(|digest| digest.as_slice()),
                 content_mount.publication_digest().as_slice(),
+                content_mount.publication().key.variant,
             ])?;
         }
     }
@@ -4381,6 +4414,14 @@ pub fn persist_selected_inventory(
     tx.execute_batch(
         super::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL,
     )?;
+    if staged
+        .languages
+        .iter()
+        .any(|language| language.storage_language == "csharp")
+        && !super::csharp_compilation::extent::stage(tx, cancellation)?
+    {
+        return Ok(false);
+    }
     tx.execute_batch(SELECTED_MOUNT_GUARDS_SQL)?;
     Ok(!cancellation.is_cancelled())
 }

@@ -16,6 +16,8 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+
+use crate::diagnostics::GoImportBindings;
 use std::sync::Arc;
 
 /// Everything Go graph resolution needs from the analyzer, as the core
@@ -557,25 +559,6 @@ fn fact_type_fqns(file: &GoFactFile, id: GoSourceTypeId, maps: &GoFactTypeMaps) 
             | GoSourceTypeShape::Compound { .. } => return Vec::new(),
         };
     }
-}
-
-/// Every name a Go file's import block binds, split by whether a workspace
-/// package answers the import path.
-///
-/// Semantic diagnostics need both halves: the workspace half decides whether a
-/// package member is indexed here, and the external half is the only way to
-/// name the package identity an exact API pack publishes. Resolving them in
-/// one pass keeps a path from appearing in both halves.
-#[derive(Debug, Default)]
-pub struct GoImportBindings {
-    /// Local name -> canonical, module-qualified workspace package prefixes.
-    pub workspace: HashMap<String, Vec<String>>,
-    /// Dot-imported canonical workspace package prefixes.
-    pub dot_workspace: Vec<String>,
-    /// Local name -> import paths that no workspace package answers.
-    pub external: HashMap<String, Vec<String>>,
-    /// Dot-imported import paths that no workspace package answers.
-    pub dot_external: Vec<String>,
 }
 
 /// `declared_package_name` answers "what `package` clause does an activated

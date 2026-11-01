@@ -1,3 +1,4 @@
+// Python-only summaries use the empty parse variant.
 //! Dormant Python environment summaries. The unstable native validation entry
 //! stages file-local inputs in SQL; only the shared reconciler persists outputs.
 //! No production parser, reader or workspace-build hook invokes this module.

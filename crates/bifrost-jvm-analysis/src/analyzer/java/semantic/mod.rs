@@ -53,11 +53,18 @@ use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 // v32: #7578 publishes shared direct-call-result condition guards.
 // v33: compose #7348/#7349/#7369 compound/static/pattern lowering with v32.
 // v35: compose #7578 decoded string-literal ConstantString values with v33.
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v35";
+// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
+// v38: #7750 guarded switch cases name an edge the guard lowering creates (v37 is held by #8650).
+// #8634: a default-only switch reaches its default arm by a SwitchCase edge.
+// Batch d1bb2a8e: combine #8682 (v39) with #7750 (v38); keep v39, above master's v38.
+// #8599: method-reference receiver binding and null-check control flow changed.
+// v40: compose #8599 above master's v38 and the open #8634 v39 identity.
+// v41: qualified this now derives an opaque enclosing receiver instead of sharing inner this.
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v41";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
-struct JavaSemanticLowerer;
+pub(crate) struct JavaSemanticLowerer;
 
 impl ProgramSemanticsLowerer for JavaSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {

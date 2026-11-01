@@ -65,6 +65,7 @@ use crate::analyzer::model::MAX_SIGNATURE_METADATA_COLUMN_BYTES;
 
 use crate::analyzer::read_ledger::IndexFamily;
 
+use crate::analyzer::semantic::partial_flow::fixpoint::ProcedurePartialFlows;
 use crate::analyzer::semantic::partial_flow::fixpoint::parse_time_partial_flows;
 
 use crate::analyzer::semantic::service::ProgramSemanticsLowerer;
@@ -271,6 +272,9 @@ pub mod class_set_summaries;
 pub mod cpp_template;
 #[doc(hidden)]
 pub mod csharp_compilation;
+pub use csharp_compilation::{
+    CSharpCompilationSetRef, FileVersionDecision, UndecidedChainRow, UnseenBranchFile,
+};
 #[doc(hidden)]
 pub mod dependency_file_evidence;
 pub mod epoch;
@@ -2379,6 +2383,12 @@ pub struct PathSymbolRow {
     pub requires_imports: bool,
 }
 
+pub(super) const OPEN_FILE_VERSION_DECISION_SQL: &str = "SELECT files.file_version_id, files.projection_digest, decisions.decision_digest, decisions.assignment_digest
+                         FROM workspace_file_versions AS files
+                         LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+                         WHERE files.workspace_id = ?1 AND files.lang = ?2 AND files.generation = ?3
+                           AND files.rel_path = ?4 AND files.input_kind = 'source' AND files.valid_until IS NULL";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct WorkspaceFileRow {
@@ -2386,6 +2396,7 @@ pub struct WorkspaceFileRow {
     pub rel_path: String,
     #[doc(hidden)]
     pub blob_oid: Oid,
+    pub decision: Option<FileVersionDecision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -3215,6 +3226,10 @@ impl AnalyzerStore {
         foreign_source_paths: &[String],
         refusals: &[WorkspaceSourceRefusalRow],
     ) -> Result<WorkspaceSnapshotId> {
+        assert!(
+            lang == "csharp" || files.iter().all(|file| file.decision.is_none()),
+            "only C# rows carry decisions"
+        );
         let configuration = configuration.to_vec();
         let refusals = refusals.to_vec();
         let foreign_source_paths = foreign_source_paths
@@ -3254,6 +3269,7 @@ impl AnalyzerStore {
                     relative_path: &file.rel_path,
                     content_oid: file.blob_oid,
                     projection_digest: Some(digest),
+                    csharp_decision: file.decision,
                 })
                 .collect::<Vec<_>>();
             for input in &configuration {
@@ -3614,7 +3630,7 @@ impl AnalyzerStore {
         storage_langs: &[String],
         generations: &HashMap<String, GenerationId>,
         rel_path: &str,
-        file_replacement: Option<(&str, Oid)>,
+        file_replacement: Option<(&str, Oid, Option<FileVersionDecision>)>,
         path_symbol_replacement: Option<(&str, &PathSymbolRow)>,
         _packages: &[String],
         package_files: &[WorkspacePackageFileRow],
@@ -3622,6 +3638,11 @@ impl AnalyzerStore {
         anchors: &[WorkspaceAnchorRow],
         refusal: Option<(&str, &WorkspaceSourceRefusalRow)>,
     ) -> Result<WorkspaceSnapshots> {
+        assert!(
+            file_replacement
+                .is_none_or(|(lang, _, decision)| decision.is_none() || lang == "csharp"),
+            "only a C# replacement row carries a decision"
+        );
         assert!(
             file_replacement.is_none() || refusal.is_none(),
             "a live source is either selected or refused: {rel_path}"
@@ -3632,7 +3653,8 @@ impl AnalyzerStore {
         let generations = generations.clone();
         let rel_path = rel_path.to_string();
         let refusal = refusal.map(|(lang, row)| (lang.to_string(), row.clone()));
-        let file_replacement = file_replacement.map(|(lang, oid)| (lang.to_string(), oid));
+        let file_replacement =
+            file_replacement.map(|(lang, oid, decision)| (lang.to_string(), oid, decision));
         let path_symbol_replacement =
             path_symbol_replacement.map(|(lang, row)| (lang.to_string(), row.clone()));
         let package_files = package_files.to_vec();
@@ -3646,7 +3668,7 @@ impl AnalyzerStore {
             let rel_path = rel_path.as_str();
             let file_replacement = file_replacement
                 .as_ref()
-                .map(|(lang, oid)| (lang.as_str(), *oid));
+                .map(|(lang, oid, decision)| (lang.as_str(), *oid, *decision));
             let path_symbol_replacement = path_symbol_replacement
                 .as_ref()
                 .map(|(lang, row)| (lang.as_str(), row));
@@ -3657,7 +3679,7 @@ impl AnalyzerStore {
             let tx = conn.transaction()?;
             let mut snapshots = HashMap::default();
             let live_lang = file_replacement
-                .map(|(lang, _)| lang)
+                .map(|(lang, _, _)| lang)
                 .or(refusal.map(|(lang, _)| lang));
             for lang in storage_langs {
                 if let Some(file_lang) = live_lang
@@ -3681,16 +3703,21 @@ impl AnalyzerStore {
                 )?;
                 let old = tx
                     .query_row(
-                        "SELECT file_version_id, projection_digest FROM workspace_file_versions
-                         WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
-                           AND rel_path = ?4 AND input_kind = 'source' AND valid_until IS NULL",
+                        OPEN_FILE_VERSION_DECISION_SQL,
                         params![workspace_id_text, lang, generation.0, rel_path],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                csharp_compilation::decode_file_decision(row, 2)?,
+                            ))
+                        },
                     )
                     .optional()?;
                 let replacement_file = file_replacement
-                    .filter(|(replacement_lang, _)| *replacement_lang == lang)
-                    .map(|(_, blob_oid)| WorkspaceFileRow {
+                    .filter(|(replacement_lang, _, _)| *replacement_lang == lang)
+                    .map(|(_, blob_oid, decision)| WorkspaceFileRow {
+                        decision,
                         rel_path: rel_path.to_string(),
                         blob_oid,
                     });
@@ -3708,14 +3735,17 @@ impl AnalyzerStore {
                 let new_digest = replacement_file
                     .as_ref()
                     .map(|file| workspace_file_projection_digest(file, &replacement_projection));
-                let changed =
-                    old.as_ref().map(|(_, digest)| digest.as_str()) != new_digest.as_deref();
-                let closed = old.as_ref().filter(|_| changed).map(|(id, _)| *id);
+                let decision = replacement_file.as_ref().and_then(|file| file.decision);
+                let changed = old.as_ref().map(|(_, digest, _)| digest.as_str())
+                    != new_digest.as_deref()
+                    || old.as_ref().and_then(|(_, _, decision)| *decision) != decision;
+                let closed = old.as_ref().filter(|_| changed).map(|(id, _, _)| *id);
                 let replacement = replacement_file.as_ref().filter(|_| changed).map(|file| {
                     workspace_inputs::WorkspaceInputRow {
                         relative_path: rel_path,
                         content_oid: file.blob_oid,
                         projection_digest: new_digest.as_deref(),
+                        csharp_decision: decision,
                     }
                 });
                 let replacements = replacement
@@ -4519,6 +4549,24 @@ impl AnalyzerStore {
                 for key in &keys {
                     if checked_languages.insert(&key.lang) { require_current_generation(&tx, &key.lang, generation)?; }
                     if seen.insert(key) {
+                        if key.lang == "csharp" && tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM blobs WHERE blob_oid=?1 AND lang=?2 AND parse_variant=?3 AND generation<>?4)",
+                            params![key.oid.to_string(),key.lang,key.variant,generation.0],|r|r.get::<_,bool>(0))? {
+                            csharp_compilation::extent::before_blob_delete(&tx, key)?;
+                        }
+                        if key.lang == "csharp" {
+                            tx.execute(
+                                "DELETE FROM csharp_source_condition_symbols WHERE blob_id IN (
+                                   SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2
+                                     AND parse_variant = ?4 AND generation <> ?3)",
+                                params![key.oid.to_string(), key.lang, generation.0, key.variant],
+                            )?;
+
+                            tx.execute(
+                                csharp_compilation::DELETE_STALE_EPOCH_CHAINS_SQL,
+                                params![key.oid.to_string(), key.lang, generation.0, key.variant],
+                            )?;
+                        }
                         remove_stale.execute(params![key.oid.to_string(), key.lang, generation.0, key.variant])?;
                         insert.execute(params![key.oid.to_string(), key.lang, generation.0, key.variant])?;
                     }
@@ -7018,16 +7066,31 @@ impl AnalyzerStore {
         for lang in langs {
             let rows =
                 candidate_rows_for_languages(&tx, std::iter::once(lang.as_str()), &sql, &[])?;
-            let mut oids: Vec<_> = rows.iter().map(|row| row.blob_oid).collect();
-            oids.sort();
-            oids.dedup();
-            let ranges = primary_ranges_by_unit_for_lang_conn(
-                &tx,
-                &BlobKey::unvaried(Oid::zero(), lang),
-                &oids,
-            )?;
+            let mut by_variant: HashMap<ParseVariant, Vec<Oid>> = HashMap::default();
+            for row in &rows {
+                by_variant
+                    .entry(row.variant)
+                    .or_default()
+                    .push(row.blob_oid);
+            }
+            let mut ranges = HashMap::default();
+            for (variant, mut oids) in by_variant {
+                oids.sort_unstable();
+                oids.dedup();
+                let key = BlobKey {
+                    oid: Oid::zero(),
+                    lang: lang.clone(),
+                    variant,
+                };
+                for ((oid, unit), range) in primary_ranges_by_unit_for_lang_conn(&tx, &key, &oids)?
+                {
+                    ranges.insert((variant, oid, unit), range);
+                }
+            }
             out.extend(rows.into_iter().map(|row| {
-                let range = ranges.get(&(row.blob_oid, row.unit_key)).copied();
+                let range = ranges
+                    .get(&(row.variant, row.blob_oid, row.unit_key))
+                    .copied();
                 (row, range)
             }));
         }
@@ -7309,6 +7372,7 @@ impl AnalyzerStore {
             "blob_reference_fact_manifests",
             "ruby_method_dispatch_modes",
             "scala_traits",
+            "csharp_source_condition_symbols",
         ] {
             let sql = format!(
                 "SELECT COUNT(*)
@@ -7346,8 +7410,9 @@ impl AnalyzerStore {
                  WHERE blobs.generation = COALESCE(epochs.generation, 0)
                    AND NOT EXISTS (
                      SELECT 1 FROM workspace_file_versions AS files
+                     LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
                      WHERE files.input_kind = 'source' AND files.blob_oid = blobs.blob_oid
-                       AND files.lang = blobs.lang AND blobs.parse_variant = x''
+                       AND files.lang = blobs.lang AND blobs.parse_variant = COALESCE(decisions.decision_digest, x'')
                    )
                    AND NOT EXISTS (
                      SELECT 1 FROM workspace_resolution_content_roots AS roots
@@ -7386,6 +7451,21 @@ impl AnalyzerStore {
                    )",
                 )?;
                 for key in &dead {
+                    csharp_compilation::extent::before_blob_delete(&tx, key)?;
+                    if key.lang == "csharp" {
+                        tx.execute(
+                            "DELETE FROM csharp_source_condition_symbols WHERE blob_id IN (
+                               SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
+                                 AND generation = COALESCE((SELECT generation FROM analysis_epochs WHERE lang = ?2), 0)
+                                 AND NOT EXISTS (SELECT 1 FROM workspace_resolution_content_roots AS roots WHERE roots.blob_id = blobs.id))",
+                            params![key.oid.to_string(), key.lang, key.variant],
+                        )?;
+
+                        tx.execute(
+                            csharp_compilation::DELETE_UNROOTED_CHAINS_SQL,
+                            params![key.oid.to_string(), key.lang, key.variant],
+                        )?;
+                    }
                     del.execute(params![key.oid.to_string(), key.lang, key.variant])?;
                 }
             }
@@ -7441,6 +7521,11 @@ impl AnalyzerStore {
             )?;
             tx.execute(
                 unit_summaries::DELETE_WORKSPACE_VERSIONS_SQL,
+                params![workspace_id],
+            )?;
+            tx.execute(
+                "DELETE FROM csharp_file_version_decisions WHERE file_version_id IN (
+                   SELECT file_version_id FROM workspace_file_versions WHERE workspace_id = ?1)",
                 params![workspace_id],
             )?;
             let revisions = tx.execute(
@@ -11163,6 +11248,9 @@ pub enum StructuralFactRowsRead {
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct PreparedParsedBlob {
+    /// Referenced preprocessor symbols supplied by the C# producer for this variant.
+    pub csharp_condition_symbols: Vec<String>,
+    pub csharp_undecided_chains: Vec<UndecidedChainRow>,
     #[doc(hidden)]
     pub key: BlobKey,
     #[doc(hidden)]
@@ -11262,6 +11350,63 @@ pub struct PreparedParsedBlob {
 }
 
 impl PreparedParsedBlob {
+    /// Attach this variant's referenced-symbol set and include its rows in write costs.
+    #[doc(hidden)]
+    pub fn with_condition_symbols(mut self, mut symbols: Vec<String>) -> Self {
+        assert_eq!(self.key.lang, "csharp", "preprocessor symbols belong to C#");
+        assert!(
+            self.csharp_condition_symbols.is_empty(),
+            "symbols are attached once"
+        );
+        symbols.sort_unstable();
+        symbols.dedup();
+        let bytes = symbols.iter().map(String::len).sum::<usize>();
+        self.logical_rows = self.logical_rows.saturating_add(symbols.len());
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes);
+        self.mutation_logical_rows = self.mutation_logical_rows.saturating_add(symbols.len());
+        self.mutation_payload_bytes = self.mutation_payload_bytes.saturating_add(bytes);
+        self.csharp_condition_symbols = symbols;
+        self
+    }
+
+    pub fn with_undecided_chains(mut self, mut rows: Vec<UndecidedChainRow>) -> Self {
+        assert_eq!(self.key.lang, "csharp");
+        assert!(self.csharp_undecided_chains.is_empty());
+        rows.sort_unstable_by_key(|row| row.chain);
+        assert!(rows.windows(2).all(|w| w[0].chain != w[1].chain));
+        for row in &mut rows {
+            row.unknown_symbols.sort_unstable();
+            row.open_reasons.sort_unstable();
+            row.disagreeing_owners.sort_unstable();
+            self.payload_bytes = self.payload_bytes.saturating_add(
+                row.unknown_symbols
+                    .iter()
+                    .chain(&row.open_reasons)
+                    .chain(&row.disagreeing_owners)
+                    .map(String::len)
+                    .sum::<usize>()
+                    + 20,
+            );
+        }
+        self.logical_rows = self.logical_rows.saturating_add(rows.len());
+        self.mutation_logical_rows = self.mutation_logical_rows.saturating_add(rows.len());
+        self.mutation_payload_bytes = self.mutation_payload_bytes.saturating_add(
+            rows.iter()
+                .map(|row| {
+                    row.unknown_symbols
+                        .iter()
+                        .chain(&row.open_reasons)
+                        .chain(&row.disagreeing_owners)
+                        .map(String::len)
+                        .sum::<usize>()
+                        + 20
+                })
+                .sum::<usize>(),
+        );
+        self.csharp_undecided_chains = rows;
+        self
+    }
+
     fn source_variant(&self) -> (Oid, ParseVariant) {
         (self.key.oid, self.key.variant)
     }
@@ -11323,6 +11468,8 @@ impl PreparedParsedBlob {
 
     fn has_same_persisted_fragment(&self, other: &Self) -> bool {
         self.key == other.key
+            && self.csharp_condition_symbols == other.csharp_condition_symbols
+            && self.csharp_undecided_chains == other.csharp_undecided_chains
             && self.generation == other.generation
             && self.units == other.units
             && self.ranges == other.ranges
@@ -12161,6 +12308,7 @@ fn try_persist_prepared_chunk_tx(
                 cancellation,
             )?;
         }
+        csharp_compilation::extent::content_available(&tx, &blob.key.lang, blob_id)?;
     }
     if cancellation.is_cancelled() {
         tx.rollback()?;
@@ -12478,6 +12626,14 @@ pub fn saturating_sum(values: impl IntoIterator<Item = usize>) -> usize {
         .fold(0usize, |total, value| total.saturating_add(value))
 }
 
+/// The semantic IR rows of one parse-time preparation and, for a complete
+/// lowering, the validated artifact and partial flows they encode.
+#[doc(hidden)]
+pub struct ParseTimeSemanticIr {
+    pub rows: PreparedSemanticIr,
+    pub lowered: Option<(Arc<SemanticArtifact>, Vec<ProcedurePartialFlows>)>,
+}
+
 /// Lowers one parsed blob with the parse-time lowerer and encodes the outcome
 /// as semantic IR rows over the tree the analysis walk read. `Ok(None)` means
 /// preparation was cancelled.
@@ -12488,7 +12644,7 @@ pub fn prepare_parse_time_semantic_ir(
     prepared: &PreparedSyntaxTree,
     key: &BlobKey,
     cancellation: &CancellationToken,
-) -> Result<Option<PreparedSemanticIr>> {
+) -> Result<Option<ParseTimeSemanticIr>> {
     let lang = key.lang.as_str();
     let oid = key.oid.to_string();
 
@@ -12496,7 +12652,11 @@ pub fn prepare_parse_time_semantic_ir(
         format!("store.prepare_parsed_blob.semantic_ir[{lang}][{oid}]")
     });
     let producer_epoch = semantic_ir_producer_epoch(&lowerer.identity());
-    let content = ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
+    let content = ContentIdentity::from_source_digest(
+        StableDigest::from_array(prepared.source_sha256()),
+        prepared.dialect().language(),
+        prepared.parse_variant(),
+    );
     let (outcome, artifact) = {
         let _lower = crate::profiling::scope("semantic_ir.lower");
         match lower_parse_time_semantic_ir(lowerer, file, prepared, content, cancellation) {
@@ -12504,24 +12664,25 @@ pub fn prepare_parse_time_semantic_ir(
             None => return Ok(None),
         }
     };
-    let partial_flows = match artifact {
+    let lowered = match artifact {
         Some(artifact) => {
             let _partial_flows = crate::profiling::scope("semantic_ir.partial_flows");
             match parse_time_partial_flows(&artifact, prepared, cancellation) {
-                Some(flows) => Some(flows),
+                Some(flows) => Some((artifact, flows)),
                 None => return Ok(None),
             }
         }
         None => None,
     };
     let _encode = crate::profiling::scope("semantic_ir.encode");
-    Ok(Some(PreparedSemanticIr::prepare(
+    let rows = PreparedSemanticIr::prepare(
         outcome,
-        partial_flows.as_deref(),
+        lowered.as_ref().map(|(_, flows)| flows.as_slice()),
         &producer_epoch,
         content,
         prepared.source().len(),
-    )))
+    );
+    Ok(Some(ParseTimeSemanticIr { rows, lowered }))
 }
 
 /// The lowering outcome, validated the way a reader would validate it, and the
@@ -12535,7 +12696,7 @@ fn lower_parse_time_semantic_ir(
     cancellation: &CancellationToken,
 ) -> Option<(SemanticIrLoweringOutcome, Option<Arc<SemanticArtifact>>)> {
     let lowered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lowerer.lower(file, prepared, &SemanticBudget::default(), cancellation)
+        lowerer.lower(file, prepared, &SemanticBudget::producer(), cancellation)
     }));
     let lowered = match lowered {
         Ok(lowered) => lowered,
@@ -12652,6 +12813,21 @@ fn write_prepared_blob_rows_tx(
     // and imports, so the summaries that listed it stop being live first.
     tx.prepare_cached(unit_summaries::WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL)?
         .execute(params![oid, lang, blob.key.variant])?;
+    csharp_compilation::extent::before_blob_delete(tx, &blob.key)?;
+    // Only C# blobs carry condition symbols (asserted at the insert below), so
+    // other languages issue no statement here.
+    if lang == "csharp" {
+        tx.execute(
+            "DELETE FROM csharp_source_condition_symbols WHERE blob_id IN (
+               SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3)",
+            params![oid, lang, blob.key.variant],
+        )?;
+
+        tx.execute(
+            csharp_compilation::DELETE_REPLACED_CHAINS_SQL,
+            params![oid, lang, blob.key.variant],
+        )?;
+    }
     tx.prepare_cached(
         "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
     )?
@@ -12665,6 +12841,34 @@ fn write_prepared_blob_rows_tx(
             blob.key.variant
         ])?;
     let blob_id = tx.last_insert_rowid();
+    assert!(
+        lang == "csharp" || blob.csharp_condition_symbols.is_empty(),
+        "only C# variants carry preprocessor symbols"
+    );
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT OR IGNORE INTO csharp_source_condition_symbols(blob_id, symbol) VALUES(?1, ?2)",
+        )?;
+        for symbol in &blob.csharp_condition_symbols {
+            insert.execute(params![blob_id, symbol])?;
+        }
+    }
+    assert!(lang == "csharp" || blob.csharp_undecided_chains.is_empty());
+    let mut insert = tx.prepare_cached(csharp_compilation::INSERT_UNDECIDED_CHAIN_SQL)?;
+    for row in &blob.csharp_undecided_chains {
+        insert.execute(params![
+            blob_id,
+            row.chain,
+            row.directive_start,
+            row.directive_end,
+            row.omitted_nonblank,
+            row.invalid_condition,
+            serde_json::to_vec(&row.unknown_symbols).expect("strings serialize"),
+            serde_json::to_vec(&row.open_reasons).expect("strings serialize"),
+            serde_json::to_vec(&row.disagreeing_owners).expect("strings serialize")
+        ])?;
+    }
+
     {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO code_units(
@@ -13233,8 +13437,8 @@ impl AnalyzerStore {
         }
         drop(query);
         drop(statement);
-        // Candidate identities read the complete relational FQ segments, and
-        // exact-definition ordering compares byte offsets across files.
+        // Stored unit keys already carry relative declaration order. Absolute
+        // ranges locate the rows but must not become semantic read inputs.
         for sql in [INDEX_DIGEST_SEGMENTS_SQL, INDEX_DIGEST_RANGES_SQL] {
             let mut statement = tx.prepare_cached(sql)?;
             let count = statement.column_count();
@@ -13244,9 +13448,11 @@ impl AnalyzerStore {
                 let hash = rows
                     .get_mut(&key)
                     .ok_or_else(|| StoreError::new("index satellite has no unit"))?;
-                hash.value(sql.as_bytes());
-                for index in 1..count {
-                    hash_index_sql_value(hash, row.get_ref(index)?);
+                if sql == INDEX_DIGEST_SEGMENTS_SQL {
+                    hash.value(sql.as_bytes());
+                    for index in 1..count {
+                        hash_index_sql_value(hash, row.get_ref(index)?);
+                    }
                 }
             }
         }
@@ -13274,7 +13480,22 @@ impl AnalyzerStore {
                 for (index, name) in columns.iter().enumerate() {
                     if name != "blob_id" {
                         hash.value(name.as_bytes());
-                        hash_index_sql_value(hash, row.get_ref(index)?);
+                        if sql == INDEX_DIGEST_METADATA_SQL && name == "parameters" {
+                            let parameters: Vec<
+                                brokk_bifrost_core::analyzer::model::ParameterMetadata,
+                            > = serde_json::from_str(&row.get::<_, String>(index)?)
+                                .map_err(|error| StoreError::corrupt(error.to_string()))?;
+                            let parameters = parameters
+                                .iter()
+                                .map(|parameter| parameter.without_source_positions())
+                                .collect::<Vec<_>>();
+                            hash.value(
+                                &serde_json::to_vec(&parameters)
+                                    .map_err(|error| StoreError::corrupt(error.to_string()))?,
+                            );
+                        } else {
+                            hash_index_sql_value(hash, row.get_ref(index)?);
+                        }
                     }
                 }
             }
@@ -16610,10 +16831,11 @@ pub const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_
       AND files.lang = selected.lang
       AND files.generation = selected.generation
       AND files.blob_oid = keys.blob_oid
-                     AND keys.parse_variant = x''
+
       AND files.valid_from <= selected.revision
       AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
-     WHERE requested.kind IN (0, 1)
+     LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+     WHERE keys.parse_variant = COALESCE(decisions.decision_digest, x'') AND requested.kind IN (0, 1)
        AND imports.is_wildcard = requested.kind
        AND imports.path_kind IS NOT 'static_member'";
 
@@ -16638,10 +16860,11 @@ const REVERSE_TYPE_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
       AND files.lang = selected.lang
       AND files.generation = selected.generation
       AND files.blob_oid = keys.blob_oid
-                     AND keys.parse_variant = x''
+
       AND files.valid_from <= selected.revision
       AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
-     WHERE requested.kind = 2";
+     LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+     WHERE keys.parse_variant = COALESCE(decisions.decision_digest, x'') AND requested.kind = 2";
 
 const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT DISTINCT files.rel_path
      FROM temp.reverse_import_lookup_keys AS requested
@@ -16664,10 +16887,11 @@ const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT DISTINCT files.rel_
       AND files.lang = selected.lang
       AND files.generation = selected.generation
       AND files.blob_oid = keys.blob_oid
-                     AND keys.parse_variant = x''
+
       AND files.valid_from <= selected.revision
       AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
-     WHERE requested.kind = 2";
+     LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+     WHERE keys.parse_variant = COALESCE(decisions.decision_digest, x'') AND requested.kind = 2";
 
 #[doc(hidden)]
 pub fn sync_reverse_reference_lookup_keys(
@@ -18039,6 +18263,8 @@ fn complete_blob_cascade_rows_sql(blob_id: &str) -> String {
              ), 0)
            + (SELECT COUNT(*) FROM blob_payload_costs AS costs
               WHERE costs.blob_id = meta.blob_id) END
+         + (SELECT COUNT(*) FROM csharp_source_condition_symbols WHERE blob_id = {blob_id})
+         + (SELECT COUNT(*) FROM csharp_undecided_chains WHERE blob_id = {blob_id})
          + {class_set_rows}
          + {rust_projection_rows}
          + {semantic_ir_rows}
@@ -18852,6 +19078,20 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
                )",
         )?;
         for key in stale_blobs {
+            csharp_compilation::extent::before_blob_delete(&tx, &key)?;
+            if key.lang == "csharp" {
+                tx.execute(
+                    "DELETE FROM csharp_source_condition_symbols WHERE blob_id IN (
+                       SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
+                         AND generation <> COALESCE((SELECT generation FROM analysis_epochs WHERE lang = ?2), 0))",
+                    params![key.oid.to_string(), key.lang, key.variant],
+                )?;
+
+                tx.execute(
+                    csharp_compilation::DELETE_RECLAIMED_CHAINS_SQL,
+                    params![key.oid.to_string(), key.lang, key.variant],
+                )?;
+            }
             delete.execute(params![key.oid.to_string(), key.lang, key.variant])?;
         }
     }
@@ -18866,6 +19106,17 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
                 WHERE analysis_epochs.lang = workspace_heads.lang), 0
              )",
             [],
+        )?;
+        tx.execute(
+            "DELETE FROM csharp_file_version_decisions WHERE file_version_id IN (
+               SELECT files.file_version_id FROM workspace_file_versions AS files
+               WHERE (files.workspace_id, files.lang, files.generation, files.valid_from) IN (
+                 SELECT revisions.workspace_id, revisions.lang, revisions.generation, revisions.revision
+                 FROM workspace_revisions AS revisions
+                 LEFT JOIN analysis_epochs AS epochs ON epochs.lang = revisions.lang
+                 WHERE revisions.generation <> COALESCE(epochs.generation, 0)
+                 ORDER BY revisions.lang, revisions.generation, revisions.revision LIMIT ?1))",
+            [usize_to_i64(remaining)?],
         )?;
         reclaimed = reclaimed.saturating_add(tx.execute(
             "DELETE FROM workspace_revisions
@@ -20439,6 +20690,8 @@ pub mod tests {
             let logical_rows = resolution.logical_rows + ir.logical_rows();
             let payload_bytes = resolution.payload_bytes + ir.payload_bytes();
             PreparedParsedBlob {
+                csharp_condition_symbols: Vec::new(),
+                csharp_undecided_chains: Vec::new(),
                 key: BlobKey::unvaried(oid, "python"),
                 generation: GenerationId::BOOTSTRAP,
                 state: Arc::clone(&state),
@@ -21279,6 +21532,8 @@ pub mod tests {
         let logical_rows = resolution.logical_rows + 3;
         let payload_bytes = resolution.payload_bytes + lang.len();
         PreparedParsedBlob {
+            csharp_condition_symbols: Vec::new(),
+            csharp_undecided_chains: Vec::new(),
             key: BlobKey::unvaried(oid, lang),
             generation: GenerationId::BOOTSTRAP,
             state,
@@ -21322,6 +21577,82 @@ pub mod tests {
             mutation_payload_bytes: payload_bytes,
             additional: Default::default(),
         }
+    }
+
+    #[test]
+    fn prepared_csharp_variants_persist_their_own_referenced_symbols() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .ensure_resolution_producer_epoch("csharp", Language::CSharp)
+            .unwrap();
+        let oid = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let mut keys = Vec::new();
+        let mut prepared = Vec::new();
+        for (digest, symbol) in [(1, "DEBUG"), (2, "FEATURE")] {
+            // An explicitly test-only empty source/row fixture, with a C# resolution bundle.
+            let mut blob = empty_publication(oid, "csharp");
+            let resolution = PreparedResolutionBundle::new(
+                Language::CSharp,
+                Default::default(),
+                Default::default(),
+                Vec::new(),
+                Default::default(),
+                Vec::new(),
+                Default::default(),
+                Vec::new(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            blob.logical_rows =
+                blob.logical_rows - blob.resolution.logical_rows + resolution.logical_rows;
+            blob.payload_bytes =
+                blob.payload_bytes - blob.resolution.payload_bytes + resolution.payload_bytes;
+            blob.mutation_logical_rows = blob.logical_rows;
+            blob.mutation_payload_bytes = blob.payload_bytes;
+            blob.resolution = resolution;
+            blob.key.variant = ParseVariant::Digest([digest; 32]);
+            keys.push(blob.key.clone());
+            prepared.push(
+                blob.with_condition_symbols(vec![symbol.into(), symbol.into()])
+                    .with_undecided_chains(vec![UndecidedChainRow {
+                        chain: 0,
+                        directive_start: 0,
+                        directive_end: 1,
+                        omitted_nonblank: digest == 1,
+                        invalid_condition: false,
+                        unknown_symbols: vec![symbol.into()],
+                        open_reasons: Vec::new(),
+                        disagreeing_owners: Vec::new(),
+                    }]),
+            );
+        }
+        let (outcomes, _) = store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
+        assert_eq!(outcomes.len(), 2);
+        for outcome in outcomes {
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        }
+        let conn = store.read_conn().unwrap();
+        let chain_rows: i64 = conn.query_row(
+            "SELECT count(*) FROM csharp_undecided_chains AS chains JOIN blobs ON blobs.id = chains.blob_id WHERE blobs.blob_oid = ?1 AND blobs.lang = 'csharp'",
+            [oid.to_string()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(chain_rows, 2);
+        drop(conn);
+        assert_eq!(
+            store.csharp_referenced_symbols(&keys[0]).unwrap(),
+            ["DEBUG"]
+        );
+        assert_eq!(
+            store.csharp_referenced_symbols(&keys[1]).unwrap(),
+            ["FEATURE"]
+        );
+        assert!(
+            store
+                .csharp_referenced_symbols(&BlobKey::unvaried(oid, "csharp"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(test)]
@@ -21818,6 +22149,7 @@ pub mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let workspace = WorkspaceId("e".repeat(64));
         let file = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/a.py".into(),
             blob_oid: oid_for(b"a"),
         };
@@ -21903,10 +22235,12 @@ pub mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let workspace_id = WorkspaceId("c".repeat(64));
         let a = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/a.py".into(),
             blob_oid: oid_for(b"a"),
         };
         let b = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/b.py".into(),
             blob_oid: oid_for(b"b"),
         };
@@ -22034,6 +22368,7 @@ pub mod tests {
             WorkspaceConfigurationInput::new(path.into(), bytes.as_bytes().into())
         };
         let source = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/Main.java".into(),
             blob_oid: oid_for(b"class Main {}"),
         };
@@ -22967,6 +23302,7 @@ pub mod tests {
             requires_imports: false,
         };
         let file = WorkspaceFileRow {
+            decision: None,
             rel_path: symbol.rel_path.clone(),
             blob_oid: symbol.blob_oid,
         };
@@ -23026,6 +23362,7 @@ pub mod tests {
                 "python",
                 GenerationId::BOOTSTRAP,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: row.rel_path.clone(),
                     blob_oid: row.blob_oid,
                 }],
@@ -23054,6 +23391,7 @@ pub mod tests {
                 "python",
                 GenerationId::BOOTSTRAP,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: row.rel_path.clone(),
                     blob_oid: row.blob_oid,
                 }],
@@ -23089,10 +23427,12 @@ pub mod tests {
             WorkspaceId("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
         let generation = GenerationId::BOOTSTRAP;
         let old_a = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/A.java".into(),
             blob_oid: oid_for(b"old A"),
         };
         let old_b = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/B.java".into(),
             blob_oid: oid_for(b"old B"),
         };
@@ -23140,10 +23480,12 @@ pub mod tests {
             .unwrap();
 
         let new_a = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/A.java".into(),
             blob_oid: oid_for(b"new A"),
         };
         let new_c = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/C.java".into(),
             blob_oid: oid_for(b"new C"),
         };
@@ -23272,6 +23614,7 @@ pub mod tests {
         let generation = GenerationId::BOOTSTRAP;
         let files = (0..10_000)
             .map(|index| WorkspaceFileRow {
+                decision: None,
                 rel_path: format!("src/File{index}.java"),
                 blob_oid: oid_for(format!("old {index}").as_bytes()),
             })
@@ -23318,7 +23661,7 @@ pub mod tests {
                     &langs,
                     &generations,
                     &rel_path,
-                    Some(("java", oid_for(format!("new {index}").as_bytes()))),
+                    Some(("java", oid_for(format!("new {index}").as_bytes()), None)),
                     None,
                     &[],
                     &[],
@@ -23372,6 +23715,7 @@ pub mod tests {
                 "java",
                 generation,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: "Old.java".into(),
                     blob_oid: old_oid,
                 }],
@@ -23595,6 +23939,29 @@ pub mod tests {
                 .collect::<Vec<_>>(),
             vec![unreachable]
         );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn gc_removes_undecided_chains_before_blob_id_reuse() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"unseen-chain-gc").unwrap();
+        let key = BlobKey::unvaried(oid, "csharp");
+        store
+            .register_blobs(std::slice::from_ref(&key), GenerationId::BOOTSTRAP)
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute("INSERT INTO csharp_undecided_chains(blob_id,chain,directive_start,directive_end,omitted_nonblank,invalid_condition,unknown_symbols,open_reasons,disagreeing_owners) VALUES((SELECT id FROM blobs WHERE blob_oid=?1 AND lang='csharp'),0,0,1,1,0,jsonb('[]'),jsonb('[]'),jsonb('[]'))", [oid.to_string()]).unwrap();
+        drop(conn);
+        let bloom = GrowableBloom::new(0.01, 8);
+        assert_eq!(store.gc_with_bloom(&bloom).unwrap(), 1);
+        let conn = store.read_conn().unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM csharp_undecided_chains", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[cfg(test)]
@@ -25154,6 +25521,12 @@ mod roundtrip_unit_properties {
 
     struct Adapter;
     impl StoreLanguageAdapter for Adapter {
+        // Test adapter.
+        fn parse_time_semantic_lowerer(
+            &self,
+        ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+            None
+        }
         fn language(&self) -> Language {
             Language::Java
         }
@@ -25237,7 +25610,7 @@ mod roundtrip_unit_properties {
                    fq_package_tail_segments, exact_fqn_tail, normalized_fqn_tail,
                    exact_parent_fqn_tail, normalized_parent_fqn_tail, package_fqn_tail,
                    fq_segment_count, fq_segment_bytes
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?9, ?10,
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?25, ?19, ?20, ?21, ?22, ?23, ?24, ?9, ?10,
                           ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 params![
                     blob_id,
@@ -25264,6 +25637,7 @@ mod roundtrip_unit_properties {
                     stored.in_declarations,
                     stored.in_definition_lookup,
                     stored.in_test_region,
+                    unit.signature(),
                 ],
             )
             .unwrap();
@@ -25904,6 +26278,12 @@ mod roundtrip_unit_properties {
 
     struct AnchoredAdapter;
     impl StoreLanguageAdapter for AnchoredAdapter {
+        // Test adapter.
+        fn parse_time_semantic_lowerer(
+            &self,
+        ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+            None
+        }
         fn language(&self) -> Language {
             Language::Java
         }
@@ -25992,6 +26372,12 @@ mod roundtrip_unit_properties {
         // event is independent of the reader's number of checkpoints.
         struct CancelOnAnchor(Arc<std::sync::atomic::AtomicBool>);
         impl StoreLanguageAdapter for CancelOnAnchor {
+            // Test adapter.
+            fn parse_time_semantic_lowerer(
+                &self,
+            ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+                None
+            }
             fn language(&self) -> Language {
                 Language::Java
             }
@@ -26048,6 +26434,12 @@ mod generation_liveness_properties {
 
     struct Adapter;
     impl StoreLanguageAdapter for Adapter {
+        // Test adapter.
+        fn parse_time_semantic_lowerer(
+            &self,
+        ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+            None
+        }
         fn language(&self) -> Language {
             Language::Java
         }
@@ -26483,6 +26875,7 @@ mod generation_liveness_properties {
                     "java",
                     GenerationId::BOOTSTRAP,
                     &[WorkspaceFileRow {
+                        decision: None,
                         rel_path: name.into(),
                         blob_oid: a,
                     }],

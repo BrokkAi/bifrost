@@ -31,8 +31,9 @@ path = "junit.xml"
 # Its scoped rayon pool uses every CPU handed to this reservation.
 # #8000's on-demand import test activates the JDK once per point, about a
 # minute each on one thread, and spreads its points over the same CPUs.
+# #8222's Scala implicit-root test does the same for its six workspaces.
 [[profile.default.overrides]]
-filter = 'test(java_indexed_jdk_closes_unacquired_default_provider_boundary) | test(java_indexed_jdk_on_demand_import_candidates)'
+filter = 'test(java_indexed_jdk_closes_unacquired_default_provider_boundary) | test(java_indexed_jdk_on_demand_import_candidates) | test(java_indexed_jdk_scala_implicit_root_navigation)'
 threads-required = "num-cpus"
 
 # #6018 owns the genuine single-connection reverse deadlocks. If explicitly
@@ -144,13 +145,22 @@ filter = 'test(issue_3006_release_zero_config)'
 threads-required = "num-cpus"
 
 # semantic_ir_rows_round_trip_every_workspace_crate_source runs only under
-# `--cfg scheduled_tests`: it lowers, stores and decodes every Rust file under
-# crates/ (about 1,500, some over 200 KB) on every available CPU, largest file
-# first. The Rust lowerer alone takes 270 s to 530 s on each of the three
-# largest files in a debug build on a loaded host (2026-10-08), so the test
-# cannot meet the 600 s threshold; it gets 30 minutes instead.
+# `--cfg scheduled_tests`: it runs the parse-time producer (lowering and
+# partial flows) over every Rust file under crates/ (about 2,250, some over
+# 500 KB) on every available CPU, largest file first, then stores and decodes
+# the rows and flows. The Rust lowerer alone takes 270 s to 530 s on each of
+# the three largest files in a debug build on a loaded host (2026-10-08), so
+# the test cannot meet the 600 s threshold. Partial flows (#8617) cost 1.39x
+# the CPU seconds of lowering and rows alone (13,735 s against 9,858 s on one
+# 32-CPU host, 2026-11-01, #8739). Release gate legs took up to 1,164 s on
+# macOS before that, so about 1,650 s now; 40 minutes keeps the margin.
 [[profile.default.overrides]]
 filter = 'test(semantic_ir_rows_round_trip_every_workspace_crate_source)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 40 }
+
+[[profile.default.overrides]]
+filter = 'test(native_java_kotlin_csharp_all_fixture_rows_and_partial_flows_round_trip)'
 threads-required = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 30 }
 
@@ -182,3 +192,12 @@ threads-required = "num-cpus"
 [[profile.default.overrides]]
 filter = 'test(shared_closer_differential_go_discovery_corpus)'
 threads-required = "num-cpus"
+
+# Both manual tests use BIFROST_J0_KOTLIN_CORPUS. Work replay edits
+# FileSpec.kt in place, so readers must share its exclusive corpus slot.
+[test-groups.kotlinpoet-corpus]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(shared_jvm_kotlinpoet_source_golden) | test(shared_closer_private_kotlinpoet_work)'
+test-group = "kotlinpoet-corpus"

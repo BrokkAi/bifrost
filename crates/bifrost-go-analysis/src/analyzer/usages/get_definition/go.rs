@@ -7,6 +7,7 @@ use brokk_bifrost_analysis::analyzer::usages::get_definition::*;
 use brokk_bifrost_analysis::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use brokk_bifrost_analysis::analyzer::usages::reference_site::ResolvedReferenceSite;
 use brokk_bifrost_analysis::analyzer::usages::reference_site::smallest_named_node_covering;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerQueryScope, CodeUnit, DeclarationKind, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, ProjectFile, resolve_analyzer,
@@ -26,8 +27,6 @@ use crate::analyzer::go::type_identity_proof::go_result_type_node;
 use brokk_bifrost_go::references::GoSelectorDescriptor;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
-
-use crate::analyzer::go::package_identity::GoModeledNominalType;
 
 use crate::analyzer::go::package_identity::GoModeledPackageCallResolution;
 
@@ -125,6 +124,11 @@ pub(crate) trait GoDefinitionProvider {
         None
     }
 
+    fn result_shape_execution_stopped(&self) -> bool {
+        self.session()
+            .is_some_and(|session| !session.observe_cancellation())
+    }
+
     fn external_import_name(&self, _import_path: &str) -> Option<String> {
         None
     }
@@ -140,27 +144,15 @@ pub(crate) trait GoDefinitionProvider {
         None
     }
 
-    fn external_package_call_result_count(
+    fn selected_modeled_call_result_count(
         &self,
-        _import_path: &str,
-        _member: &str,
-        _parameter_count: usize,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+        _source: &str,
+        _callee: Node<'_>,
+        _argument_count: usize,
     ) -> Option<usize> {
         None
-    }
-
-    fn external_callable_result_count(
-        &self,
-        owner: &str,
-        member: &str,
-        has_receiver: bool,
-        parameter_count: usize,
-    ) -> Option<usize> {
-        if has_receiver {
-            None
-        } else {
-            self.external_package_call_result_count(owner, member, parameter_count)
-        }
     }
 
     fn external_package_member_is_published(&self, _import_path: &str, _member: &str) -> bool {
@@ -174,61 +166,14 @@ pub(crate) trait GoDefinitionProvider {
     fn external_visible_package_member(&self, _import_path: &str, _member: &str) -> Option<String> {
         None
     }
+}
 
-    /// The canonical modeled member selected by one structured concrete
-    /// receiver. Providers without an activated declaration overlay abstain.
-    fn external_concrete_receiver_member(
-        &self,
-        _owner_fqn: &str,
-        _member: &str,
-        _pointer_receivers: bool,
-        _parameter_count: usize,
-    ) -> Option<String> {
-        None
-    }
-
-    /// Carry the receiver rule from the same declaration that selected the
-    /// canonical target. Older navigation-only providers retain no such proof.
-    fn external_concrete_receiver_method(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        pointer_receivers: bool,
-        parameter_count: usize,
-    ) -> Option<(String, Option<bool>)> {
-        self.external_concrete_receiver_member(
-            owner_fqn,
-            member,
-            pointer_receivers,
-            parameter_count,
-        )
-        .map(|target| (target, None))
-    }
-
-    /// The exact declaration of one method published by a modeled external
-    /// interface. This identifies the interface contract; callers must still
-    /// prove the receiver's origin before applying concurrency effects.
-    fn external_interface_receiver_member(
-        &self,
-        _owner_fqn: &str,
-        _member: &str,
-        _parameter_count: usize,
-    ) -> Option<String> {
-        None
-    }
-
-    /// One exact nominal result from one exact external declaration-fact
-    /// callable. Providers without an activated declaration overlay abstain.
-    fn external_callable_result_nominal_type(
-        &self,
-        _owner_fqn: &str,
-        _member: &str,
-        _has_receiver: bool,
-        _parameter_count: usize,
-        _result_ordinal: usize,
-    ) -> Option<GoModeledNominalType> {
-        None
-    }
+#[derive(Hash, PartialEq, Eq)]
+struct GoNestedCallKey {
+    file: ProjectFile,
+    callee_start: usize,
+    callee_end: usize,
+    argument_count: usize,
 }
 
 pub(crate) struct AnalyzerGoDefinitionProvider<'a> {
@@ -239,6 +184,9 @@ pub(crate) struct AnalyzerGoDefinitionProvider<'a> {
             brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
         >,
     >,
+    native_budget: ReceiverAnalysisBudget,
+    nested_session: std::cell::RefCell<Option<ResolutionSession>>,
+    nested_counts: CaptureScopedMemo<std::cell::RefCell<HashMap<GoNestedCallKey, Option<usize>>>>,
 }
 
 impl<'a> AnalyzerGoDefinitionProvider<'a> {
@@ -254,6 +202,9 @@ impl<'a> AnalyzerGoDefinitionProvider<'a> {
             analyzer,
             session: None,
             semantic_model_overlay,
+            native_budget: ReceiverAnalysisBudget::default(),
+            nested_session: std::cell::RefCell::new(None),
+            nested_counts: CaptureScopedMemo::default(),
         }
     }
 
@@ -270,6 +221,128 @@ impl<'a> AnalyzerGoDefinitionProvider<'a> {
             analyzer,
             session: Some(session),
             semantic_model_overlay,
+            native_budget: ReceiverAnalysisBudget::default(),
+            nested_session: std::cell::RefCell::new(None),
+            nested_counts: CaptureScopedMemo::default(),
+        }
+    }
+}
+
+fn go_request_cancellation(
+    support: &dyn GoDefinitionProvider,
+    go: &GoAnalyzer,
+) -> CancellationToken {
+    support
+        .session()
+        .and_then(ResolutionSession::cancellation)
+        .cloned()
+        .or_else(|| go.active_query_cancellation())
+        .unwrap_or_default()
+}
+
+impl AnalyzerGoDefinitionProvider<'_> {
+    fn selected_model_result_count_from_resolution(
+        &self,
+        file: &ProjectFile,
+        value: &crate::analyzer::go::native_points::GoNativeDefinitionResolution,
+        cancellation: &CancellationToken,
+        argument_count: usize,
+    ) -> Option<usize> {
+        use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+            ModelProvider, ModelProviderSelection, ModelSymbolRef, SemanticModelCallApplication,
+            SemanticModelCallableDisposition as Disposition,
+            SemanticModelCallableIncompleteReason as Incomplete, SemanticModelCallableKey,
+        };
+        let overlay = self.semantic_model_overlay.as_deref()?;
+        let selected = if let Some(selection) = value.model_member_selection.as_deref() {
+            let mut candidates = selection
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.selected && !candidate.rejected);
+            let candidate = candidates.next()?;
+            if candidates.next().is_some() {
+                return None;
+            }
+            (candidate.member.clone(), candidate.declaration.clone())
+        } else {
+            let proof = value.exact_external_call.as_ref();
+            let identity = value.external_callee_identity.as_ref()?;
+            let application_kind =
+                proof.map_or(value.call_application, |proof| proof.call_application());
+            let has_receiver = match application_kind {
+                CallApplicationKind::BoundReceiver => true,
+                CallApplicationKind::PackageFunction => false,
+                _ => return None,
+            };
+            let key = SemanticModelCallableKey::new(
+                "go",
+                identity.owner_fqn(),
+                identity.member(),
+                has_receiver,
+                u32::try_from(argument_count).ok()?,
+            );
+            let matched =
+                brokk_bifrost_analysis::analyzer::semantic_model::selected_model_callable(
+                    self.analyzer,
+                    overlay,
+                    key,
+                    proof.and_then(|proof| proof.external_member_identity()),
+                    &SemanticModelCallApplication::positional(u32::try_from(argument_count).ok()?),
+                )?;
+            // Go has one declaration per function name; a partial pack still
+            // proves the arity of its single positive record.
+            if !matches!(
+                matched.disposition,
+                Disposition::Unique | Disposition::Incomplete(Incomplete::PartialModel)
+            ) {
+                return None;
+            }
+            let [symbol] = matched.records.as_slice() else {
+                return None;
+            };
+            (
+                ModelSymbolRef {
+                    symbol_id: symbol.id.clone(),
+                    provider: ModelProvider::from(&symbol.provenance),
+                },
+                (**symbol).clone(),
+            )
+        };
+        let (member, declaration) = selected;
+        let signature = declaration.structured_signature.as_ref()?;
+        if declaration.provenance.ambiguous
+            || !signature.type_parameters.is_empty()
+            || signature
+                .parameters
+                .iter()
+                .enumerate()
+                .any(|(index, parameter)| {
+                    parameter.optional
+                        || (parameter.variadic && index + 1 != signature.parameters.len())
+                })
+        {
+            return None;
+        }
+        if let Some((results, _)) =
+            crate::analyzer::go::type_identity_proof::go_selected_callable_result_type_identities(
+                self.analyzer,
+                file,
+                &member,
+                cancellation,
+            )
+        {
+            return Some(results.len());
+        }
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        match overlay.model_callable_results(
+            &member,
+            &ModelProviderSelection::new([member.provider.clone()]),
+            cancellation,
+        ) {
+            Ok(results) => results.map(|results| results.len()),
+            Err(_) => None,
         }
     }
 }
@@ -396,6 +469,16 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         self.session
     }
 
+    fn result_shape_execution_stopped(&self) -> bool {
+        self.session
+            .is_some_and(|session| !session.observe_cancellation())
+            || self
+                .nested_session
+                .borrow()
+                .as_ref()
+                .is_some_and(|session| !session.observe_cancellation())
+    }
+
     fn external_import_name(&self, import_path: &str) -> Option<String> {
         crate::analyzer::go::package_identity::GoOverlayPackages::new(
             self.semantic_model_overlay.as_deref(),
@@ -415,31 +498,119 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         .package_call_resolution(import_path, member, parameter_count)
     }
 
-    fn external_package_call_result_count(
+    fn selected_modeled_call_result_count(
         &self,
-        import_path: &str,
-        member: &str,
-        parameter_count: usize,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        source: &str,
+        callee: Node<'_>,
+        argument_count: usize,
     ) -> Option<usize> {
-        crate::analyzer::go::package_identity::GoOverlayPackages::new(
-            self.semantic_model_overlay.as_deref(),
-        )
-        .package_call_result_count(import_path, member, parameter_count)
-    }
-
-    fn external_callable_result_count(
-        &self,
-        owner: &str,
-        member: &str,
-        has_receiver: bool,
-        parameter_count: usize,
-    ) -> Option<usize> {
-        GoOverlayPackages::new(self.semantic_model_overlay.as_deref()).callable_result_count(
-            owner,
-            member,
-            has_receiver,
-            parameter_count,
-        )
+        // A modeled count needs an overlay; without one, native work cannot supply it.
+        self.semantic_model_overlay.as_ref()?;
+        let cancellation = go_request_cancellation(self, self.analyzer);
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let key = GoNestedCallKey {
+            file: file.clone(),
+            callee_start: callee.start_byte(),
+            callee_end: callee.end_byte(),
+            argument_count,
+        };
+        if let Some(count) = self
+            .nested_counts
+            .read(&memo_attribution(self.analyzer), |memo| {
+                memo.borrow().get(&key).copied()
+            })
+        {
+            return count;
+        }
+        let outer_session = self
+            .session
+            .filter(|session| session.remaining_budget().is_some());
+        let using_nested_session = outer_session.is_none();
+        if using_nested_session && self.nested_session.borrow().is_none() {
+            *self.nested_session.borrow_mut() = Some(ResolutionSession::bounded(
+                self.native_budget,
+                Some(&cancellation),
+            ));
+        }
+        let local_session = self.nested_session.borrow();
+        let session = outer_session.or_else(|| local_session.as_ref())?;
+        if !session.observe_cancellation() {
+            return None;
+        }
+        let focused = callee.child_by_field_name("field").unwrap_or(callee);
+        let site = ResolvedReferenceSite {
+            path: brokk_bifrost_core::path_utils::rel_path_string(file),
+            text: go_node_text(focused, source).into(),
+            range: Range {
+                start_byte: focused.start_byte(),
+                end_byte: focused.end_byte(),
+                start_line: focused.start_position().row + 1,
+                end_line: focused.end_position().row + 1,
+            },
+            focus_start_byte: focused.start_byte(),
+            focus_end_byte: focused.end_byte(),
+        };
+        let prepared = self.analyzer.prepared_result_shape_syntax(token, file);
+        let tree = prepared
+            .as_ref()
+            .filter(|prepared| prepared.source() == source)
+            .map(|prepared| prepared.tree());
+        let answer =
+            crate::analyzer::go::native_points::resolve_go_definition_with_evidence_bounded(
+                brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+                    analyzer: self.analyzer,
+                    file,
+                    source,
+                    tree,
+                    site: &site,
+                    budget: session.remaining_budget().unwrap_or(self.native_budget),
+                    cancellation: Some(&cancellation),
+                },
+                || {},
+            );
+        let charged = session.charge_work(answer.work());
+        let value = match answer {
+            BoundedResolution::Complete { value, .. } => value,
+            BoundedResolution::Cancelled { .. } => return None,
+            BoundedResolution::Exceeded { limit, .. } => {
+                session.mark_exceeded(limit);
+                if using_nested_session {
+                    self.analyzer.record_query_incomplete(
+                        QueryReadIncomplete::SemanticEvidenceUnavailable(
+                            "Go call result-shape work limit exceeded".into(),
+                        ),
+                    );
+                }
+                return None;
+            }
+        };
+        if !charged {
+            if using_nested_session {
+                self.analyzer.record_query_incomplete(
+                    QueryReadIncomplete::SemanticEvidenceUnavailable(
+                        "Go call result-shape work limit exceeded".into(),
+                    ),
+                );
+            }
+            return None;
+        }
+        let result = self.selected_model_result_count_from_resolution(
+            file,
+            &value,
+            &cancellation,
+            argument_count,
+        );
+        if !cancellation.is_cancelled() {
+            self.nested_counts
+                .read(&memo_attribution(self.analyzer), |memo| {
+                    memo.borrow_mut().insert(key, result);
+                });
+        }
+        result
     }
 
     fn external_package_member_is_published(&self, import_path: &str, member: &str) -> bool {
@@ -455,72 +626,6 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         )
         .visible_member(import_path, member)
         .map(|symbol| symbol.qualified_name.clone())
-    }
-
-    fn external_concrete_receiver_member(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        pointer_receivers: bool,
-        parameter_count: usize,
-    ) -> Option<String> {
-        self.external_concrete_receiver_method(
-            owner_fqn,
-            member,
-            pointer_receivers,
-            parameter_count,
-        )
-        .map(|(target, _)| target)
-    }
-
-    fn external_concrete_receiver_method(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        pointer_receivers: bool,
-        parameter_count: usize,
-    ) -> Option<(String, Option<bool>)> {
-        let method = crate::analyzer::go::package_identity::GoOverlayPackages::new(
-            self.semantic_model_overlay.as_deref(),
-        )
-        .concrete_receiver_method(owner_fqn, member, pointer_receivers, parameter_count)?;
-        Some((
-            method.qualified_name.clone(),
-            Some(method.receiver?.pointer),
-        ))
-    }
-
-    fn external_interface_receiver_member(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        parameter_count: usize,
-    ) -> Option<String> {
-        crate::analyzer::go::package_identity::GoOverlayPackages::new(
-            self.semantic_model_overlay.as_deref(),
-        )
-        .interface_receiver_method(owner_fqn, member, parameter_count)
-        .map(|method| method.qualified_name.clone())
-    }
-
-    fn external_callable_result_nominal_type(
-        &self,
-        owner_fqn: &str,
-        member: &str,
-        has_receiver: bool,
-        parameter_count: usize,
-        result_ordinal: usize,
-    ) -> Option<GoModeledNominalType> {
-        crate::analyzer::go::package_identity::GoOverlayPackages::new(
-            self.semantic_model_overlay.as_deref(),
-        )
-        .callable_result_nominal_type(
-            owner_fqn,
-            member,
-            has_receiver,
-            parameter_count,
-            result_ordinal,
-        )
     }
 }
 
@@ -558,6 +663,19 @@ pub fn parse_go_tree(source: &str) -> Option<Tree> {
     GO_TREES.parse(source, brokk_bifrost_go::parse::parse_go)
 }
 
+/// A parser abort is operational; a recovered tree remains ordinary syntax.
+pub(crate) fn parse_go_tree_for_proof(analyzer: &dyn IAnalyzer, source: &str) -> Option<Tree> {
+    let tree = parse_go_tree(source);
+    if tree.is_none() {
+        analyzer.record_query_incomplete(
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                "Go proof parser did not produce a tree".into(),
+            ),
+        );
+    }
+    tree
+}
+
 /// Recover the result type of a known function-valued call expression from
 /// the same structured local-value inference used by Go navigation.
 ///
@@ -576,7 +694,7 @@ pub(crate) fn go_function_value_result_type_identity(
         return None;
     }
     let source = analyzer.indexed_source(file)?;
-    let tree = parse_go_tree(&source)?;
+    let tree = parse_go_tree_for_proof(analyzer, &source)?;
     let root = tree.root_node();
     let mut node = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
     while node.kind() != "call_expression" {
@@ -608,7 +726,7 @@ pub(crate) fn go_function_value_result_type_identity(
                 return None;
             };
             let type_source = analyzer.indexed_source(unit.source())?;
-            let type_tree = parse_go_tree(&type_source)?;
+            let type_tree = parse_go_tree_for_proof(analyzer, &type_source)?;
             let type_root = type_tree.root_node();
             let function_type = go_named_function_type_node(
                 type_root,
@@ -2161,20 +2279,6 @@ fn go_external_model_member_outcome(target: &str) -> DefinitionLookupOutcome {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GoModeledReceiverMember {
-    owner_fqn: String,
-    target: String,
-    pointer_receiver: Option<bool>,
-    receiver_is_interface: bool,
-}
-
-enum GoModeledReceiverLookup {
-    Missing,
-    Unique(GoModeledReceiverMember),
-    Ambiguous,
-}
-
 /// One request-local promotion route; pointer admission remains caller-typed.
 struct PromotionPath<M> {
     owner: String,
@@ -2225,96 +2329,6 @@ impl<M> PromotionPath<M> {
         paths.push(self);
         index
     }
-}
-
-fn go_modeled_receiver_lookup_with_promotion(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    owner_fqn: &str,
-    member: &str,
-    pointer_receivers: bool,
-    parameter_count: usize,
-) -> GoModeledReceiverLookup {
-    let mut paths = vec![PromotionPath::root(owner_fqn, pointer_receivers)];
-    let mut frontier = vec![0];
-    while !frontier.is_empty() {
-        let mut candidates = Vec::new();
-        for &path_index in &frontier {
-            let path = &paths[path_index];
-            // The selector-chain caller already charged the concrete receiver
-            // lookup. Only promoted receiver hops add more scope work here.
-            if path.parent.is_some() && !support.scope_step() {
-                return GoModeledReceiverLookup::Missing;
-            }
-            if let Some((target, pointer_receiver)) = support.external_concrete_receiver_method(
-                &path.owner,
-                member,
-                path.pointer_receivers,
-                parameter_count,
-            ) {
-                candidates.push(GoModeledReceiverMember {
-                    owner_fqn: path.owner.clone(),
-                    target,
-                    pointer_receiver,
-                    receiver_is_interface: false,
-                });
-            }
-            if let Some(target) =
-                support.external_interface_receiver_member(&path.owner, member, parameter_count)
-            {
-                candidates.push(GoModeledReceiverMember {
-                    owner_fqn: path.owner.clone(),
-                    target,
-                    pointer_receiver: None,
-                    receiver_is_interface: true,
-                });
-            }
-        }
-        match candidates.len() {
-            0 => {}
-            1 => {
-                return GoModeledReceiverLookup::Unique(
-                    candidates
-                        .pop()
-                        .expect("single modeled Go member candidate was checked"),
-                );
-            }
-            _ => return GoModeledReceiverLookup::Ambiguous,
-        }
-
-        let mut next = Vec::new();
-        for path_index in frontier {
-            if !support.summary_step() {
-                return GoModeledReceiverLookup::Missing;
-            }
-            let path = &paths[path_index];
-            let embedded = go_embedded_method_set_types(
-                analyzer,
-                token,
-                support,
-                &path.owner,
-                path.pointer_receivers,
-            );
-            for (embedded_owner, embedded_pointer_receivers) in embedded {
-                let path = match PromotionPath::prepare_child(
-                    &paths,
-                    path_index,
-                    embedded_owner,
-                    embedded_pointer_receivers,
-                    support,
-                ) {
-                    ControlFlow::Break(()) => return GoModeledReceiverLookup::Missing,
-                    ControlFlow::Continue(None) => continue,
-                    ControlFlow::Continue(Some(path)) => path,
-                };
-                let embedded_index = path.append_to(&mut paths);
-                next.push(embedded_index);
-            }
-        }
-        frontier = next;
-    }
-    GoModeledReceiverLookup::Missing
 }
 
 fn go_dot_import_paths(
@@ -4242,13 +4256,29 @@ fn go_call_result_count<'tree>(
             for dependency in dependencies {
                 if !active.insert(dependency.id()) {
                     // A receiver initializer may refer back to its own call.
-                    return None;
+                    return go_nested_arity_miss(support, go);
                 }
                 pending.push(dependency);
             }
         }
     }
-    counts.remove(&call.id()).flatten()
+    let result = counts.remove(&call.id()).flatten();
+    if go_request_cancellation(support, go).is_cancelled() {
+        return None;
+    }
+    result.or_else(|| go_nested_arity_miss(support, go))
+}
+
+fn go_nested_arity_miss(support: &dyn GoDefinitionProvider, go: &GoAnalyzer) -> Option<usize> {
+    // Session and cancellation stops already report through their request.
+    if !support.result_shape_execution_stopped()
+        && !go_request_cancellation(support, go).is_cancelled()
+    {
+        go.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+            "Go nested-call result arity unavailable from selected callable".into(),
+        ));
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4299,7 +4329,8 @@ fn go_resolved_call_result_count<'tree>(
                     {
                         return None;
                     }
-                    return support.external_package_call_result_count(&import_path, member, count);
+                    return support
+                        .selected_modeled_call_result_count(token, file, source, function, count);
                 }
                 candidates
             } else {
@@ -4315,7 +4346,11 @@ fn go_resolved_call_result_count<'tree>(
                     0,
                     GoLexicalEvaluation::ordinary(),
                     argument_count,
-                )?;
+                );
+                let Some(inferred) = inferred else {
+                    return support
+                        .selected_modeled_call_result_count(token, file, source, function, count);
+                };
                 let (owner, _) = go_selector_owner_fqn(support, token, go, &inferred)?;
                 match go_indexed_field_lookup_with_method_set(
                     go,
@@ -4328,24 +4363,8 @@ fn go_resolved_call_result_count<'tree>(
                     GoDefinitionMemberLookup::Unique(candidate) => vec![candidate],
                     GoDefinitionMemberLookup::Ambiguous(_) => return None,
                     GoDefinitionMemberLookup::Missing => {
-                        let GoModeledReceiverLookup::Unique(modeled) =
-                            go_modeled_receiver_lookup_with_promotion(
-                                go,
-                                token,
-                                support,
-                                &owner,
-                                member,
-                                inferred.admits_pointer_receivers(),
-                                count,
-                            )
-                        else {
-                            return None;
-                        };
-                        return support.external_callable_result_count(
-                            &modeled.owner_fqn,
-                            member,
-                            true,
-                            count,
+                        return support.selected_modeled_call_result_count(
+                            token, file, source, function, count,
                         );
                     }
                 }
@@ -4565,45 +4584,23 @@ fn go_identifier_modeled_call_argument_count(
 }
 
 struct GoInferredType {
-    identity: GoInferredTypeIdentity,
+    identity: StructuredTypeIdentity,
     file: ProjectFile,
     package: String,
     addressable: bool,
 }
 
-enum GoInferredTypeIdentity {
-    Indexed(StructuredTypeIdentity),
-    Modeled(GoModeledNominalType),
-}
-
 impl GoInferredType {
     fn indexed_identity(&self) -> Option<&StructuredTypeIdentity> {
-        match &self.identity {
-            GoInferredTypeIdentity::Indexed(identity) => Some(identity),
-            GoInferredTypeIdentity::Modeled(_) => None,
-        }
-    }
-
-    fn modeled_nominal(&self) -> Option<&GoModeledNominalType> {
-        match &self.identity {
-            GoInferredTypeIdentity::Indexed(_) => None,
-            GoInferredTypeIdentity::Modeled(nominal) => Some(nominal),
-        }
+        Some(&self.identity)
     }
 
     fn is_pointer(&self) -> bool {
-        match &self.identity {
-            GoInferredTypeIdentity::Indexed(identity) => identity.is_pointer(),
-            GoInferredTypeIdentity::Modeled(nominal) => nominal.pointer,
-        }
+        self.identity.is_pointer()
     }
 
     fn admits_pointer_receivers(&self) -> bool {
-        self.addressable
-            || match &self.identity {
-                GoInferredTypeIdentity::Indexed(identity) => identity.is_pointer(),
-                GoInferredTypeIdentity::Modeled(nominal) => nominal.pointer,
-            }
+        self.addressable || self.identity.is_pointer()
     }
 }
 
@@ -4617,7 +4614,6 @@ enum GoTypeInferenceFrame<'tree> {
     Field(String),
     Method {
         name: String,
-        parameter_count: usize,
         result_ordinal: usize,
     },
     Element,
@@ -4846,7 +4842,8 @@ fn go_expression_inferred_type_with_argument_counts<'tree>(
                                 let qualifier = go_first_named_child(support, function)?;
                                 let method = go_last_named_child(support, function)?;
                                 let method_name = go_node_text(method, source);
-                                let parameter_count = argument_count(function)?;
+                                // A spread or pending nested-call dependency keeps argument shape unknown and inference open.
+                                argument_count(function)?;
                                 let qualifier_name = go_node_text(qualifier, source);
                                 let qualifier_is_unshadowed = if qualifier.kind() == "identifier" {
                                     let binding = go_nearest_visible_binding_with_evaluation(
@@ -4877,21 +4874,7 @@ fn go_expression_inferred_type_with_argument_counts<'tree>(
                                             method_name,
                                         );
                                         if candidates.is_empty() {
-                                            (go_workspace_package_status(support, &import_path)
-                                                == GoWorkspacePackageStatus::Absent)
-                                                .then(|| {
-                                                    go_modeled_callable_result_inferred_type(
-                                                        support,
-                                                        file,
-                                                        &package,
-                                                        &import_path,
-                                                        method_name,
-                                                        false,
-                                                        parameter_count,
-                                                        result_ordinal,
-                                                    )
-                                                })
-                                                .flatten()
+                                            None
                                         } else {
                                             go_callable_return_inferred_type(
                                                 analyzer,
@@ -4906,7 +4889,6 @@ fn go_expression_inferred_type_with_argument_counts<'tree>(
                                 } else {
                                     frames.push(GoTypeInferenceFrame::Method {
                                         name: method_name.to_string(),
-                                        parameter_count,
                                         result_ordinal,
                                     });
                                     frames.push(GoTypeInferenceFrame::Expression {
@@ -4975,7 +4957,6 @@ fn go_expression_inferred_type_with_argument_counts<'tree>(
             }
             GoTypeInferenceFrame::Method {
                 name: method,
-                parameter_count,
                 result_ordinal,
             } => {
                 let owner = values.pop()?;
@@ -4996,31 +4977,7 @@ fn go_expression_inferred_type_with_argument_counts<'tree>(
                             result_ordinal,
                         )
                     }
-                    GoDefinitionMemberLookup::Missing => {
-                        let GoModeledReceiverLookup::Unique(modeled) =
-                            go_modeled_receiver_lookup_with_promotion(
-                                analyzer,
-                                token,
-                                support,
-                                &owner_fqn,
-                                &method,
-                                owner.admits_pointer_receivers(),
-                                parameter_count,
-                            )
-                        else {
-                            return None;
-                        };
-                        go_modeled_callable_result_inferred_type(
-                            support,
-                            &owner.file,
-                            &owner.package,
-                            &modeled.owner_fqn,
-                            &method,
-                            true,
-                            parameter_count,
-                            result_ordinal,
-                        )
-                    }
+                    GoDefinitionMemberLookup::Missing => None,
                     GoDefinitionMemberLookup::Ambiguous(_) => None,
                 }?;
                 values.push(inferred);
@@ -5030,12 +4987,9 @@ fn go_expression_inferred_type_with_argument_counts<'tree>(
                 let identity = iterable.indexed_identity()?;
                 let addressable =
                     identity.is_slice() || (identity.is_array() && iterable.addressable);
-                let GoInferredTypeIdentity::Indexed(identity) = iterable.identity else {
-                    unreachable!("indexed identity was checked above")
-                };
-                iterable.identity = GoInferredTypeIdentity::Indexed(
-                    identity.into_container_element_with(|| support.scope_step())?,
-                );
+                let identity = iterable.identity;
+                iterable.identity =
+                    identity.into_container_element_with(|| support.scope_step())?;
                 iterable.addressable = addressable;
                 values.push(iterable);
             }
@@ -5046,18 +5000,14 @@ fn go_expression_inferred_type_with_argument_counts<'tree>(
             }
             GoTypeInferenceFrame::AddressOf => {
                 let mut inferred = values.pop()?;
-                let GoInferredTypeIdentity::Indexed(identity) = inferred.identity else {
-                    return None;
-                };
-                inferred.identity = GoInferredTypeIdentity::Indexed(identity.wrap_pointer()?);
+                let identity = inferred.identity;
+                inferred.identity = identity.wrap_pointer()?;
                 inferred.addressable = false;
                 values.push(inferred);
             }
             GoTypeInferenceFrame::Dereference => {
                 let mut inferred = values.pop()?;
-                let GoInferredTypeIdentity::Indexed(identity) = &inferred.identity else {
-                    return None;
-                };
+                let identity = &inferred.identity;
                 if !identity.is_pointer() {
                     return None;
                 }
@@ -5088,10 +5038,8 @@ fn go_variadic_binding_inferred_type(
 ) -> Option<GoInferredType> {
     let element = parameter.child_by_field_name("type")?;
     let mut inferred = go_inferred_type_from_node(support, element, file, source, package)?;
-    let GoInferredTypeIdentity::Indexed(identity) = inferred.identity else {
-        unreachable!("syntax-derived types are indexed");
-    };
-    inferred.identity = GoInferredTypeIdentity::Indexed(identity.wrap_slice()?);
+    let identity = inferred.identity;
+    inferred.identity = identity.wrap_slice()?;
     Some(inferred)
 }
 
@@ -5103,13 +5051,11 @@ fn go_inferred_type_from_node(
     package: &str,
 ) -> Option<GoInferredType> {
     Some(GoInferredType {
-        identity: GoInferredTypeIdentity::Indexed(
-            brokk_bifrost_go::declarations::go_structured_type_identity_bounded(
-                node,
-                source,
-                || support.scope_step(),
-            )?,
-        ),
+        identity: brokk_bifrost_go::declarations::go_structured_type_identity_bounded(
+            node,
+            source,
+            || support.scope_step(),
+        )?,
         file: file.clone(),
         package: package.to_string(),
         addressable: false,
@@ -5153,10 +5099,8 @@ fn go_builtin_new_inferred_type(
     }
     let type_node = argument?;
     let mut inferred = go_inferred_type_from_node(support, type_node, file, source, package)?;
-    let GoInferredTypeIdentity::Indexed(identity) = inferred.identity else {
-        unreachable!("syntax-derived type identity is indexed")
-    };
-    inferred.identity = GoInferredTypeIdentity::Indexed(identity.wrap_pointer()?);
+    let identity = inferred.identity;
+    inferred.identity = identity.wrap_pointer()?;
     inferred.addressable = false;
     Some(inferred)
 }
@@ -5183,7 +5127,7 @@ fn go_callable_return_inferred_type(
                 continue;
             };
             let candidate_type = GoInferredType {
-                identity: GoInferredTypeIdentity::Indexed(identity),
+                identity,
                 file: candidate.source().clone(),
                 package: candidate.package_name().to_string(),
                 addressable: false,
@@ -5203,52 +5147,16 @@ fn go_callable_return_inferred_type(
     (inferred.len() == 1).then(|| inferred.pop()).flatten()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn go_modeled_callable_result_inferred_type(
-    support: &dyn GoDefinitionProvider,
-    file: &ProjectFile,
-    package: &str,
-    owner_fqn: &str,
-    member: &str,
-    has_receiver: bool,
-    parameter_count: usize,
-    result_ordinal: usize,
-) -> Option<GoInferredType> {
-    Some(GoInferredType {
-        identity: GoInferredTypeIdentity::Modeled(support.external_callable_result_nominal_type(
-            owner_fqn,
-            member,
-            has_receiver,
-            parameter_count,
-            result_ordinal,
-        )?),
-        file: file.clone(),
-        package: package.to_string(),
-        addressable: false,
-    })
-}
-
 fn go_inferred_types_equal(
     support: &dyn GoDefinitionProvider,
     left: &GoInferredType,
     right: &GoInferredType,
 ) -> Option<bool> {
-    match (&left.identity, &right.identity) {
-        (
-            GoInferredTypeIdentity::Indexed(left_identity),
-            GoInferredTypeIdentity::Indexed(right_identity),
-        ) => {
-            if left.file != right.file || left.package != right.package {
-                return Some(false);
-            }
-            left_identity.structurally_eq_with(right_identity, || support.scope_step())
-        }
-        (
-            GoInferredTypeIdentity::Modeled(left_nominal),
-            GoInferredTypeIdentity::Modeled(right_nominal),
-        ) => Some(left_nominal == right_nominal),
-        _ => Some(false),
+    if left.file != right.file || left.package != right.package {
+        return Some(false);
     }
+    left.identity
+        .structurally_eq_with(&right.identity, || support.scope_step())
 }
 
 fn go_field_inferred_type_for_receiver(
@@ -5264,7 +5172,7 @@ fn go_field_inferred_type_for_receiver(
     )?;
     let identity = go_field_unit_type_identity(analyzer, support, &candidate)?;
     Some(GoInferredType {
-        identity: GoInferredTypeIdentity::Indexed(identity),
+        identity,
         file: candidate.source().clone(),
         package: candidate.package_name().to_string(),
         addressable: !candidate.is_function() && owner.admits_pointer_receivers(),
@@ -5287,9 +5195,6 @@ fn go_selector_owner_fqn(
     go: &GoAnalyzer,
     owner: &GoInferredType,
 ) -> Option<(String, bool)> {
-    if let Some(modeled) = owner.modeled_nominal() {
-        return Some((modeled.qualified_name.clone(), true));
-    }
     if let Some(owner_fqn) = go_resolve_inferred_type_fqn(support, token, go, owner) {
         return Some((owner_fqn, false));
     }
@@ -5305,17 +5210,14 @@ fn go_resolve_inferred_type_fqn(
     go: &GoAnalyzer,
     inferred: &GoInferredType,
 ) -> Option<String> {
-    match &inferred.identity {
-        GoInferredTypeIdentity::Indexed(identity) => go_resolve_structured_type_fqn(
-            support,
-            token,
-            go,
-            &inferred.file,
-            &inferred.package,
-            identity,
-        ),
-        GoInferredTypeIdentity::Modeled(nominal) => Some(nominal.qualified_name.clone()),
-    }
+    go_resolve_structured_type_fqn(
+        support,
+        token,
+        go,
+        &inferred.file,
+        &inferred.package,
+        &inferred.identity,
+    )
 }
 
 /// The imported nominal owner a reviewed concrete-receiver fact may prove.
@@ -7698,6 +7600,7 @@ func NewWorker() Worker { return Worker{} }
             }
             for (owner, name, arity, count, method, result) in [
                 ("example.com/external", "MakePair", 0, 2, false, "testing.T"),
+                ("example.com/external", "Generic", 0, 1, false, "int"),
                 ("example.com/custom", "MakePair", 0, 1, false, "int"),
                 (
                     "old.example/app/internal/pkg",
@@ -7722,6 +7625,9 @@ func NewWorker() Worker { return Worker{} }
                 let symbol = format!("{owner}.{name}");
                 let parameters: Vec<_> = (0..arity).map(|i| serde_json::json!({"name":format!("arg{i}"),"type":{"kind":"named","name":"int"}})).collect();
                 let mut signature = serde_json::json!({"parameters":parameters});
+                if name == "Generic" {
+                    signature["type_parameters"] = serde_json::json!(["T"]);
+                }
                 if count > 0 {
                     let first = serde_json::json!({"kind":"named","name":result});
                     signature["returns"] = if count == 1 {
@@ -7777,6 +7683,128 @@ func NewWorker() Worker { return Worker{} }
                 "fixture.go.native-port",
                 &source,
                 &request,
+            );
+        }
+
+        #[test]
+        fn nested_generic_miss_records_one_gap_but_budget_miss_does_not() {
+            let source = "package main\nimport external \"example.com/external\"\nfunc use() { outer(external.Generic()) }\n";
+            let fixture = AnalyzerFixture::new_for_language(
+                Language::Go,
+                &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+            );
+            activate_native_authority(&fixture);
+            let file = ProjectFile::new(fixture.project_root(), "main.go");
+            let tree = parse_go_tree(source).expect("Go tree");
+            let start = source.find("external.Generic()").expect("inner call");
+            let inner = tree
+                .root_node()
+                .named_descendant_for_byte_range(start, start + "external.Generic()".len())
+                .expect("inner call node");
+            assert_eq!(inner.kind(), "call_expression");
+            let outer_start = source.find("outer(").expect("outer call");
+            let outer = tree
+                .root_node()
+                .named_descendant_for_byte_range(outer_start, outer_start + "outer".len())
+                .expect("outer callable");
+            assert_eq!(outer.kind(), "identifier");
+            let go = resolve_analyzer::<GoAnalyzer>(fixture.analyzer.analyzer())
+                .expect("fixture Go analyzer");
+
+            let provider = AnalyzerGoDefinitionProvider::new(
+                go,
+                fixture.analyzer.analyzer().semantic_model_overlay(),
+            );
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(go);
+            for _ in 0..2 {
+                assert_eq!(
+                    go_call_result_count(&provider, scope.token(), go, &file, source, inner),
+                    None,
+                );
+            }
+            assert_eq!(
+                provider
+                    .nested_counts
+                    .read(&memo_attribution(go), |memo| memo.borrow().len()),
+                1
+            );
+            assert_eq!(
+                go_selected_receiver_argument_shape(
+                    &provider,
+                    scope.token(),
+                    go,
+                    &file,
+                    source,
+                    outer,
+                ),
+                None,
+            );
+            assert_eq!(
+                scope.captured_read_incompleteness(),
+                vec![QueryReadIncomplete::SemanticEvidenceGap(
+                    "Go nested-call result arity unavailable from selected callable".into(),
+                )]
+            );
+            assert_eq!(
+                scope.read_completion(),
+                Err(QueryReadIncomplete::SemanticEvidenceGap(
+                    "Go nested-call result arity unavailable from selected callable".into(),
+                ))
+            );
+
+            let budget = ReceiverAnalysisBudget {
+                max_scope_nodes: 16,
+                ..ReceiverAnalysisBudget::default()
+            };
+            let session = ResolutionSession::bounded(budget, None);
+            let provider = AnalyzerGoDefinitionProvider::bounded(
+                go,
+                &session,
+                fixture.analyzer.analyzer().semantic_model_overlay(),
+            );
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(go);
+            assert_eq!(
+                go_call_result_count(&provider, scope.token(), go, &file, source, inner),
+                None,
+            );
+            assert!(matches!(
+                session.finish(()),
+                BoundedResolution::Exceeded { .. }
+            ));
+            assert!(
+                provider
+                    .nested_counts
+                    .read(&memo_attribution(go), |memo| memo.borrow().is_empty())
+            );
+            assert!(scope.captured_read_incompleteness().is_empty());
+            assert!(scope.read_completion().is_ok());
+
+            let mut provider = AnalyzerGoDefinitionProvider::new(
+                go,
+                fixture.analyzer.analyzer().semantic_model_overlay(),
+            );
+            provider.native_budget = ReceiverAnalysisBudget {
+                max_scope_nodes: 0,
+                ..ReceiverAnalysisBudget::default()
+            };
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(go);
+            assert_eq!(
+                go_call_result_count(&provider, scope.token(), go, &file, source, inner),
+                None,
+            );
+            let reason = QueryReadIncomplete::SemanticEvidenceUnavailable(
+                "Go call result-shape work limit exceeded".into(),
+            );
+            assert_eq!(scope.captured_read_incompleteness(), vec![reason.clone()]);
+            assert_eq!(
+                go_call_result_count(&provider, scope.token(), go, &file, source, inner),
+                None,
+            );
+            assert_eq!(scope.captured_read_incompleteness(), vec![reason]);
+            assert!(
+                provider
+                    .nested_counts
+                    .read(&memo_attribution(go), |memo| memo.borrow().is_empty())
             );
         }
         fn resolve_native_receiver(

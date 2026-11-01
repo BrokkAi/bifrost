@@ -1395,6 +1395,840 @@ mod go_extraction_tests_global {
         use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: tests :: native_query_plan_tests :: shared_support :: registry ;
 
         #[test]
+        fn go_hierarchy_lookup_blobs_and_selection_coverage() {
+            use brokk_bifrost_analysis::analyzer::resolution::fact_source::TypedFactPageVisitor;
+            use brokk_bifrost_analysis::analyzer::resolution::model::{SemanticId, SharedNameId};
+            use brokk_bifrost_analysis::analyzer::store::resolution::TypedFactRelation;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_context::GoHierarchySelectionCoverage;
+            use rusqlite::params;
+
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; type Target struct{}; type Wrap struct{ Target }",
+                "package provider; type Target struct{}; type I interface{ M() }",
+                "package provider; type Other struct{ Target }; type J interface{ M() }",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            assert_eq!(
+                operation
+                    .go_hierarchy_selection_coverage(context, "go")
+                    .unwrap(),
+                GoHierarchySelectionCoverage::Workspace
+            );
+            let source = operation.ready.typed_source();
+            for (relation, spelling, expected_paths) in [
+                (
+                    TypedFactRelation::EmbeddedTypeLookup,
+                    "Target",
+                    vec![GO_ROOT_CONSUMER_PATH, GO_ROOT_DECOY_PATH],
+                ),
+                (
+                    TypedFactRelation::InterfaceMethodLookup,
+                    "M",
+                    vec![GO_ROOT_PROVIDER_PATH, GO_ROOT_DECOY_PATH],
+                ),
+            ] {
+                let id: i64 = conn.query_row(
+                    "SELECT lookup.identity_id FROM resolution_typed_fact_lookups lookup JOIN resolution_identities name ON name.id=lookup.identity_id WHERE lookup.relation=?1 AND name.spelling=?2 LIMIT 1",
+                    params![relation.code(), spelling],
+                    |row| row.get(0),
+                ).unwrap();
+                let name = SemanticId::shared_name(SharedNameId::interned(id));
+                let mut found = Vec::new();
+                let mut callback = |page: &[brokk_bifrost_analysis::analyzer::store::resolution_typed::GoLookupCandidate]| {
+                    found.extend_from_slice(page);
+                    Ok(true)
+                };
+                let mut visitor = TypedFactPageVisitor::new(&mut callback);
+                let outcome = match relation {
+                    TypedFactRelation::EmbeddedTypeLookup => source
+                        .visit_go_embedded_type_candidate_pages(
+                            &[name],
+                            &cancellation,
+                            &mut visitor,
+                        ),
+                    TypedFactRelation::InterfaceMethodLookup => source
+                        .visit_go_interface_method_candidate_pages(
+                            &[name],
+                            &cancellation,
+                            &mut visitor,
+                        ),
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                assert!(outcome.is_exhausted());
+                let mut expected = expected_paths
+                    .into_iter()
+                    .map(|path| {
+                        conn.query_row(
+                            "SELECT blob_id FROM temp.selected_resolution_mounts WHERE storage_language='go' AND persisted_relative_path=?1",
+                            [path],
+                            |row| row.get::<_, i64>(0),
+                        ).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                expected.sort_unstable();
+                let mut actual = found.iter().map(|row| row.blob_id).collect::<Vec<_>>();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "{relation:?}");
+                let keys = source
+                    .go_lookup_read_keys(&[name], relation, &cancellation)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0].relation, relation);
+                assert_eq!(keys[0].name, name);
+                assert_eq!(keys[0].identity_id, Some(id));
+                assert_eq!(
+                    keys[0].selection_fingerprint,
+                    operation.ready.inventory.fingerprint()
+                );
+            }
+            let missing = SemanticId::shared_name(SharedNameId::per_request(999));
+            let missing_keys = source
+                .go_lookup_read_keys(
+                    &[missing],
+                    TypedFactRelation::EmbeddedTypeLookup,
+                    &cancellation,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(missing_keys.len(), 1);
+            assert_eq!(missing_keys[0].identity_id, None);
+            assert_eq!(
+                missing_keys[0].selection_fingerprint,
+                operation.ready.inventory.fingerprint()
+            );
+            // Both relations use this same indexed membership statement; only
+            // the relation literal differs.
+            let pin =
+                brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::pinned(
+                    "selected_typed_shared_membership",
+                );
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", pin.sql))
+                .unwrap()
+                .query_map(params![0_i64, 1_i64], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("resolution_typed_fact_lookups_identity")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .all(|line| !line.contains("SCAN resolution_typed_fact_lookups")),
+                "{plan:?}"
+            );
+            let excluded = operation
+                .mount_table()
+                .mount_for_path("go", GO_ROOT_DECOY_PATH)
+                .unwrap()
+                .unwrap()
+                .ordinal();
+            conn.execute(
+                "DELETE FROM temp.selected_resolution_scope_mounts WHERE mount_ordinal=?1",
+                [excluded.get()],
+            )
+            .unwrap();
+            assert_eq!(
+                operation
+                    .go_hierarchy_selection_coverage(context, "go")
+                    .unwrap(),
+                GoHierarchySelectionCoverage::Partial
+            );
+            let (ordinal, key): (u32, u32) = conn.query_row(
+                "SELECT mount.mount_ordinal,semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_type_declarations declaration ON declaration.blob_id=mount.blob_id JOIN source_native_declaration_bridges bridge ON bridge.blob_id=declaration.blob_id AND bridge.declaration_id=declaration.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND declaration.name='Target'",
+                [GO_ROOT_CONSUMER_PATH],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            let answer = operation.go_direct_subtypes(
+                context,
+                "go",
+                SemanticId::local(ordinal, key),
+                &cancellation,
+                &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::unbounded(),
+            ).unwrap();
+            assert!(
+                answer
+                    .open_reasons
+                    .contains(&"selection does not cover workspace"),
+                "{answer:?}"
+            );
+            assert!(!answer.is_complete());
+            assert_eq!(answer.read_keys.coverage.unwrap().context_id, context);
+            assert!(
+                answer
+                    .read_keys
+                    .names
+                    .iter()
+                    .any(|key| key.relation == TypedFactRelation::EmbeddedTypeLookup)
+            );
+        }
+
+        #[test]
+        fn go_selected_type_support_is_local_and_role_filtered() {
+            use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_hierarchy::GoTypeSupport;
+            use rusqlite::params;
+
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; type Target struct{}; type Alias = Target",
+                "package provider; type Other struct{}",
+                "package provider; type Third struct{}",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let ordinal: u32 = conn.query_row(
+                "SELECT mount_ordinal FROM temp.selected_resolution_mounts WHERE persisted_relative_path=?1",
+                [GO_ROOT_CONSUMER_PATH],
+                |row| row.get(0),
+            ).unwrap();
+            {
+                let name = "Target";
+                let expected = GoTypeSupport::Supported;
+                let key: u32 = conn.query_row(
+                    "SELECT semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_native_declaration_bridges bridge ON bridge.blob_id=mount.blob_id LEFT JOIN source_go_type_declarations declaration ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id LEFT JOIN source_go_aliases alias ON alias.blob_id=bridge.blob_id AND alias.declaration_id=bridge.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.mount_ordinal=?1 AND COALESCE(declaration.name,alias.name)=?2",
+                    params![ordinal, name],
+                    |row| row.get(0),
+                ).unwrap();
+                let definition = SemanticId::local(ordinal, key);
+                assert_eq!(
+                    operation
+                        .go_type_supports(context, "go", definition, &cancellation)
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    operation
+                        .go_type_supports(context, "test", definition, &cancellation)
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+
+        fn go_hierarchy_store() -> (GoRootResolutionOperationFixture, i64) {
+            use rusqlite::params;
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; import p \"example.test/root/provider\"; type Wrap struct{p.Base}; type Mix struct{p.Base;p.Other}; type Mid struct{p.Base}; type Leaf struct{Mid}; type J interface{p.I}; type J2 interface{M()}; type SJ struct{J2}; type Alias = interface{M()}; type SA struct{Alias}",
+                "package provider; type Base struct{}; func (Base) M(){}; type Other struct{}; func (Other) N(){}; type I interface{M()}; type I2 interface{M();N()}; type Any interface{}",
+                "package provider; type Other struct{}; type Jtest interface{M()}",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            fixture.store.conn.execute(move |conn| {
+                conn.execute(
+                    "UPDATE go_context_publications SET complete=1 WHERE context_id=?1",
+                    [context],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE go_package_instances SET complete=1 WHERE context_id=?1",
+                    [context],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE go_package_imports SET complete=1 WHERE context_id=?1",
+                    [context],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE go_package_files SET source_role='test' WHERE package_id=(SELECT package_id FROM go_package_instances WHERE context_id=?1 AND tool_import_path='example.test/root/other/provider') AND rel_path=?2",
+                    params![context, GO_ROOT_DECOY_PATH],
+                ).unwrap();
+                conn.execute(
+                    "UPDATE go_package_instances SET for_test='example.test/root/other/provider' WHERE context_id=?1 AND tool_import_path='example.test/root/other/provider'",
+                    [context],
+                ).unwrap();
+            });
+            (fixture, context)
+        }
+
+        fn go_hierarchy_declaration(
+            conn: &rusqlite::Connection,
+            path: &str,
+            name: &str,
+        ) -> brokk_bifrost_analysis::analyzer::resolution::model::SemanticId {
+            use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
+            use rusqlite::params;
+            let (ordinal, key): (u32, u32) = conn.query_row(
+                "SELECT mount.mount_ordinal,semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_type_declarations declaration ON declaration.blob_id=mount.blob_id JOIN source_native_declaration_bridges bridge ON bridge.blob_id=declaration.blob_id AND bridge.declaration_id=declaration.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND declaration.name=?2",
+                params![path, name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            SemanticId::local(ordinal, key)
+        }
+
+        #[test]
+        #[hardwon(
+            "#8751: review found a parenthesized interface-literal alias target made direct subtypes falsely Complete"
+        )]
+        fn go_alias_interface_literal_wrappers_keep_inverse_open() {
+            use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            use rusqlite::params;
+            for source in [
+                "package provider; type I interface{ M() }; type Alias = interface{ M() }; type S struct{ Alias }",
+                "package provider; type I interface{ M() }; type Alias = (interface{ M() }); type S struct{ Alias }",
+            ] {
+                let fixture = GoRootResolutionOperationFixture::with_sources([
+                    "package consumer",
+                    source,
+                    "package provider; type Other struct{}",
+                ]);
+                let context =
+                    publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+                fixture.store.conn.execute(move |conn| {
+                    for table in [
+                        "go_context_publications",
+                        "go_package_instances",
+                        "go_package_imports",
+                    ] {
+                        conn.execute(
+                            &format!("UPDATE {table} SET complete=1 WHERE context_id=?1"),
+                            [context],
+                        )
+                        .unwrap();
+                    }
+                });
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let conn = operation.ready.inventory.connection();
+                let interface = go_hierarchy_declaration(conn, GO_ROOT_PROVIDER_PATH, "I");
+                let subtype = operation
+                    .go_direct_subtypes(
+                        context,
+                        "go",
+                        interface,
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert!(
+                    subtype
+                        .open_reasons
+                        .contains(&"interface method has no declaring interface identity"),
+                    "{source}: {subtype:?}"
+                );
+                assert!(!subtype.is_complete(), "{source}: {subtype:?}");
+                let (mount, key): (u32, u32) = conn
+                    .query_row(
+                        "SELECT mount.mount_ordinal,semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_type_declarations owner ON owner.blob_id=mount.blob_id JOIN source_go_callables method ON method.blob_id=owner.blob_id AND method.owner_type_id=owner.type_id JOIN source_native_declaration_bridges bridge ON bridge.blob_id=method.blob_id AND bridge.declaration_id=method.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND owner.name='I' AND method.name='M'",
+                        params![GO_ROOT_PROVIDER_PATH],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                let family = operation
+                    .go_native_method_family(
+                        context,
+                        "go",
+                        SemanticId::local(mount, key),
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert!(
+                    family
+                        .implemented_by
+                        .open_reasons
+                        .contains(&"interface method has no declaring interface identity"),
+                    "{source}: {family:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn go_direct_supertypes_confirm_selected_struct_and_interface_embeddings() {
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            let (fixture, context) = go_hierarchy_store();
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let declaration = |path: &str, name: &str| go_hierarchy_declaration(conn, path, name);
+            for (child, parent) in [("Wrap", "Base"), ("J", "I")] {
+                let answer = operation
+                    .go_direct_supertypes(
+                        context,
+                        "go",
+                        declaration(GO_ROOT_CONSUMER_PATH, child),
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert_eq!(answer.parents.len(), 1, "{answer:?}");
+                assert!(answer.is_complete(), "{answer:?}");
+                assert_eq!(
+                    answer.parents[0].targets,
+                    vec![declaration(GO_ROOT_PROVIDER_PATH, parent)]
+                );
+            }
+        }
+
+        #[test]
+        fn go_direct_subtypes_confirm_embedded_and_combined_method_receivers() {
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            let (fixture, context) = go_hierarchy_store();
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let declaration = |path: &str, name: &str| go_hierarchy_declaration(conn, path, name);
+            let reverse = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_PROVIDER_PATH, "Base"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(reverse.is_complete(), "{reverse:?}");
+            assert_eq!(
+                reverse.edges,
+                vec![
+                    declaration(GO_ROOT_CONSUMER_PATH, "Wrap"),
+                    declaration(GO_ROOT_CONSUMER_PATH, "Mix"),
+                    declaration(GO_ROOT_CONSUMER_PATH, "Mid"),
+                ]
+            );
+            let interface_reverse = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_PROVIDER_PATH, "I"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(
+                interface_reverse
+                    .edges
+                    .contains(&declaration(GO_ROOT_CONSUMER_PATH, "J")),
+                "{interface_reverse:?}"
+            );
+            assert!(
+                interface_reverse
+                    .edges
+                    .contains(&declaration(GO_ROOT_PROVIDER_PATH, "Base")),
+                "{interface_reverse:?}"
+            );
+            assert!(
+                interface_reverse
+                    .edges
+                    .contains(&declaration(GO_ROOT_CONSUMER_PATH, "Wrap")),
+                "{interface_reverse:?}"
+            );
+            for name in ["Mid", "Leaf"] {
+                assert!(
+                    interface_reverse
+                        .edges
+                        .contains(&declaration(GO_ROOT_CONSUMER_PATH, name)),
+                    "{name}: {interface_reverse:?}"
+                );
+            }
+            assert!(
+                interface_reverse
+                    .edges
+                    .contains(&declaration(GO_ROOT_CONSUMER_PATH, "SJ")),
+                "{interface_reverse:?}"
+            );
+            // Alias of an interface literal stays Open until #8762.
+            assert!(
+                !interface_reverse
+                    .edges
+                    .contains(&declaration(GO_ROOT_CONSUMER_PATH, "SA")),
+                "{interface_reverse:?}"
+            );
+            assert!(
+                interface_reverse
+                    .open_reasons
+                    .contains(&"interface method has no declaring interface identity"),
+                "{interface_reverse:?}"
+            );
+            assert!(!interface_reverse.is_complete(), "{interface_reverse:?}");
+            let (alias_mount, alias_key): (u32, u32) = conn
+                .query_row(
+                    "SELECT mount.mount_ordinal,member.definition_key FROM temp.selected_resolution_mounts mount JOIN resolution_package_members member ON member.blob_id=mount.blob_id AND member.namespace='type' JOIN resolution_semantic_catalog catalog ON catalog.blob_id=member.blob_id AND catalog.local_key=member.lookup_key JOIN resolution_identities identity ON identity.id=catalog.shared_identity JOIN source_go_aliases alias ON alias.blob_id=member.blob_id AND alias.name=identity.spelling WHERE mount.persisted_relative_path=?1 AND alias.name='Alias'",
+                    [GO_ROOT_CONSUMER_PATH],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let alias_reverse = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    brokk_bifrost_analysis::analyzer::resolution::model::SemanticId::local(
+                        alias_mount,
+                        alias_key,
+                    ),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(!alias_reverse.is_complete(), "{alias_reverse:?}");
+            assert!(
+                alias_reverse
+                    .open_reasons
+                    .contains(&"interface method has no declaring interface identity"),
+                "{alias_reverse:?}"
+            );
+            let combined = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_PROVIDER_PATH, "I2"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(!combined.is_complete(), "{combined:?}");
+            assert!(
+                combined
+                    .open_reasons
+                    .contains(&"interface method has no declaring interface identity"),
+                "{combined:?}"
+            );
+            assert!(
+                combined
+                    .edges
+                    .contains(&declaration(GO_ROOT_CONSUMER_PATH, "Mix")),
+                "{combined:?}"
+            );
+            assert!(
+                !combined
+                    .edges
+                    .contains(&declaration(GO_ROOT_PROVIDER_PATH, "Base")),
+                "{combined:?}"
+            );
+            let unenumerable = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_PROVIDER_PATH, "Any"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(!unenumerable.is_complete(), "{unenumerable:?}");
+            assert!(
+                unenumerable
+                    .open_reasons
+                    .iter()
+                    .any(|reason| reason.contains("unenumerable")),
+                "{unenumerable:?}"
+            );
+            let tiny = ResolutionSession::bounded_with_total_work(
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
+                1,
+                Some(&cancellation),
+            );
+            let exhausted = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_PROVIDER_PATH, "Base"),
+                    &cancellation,
+                    &tiny,
+                )
+                .unwrap();
+            assert!(!exhausted.is_complete(), "{exhausted:?}");
+            assert!(
+                exhausted
+                    .open_reasons
+                    .iter()
+                    .any(|reason| reason.contains("budget")),
+                "{exhausted:?}"
+            );
+        }
+
+        #[test]
+        fn go_native_method_family_confirms_both_directions_and_source_roles() {
+            use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            use rusqlite::params;
+            let (fixture, context) = go_hierarchy_store();
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let method = |owner: &str, name: &str| {
+                let (ordinal, key): (u32, u32) = conn.query_row(
+                    "SELECT mount.mount_ordinal,semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_type_declarations owner ON owner.blob_id=mount.blob_id JOIN source_go_callables callable ON callable.blob_id=owner.blob_id JOIN source_native_declaration_bridges bridge ON bridge.blob_id=callable.blob_id AND bridge.declaration_id=callable.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND owner.name=?2 AND callable.name=?3 AND (callable.owner_type_id=owner.type_id OR (owner.name='Base' AND callable.owner_type_id IS NULL))",
+                    params![GO_ROOT_PROVIDER_PATH, owner, name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                SemanticId::local(ordinal, key)
+            };
+            let family = operation
+                .go_native_method_family(
+                    context,
+                    "go",
+                    method("Base", "M"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(family.implements.is_complete(), "{family:?}");
+            assert!(
+                family.implements.methods.contains(&method("I", "M")),
+                "{family:?}"
+            );
+            let inverse = operation
+                .go_native_method_family(
+                    context,
+                    "go",
+                    method("I", "M"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(!inverse.implemented_by.is_complete(), "{inverse:?}");
+            assert!(
+                inverse
+                    .implemented_by
+                    .open_reasons
+                    .contains(&"interface method has no declaring interface identity"),
+                "{inverse:?}"
+            );
+            assert!(
+                inverse.implemented_by.methods.len() >= 3,
+                "embedded interface promotions missing from ImplementedBy: {inverse:?}"
+            );
+            assert!(
+                inverse
+                    .implemented_by
+                    .methods
+                    .contains(&method("Base", "M")),
+                "{inverse:?}"
+            );
+            assert!(family.implements.read_keys.coverage.is_some());
+            assert!(family.implements.read_keys.names.iter().any(|key| {
+                key.relation == brokk_bifrost_analysis::analyzer::store::resolution::TypedFactRelation::InterfaceMethodLookup
+            }));
+            let decoy_method: (u32, u32) = conn.query_row(
+                "SELECT mount.mount_ordinal,semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_callables callable ON callable.blob_id=mount.blob_id JOIN source_native_declaration_bridges bridge ON bridge.blob_id=callable.blob_id AND bridge.declaration_id=callable.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND callable.name='M'",
+                [GO_ROOT_DECOY_PATH],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            let decoy_method = SemanticId::local(decoy_method.0, decoy_method.1);
+            assert!(
+                !family.implements.methods.contains(&decoy_method),
+                "{family:?}"
+            );
+            let test_family = operation
+                .go_native_method_family(
+                    context,
+                    "test",
+                    method("Base", "M"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(
+                test_family.implements.methods.contains(&decoy_method),
+                "{test_family:?}"
+            );
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            let stopped = operation
+                .go_native_method_family(
+                    context,
+                    "go",
+                    method("Base", "M"),
+                    &cancelled,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(!stopped.implements.is_complete(), "{stopped:?}");
+            assert!(!stopped.implemented_by.is_complete(), "{stopped:?}");
+        }
+
+        #[test]
+        fn go_alias_embeddings_follow_chains_and_fail_closed() {
+            use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            use rusqlite::params;
+
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; import p \"example.test/root/provider\"; type Alias = p.Base; type Wrap struct{Alias}; type A1 = p.Base; type A2 = A1; type Deep struct{A2}; type P = *p.WrappedBase; type S struct{P}; type Q = (p.WrappedBase); type U struct{Q}; type C1 = C2; type C2 = C1; type CycleWrap struct{C1}; type Self = Self; type SelfWrap struct{Self}; type Missing = p.Nope; type MissingWrap struct{Missing}; type Direct struct{p.Base}",
+                "package provider; type Base struct{}; type WrappedBase struct{}",
+                "package provider; type Decoy struct{}",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            fixture.store.conn.execute(move |conn| {
+                conn.execute(
+                    "UPDATE go_context_publications SET complete=1 WHERE context_id=?1",
+                    [context],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE go_package_instances SET complete=1 WHERE context_id=?1",
+                    [context],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE go_package_imports SET complete=1 WHERE context_id=?1",
+                    [context],
+                )
+                .unwrap();
+            });
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let declaration = |path: &str, name: &str| {
+                let (ordinal, key): (u32, u32) = conn.query_row(
+                    "SELECT mount.mount_ordinal,semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_type_declarations declaration ON declaration.blob_id=mount.blob_id JOIN source_native_declaration_bridges bridge ON bridge.blob_id=declaration.blob_id AND bridge.declaration_id=declaration.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND declaration.name=?2",
+                    params![path, name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                SemanticId::local(ordinal, key)
+            };
+            let mut statement = conn
+                .prepare(
+                    "SELECT identity.spelling FROM temp.selected_resolution_mounts mount \
+                 JOIN resolution_typed_fact_lookups lookup ON lookup.blob_id=mount.blob_id \
+                 JOIN resolution_identities identity ON identity.id=lookup.identity_id \
+                 WHERE mount.persisted_relative_path=?1 AND lookup.relation=?2 \
+                 ORDER BY identity.spelling",
+                )
+                .unwrap();
+            let alias_target_names = statement.query_map(
+                params![
+                    GO_ROOT_CONSUMER_PATH,
+                    brokk_bifrost_analysis::analyzer::store::resolution::TypedFactRelation::AliasTargetLookup.code(),
+                ],
+                |row| row.get::<_, String>(0),
+            ).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(
+                alias_target_names,
+                ["A1", "Base", "C1", "C2", "Nope", "Self", "WrappedBase"]
+            );
+            drop(statement);
+            let direct = operation
+                .go_direct_supertypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_CONSUMER_PATH, "Direct"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(direct.is_complete(), "{direct:?}");
+            assert_eq!(
+                direct.parents[0].targets,
+                vec![declaration(GO_ROOT_PROVIDER_PATH, "Base")]
+            );
+            let alias = operation
+                .go_direct_supertypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_CONSUMER_PATH, "Wrap"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(alias.is_complete(), "{alias:?}");
+            assert_eq!(
+                alias.parents[0].targets,
+                vec![declaration(GO_ROOT_PROVIDER_PATH, "Base")]
+            );
+            let deep = operation
+                .go_direct_supertypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_CONSUMER_PATH, "Deep"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(deep.is_complete(), "{deep:?}");
+            assert_eq!(
+                deep.parents[0].targets,
+                vec![declaration(GO_ROOT_PROVIDER_PATH, "Base")]
+            );
+            for name in ["S", "U"] {
+                let wrapped = operation
+                    .go_direct_supertypes(
+                        context,
+                        "go",
+                        declaration(GO_ROOT_CONSUMER_PATH, name),
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert!(wrapped.is_complete(), "{name}: {wrapped:?}");
+                assert_eq!(
+                    wrapped.parents[0].targets,
+                    vec![declaration(GO_ROOT_PROVIDER_PATH, "WrappedBase")],
+                    "{name}: {wrapped:?}"
+                );
+            }
+            let inverse = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_PROVIDER_PATH, "Base"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(inverse.is_complete(), "{inverse:?}");
+            for name in ["Direct", "Wrap", "Deep"] {
+                assert!(
+                    inverse
+                        .edges
+                        .contains(&declaration(GO_ROOT_CONSUMER_PATH, name)),
+                    "{name}: {inverse:?}"
+                );
+            }
+            let wrapped_inverse = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    declaration(GO_ROOT_PROVIDER_PATH, "WrappedBase"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(wrapped_inverse.is_complete(), "{wrapped_inverse:?}");
+            for name in ["S", "U"] {
+                assert!(
+                    wrapped_inverse
+                        .edges
+                        .contains(&declaration(GO_ROOT_CONSUMER_PATH, name)),
+                    "{name}: {wrapped_inverse:?}"
+                );
+            }
+            for (name, reason) in [
+                ("CycleWrap", "alias target cycle"),
+                ("SelfWrap", "alias target cycle"),
+                ("MissingWrap", "alias target is unresolved"),
+            ] {
+                let result = operation
+                    .go_direct_supertypes(
+                        context,
+                        "go",
+                        declaration(GO_ROOT_CONSUMER_PATH, name),
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert!(!result.is_complete(), "{name}: {result:?}");
+                assert!(
+                    result
+                        .parents
+                        .iter()
+                        .any(|parent| parent.open_reason == Some(reason)),
+                    "{name}: {result:?}"
+                );
+            }
+        }
+
+        #[test]
         #[hardwon("#5658: Go alias summaries materialized occurrence arenas for unrelated blobs")]
         fn native_query_plan_go_alias_rows_are_identical() {
             let fixture = GoRootResolutionOperationFixture::with_sources([

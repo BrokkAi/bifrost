@@ -144,12 +144,30 @@ impl TypeTermHooks for GoTypeTermHooks<'_, '_, '_> {
             None
         }
     }
+    fn slice_element<'a>(&self, term: &'a TypeRef) -> Option<&'a TypeRef> {
+        if let TypeRef::Slice { element } = term {
+            Some(element)
+        } else {
+            None
+        }
+    }
+    fn map_elements<'a>(&self, term: &'a TypeRef) -> Option<(&'a TypeRef, &'a TypeRef)> {
+        if let TypeRef::Map { key, value } = term {
+            Some((key, value))
+        } else {
+            None
+        }
+    }
 }
 
-struct GoCallableResultHooks<'a, 'selection, 'store>(GoTypeTermHooks<'a, 'selection, 'store>);
+struct GoCallableResultHooks<'a, 'selection, 'store>(
+    GoTypeTermHooks<'a, 'selection, 'store>,
+    std::cell::Cell<usize>,
+);
 
 impl TypeTermHooks for GoCallableResultHooks<'_, '_, '_> {
     fn allocate(&mut self) -> (SemanticId, [u8; 32]) {
+        self.1.set(self.1.get().saturating_add(1));
         self.0.allocate()
     }
     fn wrap<T>(&self, row: T) -> SelectedTypedRow<T> {
@@ -182,11 +200,132 @@ impl TypeTermHooks for GoCallableResultHooks<'_, '_, '_> {
         self.0.exact_nominal(term)
     }
     fn pointer_element<'a>(&self, term: &'a TypeRef) -> Option<&'a TypeRef> {
-        self.0.pointer_element(term)
+        let element = self.0.pointer_element(term);
+        if element.is_some() {
+            // The iterative lowerer revisits each pointer after its operand.
+            self.1.set(self.1.get().saturating_add(1));
+        }
+        element
+    }
+    fn slice_element<'a>(&self, term: &'a TypeRef) -> Option<&'a TypeRef> {
+        self.0.slice_element(term)
+    }
+    fn map_elements<'a>(&self, term: &'a TypeRef) -> Option<(&'a TypeRef, &'a TypeRef)> {
+        self.0.map_elements(term)
     }
 }
 
 impl SelectedResolutionTypedSource<'_, '_> {
+    /// Export scalar identities while this lowering's intern table is alive.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn selected_go_callable_result_types(
+        &self,
+        member: &ModelSymbolRef,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<(
+            Vec<Option<crate::analyzer::resolution::CanonicalTypeIdentity>>,
+            usize,
+        )>,
+    > {
+        use crate::analyzer::resolution::local_identity::SharedNameInterner;
+        let Some(Some(declaration)) =
+            self.read_model_member_callable_result(member, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let Some(signature) = declaration.signature else {
+            return Ok(None);
+        };
+        let memo = self.external_signatures.borrow();
+        let names = self.selection.shared_names();
+        let mut results = Vec::new();
+        for result in signature.result_types() {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let scalar = crate::analyzer::resolution::canonical_type_identity(
+                result.slot(),
+                |slot| {
+                    use crate::analyzer::resolution::CanonicalTypeNode;
+                    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeComponentKind;
+                    let frontier = memo.seeds.get(&slot)?.row().frontier();
+                    if frontier.completion() != &ResolutionCompletion::Complete {
+                        return None;
+                    }
+                    let [value] = frontier.possible_values() else {
+                        return None;
+                    };
+                    let ty = value.ty();
+                    let identity = ty.identity();
+                    let indirection = ty.indirection();
+                    if let Some(components) = memo.components.get(&identity) {
+                        let [first, ..] = components.as_slice() else {
+                            return None;
+                        };
+                        let constructor = first.row().constructor();
+                        if components
+                            .iter()
+                            .any(|row| row.row().constructor() != constructor)
+                        {
+                            return None;
+                        }
+                        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeConstructorKind;
+                        match constructor {
+                            ResolutionTypeConstructorKind::Slice
+                                if components.len() == 1
+                                    && first.row().kind()
+                                        == ResolutionTypeComponentKind::Element =>
+                            {
+                                Some(CanonicalTypeNode::Sequence {
+                                    element: first.row().component(),
+                                    indirection,
+                                })
+                            }
+                            ResolutionTypeConstructorKind::Map if components.len() == 2 => {
+                                let key = components
+                                    .iter()
+                                    .find(|row| {
+                                        row.row().kind() == ResolutionTypeComponentKind::Key
+                                    })?
+                                    .row()
+                                    .component();
+                                let value = components
+                                    .iter()
+                                    .find(|row| {
+                                        row.row().kind() == ResolutionTypeComponentKind::Value
+                                    })?
+                                    .row()
+                                    .component();
+                                Some(CanonicalTypeNode::Map {
+                                    key,
+                                    value,
+                                    indirection,
+                                })
+                            }
+                            _ => None,
+                        }
+                    } else if memo.descriptors.contains_key(&identity) {
+                        let name = identity.shared_name_id()?;
+                        Some(CanonicalTypeNode::Nominal {
+                            digest: names.digest_for_id(name)?,
+                            indirection,
+                        })
+                    } else {
+                        None
+                    }
+                },
+            );
+            assert_eq!(
+                results.len(),
+                result.ordinal() as usize,
+                "model result ordinals are contiguous"
+            );
+            results.push(scalar);
+        }
+        Ok(Some((results, declaration.lowering_work)))
+    }
+
     pub(super) fn read_unindexed_model_callable_result(
         &self,
         frontier: &crate::analyzer::resolution::UnindexedExternalFrontier,
@@ -411,6 +550,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .context_identities
             .model_member_semantic(&member, &self.selection.shared_names());
         let mut lowered = None;
+        let mut lowering_work = 0usize;
         if let (Some(signature), Some(results)) =
             (declaration.structured_signature.as_ref(), results)
             && !declaration.provenance.ambiguous
@@ -442,6 +582,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     cancellation,
                 };
                 let (slot, _) = hooks.allocate();
+                lowering_work = lowering_work.saturating_add(hooks.next_slot as usize);
                 let ordinal = u32::try_from(position).expect("model parameter ordinal fits u32");
                 parameters.push(LoweredCallableParameterProperty::new(
                     ordinal,
@@ -454,18 +595,21 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 ));
             }
             for (position, term) in results.iter().enumerate() {
-                let mut hooks = GoCallableResultHooks(GoTypeTermHooks {
-                    source: self,
-                    owner: &owner,
-                    owner_kind,
-                    member: &member,
-                    selection: &selection,
-                    purpose: "callable-result",
-                    position,
-                    next_slot: 0,
-                    nominal_name: None,
-                    cancellation,
-                });
+                let mut hooks = GoCallableResultHooks(
+                    GoTypeTermHooks {
+                        source: self,
+                        owner: &owner,
+                        owner_kind,
+                        member: &member,
+                        selection: &selection,
+                        purpose: "callable-result",
+                        position,
+                        next_slot: 0,
+                        nominal_name: None,
+                        cancellation,
+                    },
+                    std::cell::Cell::new(0),
+                );
                 let Some(slot) = lower_type_term(
                     &mut memo,
                     term.as_ref().unwrap_or(&TypeRef::Unknown),
@@ -476,6 +620,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 else {
                     return Ok(None);
                 };
+                lowering_work = lowering_work.saturating_add(hooks.1.get());
                 result_types.push(LoweredCallableResultTypeProperty::new(
                     u32::try_from(position).expect("model result ordinal fits u32"),
                     slot,
@@ -500,6 +645,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             selection,
             declaration,
             signature: lowered,
+            lowering_work,
         })))
     }
 

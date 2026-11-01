@@ -16,7 +16,14 @@ impl RegexSyntax for LiteralSyntax {
     fn inline_flags(&self, _: &[char], _: usize, _: RegexFlags) -> Option<(usize, RegexFlags)> {
         None
     }
-    fn escape(&self, _: &[char], _: usize, _: bool, _: RegexFlags) -> Option<EscapeValue> {
+    fn escape(
+        &self,
+        _: &[char],
+        _: usize,
+        _: bool,
+        _: RegexFlags,
+        _: &CaptureGroups,
+    ) -> Option<EscapeValue> {
         None
     }
     fn class_atom(&self, chars: &[char], start: usize, _: RegexFlags) -> Option<ClassAtom> {
@@ -50,6 +57,9 @@ impl RegexSyntax for LiteralSyntax {
     }
     fn supports_possessive_quantifiers(&self) -> bool {
         true
+    }
+    fn final_line_terminators(&self, _: RegexFlags) -> &'static [&'static str] {
+        &["\n"]
     }
     fn analyze(&self, _: &mut RegexAnalysis<'_>) {}
 }

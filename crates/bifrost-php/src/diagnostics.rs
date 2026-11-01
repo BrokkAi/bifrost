@@ -17,8 +17,9 @@ use crate::graph::resolver::{
 };
 use crate::graph::syntax::{
     PhpMagicSurface, instance_receiver_type_fq_name, instanceof_type_node, is_local_scope,
-    literal_member_identifier, magic_member_names, seed_assignment_binding, seed_parameter_types,
-    static_member_parts, static_scope_type_fq_name,
+    is_relative_scope_keyword, literal_member_identifier, magic_member_names,
+    php_member_name_matches, seed_assignment_binding, seed_parameter_types, static_member_parts,
+    static_scope_type_fq_name,
 };
 use crate::graph::{PhpCallableFacts, PhpGraphSource};
 use crate::graph_support::{PhpSource, php_direct_declared_class_parent};
@@ -462,8 +463,7 @@ impl PhpDiagnosticCollector<'_> {
             return;
         }
         let owner = self.static_scope_fqn(scope);
-        if owner.is_none() && matches!(node_text(scope, self.source), "self" | "static" | "parent")
-        {
+        if owner.is_none() && is_relative_scope_keyword(node_text(scope, self.source)) {
             return;
         }
         // An owner the workspace does not declare may still be an indexed
@@ -547,12 +547,7 @@ impl PhpDiagnosticCollector<'_> {
                 );
                 return;
             }
-            let fqn = format!("{owner}.{member_name}");
-            if !self.support.fqn(&fqn).is_empty()
-                || !self
-                    .inherited_member_candidates(&owner, member_name)
-                    .is_empty()
-            {
+            if self.owner_or_ancestor_has_member(&owner, member_name) {
                 self.report
                     .push_resolved(range, BoundaryStatus::WorkspaceLocal);
                 return;
@@ -630,31 +625,6 @@ impl PhpDiagnosticCollector<'_> {
         }
     }
 
-    fn inherited_member_candidates(&self, owner_fqn: &str, member: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::default();
-        let mut level = self.direct_parent_fqns(owner_fqn);
-        seen.insert(owner_fqn.to_string());
-        while !level.is_empty() {
-            let mut next_level = Vec::new();
-            for ancestor in level {
-                if !seen.insert(ancestor.clone()) {
-                    continue;
-                }
-                let candidate = format!("{ancestor}.{member}");
-                if self.support.fqn_exists(&candidate) {
-                    out.push(candidate);
-                }
-                next_level.extend(self.direct_parent_fqns(&ancestor));
-            }
-            if !out.is_empty() {
-                return out;
-            }
-            level = next_level;
-        }
-        out
-    }
-
     fn direct_parent_fqns(&self, owner_fqn: &str) -> Vec<String> {
         self.support
             .fqn(owner_fqn)
@@ -695,7 +665,14 @@ impl PhpDiagnosticCollector<'_> {
                 if !seen.insert(owner.clone()) {
                     continue;
                 }
-                if self.support.fqn_exists(&format!("{owner}.{member}")) {
+                // PHP method names, magic ones included, ignore ASCII case;
+                // property and constant names do not.
+                if self
+                    .support
+                    .fqn_direct_children(&owner)
+                    .iter()
+                    .any(|child| php_member_name_matches(child, member))
+                {
                     return true;
                 }
                 next_level.extend(self.direct_parent_fqns(&owner));

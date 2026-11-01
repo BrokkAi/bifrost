@@ -646,6 +646,7 @@ pub fn dispatch_boundary_kind_locator_work(kind: &DispatchBoundaryKind) -> Seman
         } => semantic_locator_work(locator),
         DispatchBoundaryKind::External(None)
         | DispatchBoundaryKind::Unresolved
+        | DispatchBoundaryKind::HierarchyUnenumerated
         | DispatchBoundaryKind::Truncated => SemanticWork::default(),
     }
 }
@@ -1151,6 +1152,7 @@ pub const fn dispatch_boundary_rank(kind: &DispatchBoundaryKind) -> u8 {
         DispatchBoundaryKind::Deferred { .. } => 2,
         DispatchBoundaryKind::Unresolved => 3,
         DispatchBoundaryKind::Truncated => 4,
+        DispatchBoundaryKind::HierarchyUnenumerated => 5,
     }
 }
 

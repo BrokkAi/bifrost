@@ -108,6 +108,19 @@ impl Producer<'_, '_> {
         site
     }
 
+    pub(super) fn absolute_path(node: Node<'_>) -> bool {
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "alias_qualified_name" {
+                return true;
+            }
+            if node.kind() != "generic_name" {
+                pending.extend(named_children(node));
+            }
+        }
+        false
+    }
+
     pub(super) fn reference_path(&mut self, node: Node<'_>, ctx: Context) {
         let Some(parts) = self.path(node) else {
             return;
@@ -116,20 +129,7 @@ impl Producer<'_, '_> {
             return;
         }
         let namespace = reference_namespace(node);
-        let absolute = {
-            let mut pending = vec![node];
-            let mut absolute = false;
-            while let Some(n) = pending.pop() {
-                if n.kind() == "alias_qualified_name" {
-                    absolute = true;
-                    break;
-                }
-                if n.kind() != "generic_name" {
-                    pending.extend(named_children(n));
-                }
-            }
-            absolute
-        };
+        let absolute = Self::absolute_path(node);
         if parts.len() == 1 && !absolute {
             let reference = self.reference(parts[0], ctx, namespace);
             // ECMA-334 14.7: free namespace members supply types, not methods.
@@ -171,6 +171,17 @@ impl Producer<'_, '_> {
             )
         });
         if let Some(reference) = prefix {
+            if namespace == ResolutionNamespace::Type {
+                self.facts
+                    .root_references
+                    .push(ResolutionRootReferenceFact {
+                        reference,
+                        root_scope: ctx.scope,
+                        anchor: ResolutionRootImportAnchor::Lexical,
+                        prefix_reference: None,
+                        owner_continued: false,
+                    });
+            }
             if namespace != ResolutionNamespace::Type {
                 self.facts
                     .add_gap(reference, ResolutionGapKind::AmbiguousQualifiedType);

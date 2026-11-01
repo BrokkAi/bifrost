@@ -9025,8 +9025,8 @@ fn seed_parent_scope_declaration(
 /// `function_definition` anywhere above (#2079). A `def` inside an anonymous
 /// template that a method body constructs (`def m = new T { def helper = .. }`)
 /// is a member of that template: extraction mints it as
-/// `Owner.m$anon$L:C.helper`, and every bare `helper(..)` inside the template
-/// names that member. Reading it as a local `def` of `m` instead declared the
+/// a synthetic anonymous owner under `Owner.m`, and every bare
+/// `helper(..)` inside the template names that member. Reading it as a local `def` of `m` instead declared the
 /// name as an opaque shadow across the whole method, which made the inverse
 /// scan drop every such call before any owner lookup ran while forward
 /// resolution still answered with the minted identity.

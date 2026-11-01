@@ -639,6 +639,24 @@ impl<'project> SelectedResolutionAuthority<'project> {
         })
     }
 
+    /// All producer gaps attributed to one source site, independently of the
+    /// surrounding scope's unknown-publisher inventory.
+    pub(crate) fn site_gap_reasons(
+        &self,
+        mount: &SelectedResolutionMountRecord,
+        site: ResolutionSiteId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        self.read_authority(mount, cancellation, |conn| {
+            Ok(conn
+                .prepare_cached(authority_rows::SITE_GAP_REASONS_SQL)?
+                .query_map(rusqlite::params![mount.blob_id(), site.get()], |row| {
+                    Ok(SemanticId::local(mount.ordinal().get(), row.get(0)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
     pub(crate) fn unsupported_gap_reasons(
         &self,
         mount: &SelectedResolutionMountRecord,

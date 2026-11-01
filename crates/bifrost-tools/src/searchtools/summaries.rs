@@ -6,7 +6,7 @@ use crate::searchtools::*;
 
 use brokk_bifrost_analysis::analyzer::languages::package_fq_name;
 
-use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+use brokk_bifrost_analysis::analyzer::i_analyzer::{AnalyzerQueryScope, QueryReadIncomplete};
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -51,6 +51,45 @@ pub struct SummaryResult {
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub too_broad: Vec<TooBroadScope>,
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<SummaryIncompleteReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryIncompleteReason {
+    Cancelled,
+    TimeBudget,
+    StructureUnavailable,
+    SemanticEvidenceUnavailable,
+    ArtifactUnavailable,
+    SemanticEvidenceGap,
+    StoreFailure,
+    SourceUnavailable,
+}
+
+fn summary_read_reason(
+    reason: QueryReadIncomplete,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> SummaryIncompleteReason {
+    match reason {
+        QueryReadIncomplete::Cancelled
+            if cancellation.is_some_and(|token| token.is_timed_out()) =>
+        {
+            SummaryIncompleteReason::TimeBudget
+        }
+        QueryReadIncomplete::Cancelled => SummaryIncompleteReason::Cancelled,
+        QueryReadIncomplete::StructureUnavailable(_) => {
+            SummaryIncompleteReason::StructureUnavailable
+        }
+        QueryReadIncomplete::SemanticEvidenceUnavailable(_) => {
+            SummaryIncompleteReason::SemanticEvidenceUnavailable
+        }
+        QueryReadIncomplete::ArtifactUnavailable(_) => SummaryIncompleteReason::ArtifactUnavailable,
+        QueryReadIncomplete::SemanticEvidenceGap(_) => SummaryIncompleteReason::SemanticEvidenceGap,
+        QueryReadIncomplete::StoreFailure(_) => SummaryIncompleteReason::StoreFailure,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -755,6 +794,17 @@ fn summarize_symbol_targets_with_cancellation(
         ambiguous,
         ambiguous_paths: Vec::new(),
         too_broad,
+        complete: !cancellation
+            .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled),
+        incomplete_reason: cancellation
+            .filter(|token| token.is_cancelled())
+            .map(|token| {
+                if token.is_timed_out() {
+                    SummaryIncompleteReason::TimeBudget
+                } else {
+                    SummaryIncompleteReason::Cancelled
+                }
+            }),
     }
 }
 
@@ -793,7 +843,7 @@ pub fn get_summaries_with_cancellation(
     // an N-target request walked the workspace O(N) times (#1334). It also
     // carries the caller's deadline down to reads whose signatures do not take
     // one, which is what `get_summaries[g]` needed in #1908.
-    let _analyzer_query = match cancellation {
+    let analyzer_query = match cancellation {
         Some(cancellation) => AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
         None => AnalyzerQueryScope::new(analyzer),
     };
@@ -803,7 +853,26 @@ pub fn get_summaries_with_cancellation(
         GET_SUMMARIES_MAX_FILES_PER_TARGET,
         cancellation,
     );
-    summarize_routed_targets_with_cancellation(analyzer, token, &targets, cancellation)
+    let result =
+        summarize_routed_targets_with_cancellation(analyzer, token, &targets, cancellation);
+    finish_summary_result(result, &analyzer_query, cancellation)
+}
+
+/// Fold the query scope's read completion into a summary result, so every
+/// public `SummaryResult` reports the same incompleteness: the first reason
+/// recorded while summarizing wins, then any read the scope saw fail.
+fn finish_summary_result(
+    mut result: SummaryResult,
+    analyzer_query: &AnalyzerQueryScope<'_>,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> SummaryResult {
+    if let Err(reason) = analyzer_query.read_completion() {
+        result
+            .incomplete_reason
+            .get_or_insert(summary_read_reason(reason, cancellation));
+    }
+    result.complete = result.incomplete_reason.is_none();
+    result
 }
 
 pub(crate) fn skim_files_for_files(
@@ -856,16 +925,18 @@ pub(crate) fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Op
 }
 
 pub fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
-    summarize_files_with_cancellation(analyzer, files, None)
+    let analyzer_query = AnalyzerQueryScope::new(analyzer);
+    let result = summarize_files_with_cancellation(analyzer, files, None);
+    finish_summary_result(result, &analyzer_query, None)
 }
 
 fn summary_block_for_file_with_cancellation(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
-) -> Option<SummaryBlock> {
+) -> Result<Option<SummaryBlock>, ()> {
     if cancellation.is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled) {
-        return None;
+        return Ok(None);
     }
     let mut elements = analyzer
         .summary_file_projection(file)
@@ -889,18 +960,21 @@ fn summary_block_for_file_with_cancellation(
     });
 
     let (elements, fallback_reason) = if elements.is_empty() {
-        summary_fallback_for_file(analyzer, file)?
+        match summary_fallback_for_file(analyzer, file)? {
+            Some(fallback) => fallback,
+            None => return Ok(None),
+        }
     } else {
         (elements, None)
     };
 
-    Some(SummaryBlock {
+    Ok(Some(SummaryBlock {
         label: rel_path_string(file),
         path: rel_path_string(file),
         preamble: file_preamble(analyzer, file, &elements),
         fallback_reason,
         elements,
-    })
+    }))
 }
 
 fn summarize_files_with_cancellation(
@@ -910,12 +984,18 @@ fn summarize_files_with_cancellation(
 ) -> SummaryResult {
     let _scope = profiling::scope("searchtools::summarize_files");
     let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
-    let mut summaries: Vec<_> = files
+    let outcomes: Vec<_> = files
         .into_par_iter()
-        .filter_map(|file| {
+        .map(|file| {
             attribution
                 .run(|| summary_block_for_file_with_cancellation(analyzer, &file, cancellation))
         })
+        .collect();
+    let source_unavailable = outcomes.iter().any(Result::is_err);
+    let mut summaries: Vec<_> = outcomes
+        .into_iter()
+        .filter_map(Result::ok)
+        .flatten()
         .collect();
     summaries.sort_by(|left, right| {
         left.path
@@ -930,28 +1010,43 @@ fn summarize_files_with_cancellation(
         ambiguous: Vec::new(),
         ambiguous_paths: Vec::new(),
         too_broad: Vec::new(),
+        complete: !source_unavailable
+            && !cancellation
+                .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled),
+        incomplete_reason: cancellation
+            .filter(|token| token.is_cancelled())
+            .map(|token| {
+                if token.is_timed_out() {
+                    SummaryIncompleteReason::TimeBudget
+                } else {
+                    SummaryIncompleteReason::Cancelled
+                }
+            })
+            .or(source_unavailable.then_some(SummaryIncompleteReason::SourceUnavailable)),
     }
 }
+
+type SummaryFallback = (Vec<SummaryElement>, Option<String>);
 
 pub(crate) fn summary_fallback_for_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-) -> Option<(Vec<SummaryElement>, Option<String>)> {
-    let include_elements = include_fallback_elements(analyzer, file);
+) -> Result<Option<SummaryFallback>, ()> {
+    let include_elements = include_fallback_elements(analyzer, file)?;
     if !include_elements.is_empty() {
-        return Some((
+        return Ok(Some((
             include_elements,
             Some("no indexed declarations found; showing top-level includes".to_string()),
-        ));
+        )));
     }
 
-    excerpt_fallback_elements(analyzer, file).map(|(elements, note)| (elements, Some(note)))
+    Ok(excerpt_fallback_elements(analyzer, file).map(|(elements, note)| (elements, Some(note))))
 }
 
 pub(crate) fn include_fallback_elements(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-) -> Vec<SummaryElement> {
+) -> Result<Vec<SummaryElement>, ()> {
     let include_lines: Vec<_> = analyzer
         .import_statements(file)
         .iter()
@@ -959,11 +1054,11 @@ pub(crate) fn include_fallback_elements(
         .cloned()
         .collect();
     if include_lines.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let Ok(content) = analyzer.project().read_source(file) else {
-        return Vec::new();
+        return Err(());
     };
     let path = rel_path_string(file);
     let physical_lines: Vec<&str> = content.lines().collect();
@@ -1002,7 +1097,7 @@ pub(crate) fn include_fallback_elements(
             presentation: None,
         });
     }
-    elements
+    Ok(elements)
 }
 
 pub(crate) fn excerpt_fallback_elements(
@@ -1043,7 +1138,11 @@ pub(crate) fn sampled_excerpt_note(sampled: &model_context::HeadTail) -> String 
 }
 
 pub(crate) fn is_include_statement(statement: &str) -> bool {
-    statement.trim_start().starts_with("#include")
+    // C++ import producers normalize the snippet before storing it.
+    if statement.trim_start().starts_with("#include") {
+        debug_assert!(statement.trim_start() == statement);
+    }
+    statement.starts_with("#include")
 }
 
 pub(crate) fn normalize_include_line(line: &str) -> String {
@@ -1094,6 +1193,10 @@ fn summarize_routed_targets_with_cancellation(
     file_output
         .ambiguous_paths
         .extend(summary_targets.ambiguous_paths.clone());
+    file_output.incomplete_reason = file_output
+        .incomplete_reason
+        .or(symbol_output.incomplete_reason);
+    file_output.complete = file_output.incomplete_reason.is_none();
     file_output.summaries.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -2045,7 +2148,7 @@ mod selected_java_outer_relevance_tests {
             );
             assert!(!result.complete);
             assert_eq!(
-                Some(MostRelevantFilesIncompleteReason::UsageGraphIncomplete),
+                Some(MostRelevantFilesIncompleteReason::UsageGraphIncompleteAndHistoryUnavailable),
                 result.incomplete_reason
             );
             let ranked = paths(&result);

@@ -1290,6 +1290,7 @@ fn declaration_attributes_and_expression_roles_have_editor_support() {
         r#"(array_creation :type (identifier) :dimensions ((capture "dimension")) :value (collection_literal))"#,
         r#"(unary_expression :operator (capture "op") :operand (identifier))"#,
         r#"(lock :value (identifier) :body (block))"#,
+        r#"(type_literal :type (identifier))"#,
         r#"(if :test (identifier) :consequence (identifier) :alternative (identifier))"#,
         r#"(continue :label (name "outer"))"#,
     ] {

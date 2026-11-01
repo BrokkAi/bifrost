@@ -158,6 +158,7 @@ pub(crate) fn intrinsic_member_inventory(owner: &str) -> Option<&'static [Intrin
 #[derive(Clone, Copy)]
 pub enum IntrinsicMemberInventory {
     Jvm(&'static [brokk_bifrost_jvm::intrinsics::ClosedOwnerMember]),
+    JvmRoot(&'static [brokk_bifrost_jvm::intrinsics::IntrinsicMember]),
     PythonObject(Option<(u16, u16)>),
 }
 
@@ -181,6 +182,10 @@ pub fn closed_intrinsic_member_inventory(
     } else {
         brokk_bifrost_jvm::intrinsics::closed_owner_member_inventory(owner)
             .map(IntrinsicMemberInventory::Jvm)
+            .or_else(|| {
+                brokk_bifrost_jvm::intrinsics::source_language_root_member_inventory(owner)
+                    .map(IntrinsicMemberInventory::JvmRoot)
+            })
     }
 }
 
@@ -196,6 +201,21 @@ impl IntrinsicMemberInventory {
         use brokk_bifrost_python::intrinsics::{self, Availability, PythonVersion};
         match self {
             Self::Jvm(members) => {
+                if members.iter().any(|member| {
+                    super::ResolutionLookupSemanticRecipe::new(
+                        Language::Kotlin,
+                        namespace,
+                        member.name,
+                    )
+                    .name_digest()
+                        == lookup_digest
+                }) {
+                    Present
+                } else {
+                    Absent
+                }
+            }
+            Self::JvmRoot(members) => {
                 if members.iter().any(|member| {
                     super::ResolutionLookupSemanticRecipe::new(
                         Language::Kotlin,

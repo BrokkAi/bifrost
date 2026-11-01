@@ -3,6 +3,10 @@
 use super::go_context::{GoContextSelection, GoDotImportContext, GoPackageInventoryState};
 use super::placement_access::read_placement_rows;
 use super::*;
+use crate::analyzer::resolution::selected_context::{
+    PreparedContextIdentityField, PreparedContextIdentityPolicy, PreparedContextPayload,
+    PreparedContextSnapshot,
+};
 use crate::analyzer::resolution::{
     LoweredGoPackageImport, SelectedGoImportBindingDescriptor, SharedNameInterner,
 };
@@ -159,13 +163,8 @@ pub(super) struct GoPreparedContextKey {
 pub(super) type GoPreparedContextMemo =
     super::context_preparation::RequestContextMemo<GoPreparedContextKey, GoPreparedImportContext>;
 
-/// One bounded cache entry retains only shared names referenced by its file
-/// context. Numeric keys are snapshot-local and never installed in a request.
-#[derive(Clone)]
-pub(crate) struct GoPreparedImportContextSnapshot {
-    prepared: GoPreparedImportContext,
-    shared_names: HashMap<SemanticId, [u8; 32]>,
-}
+/// Go retains the shared envelope in the existing store cache.
+pub(crate) type GoPreparedImportContextSnapshot = PreparedContextSnapshot<GoPreparedImportContext>;
 
 #[cfg(any(test, feature = "test-support"))]
 impl SelectedResolutionOperation<'_, '_> {
@@ -332,7 +331,22 @@ impl GoPreparedImportContext {
             diagnostic_view,
         } = self;
         let identities = context.identity_space();
-        identities.assert_go_snapshot_safe();
+        identities.assert_snapshot_fields(|field| {
+            use PreparedContextIdentityField::*;
+            match field {
+                UnindexedGoImports | Numbers | NamedReasons => PreparedContextIdentityPolicy::Allow,
+                RustPreludeReferences
+                | ExternalTypeImportPaths
+                | JavaImportRouteGapReasons
+                | JvmExternalTypeIdentities
+                | JvmExternalTypeIdentitiesByReference
+                | JvmExternalTypeBoundaries
+                | JvmExternalOwners
+                | ModelMembers
+                | JvmSupertypeNames
+                | JvmExternalMembers => PreparedContextIdentityPolicy::Refuse,
+            }
+        });
         let Some(GoImportDiagnosticView {
             bindings,
             source_authority_gaps,
@@ -399,31 +413,41 @@ impl GoPreparedImportContext {
         source: &dyn BatchResolutionFragmentSource,
         cancellation: &CancellationToken,
     ) -> Result<Option<GoPreparedImportContextSnapshot>> {
-        self.assert_go_snapshot_safe();
-        let identities = self.context.identity_space().isolated_clone();
-        let mut context = self.context.clone().with_identity_space(identities);
-        let mut shared_names = HashMap::default();
-        context.remap_shared_names(|identity| {
-            if let Some(digest) = source.shared_name_digest_for_identity(identity, cancellation)? {
-                shared_names.insert(identity, digest);
-            }
-            Ok(identity)
-        })?;
-        if cancellation.is_cancelled() {
-            return Ok(None);
+        PreparedContextSnapshot::capture(self, source, cancellation)
+    }
+}
+
+impl PreparedContextPayload for GoPreparedImportContext {
+    fn identity_space(&self) -> SelectedContextIdentities {
+        self.context.identity_space()
+    }
+
+    fn isolated_payload(&self, identities: SelectedContextIdentities) -> Self {
+        Self {
+            stage: self.stage,
+            context: self.context.clone().with_identity_space(identities),
+            demand: self.demand.clone(),
+            source_import_refusals: self.source_import_refusals.clone(),
+            package_inventory: self.package_inventory.clone(),
+            blueprint: None,
+            diagnostic_view: self.diagnostic_view.clone(),
         }
-        Ok(Some(GoPreparedImportContextSnapshot {
-            prepared: Self {
-                stage: self.stage,
-                context,
-                demand: self.demand.clone(),
-                source_import_refusals: self.source_import_refusals.clone(),
-                package_inventory: self.package_inventory.clone(),
-                blueprint: None,
-                diagnostic_view: self.diagnostic_view.clone(),
-            },
-            shared_names,
-        }))
+    }
+
+    fn with_identity_space(mut self, identities: SelectedContextIdentities) -> Self {
+        self.context = self.context.with_identity_space(identities);
+        self
+    }
+
+    fn assert_snapshot_safe(&self) {
+        self.assert_go_snapshot_safe();
+    }
+
+    fn remap_shared_names(
+        &mut self,
+        remap: &mut dyn FnMut(SemanticId) -> Result<SemanticId>,
+    ) -> Result<()> {
+        self.context.remap_shared_names(remap)
     }
 }
 
@@ -433,25 +457,7 @@ impl GoPreparedImportContextSnapshot {
         identities: &SelectedContextIdentities,
         names: &dyn SharedNameInterner,
     ) -> Result<GoPreparedImportContext> {
-        self.prepared.assert_go_snapshot_safe();
-        let mut context = self.prepared.context.clone();
-        context.remap_shared_names(|identity| {
-            let digest = self
-                .shared_names
-                .get(&identity)
-                .expect("a cached context retains every referenced shared-name digest");
-            Ok(SemanticId::shared_name(names.intern(*digest)))
-        })?;
-        identities.copy_from_empty(&self.prepared.context.identity_space());
-        Ok(GoPreparedImportContext {
-            stage: self.prepared.stage,
-            context: context.with_identity_space(identities.clone()),
-            demand: self.prepared.demand.clone(),
-            source_import_refusals: self.prepared.source_import_refusals.clone(),
-            package_inventory: self.prepared.package_inventory.clone(),
-            blueprint: None,
-            diagnostic_view: self.prepared.diagnostic_view.clone(),
-        })
+        self.restore(identities, names, |_| Ok(()))
     }
 }
 
@@ -2388,12 +2394,12 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
         let mut heap = super::super::cache_budget::RetainedHeap::default();
         heap.add(std::mem::size_of_val(self));
         assert!(
-            self.prepared.blueprint.is_none(),
+            self.payload.blueprint.is_none(),
             "a cached context retains no request blueprint"
         );
-        self.prepared.context.charge_retained(&mut heap);
+        self.payload.context.charge_retained(&mut heap);
         heap.map(&self.shared_names);
-        let demand = &self.prepared.demand;
+        let demand = &self.payload.demand;
         heap.map(&demand.import_packages);
         heap.map(&demand.context_completions);
         for completion in demand.context_completions.values() {
@@ -2433,8 +2439,8 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
                 }
             }
         }
-        heap.vec(&self.prepared.source_import_refusals);
-        for refusal in &self.prepared.source_import_refusals {
+        heap.vec(&self.payload.source_import_refusals);
+        for refusal in &self.payload.source_import_refusals {
             heap.add(
                 refusal.importer.capacity()
                     + refusal.spelling.capacity()
@@ -2453,8 +2459,8 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
                     .sum(),
             );
         }
-        heap.map(&self.prepared.package_inventory.fragments);
-        if let Some(view) = &self.prepared.diagnostic_view {
+        heap.map(&self.payload.package_inventory.fragments);
+        if let Some(view) = &self.payload.diagnostic_view {
             heap.vec(&view.bindings);
             for binding in &view.bindings {
                 heap.add(
@@ -2486,7 +2492,7 @@ mod snapshot_tests {
 
     fn snapshot(identities: SelectedContextIdentities) -> GoPreparedImportContextSnapshot {
         GoPreparedImportContextSnapshot {
-            prepared: GoPreparedImportContext {
+            payload: GoPreparedImportContext {
                 stage: GoPreparationStage::Full,
                 context: SelectedResolutionContextSet::new(identities, Vec::new(), 0, &|_| {
                     Ok(None)
@@ -2511,7 +2517,7 @@ mod snapshot_tests {
     #[should_panic(expected = "diagnostic snapshot retains only canonical named reasons")]
     fn prepared_context_snapshot_rejects_unregistered_diagnostic_identity() {
         let mut cached = snapshot(SelectedContextIdentities::new());
-        cached.prepared.diagnostic_view = Some(GoImportDiagnosticView {
+        cached.payload.diagnostic_view = Some(GoImportDiagnosticView {
             bindings: vec![GoImportDiagnosticBinding {
                 local_name: "missing".into(),
                 source_spelling: "example.test/missing".into(),

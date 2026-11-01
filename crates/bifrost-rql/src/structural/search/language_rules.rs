@@ -19,6 +19,10 @@ pub(super) struct LanguageRuleMatches {
 pub(super) struct LanguageRuleMatch {
     pub(super) select: Range,
     pub(super) report: Range,
+    /// Why the match is a heuristic guess rather than a structural fact, for
+    /// a relation that ranks likely candidates instead of proving one. A
+    /// policy finding from such a match is only possible, with this reason.
+    pub(super) heuristic: Option<&'static str>,
 }
 
 impl From<Range> for LanguageRuleMatch {
@@ -26,6 +30,16 @@ impl From<Range> for LanguageRuleMatch {
         Self {
             select: range,
             report: range,
+            heuristic: None,
+        }
+    }
+}
+
+impl LanguageRuleMatch {
+    pub(super) fn heuristic(range: Range, reason: &'static str) -> Self {
+        Self {
+            heuristic: Some(reason),
+            ..Self::from(range)
         }
     }
 }
@@ -101,8 +115,8 @@ impl LanguageRuleMatches {
         file: &ProjectFile,
     ) -> Self {
         let mut matches = ranges.into_iter().map(Into::into).collect::<Vec<_>>();
-        matches.sort_unstable_by_key(|matched| (matched.select, matched.report));
-        matches.dedup_by_key(|matched| (matched.select, matched.report));
+        matches.sort_unstable_by_key(|matched| (matched.select, matched.report, matched.heuristic));
+        matches.dedup_by_key(|matched| (matched.select, matched.report, matched.heuristic));
         if undecided.is_empty() {
             return Self {
                 matches,
@@ -119,4 +133,59 @@ impl LanguageRuleMatches {
         );
         Self::incomplete(matches, language, message)
     }
+}
+
+/// Acquire the exact indexed reading instead of parsing source without its configuration.
+pub(super) fn selected_syntax(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+) -> Result<
+    std::sync::Arc<brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree>,
+    LanguageRuleMatches,
+> {
+    use crate::analyzer::common::language_for_file;
+    use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+    use brokk_bifrost_analysis::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
+    let language = language_for_file(file);
+    let outcome = analyzer
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)
+        .map_or(StructuralSyntaxLimitedOutcome::Unavailable, |provider| {
+            provider.structural_syntax_limited(file, source.len(), None)
+        });
+    let (cause, reason) = match outcome {
+        StructuralSyntaxLimitedOutcome::Available(syntax)
+            if syntax.prepared().source() == source =>
+        {
+            return Ok(syntax.clone_prepared());
+        }
+        StructuralSyntaxLimitedOutcome::Available(_) => (
+            DerivationExecutionCause::Snapshot,
+            "selected syntax differs from the source snapshot",
+        ),
+        StructuralSyntaxLimitedOutcome::Exceeded { .. } => (
+            DerivationExecutionCause::Budget,
+            "selected syntax exceeds the source budget",
+        ),
+        StructuralSyntaxLimitedOutcome::Cancelled => (
+            DerivationExecutionCause::Cancelled,
+            "selected syntax acquisition was cancelled",
+        ),
+        StructuralSyntaxLimitedOutcome::Unavailable => (
+            DerivationExecutionCause::Provider,
+            "selected syntax is unavailable",
+        ),
+    };
+    analyzer.mark_execution_dependent();
+    let mut result = LanguageRuleMatches::incomplete(
+        Vec::<Range>::new(),
+        language.config_label(),
+        format!("{reason} for {}", super::rel_path_string(file)),
+    );
+    for diagnostic in &mut result.diagnostics {
+        diagnostic.incompleteness = super::results::Incompleteness::Operational(cause);
+    }
+    Err(result)
 }

@@ -35,6 +35,9 @@ use super::{
     should_escape_text_character,
 };
 
+#[cfg(test)]
+mod human_run_summary_tests;
+
 const MAX_CONCISE_WITNESS_STEPS: usize = 12;
 
 /// Amount of policy audit detail included in human output.
@@ -4786,3 +4789,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "human_report_evidence.rs"]
+mod human_report_evidence;

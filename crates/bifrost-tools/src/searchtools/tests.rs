@@ -1,5 +1,8 @@
 use crate::searchtools::navigation::SearchSymbolsParams;
 
+mod rendered_overload;
+mod scan_lexical_limits;
+
 use crate::searchtools::navigation::search_symbols_with_cancellation;
 
 use crate::searchtools::navigation::search_symbols_with_cap;

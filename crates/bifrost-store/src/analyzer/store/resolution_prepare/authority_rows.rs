@@ -35,6 +35,9 @@ pub(crate) const ROOT_EXPORT_HALVES_SQL: &str = "SELECT i.semantic_language, i.n
 
 pub(crate) const LOOKUP_RECIPES_SQL: &str = "SELECT i.semantic_language, i.namespace, i.spelling, i.identity_digest FROM resolution_semantic_catalog c JOIN resolution_identities i ON i.id=c.shared_identity WHERE c.blob_id=?1 AND i.namespace IS NOT NULL ORDER BY c.local_key";
 
+pub const SITE_GAP_REASONS_SQL: &str =
+    "SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 ORDER BY reason";
+
 pub(crate) const UNSUPPORTED_GAP_REASONS_SQL: &str = "SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 AND origin=?3 UNION ALL SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 AND origin=?4 UNION ALL SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 AND origin=?5 ORDER BY reason";
 
 pub(crate) const TYPE_IDENTITY_OBSERVATION_SITES_SQL: &str = "SELECT p.output_slot FROM resolution_sites s JOIN resolution_binding_projections p ON p.blob_id=s.blob_id AND p.reference=s.site WHERE s.blob_id=?1 AND s.site=?2 AND p.kind IN (?3,?4) ORDER BY p.output_slot";
@@ -100,6 +103,7 @@ pub(crate) const PINNED_SQL: &[(&str, &str)] = &[
     ("root_export_halves_sql", ROOT_EXPORT_HALVES_SQL),
     ("lookup_recipes_sql", LOOKUP_RECIPES_SQL),
     ("unsupported_gap_reasons_sql", UNSUPPORTED_GAP_REASONS_SQL),
+    ("site_gap_reasons_sql", SITE_GAP_REASONS_SQL),
     (
         "type_identity_observation_sites_sql",
         TYPE_IDENTITY_OBSERVATION_SITES_SQL,

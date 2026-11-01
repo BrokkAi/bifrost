@@ -40,8 +40,8 @@ use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequ
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_go::diagnostics::GoImportBindings;
 use brokk_bifrost_go::diagnostics::{GoExternalEvidence, GoPackageSurface};
-use brokk_bifrost_go::graph::resolver::GoImportBindings;
 use std::sync::Arc;
 
 pub(crate) fn collect_go_semantic_diagnostics(

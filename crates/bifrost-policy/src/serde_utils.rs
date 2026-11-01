@@ -3,6 +3,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, de};
 
+#[cfg(test)]
+mod string_contract_tests;
+
 pub(crate) fn deserialize_from_string<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,

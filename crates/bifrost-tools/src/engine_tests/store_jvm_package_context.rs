@@ -52,6 +52,7 @@ pub mod tests {
         let files = sources
             .iter()
             .map(|(path, source)| WorkspaceFileRow {
+                decision: None,
                 rel_path: (*path).to_owned(),
                 blob_oid: Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap(),
             })

@@ -554,6 +554,14 @@ pub fn gap_has_exit_only_control(gap: &SemanticGap) -> bool {
         )
 }
 
+/// An omitted exceptional route with no in-procedure user-code observer.
+/// AfterInertDrops needs the workspace oracle's inert-drop proof; raw flow
+/// state has no such proof and must leave that variant open.
+fn gap_has_unobserved_exceptional_exit(gap: &SemanticGap) -> bool {
+    gap_has_exit_only_control(gap)
+        && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+}
+
 /// Cleanup can only continue its destination or unwind. Finally/recover
 /// languages and unchecked C++ remain excluded from this contract (#6409).
 pub fn destructor_style_cleanup(language: Language) -> bool {
@@ -594,7 +602,9 @@ fn axes_blocked_by(semantics: &ProcedureSemantics, gap: &SemanticGap) -> &'stati
     // R-cleanup (#6409): emit_cleanup_completion_route retains destination;
     // no Invoke havoc premise is needed for control-shaped axes. Binding and
     // same-evaluation axes retain their original capability classifications.
-    if gap_has_exit_only_control(gap)
+    // #8602: only observer-free exceptional exits close relation axes. Active
+    // defers and non-inert drops remain open despite exiting normal control.
+    if gap_has_unobserved_exceptional_exit(gap)
         || cleanup_is_control_irrelevant(semantics, gap)
         || (matches!(
             gap.capability,
@@ -608,8 +618,8 @@ fn axes_blocked_by(semantics: &ProcedureSemantics, gap: &SemanticGap) -> &'stati
 }
 
 // A target-scoped proof may query cleanup/completion code itself. Keep its
-// existing exceptional-region obligations even when the global ordinary-body
-// axes close (#6409); its own discharge logic judges those selected targets.
+// exceptional-region obligations even when global ordinary-body axes close;
+// the exact target proof judges whether an exit can affect its relation.
 fn scoped_axes_blocked_by(
     semantics: &ProcedureSemantics,
     gap: &SemanticGap,
@@ -1473,9 +1483,9 @@ impl FlowStateDerivation {
     }
 
     /// Overwrite/absence proofs enumerate reads and completion, beyond the
-    /// retained topology. #6409 closes ordinary-body control axes but cannot
-    /// discharge omitted destructor observations or decide whether an abort
-    /// counts as leaving a value unread. Preserve that consumer's obligations.
+    /// retained topology. A value is live only if some path reads it; an exit
+    /// that no code observes reads nothing (owner decision, #8602). Cleanup
+    /// and deferred observers still keep their own obligations open.
     pub fn overwrite_observation_completeness(
         &self,
         procedure: &ProcedureHandle,
@@ -1486,6 +1496,7 @@ impl FlowStateDerivation {
         for gap in semantics.gaps() {
             if capability_axes_blocked_by(gap.capability).contains(&FlowStateAxis::ReachingRelation)
                 && axes_blocked_by(semantics, gap).is_empty()
+                && !gap_has_unobserved_exceptional_exit(gap)
             {
                 push_gap_reason(&mut reasons, gap);
             }
@@ -1532,7 +1543,7 @@ impl FlowStateDerivation {
         );
 
         let observation_completeness = self.overwrite_observation_completeness(procedure);
-        let reasons = observation_completeness
+        let mut reasons = observation_completeness
             .reasons()
             .iter()
             .filter(|reason| {
@@ -1551,6 +1562,17 @@ impl FlowStateDerivation {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // A normal continuation may count as the only live route across an
+        // unobserved abort. Keep a gap at the establishment or on a cycle:
+        // its point may be revisited after a replacement candidate, so one
+        // static gap cannot certify every dynamic occurrence of that value.
+        for gap in semantics.gaps().iter().filter(|gap| {
+            gap_has_unobserved_exceptional_exit(gap)
+                && (gap.point == establishment.point
+                    || self.point_reaches(semantics, gap.point, gap.point, false))
+        }) {
+            push_gap_reason(&mut reasons, gap);
+        }
         let mut cfg_request =
             CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation);
         let result = locate_gap_reasons(
@@ -3866,7 +3888,10 @@ where
             let gap_safe = *candidate_gap_safety[index].get_or_insert_with(|| {
                 control_gaps.iter().all(|gap| {
                     gap.subject != SemanticGapSubject::Procedure
-                        && dominance.dominates(graph, candidate, gap.point)
+                        && (dominance.dominates(graph, candidate, gap.point)
+                            || (gap_has_unobserved_exceptional_exit(gap)
+                                && point_reaches(graph, gap.point, candidate, false)
+                                && !point_reaches(graph, candidate, gap.point, false)))
                 })
             });
             if gap_safe {
@@ -8633,6 +8658,12 @@ where
         gaps_by_point,
     } = inputs;
     let origin = &events[establishment_event];
+    let unobserved_exit_points = semantics
+        .gaps()
+        .iter()
+        .filter(|gap| gap_has_unobserved_exceptional_exit(gap))
+        .map(|gap| gap.point)
+        .collect::<HashSet<_>>();
     let reachable = forward_reachability(graph, semantics.entry_point(), request)?;
     if !reachable.contains(graph, origin.point) {
         // #7340: missing prefix edges cannot prove source unreachability. Any
@@ -8805,8 +8836,17 @@ where
         }
         continuing[state] = true;
         let mut has_successor = false;
-        for (_, successor) in graph.successors(point_id) {
+        for (edge_id, successor) in graph.successors(point_id) {
             request.visit_pair()?;
+            if unobserved_exit_points.contains(&point_id)
+                && semantics
+                    .control_edge(edge_id)
+                    .expect("graph edge belongs to the procedure")
+                    .kind
+                    == ControlEdgeKind::Exceptional
+            {
+                continue;
+            }
             has_successor = true;
             let next = successor.index();
             adjacency[state].push(next);
@@ -12553,15 +12593,16 @@ func read(input *item, value *item) int {
                 && !dominance.dominates(procedure.semantics(), candidate, gap.point),
             "the gap is before the result and is not made harmless by ordinary candidate placement"
         );
-        assert!(
+        assert_eq!(
             derivation
                 .any_normal_return_dominates_targets(
                     &procedure,
                     std::slice::from_ref(&validator),
                     &[target],
                 )
-                .is_none(),
-            "generic dominance must retain the exceptional-flow hole"
+                .as_deref(),
+            Some([true].as_slice()),
+            "the unobserved exit cannot bypass the normal-return candidate"
         );
         assert_eq!(
             derivation
@@ -13345,11 +13386,12 @@ func read(input *item, value *item) int {
                 && dominance.dominates(procedure.semantics(), candidate, target),
             "the regression requires a pre-result gap and retained point dominance"
         );
-        assert!(
+        assert_eq!(
             derivation
                 .any_candidate_dominates_targets(&procedure, &[candidate], &[target])
-                .is_none(),
-            "generic point dominance must retain the exceptional-flow hole"
+                .as_deref(),
+            Some([true].as_slice()),
+            "an unobserved exceptional exit cannot bypass the candidate to reach its use"
         );
         assert_eq!(
             derivation
@@ -13379,10 +13421,8 @@ func read(input *item, value *item) int {
 "#;
 
     #[test]
-    #[hardwon(
-        "cf2e70f23ccf: exceptional exits after result creation must still block result-use dominance"
-    )]
-    fn result_point_dominance_retains_post_establishment_exceptional_exits() {
+    // Owner ruling on #8602 (2026-10-31): an unobserved exit cannot change in-procedure dominance; this replaces the cf2e70f23ccf boundary.
+    fn result_point_dominance_discharges_post_establishment_unobserved_exits() {
         let fixture = Fixture::new(
             Language::Go,
             &[("main.go", GO_POINT_DOMINANCE_POST_RESULT_GAP)],
@@ -13414,7 +13454,7 @@ func read(input *item, value *item) int {
                 && dominance.dominates(procedure.semantics(), candidate, target),
             "the post-result gap is the only intended obstacle before a retained candidate dominator"
         );
-        assert!(
+        assert_eq!(
             derivation
                 .any_candidate_dominates_result_uses(
                     &procedure,
@@ -13422,8 +13462,9 @@ func read(input *item, value *item) int {
                     &[candidate],
                     &[target],
                 )
-                .is_none(),
-            "an exceptional-flow hole after result establishment and before the candidate remains blocking"
+                .as_deref(),
+            Some([true].as_slice()),
+            "a reached candidate follows only the normal continuation of an unobserved exit"
         );
     }
 

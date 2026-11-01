@@ -5,6 +5,7 @@
 //! object. The discriminants that make those bytes meaningful remain ordinary
 //! constrained columns.
 
+use brokk_bifrost_core::gitblob::ParseVariant;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::Sha256;
 use std::sync::LazyLock;
@@ -71,6 +72,9 @@ pub struct ClassSetSummaryFamilyLookupRow {
 pub struct ClassSetSummaryAttachment {
     pub rel_path: String,
     pub blob_oid: String,
+    /// Together with the OID and storage namespace, the complete owner BlobKey.
+    /// On load, recovered from the existing owner blob FK.
+    pub parse_variant: ParseVariant,
     pub storage_language_key: crate::analyzer::semantic::StorageLanguageKey,
     pub language: Language,
 }
@@ -466,12 +470,14 @@ impl ClassSetSummaryRow {
         let ClassSetSummaryAttachment {
             rel_path,
             blob_oid: _,
+            parse_variant: _,
             storage_language_key,
             language,
         } = attachment;
         let ClassSetSummaryAttachment {
             rel_path: other_rel_path,
             blob_oid: _,
+            parse_variant: _,
             storage_language_key: other_storage_language_key,
             language: other_language,
         } = other_attachment;
@@ -763,7 +769,7 @@ pub(crate) static CLASS_SET_SUMMARY_LOOKUP_SQL: LazyLock<String> = LazyLock::new
             carrier_digest, field_slots_digest, root_surface_digest, direct_calls_digest,
             entry_fact_ordinal, fact_count, exit_count,
             reached_count, dependency_count, read_count, charge_count, output_digest,
-            content_digest
+            content_digest, blobs.parse_variant
      FROM class_set_summaries AS summaries
      JOIN blobs ON blobs.id = summaries.owner_blob_id
      JOIN blob_meta AS meta ON meta.blob_id = blobs.id
@@ -1126,6 +1132,7 @@ fn load_summary_for_digest(
                     row.get::<_, usize>(23)?,
                     row.get::<_, Vec<u8>>(24)?,
                     row.get::<_, Vec<u8>>(25)?,
+                    row.get::<_, ParseVariant>(26)?,
                 ))
             },
         )
@@ -1150,10 +1157,11 @@ fn live_owner_blob_id(conn: &rusqlite::Connection, summary: &ClassSetSummaryRow)
     let storage_language_key = &summary.header.attachment.storage_language_key;
     super::live_class_set_owner_blob_id(
         conn,
-        &super::BlobKey::unvaried(
-            git2::Oid::from_str(&summary.header.attachment.blob_oid)?,
-            storage_language_key.as_str(),
-        ),
+        &super::BlobKey {
+            oid: git2::Oid::from_str(&summary.header.attachment.blob_oid)?,
+            lang: storage_language_key.as_str().to_owned(),
+            variant: summary.header.attachment.parse_variant,
+        },
     )?
     .ok_or_else(|| {
         StoreError::new(format!(
@@ -1564,6 +1572,7 @@ type RawHeader = (
     usize,
     Vec<u8>,
     Vec<u8>,
+    ParseVariant,
 );
 fn load_summary(
     conn: &rusqlite::Connection,
@@ -1597,6 +1606,7 @@ fn load_summary(
         charge_count,
         stored_output,
         stored_content,
+        parse_variant,
     ) = raw;
     let language = Language::from_config_label(&lang).ok_or_else(|| {
         StoreError::new(format!(
@@ -1639,6 +1649,7 @@ fn load_summary(
             attachment: ClassSetSummaryAttachment {
                 rel_path,
                 blob_oid,
+                parse_variant,
                 storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_store(
                     storage_lang,
                 ),
@@ -1880,7 +1891,7 @@ mod tests {
     // Every EXPLAIN QUERY PLAN pin below runs its assertions once against a
     // store with no planner statistics and once with the statistics captured
     // from real corpus stores, because production carries the latter (#3016).
-    use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, ProcedureCallSiteLocator};
+    use crate::analyzer::read_ledger::{CallSiteLocator, LookupKind, LookupQuestion};
     use crate::analyzer::semantic::ids::StableDigest;
     use crate::analyzer::store::planner_statistics::tests::{explain_pin, pinned};
     use crate::analyzer::store::test_adapters::{
@@ -1918,13 +1929,13 @@ mod tests {
                child_count,import_statement_count,type_identifier_count,is_complete
              )
              SELECT id,lang,0,'',0,0,0,0,0,0,0,0,1
-             FROM blobs WHERE blob_oid=?1 AND lang=?2",
+             FROM blobs WHERE blob_oid=?1 AND lang=?2 AND parse_variant=X''",
             rusqlite::params![oid, storage_key],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO blob_payload_costs(blob_id,payload_bytes)
-             SELECT id,0 FROM blobs WHERE blob_oid=?1 AND lang=?2",
+             SELECT id,0 FROM blobs WHERE blob_oid=?1 AND lang=?2 AND parse_variant=X''",
             rusqlite::params![oid, storage_key],
         )
         .unwrap();
@@ -1950,6 +1961,7 @@ mod tests {
                     behavior_read_digest: digest_byte(7),
                 },
                 owner_blob_oid: BLOB.to_owned(),
+                owner_parse_variant: ParseVariant::Empty,
                 artifact_public_identity: digest_byte(identity + 1),
                 artifact_content_identity: digest_byte(identity + 2),
                 exact_behavior_digest: digest_byte(18),
@@ -1972,6 +1984,7 @@ mod tests {
         summary.header.attachment = ClassSetSummaryAttachment {
             rel_path: surface.header.key.owner_rel_path.clone(),
             blob_oid: surface.header.owner_blob_oid.clone(),
+            parse_variant: surface.header.owner_parse_variant,
             storage_language_key: surface.header.key.owner_storage_language_key.clone(),
             language: surface.header.key.language,
         };
@@ -1999,6 +2012,7 @@ mod tests {
                     behavior_read_digest: digest_byte(7),
                 },
                 owner_blob_oid: BLOB.to_string(),
+                owner_parse_variant: ParseVariant::Empty,
                 artifact_public_identity: digest_byte(3),
                 artifact_content_identity: digest_byte(4),
                 exact_behavior_digest: digest_byte(18),
@@ -2022,6 +2036,7 @@ mod tests {
                 attachment: ClassSetSummaryAttachment {
                     rel_path: "src/app.py".to_string(),
                     blob_oid: BLOB.to_string(),
+                    parse_variant: ParseVariant::Empty,
                     storage_language_key:
                         crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
                     language: Language::Python,
@@ -2090,14 +2105,10 @@ mod tests {
                 ordinal: 0,
                 key: ReadKey::Lookup {
                     kind: LookupKind::ProcedureDispatch,
-                    question: LookupQuestion::ProcedureCallSite {
+                    question: LookupQuestion::CallSite {
                         rel_path: Box::from("src/callee.py"),
                         procedure: StableDigest::sha256(b"callee"),
-                        site: ProcedureCallSiteLocator {
-                            start_byte: 12,
-                            end_byte: 19,
-                            ordinal: 0,
-                        },
+                        site: CallSiteLocator { ordinal: 0 },
                     },
                     digest: StableDigest::sha256(b"targets"),
                 },
@@ -2291,6 +2302,87 @@ mod tests {
                         &family.owner_storage_language_key,
                     )
                     .unwrap()
+            );
+        }
+        // A second C# decision product for identical bytes is a distinct owner.
+        let variants = [
+            ParseVariant::Digest([71; 32]),
+            ParseVariant::Digest([72; 32]),
+        ];
+        let mut variant_products = Vec::new();
+        for (index, variant) in variants.into_iter().enumerate() {
+            insert_complete_storage_blob(&store, BLOB, "csharp");
+            store.conn.lock().unwrap().execute(
+                "UPDATE blobs SET parse_variant=?1 WHERE blob_oid=?2 AND lang='csharp' AND parse_variant=X''",
+                rusqlite::params![variant, BLOB],
+            ).unwrap();
+            let mut header = dialect_surface(
+                "src/Owner.cs",
+                "csharp",
+                Language::CSharp,
+                80 + index as u8,
+                90 + index as u8,
+            )
+            .header;
+            header.owner_parse_variant = variant;
+            let surface =
+                ClassSetProcedureSurfaceRow::try_new(header, vec![], vec![], vec![]).unwrap();
+            store
+                .publish_class_set_procedure_surface(surface.clone(), &CancellationToken::new())
+                .unwrap();
+            let summary = summary_for_dialect_surface(100 + index as u8, &surface);
+            store
+                .publish_class_set_summary(summary.clone(), &CancellationToken::new())
+                .unwrap();
+            assert_eq!(
+                store
+                    .class_set_summary_for_digest(summary.header.key.lookup_digest)
+                    .unwrap()
+                    .unwrap()
+                    .header
+                    .attachment
+                    .parse_variant,
+                variant
+            );
+            assert_eq!(
+                store
+                    .class_set_procedure_surface_for_digest(*surface.surface_digest())
+                    .unwrap()
+                    .unwrap()
+                    .header
+                    .owner_parse_variant,
+                variant
+            );
+            variant_products.push((surface, summary));
+        }
+        // Exercise the same FK cascade that blob GC uses. Deleting the other
+        // decision row must retain both products attached to the selected row.
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "DELETE FROM blobs WHERE blob_oid=?1 AND lang='csharp' AND parse_variant=?2",
+                    rusqlite::params![BLOB, variants[0]],
+                )
+                .unwrap(),
+            1
+        );
+        for (index, (surface, summary)) in variant_products.into_iter().enumerate() {
+            assert_eq!(
+                store
+                    .class_set_procedure_surface_for_digest(*surface.surface_digest())
+                    .unwrap()
+                    .is_some(),
+                index == 1
+            );
+            assert_eq!(
+                store
+                    .class_set_summary_for_digest(summary.header.key.lookup_digest)
+                    .unwrap()
+                    .is_some(),
+                index == 1
             );
         }
     }

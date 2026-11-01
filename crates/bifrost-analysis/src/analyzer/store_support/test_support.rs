@@ -736,6 +736,7 @@ pub mod operation_fixture_support {
         SelectedResolutionContentMountRequest::new(
             publication,
             WorkspaceFileRow {
+                decision: None,
                 rel_path: path.to_owned(),
                 blob_oid,
             },

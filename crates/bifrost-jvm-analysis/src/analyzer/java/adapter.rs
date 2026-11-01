@@ -64,7 +64,20 @@ impl LanguageAdapter for JavaAdapter {
         Some(&JAVA_COGNITIVE_CONFIG)
     }
 }
+static JAVA_SEMANTIC_LOWERER: super::semantic::JavaSemanticLowerer =
+    super::semantic::JavaSemanticLowerer;
+
 impl StoreLanguageAdapter for JavaAdapter {
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        Some(
+            brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer::new(
+                &JAVA_SEMANTIC_LOWERER,
+            ),
+        )
+    }
+
     fn source_fact_storage(
         &self,
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>

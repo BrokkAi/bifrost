@@ -178,6 +178,30 @@ pub mod replay_observations {
     use super::QueryObligations;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Construct a closed answer carrier for cross-crate cache boundary tests.
+    pub fn answer_for_cache_test(
+        obligations: QueryObligations,
+    ) -> super::super::FactResolutionAnswer {
+        let mut answer = super::super::fact_resolution::incomplete_fact_resolution_answer(
+            None,
+            super::super::ResolutionCompletion::Complete,
+            &crate::CancellationToken::new(),
+        );
+        answer.query_obligations = obligations;
+        answer
+    }
+
+    /// Exercise the evaluator's actual closed-value consumer at a crate boundary.
+    pub fn read_closed_answer_for_cache_test(
+        answer: super::super::FactResolutionAnswer,
+        consumer: &mut QueryObligations,
+    ) -> super::super::FactResolutionAnswer {
+        let obligations = answer.query_obligations.clone();
+        super::ClosedQueryValue::new(answer, obligations)
+            .read(consumer)
+            .clone()
+    }
+
     #[derive(Clone, Copy, Debug)]
     pub enum Path {
         Fresh,

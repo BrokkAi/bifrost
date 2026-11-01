@@ -167,6 +167,7 @@ normalized_kinds! {
     ArrayCreation => "array_creation": "Match an array creation expression.",
     UnaryExpression => "unary_expression": "Match a unary expression.",
     Lock => "lock": "Match a synchronized or lock statement.",
+    TypeLiteral => "type_literal": "Match an expression whose value is a written type, such as C# `typeof(T)`; its `type` role is the type operand.",
 }
 
 impl NormalizedKind {
@@ -230,7 +231,8 @@ impl NormalizedKind {
             | Goto
             | Break
             | Continue => None,
-            Yield | Cast | InstanceOf | Subscript | ArrayCreation | UnaryExpression | Lock => None,
+            Yield | Cast | InstanceOf | Subscript | ArrayCreation | UnaryExpression | Lock
+            | TypeLiteral => None,
         }
     }
 
@@ -285,9 +287,8 @@ impl NormalizedKind {
             | Comparison
             | ComparisonChain => false,
             Lock => true,
-            Await | Yield | Cast | InstanceOf | Subscript | ArrayCreation | UnaryExpression => {
-                false
-            }
+            Await | Yield | Cast | InstanceOf | Subscript | ArrayCreation | UnaryExpression
+            | TypeLiteral => false,
         }
     }
 }
@@ -514,7 +515,7 @@ impl Role {
             ),
             Role::Key => kind == ObjectProperty,
             Role::Test => matches!(kind, Assertion | If | Switch | Case),
-            Role::Type => matches!(kind, Cast | InstanceOf | ArrayCreation),
+            Role::Type => matches!(kind, Cast | InstanceOf | ArrayCreation | TypeLiteral),
             Role::Operand => matches!(kind, InstanceOf | UnaryExpression),
             Role::Consequence | Role::Alternative => kind == If,
             Role::Body => matches!(kind, Lock | Switch | Case | Label),

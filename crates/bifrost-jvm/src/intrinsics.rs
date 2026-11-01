@@ -1,6 +1,7 @@
 //! Pinned language knowledge for unavailable JVM default-import providers.
 //!
-//! The tables certify name absence only. A present name still requires indexed
+//! The inventories certify name absence. Erased aliases supply target spellings.
+//! A present name still requires indexed
 //! declarations for its types, members, overloads, and receiver applicability.
 //! These fixed tables never depend on workspace size or active semantic packs.
 
@@ -13,6 +14,285 @@ mod data;
 /// root, default-provider and closed-owner inventories. Regeneration invalidates
 /// persisted resolution inputs automatically.
 pub const INVENTORY_EPOCH_INPUT: &str = include_str!("intrinsic_inventory_data.rs");
+
+/// An implicit provider that can make a bare JVM name visible without an
+/// explicit import in the source file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum JvmImplicitRootProvider {
+    Package(&'static str),
+    ScalaPredef,
+}
+
+// List order is part of external-provider identity. Precedence is separate:
+// lower ranks shadow higher ranks; equal ranks form an unordered group in the walk.
+const JAVA_IMPLICIT_ROOTS: [(JvmImplicitRootProvider, u32); 1] =
+    [(JvmImplicitRootProvider::Package("java.lang"), 0)];
+const KOTLIN_IMPLICIT_ROOTS: [(JvmImplicitRootProvider, u32); 10] = [
+    (JvmImplicitRootProvider::Package("kotlin"), 0),
+    (JvmImplicitRootProvider::Package("kotlin.annotation"), 0),
+    (JvmImplicitRootProvider::Package("kotlin.collections"), 0),
+    (JvmImplicitRootProvider::Package("kotlin.comparisons"), 0),
+    (JvmImplicitRootProvider::Package("kotlin.io"), 0),
+    (JvmImplicitRootProvider::Package("kotlin.ranges"), 0),
+    (JvmImplicitRootProvider::Package("kotlin.sequences"), 0),
+    (JvmImplicitRootProvider::Package("kotlin.text"), 0),
+    (JvmImplicitRootProvider::Package("kotlin.jvm"), 0),
+    (JvmImplicitRootProvider::Package("java.lang"), 1),
+];
+const SCALA_IMPLICIT_ROOTS: [(JvmImplicitRootProvider, u32); 3] = [
+    (JvmImplicitRootProvider::Package("java.lang"), 2),
+    (JvmImplicitRootProvider::Package("scala"), 1),
+    (JvmImplicitRootProvider::ScalaPredef, 0),
+];
+
+const fn providers<const N: usize>(
+    entries: &[(JvmImplicitRootProvider, u32); N],
+) -> [JvmImplicitRootProvider; N] {
+    let mut result = [JvmImplicitRootProvider::ScalaPredef; N];
+    let mut index = 0;
+    while index < N {
+        result[index] = entries[index].0;
+        index += 1;
+    }
+    result
+}
+
+const JAVA_IMPLICIT_ROOT_PROVIDERS: [JvmImplicitRootProvider; 1] = providers(&JAVA_IMPLICIT_ROOTS);
+const KOTLIN_IMPLICIT_ROOT_PROVIDERS: [JvmImplicitRootProvider; 10] =
+    providers(&KOTLIN_IMPLICIT_ROOTS);
+const SCALA_IMPLICIT_ROOT_PROVIDERS: [JvmImplicitRootProvider; 3] =
+    providers(&SCALA_IMPLICIT_ROOTS);
+
+/// Implicit providers in identity order, with their language-defined precedence.
+pub fn language_implicit_roots(language: Language) -> &'static [(JvmImplicitRootProvider, u32)] {
+    let (entries, same_rank_groups): (&[(JvmImplicitRootProvider, u32)], &[u32]) = match language {
+        Language::Java => (&JAVA_IMPLICIT_ROOTS, &[]),
+        Language::Kotlin => (&KOTLIN_IMPLICIT_ROOTS, &[0]),
+        Language::Scala => (&SCALA_IMPLICIT_ROOTS, &[]),
+        _ => (&[], &[]),
+    };
+    for (index, (provider, rank)) in entries.iter().enumerate() {
+        for (other, other_rank) in &entries[..index] {
+            debug_assert_ne!(provider, other, "implicit provider groups are sets");
+            debug_assert!(
+                rank != other_rank || same_rank_groups.contains(rank),
+                "equal ranks require an explicit group"
+            );
+        }
+    }
+    entries
+}
+
+/// The implicit providers in stable identity order, independent of precedence.
+#[doc(hidden)]
+pub const fn language_implicit_root_providers(
+    language: Language,
+) -> &'static [JvmImplicitRootProvider] {
+    match language {
+        Language::Java => &JAVA_IMPLICIT_ROOT_PROVIDERS,
+        Language::Kotlin => &KOTLIN_IMPLICIT_ROOT_PROVIDERS,
+        Language::Scala => &SCALA_IMPLICIT_ROOT_PROVIDERS,
+        _ => &[],
+    }
+}
+
+/// A certified empty root walk is distinct from an unavailable provider.
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ImplicitRootLookup<T> {
+    Answer(T),
+    Absent,
+    Open,
+}
+
+impl<T> ImplicitRootLookup<T> {
+    pub fn into_answer(self) -> Option<T> {
+        match self {
+            Self::Answer(answer) => Some(answer),
+            Self::Absent | Self::Open => None,
+        }
+    }
+}
+
+/// Select the first answering implicit root, or leave the name open when a
+/// higher root cannot certify absence. Ranks order precedence independently of identity.
+pub fn ordered_implicit_root<T: PartialEq>(
+    language: Language,
+    name: &str,
+    mut lookup: impl FnMut(&'static str) -> Option<T>,
+) -> ImplicitRootLookup<T> {
+    let mut roots = language_implicit_roots(language).to_vec();
+    roots.sort_by_key(|(_, rank)| *rank);
+    let mut groups = roots.as_slice();
+    while let Some((_, rank)) = groups.first() {
+        let end = groups.partition_point(|(_, candidate)| candidate == rank);
+        let (group, remaining) = groups.split_at(end);
+        let mut answer = None;
+        let mut open = false;
+        for (root, _) in group {
+            let root = match root {
+                JvmImplicitRootProvider::Package(name) => *name,
+                JvmImplicitRootProvider::ScalaPredef => "scala.Predef",
+            };
+            if let Some(candidate) = lookup(root) {
+                if answer.as_ref().is_some_and(|answer| *answer != candidate) {
+                    return ImplicitRootLookup::Open;
+                }
+                answer = Some(candidate);
+            } else if !default_provider_excludes_name(language, root, name) {
+                open = true;
+            }
+        }
+        if open {
+            return ImplicitRootLookup::Open;
+        }
+        if let Some(answer) = answer {
+            return ImplicitRootLookup::Answer(answer);
+        }
+        groups = remaining;
+    }
+    ImplicitRootLookup::Absent
+}
+
+/// Erased type aliases of the implicit Scala roots, with fully qualified targets.
+/// Like DEFAULT_PROVIDER_NAMES, the version basis is scala-library 2.13.16
+/// (scala/package.scala:20-144 and scala/Predef.scala:146-187). These entries
+/// are shared by the supported 2.13/Scala 3 library envelope, not version keyed.
+/// Scala 3.3.5 uses the 2.13 library; its stdLibPatches/Predef.scala adds
+/// methods but no replacement type aliases. This table supplies no members or
+/// declaration locations: callers must resolve the target through their index.
+pub const SCALA_IMPLICIT_ROOT_TYPE_ALIASES: &[(&str, &str, &str)] = &[
+    ("scala", "Cloneable", "java.lang.Cloneable"),
+    ("scala", "Serializable", "java.io.Serializable"),
+    ("scala", "Throwable", "java.lang.Throwable"),
+    ("scala", "Exception", "java.lang.Exception"),
+    ("scala", "Error", "java.lang.Error"),
+    ("scala", "RuntimeException", "java.lang.RuntimeException"),
+    (
+        "scala",
+        "NullPointerException",
+        "java.lang.NullPointerException",
+    ),
+    (
+        "scala",
+        "ClassCastException",
+        "java.lang.ClassCastException",
+    ),
+    (
+        "scala",
+        "IndexOutOfBoundsException",
+        "java.lang.IndexOutOfBoundsException",
+    ),
+    (
+        "scala",
+        "ArrayIndexOutOfBoundsException",
+        "java.lang.ArrayIndexOutOfBoundsException",
+    ),
+    (
+        "scala",
+        "StringIndexOutOfBoundsException",
+        "java.lang.StringIndexOutOfBoundsException",
+    ),
+    (
+        "scala",
+        "UnsupportedOperationException",
+        "java.lang.UnsupportedOperationException",
+    ),
+    (
+        "scala",
+        "IllegalArgumentException",
+        "java.lang.IllegalArgumentException",
+    ),
+    (
+        "scala",
+        "NoSuchElementException",
+        "java.util.NoSuchElementException",
+    ),
+    (
+        "scala",
+        "NumberFormatException",
+        "java.lang.NumberFormatException",
+    ),
+    (
+        "scala",
+        "AbstractMethodError",
+        "java.lang.AbstractMethodError",
+    ),
+    (
+        "scala",
+        "InterruptedException",
+        "java.lang.InterruptedException",
+    ),
+    ("scala", "TraversableOnce", "scala.collection.IterableOnce"),
+    ("scala", "IterableOnce", "scala.collection.IterableOnce"),
+    ("scala", "Traversable", "scala.collection.Iterable"),
+    ("scala", "Iterable", "scala.collection.Iterable"),
+    ("scala", "Seq", "scala.collection.immutable.Seq"),
+    (
+        "scala",
+        "IndexedSeq",
+        "scala.collection.immutable.IndexedSeq",
+    ),
+    ("scala", "Iterator", "scala.collection.Iterator"),
+    (
+        "scala",
+        "BufferedIterator",
+        "scala.collection.BufferedIterator",
+    ),
+    ("scala", "List", "scala.collection.immutable.List"),
+    ("scala", "::", "scala.collection.immutable.::"),
+    ("scala", "Stream", "scala.collection.immutable.Stream"),
+    ("scala", "LazyList", "scala.collection.immutable.LazyList"),
+    ("scala", "Vector", "scala.collection.immutable.Vector"),
+    (
+        "scala",
+        "StringBuilder",
+        "scala.collection.mutable.StringBuilder",
+    ),
+    ("scala", "Range", "scala.collection.immutable.Range"),
+    ("scala", "BigDecimal", "scala.math.BigDecimal"),
+    ("scala", "BigInt", "scala.math.BigInt"),
+    ("scala", "Equiv", "scala.math.Equiv"),
+    ("scala", "Fractional", "scala.math.Fractional"),
+    ("scala", "Integral", "scala.math.Integral"),
+    ("scala", "Numeric", "scala.math.Numeric"),
+    ("scala", "Ordered", "scala.math.Ordered"),
+    ("scala", "Ordering", "scala.math.Ordering"),
+    ("scala", "PartialOrdering", "scala.math.PartialOrdering"),
+    ("scala", "PartiallyOrdered", "scala.math.PartiallyOrdered"),
+    ("scala", "Either", "scala.util.Either"),
+    ("scala", "Left", "scala.util.Left"),
+    ("scala", "Right", "scala.util.Right"),
+    ("scala.Predef", "String", "java.lang.String"),
+    ("scala.Predef", "Class", "java.lang.Class"),
+    ("scala.Predef", "Function", "scala.Function1"),
+    ("scala.Predef", "Map", "scala.collection.immutable.Map"),
+    ("scala.Predef", "Set", "scala.collection.immutable.Set"),
+    ("scala.Predef", "OptManifest", "scala.reflect.OptManifest"),
+    ("scala.Predef", "Manifest", "scala.reflect.Manifest"),
+];
+
+pub fn implicit_root_type_alias(
+    language: Language,
+    root: &str,
+    name: &str,
+) -> Option<&'static str> {
+    if !language_implicit_root_providers(language)
+        .iter()
+        .any(|provider| match provider {
+            JvmImplicitRootProvider::Package(package) => *package == root,
+            JvmImplicitRootProvider::ScalaPredef => root == "scala.Predef",
+        })
+    {
+        return None;
+    }
+    SCALA_IMPLICIT_ROOT_TYPE_ALIASES
+        .iter()
+        .find_map(|&(provider, alias, target)| {
+            (provider == root && alias == name).then_some(target)
+        })
+}
 
 /// Whether this language can use an inventory as an absence-only provider.
 pub fn language_has_member_inventory(language: Language, owner: &str) -> bool {
@@ -79,14 +359,12 @@ pub fn default_provider_names(
     language: Language,
     provider: &str,
 ) -> Option<&'static [&'static str]> {
-    let is_default = match language {
-        Language::Java => provider == "java.lang",
-        Language::Kotlin => crate::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES
-            .iter()
-            .any(|package| package.rendered == provider),
-        Language::Scala => matches!(provider, "java.lang" | "scala" | "scala.Predef"),
-        _ => false,
-    };
+    let is_default = language_implicit_root_providers(language)
+        .iter()
+        .any(|root| match root {
+            JvmImplicitRootProvider::Package(name) => *name == provider,
+            JvmImplicitRootProvider::ScalaPredef => provider == "scala.Predef",
+        });
     if !is_default {
         return None;
     }
@@ -110,14 +388,66 @@ pub fn root_member_inventory(owner: &str) -> Option<&'static [IntrinsicMember]> 
         .find_map(|(name, members)| (*name == owner).then_some(*members))
 }
 
+/// Compiler and language-defined roots whose member names are complete.
+/// Java Object retains its separate JLS method authority.
+pub fn source_language_root_member_inventory(owner: &str) -> Option<&'static [IntrinsicMember]> {
+    SOURCE_LANGUAGE_ROOTS
+        .iter()
+        .any(|(_, root)| *root == owner)
+        .then(|| root_member_inventory(owner))
+        .flatten()
+}
+
 // These source-language roots have closed hierarchies as well as closed member
 // inventories. Java Object retains its existing producer obligation and ordinals.
+const JVM_OBJECT_ROOT: &str = "java.lang.Object";
+
 const SOURCE_LANGUAGE_ROOTS: &[(Language, &str)] = &[
     (Language::Kotlin, "kotlin.Any"),
     (Language::Kotlin, "kotlin.Annotation"),
     (Language::Scala, "scala.Any"),
     (Language::Scala, "scala.AnyRef"),
 ];
+
+const IMPLICIT_SUPERCLASS_ROOTS: &[(Language, &str)] = &[
+    (Language::Java, JVM_OBJECT_ROOT),
+    (Language::Kotlin, "kotlin.Any"),
+    (Language::Scala, "scala.AnyRef"),
+];
+
+/// The closed parent named by each JVM producer's ImplicitSuperclass fact.
+pub fn implicit_superclass_root(language: Language) -> Option<&'static str> {
+    IMPLICIT_SUPERCLASS_ROOTS
+        .iter()
+        .find_map(|&(candidate, root)| (candidate == language).then_some(root))
+        .inspect(|root| assert_eq!(intrinsic_root_owner(root), Some(*root)))
+}
+
+/// Canonical owner for a closed source-language root or the shared JVM Object.
+/// Hierarchy projections use this same set as the language-root inventories.
+pub fn intrinsic_root_owner(owner: &str) -> Option<&'static str> {
+    SOURCE_LANGUAGE_ROOTS
+        .iter()
+        .map(|(_, name)| *name)
+        .chain(std::iter::once(JVM_OBJECT_ROOT))
+        .find(|name| *name == owner)
+}
+
+// Compiler declarations are positive Type authority, separate from inventories
+// that merely certify name absence in an implicit provider.
+const COMPILER_ROOT_OWNERS: &[(Language, &str, &str, &str)] = &[
+    (Language::Scala, "scala", "Any", "scala.Any"),
+    (Language::Scala, "scala", "AnyRef", "scala.AnyRef"),
+];
+
+/// Return the intrinsic owner FQN of a compiler-synthesized Type declaration.
+pub fn compiler_root_owner(language: Language, package: &str, name: &str) -> Option<&'static str> {
+    COMPILER_ROOT_OWNERS
+        .iter()
+        .find_map(|&(lang, pkg, member, owner)| {
+            (language == lang && package == pkg && name == member).then_some(owner)
+        })
+}
 
 /// A synthetic absolute route to one of these roots needs no open hierarchy
 /// obligation. The member tables already include the root's inherited members.
@@ -136,7 +466,7 @@ pub fn language_root_member_inventory(
     owner: &str,
 ) -> Option<&'static [IntrinsicMember]> {
     let defined = SOURCE_LANGUAGE_ROOTS.contains(&(language, owner))
-        || (owner == "java.lang.Object"
+        || (owner == JVM_OBJECT_ROOT
             && matches!(
                 language,
                 Language::Java | Language::Kotlin | Language::Scala
@@ -320,4 +650,33 @@ pub fn specified_method_inventory(owner: &str) -> Option<&'static [JvmImplicitIn
         "java.lang.Object" => Some(&JAVA_OBJECT_METHODS),
         _ => None,
     }
+}
+
+#[test]
+fn implicit_root_groups_preserve_ambiguity_and_shared_targets() {
+    use ImplicitRootLookup::{Answer, Open};
+    assert_eq!(
+        ordered_implicit_root(Language::Kotlin, "String", |root| {
+            (root != "java.lang").then_some("shared.Target")
+        }),
+        Answer("shared.Target")
+    );
+    assert_eq!(
+        ordered_implicit_root(Language::Kotlin, "String", |root| {
+            (root == "kotlin.collections").then_some("shared.Target")
+        }),
+        Open
+    );
+    assert_eq!(
+        ordered_implicit_root(Language::Kotlin, "String", |root| {
+            matches!(root, "kotlin" | "kotlin.collections").then_some(root)
+        }),
+        Open
+    );
+    assert_eq!(
+        ordered_implicit_root(Language::Kotlin, "String", |root| {
+            (root == "java.lang").then_some("java.lang.String")
+        }),
+        Open
+    );
 }

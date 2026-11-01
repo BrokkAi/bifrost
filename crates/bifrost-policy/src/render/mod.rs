@@ -6,7 +6,13 @@
 //! canonical contract.
 
 mod human;
+#[cfg(test)]
+mod human_contract_tests;
+#[cfg(test)]
+mod human_final_contract_tests;
 mod sarif;
+#[cfg(test)]
+mod sarif_contract_tests;
 
 use std::fmt;
 use std::io::{self, Write};

@@ -652,7 +652,7 @@ pub use brokk_bifrost_core::analyzer::carried_context::CarriedContext;
 pub use brokk_bifrost_core::analyzer::project_reads::without_project_reads;
 pub use i_analyzer::{
     ReadAttribution, ReadAttributionGuard, read_attribution_fallback_count,
-    read_attribution_records_reads,
+    read_attribution_records_reads, record_position_read,
 };
 
 pub use crate::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};

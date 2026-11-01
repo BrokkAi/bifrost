@@ -367,6 +367,9 @@ fn normalize_literal_source_path(raw: &str, root: &Path) -> Result<PathBuf, Stri
 }
 
 fn normalize_absolute_source_string(raw: &str, root: &Path) -> Result<String, String> {
+    if let Some(relative) = crate::mcp_common::canonical_relative_glob(raw, root) {
+        return relative;
+    }
     let raw_norm = raw.replace('\\', "/");
     let root_norm = root.display().to_string().replace('\\', "/");
     crate::mcp_common::strip_workspace_root(&raw_norm, &root_norm)

@@ -356,6 +356,13 @@ pub fn prepare_policy_suppression_document(
     let mut encoded = serde_json::to_string_pretty(&document)
         .expect("policy suppression document serialization cannot fail");
     encoded.push('\n');
+    if crate::is_over_u64_byte_limit(&encoded, MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES) {
+        return Err(PolicySuppressionDocumentError::Validation(
+            PolicySuppressionValidationError::DocumentTooLarge {
+                max_bytes: MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES,
+            },
+        ));
+    }
     Ok(encoded)
 }
 
@@ -1294,6 +1301,7 @@ pub(crate) fn bounded_json_error_message(message: &str) -> Box<str> {
 impl RetainedSize for PolicyReportEvaluationContext {
     fn retained_size(&self) -> usize {
         std::mem::size_of::<Self>()
+            .saturating_add(std::mem::size_of_val(self.suppression_sources.as_ref()))
             .saturating_add(self.suppression_sources.iter().fold(0, |bytes, source| {
                 bytes.saturating_add(retained_extra(source))
             }))
@@ -1772,3 +1780,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "suppression_contract_tests.rs"]
+mod suppression_contract_tests;

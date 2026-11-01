@@ -70,19 +70,16 @@ pub(crate) struct JsTsMemoCaches {
     /// Resolved direct supertypes of a class-like code unit.
     pub(crate) direct_ancestors: AttributedCache<CodeUnit, Vec<CodeUnit>>,
     /// Whole-workspace class descendant index, built once per bucket.
-    /// `PoolSafeMemo`, not `OnceLock`: the build walks every workspace class
-    /// through `get_direct_ancestors`, whose misses reach `usage_index`
-    /// and its rayon fan-out -- a blocking `get_or_init` held across that is
-    /// the #1416 self-deadlock shape its two sibling cells below already
-    /// migrated away from.
-    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
-    /// gets an index that was never built over them (issue #1748). Two cells at
-    /// most, because the exclusion verdict is a pure function of the analyzer
-    /// and the file.
+    /// Byte-bounded outcomes and read receipts, separated by test-filter
+    /// variant (#1748). Cold builds do not wait behind another query's deadline.
     pub(crate) direct_descendant_index: super::workspace_facts::DescendantMemos,
-    /// Reverse import edges (importer files by imported file), built once per bucket.
-    pub(crate) reverse_import_index:
-        WorkspaceAuthorityMemo<PoolSafeMemo<super::workspace_facts::ReverseImports>>,
+    /// Byte-bounded reverse import edges and their complete read receipts.
+    pub(crate) reverse_import_index: WorkspaceAuthorityMemo<
+        brokk_bifrost_analysis::analyzer::common::ReplayableQueryCache<
+            (),
+            Arc<super::workspace_facts::ReverseImports>,
+        >,
+    >,
     /// JS/TS usage-resolution maps, built once per bucket and reused across queries.
     pub(crate) jsts_usage_index:
         ReplayingMemo<PoolSafeMemo<ReplayingMemoEntry<Arc<JsTsUsageIndex>, ReadKey>>>,
@@ -105,7 +102,7 @@ impl JsTsMemoCaches {
             direct_descendant_index: super::workspace_facts::DescendantMemos::new(),
             reverse_import_index: WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::JsTsReverseImports,
-                PoolSafeMemo::new(),
+                super::workspace_facts::reverse_import_memo(),
             ),
             jsts_usage_index: ReplayingMemo::new(PoolSafeMemo::new()),
         }

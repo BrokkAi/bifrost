@@ -20,13 +20,6 @@ pub struct RenameFailure {
 }
 
 #[derive(Debug, Clone)]
-pub struct PreparedRename {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub placeholder: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct RenameEdit {
     pub start_byte: usize,
     pub end_byte: usize,

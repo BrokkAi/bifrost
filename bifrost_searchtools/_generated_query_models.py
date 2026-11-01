@@ -98,6 +98,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     RECOVERED_SYNTAX_INCOMPLETE = 'recovered_syntax_incomplete'
     UNSUPPORTED_IMPORT_ANALYSIS = 'unsupported_import_analysis'
     DYNAMIC_IMPORT_TARGET = 'dynamic_import_target'
+    HIERARCHY_INCOMPLETE = 'hierarchy_incomplete'
     SEMANTIC_RESULTS_OMITTED = 'semantic_results_omitted'
     SEMANTIC_WORKSPACE_REQUIRED = 'semantic_workspace_required'
     NO_ENCLOSING_PROCEDURE = 'no_enclosing_procedure'
@@ -108,6 +109,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     SEMANTIC_BUDGET_EXHAUSTED = 'semantic_budget_exhausted'
     SEMANTIC_PROVIDER_FAILED = 'semantic_provider_failed'
     SEMANTIC_PACK_ACQUISITION_PENDING = 'semantic_pack_acquisition_pending'
+    WORKSPACE_SEMANTIC_MODELS_NOT_LOADED = 'workspace_semantic_models_not_loaded'
     UNRESOLVED_PROTOCOL_REFERENCE = 'unresolved_protocol_reference'
     TYPESTATE_REGISTRATION_STALE = 'typestate_registration_stale'
     TYPESTATE_HANDLE_STALE = 'typestate_handle_stale'
@@ -2883,6 +2885,7 @@ class CodeQueryPythonRuleFact:
     nested_loop_reused: bool | None
     nested_scope: bool | None
     none_returns: int | None
+    normal_returns: int | None
     operand_kind: str | None
     optimizing_parameter: bool | None
     outcome: str
@@ -2902,6 +2905,7 @@ class CodeQueryPythonRuleFact:
     related_scope_kind: str | None
     relation: str
     result_use: str | None
+    return_constant: str | None
     return_contract: str | None
     returns_receiver: bool | None
     scope_is_public: bool | None
@@ -4737,6 +4741,7 @@ class CodeQueryStructuralMatch:
     decorator_ranges: list[CodeQueryRange]
     enclosing_symbol: str | None
     end_line: int
+    heuristic: str | None
     id: str | None
     kind: str
     language: str
@@ -14546,6 +14551,7 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         'nested_loop_reused',
         'nested_scope',
         'none_returns',
+        'normal_returns',
         'operand_kind',
         'optimizing_parameter',
         'outcome',
@@ -14565,6 +14571,7 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         'related_scope_kind',
         'relation',
         'result_use',
+        'return_constant',
         'return_contract',
         'returns_receiver',
         'scope_is_public',
@@ -14821,6 +14828,10 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         none_returns_value = _decode_defs_code_query_result_item_union_75_properties_none_returns(value['none_returns'], f"{prefix}.none_returns")
     else:
         none_returns_value = None
+    if 'normal_returns' in value:
+        normal_returns_value = _decode_defs_code_query_result_item_union_75_properties_normal_returns(value['normal_returns'], f"{prefix}.normal_returns")
+    else:
+        normal_returns_value = None
     if 'operand_kind' in value:
         operand_kind_value = _decode_defs_code_query_result_item_union_75_properties_operand_kind(value['operand_kind'], f"{prefix}.operand_kind")
     else:
@@ -14879,6 +14890,10 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         result_use_value = _decode_defs_code_query_result_item_union_75_properties_result_use(value['result_use'], f"{prefix}.result_use")
     else:
         result_use_value = None
+    if 'return_constant' in value:
+        return_constant_value = _decode_defs_code_query_result_item_union_75_properties_return_constant(value['return_constant'], f"{prefix}.return_constant")
+    else:
+        return_constant_value = None
     if 'return_contract' in value:
         return_contract_value = _decode_defs_code_query_result_item_union_75_properties_return_contract(value['return_contract'], f"{prefix}.return_contract")
     else:
@@ -14994,6 +15009,7 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         nested_loop_reused=nested_loop_reused_value,
         nested_scope=nested_scope_value,
         none_returns=none_returns_value,
+        normal_returns=normal_returns_value,
         operand_kind=operand_kind_value,
         optimizing_parameter=optimizing_parameter_value,
         outcome=outcome_value,
@@ -15013,6 +15029,7 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         related_scope_kind=related_scope_kind_value,
         relation=relation_value,
         result_use=result_use_value,
+        return_constant=return_constant_value,
         return_contract=return_contract_value,
         returns_receiver=returns_receiver_value,
         scope_is_public=scope_is_public_value,
@@ -20826,6 +20843,7 @@ def _decode_code_query_structural_match(value: Any, prefix: str = 'CodeQueryStru
         'decorator_ranges',
         'enclosing_symbol',
         'end_line',
+        'heuristic',
         'id',
         'kind',
         'language',
@@ -20873,6 +20891,10 @@ def _decode_code_query_structural_match(value: Any, prefix: str = 'CodeQueryStru
     else:
         enclosing_symbol_value = None
     end_line_value = _decode_defs_code_query_result_item_union_0_properties_end_line(value['end_line'], f"{prefix}.end_line")
+    if 'heuristic' in value:
+        heuristic_value = _decode_defs_code_query_result_item_union_0_properties_heuristic(value['heuristic'], f"{prefix}.heuristic")
+    else:
+        heuristic_value = None
     if 'id' in value:
         id_value = _decode_defs_code_query_result_item_union_0_properties_id(value['id'], f"{prefix}.id")
     else:
@@ -20905,6 +20927,7 @@ def _decode_code_query_structural_match(value: Any, prefix: str = 'CodeQueryStru
         decorator_ranges=decorator_ranges_value,
         enclosing_symbol=enclosing_symbol_value,
         end_line=end_line_value,
+        heuristic=heuristic_value,
         id=id_value,
         kind=kind_value,
         language=language_value,
@@ -22544,8 +22567,8 @@ def _decode_defs_code_query_declaration_properties_start_line(value: Any, prefix
     return value
 
 def _decode_defs_code_query_diagnostic_code(value: Any, prefix: str = 'CodeQueryDiagnosticCode') -> CodeQueryDiagnosticCode:
-    values_repr = "['invalid_plan', 'cancelled', 'unsupported_structural_feature', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query']"
-    if value not in ('invalid_plan', 'cancelled', 'unsupported_structural_feature', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query'):
+    values_repr = "['invalid_plan', 'cancelled', 'unsupported_structural_feature', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query']"
+    if value not in ('invalid_plan', 'cancelled', 'unsupported_structural_feature', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query'):
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return CodeQueryDiagnosticCode(value)
 
@@ -23982,6 +24005,16 @@ def _decode_defs_code_query_result_item_union_0_properties_end_line(value: Any, 
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
+
+def _decode_defs_code_query_result_item_union_0_properties_heuristic(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_code_query_result_item_union_0_properties_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
@@ -30863,6 +30896,22 @@ def _decode_defs_code_query_result_item_union_75_properties_none_returns_union_0
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
+def _decode_defs_code_query_result_item_union_75_properties_normal_returns(value: Any, prefix: str = "union") -> int | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_defs_code_query_result_item_union_75_properties_normal_returns_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_75_properties_normal_returns_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
 def _decode_defs_code_query_result_item_union_75_properties_operand_kind(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
@@ -31020,6 +31069,16 @@ def _decode_defs_code_query_result_item_union_75_properties_result_type(value: A
     return value
 
 def _decode_defs_code_query_result_item_union_75_properties_result_use(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_75_properties_return_constant(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []

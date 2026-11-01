@@ -185,3 +185,20 @@ pub mod topology;
 pub mod trace;
 #[doc(hidden)]
 pub mod workspace_document;
+
+/// A proven intrinsic call's value transfer, independent of the flow engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntrinsicTransfer {
+    ReceiverToResult,
+    ArgumentToResult,
+    FreshResult,
+}
+
+/// A language-owned intrinsic identity and its value transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntrinsicCall {
+    pub operation: String,
+    pub transfer: IntrinsicTransfer,
+    pub model_namespace: &'static str,
+    pub content_domain: &'static [u8],
+}

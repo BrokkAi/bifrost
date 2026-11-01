@@ -62,15 +62,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     "Kotlin capture destination must be {expected}, allocated {location}"
                 )));
             }
-            self.append_effect(
-                builder,
-                entry,
-                SemanticEffect::MemoryLoad {
-                    kind: MemoryAccessKind::Capture,
-                    location,
-                    result: value,
-                },
-            )?;
+            if capture.mutable {
+                self.shared_binding_locations
+                    .insert(value, (location, MemoryAccessKind::Capture));
+            } else {
+                self.append_effect(
+                    builder,
+                    entry,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Capture,
+                        location,
+                        result: value,
+                    },
+                )?;
+            }
+            if capture.delegated {
+                self.delegated_locals.insert(value);
+            }
             if !capture_binding_expected {
                 self.add_gap(
                     builder,
@@ -82,6 +90,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
             self.captured_bindings.insert(capture.name.into(), value);
+        }
+        Ok(())
+    }
+
+    pub(in crate::analyzer::kotlin::semantic) fn emit_shared_binding_cells(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        spec: &ProcedureSpec<'tree>,
+    ) -> Result<(), KotlinLoweringError> {
+        for &(name, declaration_start) in &spec.shared_bindings {
+            let value = self
+                .local_declaration_value(name, declaration_start)
+                .expect("inventoried shared Kotlin binding exists");
+            let location = self.session.add_memory_location(
+                builder,
+                entry,
+                MemoryLocationKind::LexicalCell { binding: value },
+            )?;
+            assert!(
+                self.shared_binding_locations
+                    .insert(value, (location, MemoryAccessKind::LexicalCell))
+                    .is_none(),
+                "one Kotlin binding has one shared cell"
+            );
         }
         Ok(())
     }
@@ -430,6 +463,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "reading a delegated local calls the delegate's getValue, which is not yet a call site",
             )?;
+        } else if let Some(source) = source
+            && let Some((location, kind)) = self.shared_binding_locations.get(&source).copied()
+        {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryLoad {
+                    kind,
+                    location,
+                    result: target,
+                },
+            )?;
+            return Ok(());
         }
         if let Some(source) = source
             && source != target
@@ -827,6 +873,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let name = node_text(self.prepared.source(), node)?;
         self.local_at(name, node.start_byte())
             .or_else(|| self.parameters.get(name).copied())
+            .or_else(|| self.captured_bindings.get(name).copied())
     }
 
     /// The primitive scalar type proven for a bare local or parameter name.
@@ -1043,6 +1090,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
             }
+        }
+        if let Some((location, kind)) = self.shared_binding_locations.get(&target).copied() {
+            let stored_value = if matches!(outcome, KotlinAdaptationOutcome::Adapted(_)) {
+                target
+            } else {
+                source
+            };
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryStore {
+                    kind,
+                    location,
+                    value: stored_value,
+                },
+            )?;
         }
         Ok(())
     }

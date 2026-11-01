@@ -251,6 +251,13 @@ impl NativePointBatch {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn persisted_reads_for_test(
+        &self,
+    ) -> &crate::analyzer::store::resolution_operation::SelectedPointReadMemos {
+        &self.persisted_reads
+    }
+
     pub fn persisted_read_counts_for_test(&self) -> (usize, usize, usize) {
         self.persisted_reads.read_counts_for_test()
     }
@@ -348,6 +355,7 @@ impl NativePointBatch {
                 work,
             };
         }
+        let _fill_scope = crate::analyzer::AnalyzerQueryScope::for_retained_fill(query.analyzer);
         let ((fill, incompleteness), reads) =
             crate::analyzer::capture_query_reads(query.analyzer, || {
                 let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(
@@ -1533,13 +1541,19 @@ fn adapt_definition_answer_impl(
             ),
             kind: "native_external_member_inventory".into(),
             message: format!(
-                "indexed external member rows {:?}; static={}",
+                "indexed external member rows {:?}; static={}{}",
                 answer
                     .external_members
                     .iter()
                     .map(|member| &member.identity)
                     .collect::<Vec<_>>(),
-                first.is_static
+                first.is_static,
+                first
+                    .pack
+                    .as_ref()
+                    .map_or_else(String::new, |(id, version)| format!(
+                        "; pack={id}@{version}"
+                    ))
             ),
         });
     }

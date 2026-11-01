@@ -970,3 +970,54 @@ class Locking {
   "truncated": false
 }
 ```
+
+## Select type literals
+
+A `typeof(T)` expression is a `type_literal`. Its `type` role is the written
+type operand. Under `resolved-value`, the operand resolves to one exact
+declaration identity, also when the literal is read through
+`.AssemblyQualifiedName` or `.FullName`.
+
+<!-- code-query-fixture:csharp/TypeLiterals.cs -->
+```csharp
+class Proxy {}
+class Setup {
+    string ProxyName() => typeof(Proxy).AssemblyQualifiedName;
+}
+```
+
+<!-- code-query-case:type-literal:rql -->
+```lisp
+(language csharp (type_literal :type (capture "type")))
+```
+
+<!-- code-query-case:type-literal:json -->
+```json
+{"languages":["csharp"],"match":{"kind":"type_literal","type":{"capture":"type"}}}
+```
+
+<!-- code-query-case:type-literal:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "csharp/TypeLiterals.cs",
+      "language": "csharp",
+      "kind": "type_literal",
+      "start_line": 3,
+      "end_line": 3,
+      "text": "typeof(Proxy)",
+      "enclosing_symbol": "Setup.ProxyName",
+      "captures": [
+        {
+          "name": "type",
+          "text": "Proxy",
+          "start_line": 3
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```

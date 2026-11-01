@@ -624,11 +624,15 @@ fn admit_candidates_by_source_bytes(
     max_source_bytes: Option<usize>,
     cancellation: &CancellationToken,
 ) -> (HashSet<ProjectFile>, usize, bool, bool) {
+    if cancellation.is_cancelled() {
+        return (HashSet::default(), 0, false, true);
+    }
+    let mut ordered = candidates.iter().cloned().collect::<Vec<_>>();
+    analyzer.prefetch_parse_variants(&ordered);
     let Some(max_source_bytes) = max_source_bytes else {
         return (candidates, 0, false, false);
     };
 
-    let mut ordered = candidates.iter().cloned().collect::<Vec<_>>();
     ordered.sort_by_key(|file| (!protected_candidates.contains(file), file.clone()));
     let mut admitted = HashSet::default();
     let mut scanned_source_bytes = 0usize;

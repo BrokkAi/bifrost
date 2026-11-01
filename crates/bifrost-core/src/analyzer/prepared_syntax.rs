@@ -104,6 +104,7 @@ pub enum PreparedSourceOrigin {
 pub struct PreparedSyntaxTree {
     source: PreparedSyntaxSource,
     source_sha256: OnceLock<[u8; 32]>,
+    parse_variant: crate::gitblob::ParseVariant,
     #[cfg(debug_assertions)]
     source_key: (usize, usize),
     tree: Tree,
@@ -134,6 +135,7 @@ impl PreparedSyntaxTree {
         Self {
             source,
             source_sha256: OnceLock::new(),
+            parse_variant: crate::gitblob::ParseVariant::Empty,
             #[cfg(debug_assertions)]
             source_key,
             tree,
@@ -143,6 +145,15 @@ impl PreparedSyntaxTree {
             origin,
             overlay_revision,
         }
+    }
+
+    pub fn with_parse_variant(mut self, variant: crate::gitblob::ParseVariant) -> Self {
+        self.parse_variant = variant;
+        self
+    }
+
+    pub fn parse_variant(&self) -> crate::gitblob::ParseVariant {
+        self.parse_variant
     }
 
     pub fn with_preprocessor(mut self, preprocessor: Option<Arc<dyn SourcePreprocessor>>) -> Self {

@@ -1,6 +1,7 @@
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
+use brokk_bifrost_core::analyzer::project::{PartialWorkspaceListing, Project};
 
 use brokk_bifrost_core::git_file::parse_rev_path;
 
@@ -26,6 +27,7 @@ use brokk_bifrost_core::path_utils::rel_path_string;
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 const DEFAULT_FIND_FILES_CONTAINING_LIMIT: usize = 50;
 const DEFAULT_SEARCH_FILE_CONTENTS_CONTEXT: usize = 2;
@@ -60,11 +62,6 @@ pub struct SearchFileContentsParams {
     pub case_insensitive: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkimFilesParams {
-    pub file_paths: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct GetFileContentsResult {
     pub files: Vec<FileContent>,
@@ -91,6 +88,8 @@ pub struct FindFilesContainingResult {
     pub files: Vec<String>,
     pub truncated: bool,
     pub invalid_patterns: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub incomplete_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +97,8 @@ pub struct SearchFileContentsResult {
     pub matches: Vec<FileMatchGroup>,
     pub truncated: bool,
     pub invalid_patterns: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub incomplete_reasons: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
     /// `file_path` as the caller wrote it, when it names no workspace file and
@@ -121,28 +122,6 @@ pub struct LineMatch {
     pub text: String,
     pub before: Vec<String>,
     pub after: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SkimFilesResult {
-    pub files: Vec<SkimFileEntry>,
-    pub not_found: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub ambiguous_paths: Vec<AmbiguousPathInput>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SkimFileEntry {
-    pub path: String,
-    pub declarations: Vec<SkimDeclaration>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SkimDeclaration {
-    pub symbol: String,
-    pub kind: String,
-    pub start_line: usize,
-    pub end_line: usize,
 }
 
 pub fn get_file_contents(
@@ -275,20 +254,11 @@ pub fn find_files_containing(
             files: Vec::new(),
             truncated: false,
             invalid_patterns,
+            incomplete_reasons: Vec::new(),
         };
     }
 
-    let all_files = match project.all_files() {
-        Ok(files) => files,
-        Err(_) => {
-            return FindFilesContainingResult {
-                files: Vec::new(),
-                truncated: false,
-                invalid_patterns,
-            };
-        }
-    };
-
+    let (all_files, incomplete_reasons) = listed_files(project);
     let files: Vec<ProjectFile> = all_files.into_iter().collect();
     let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let mut matched: Vec<String> = files
@@ -316,6 +286,22 @@ pub fn find_files_containing(
         files: matched,
         truncated,
         invalid_patterns,
+        incomplete_reasons,
+    }
+}
+
+/// The workspace files to search and the reasons the listing is incomplete.
+/// A walk that failed under part of the tree still searches the files it did
+/// enumerate, so one unreadable directory does not erase the whole answer.
+fn listed_files(project: &dyn Project) -> (BTreeSet<ProjectFile>, Vec<String>) {
+    match project.all_files() {
+        Ok(files) => (files, Vec::new()),
+        Err(err) => (
+            PartialWorkspaceListing::files_of(&err)
+                .cloned()
+                .unwrap_or_default(),
+            vec![format!("all_files: {err}")],
+        ),
     }
 }
 
@@ -334,6 +320,7 @@ pub fn search_file_contents(
             invalid_patterns,
             ambiguous_paths: Vec::new(),
             unmatched_paths: Vec::new(),
+            incomplete_reasons: Vec::new(),
         };
     }
 
@@ -370,18 +357,7 @@ pub fn search_file_contents(
         }
     });
 
-    let all_files = match project.all_files() {
-        Ok(files) => files,
-        Err(_) => {
-            return SearchFileContentsResult {
-                matches: Vec::new(),
-                truncated: false,
-                invalid_patterns,
-                ambiguous_paths,
-                unmatched_paths,
-            };
-        }
-    };
+    let (all_files, listing_reasons) = listed_files(project);
 
     let context = params.context_lines.min(MAX_CONTEXT_LINES);
     let candidates: Vec<ProjectFile> = if filter_requested && !ambiguous_paths.is_empty() {
@@ -398,30 +374,43 @@ pub fn search_file_contents(
     };
 
     let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
-    let mut groups: Vec<FileMatchGroup> = candidates
+    let results: Vec<(Option<FileMatchGroup>, Option<String>)> = candidates
         .into_par_iter()
-        .filter_map(|file| {
+        .map(|file| {
             attribution.run(|| {
                 if !is_searchable_text_file(&file) {
-                    return None;
+                    return (None, None);
                 }
-                let contents = project.read_source(&file).ok()?;
+                let contents = match project.read_source(&file) {
+                    Ok(contents) => contents,
+                    Err(err) => {
+                        return (
+                            None,
+                            Some(format!("read_source {}: {err}", rel_path_string(&file))),
+                        );
+                    }
+                };
                 // Bound the per-file line count before allocating `Vec<&str>`.
                 // A 5 MB single-byte-line file would otherwise produce ~5M slices
                 // (≈120 MB of Vec headers) across rayon workers — a memory-pressure
                 // amplifier despite the byte cap.
-                if contents.bytes().filter(|&b| b == b'\n').count() > MAX_LINES_PER_FILE_SCAN {
-                    return None;
+                let line_count = contents.bytes().filter(|&b| b == b'\n').count()
+                    + usize::from(!contents.ends_with('\n'));
+                if line_count > MAX_LINES_PER_FILE_SCAN {
+                    return (
+                        None,
+                        Some(format!("line_limit: {}", rel_path_string(&file))),
+                    );
                 }
                 let lines: Vec<&str> = contents.split('\n').collect();
                 let mut hits = Vec::new();
                 let mut file_truncated = false;
                 for (idx, line) in lines.iter().enumerate() {
-                    if hits.len() >= MAX_PER_FILE_SEARCH_MATCHES {
-                        file_truncated = true;
-                        break;
-                    }
                     if regexes.iter().any(|regex| regex.is_match(line)) {
+                        if hits.len() >= MAX_PER_FILE_SEARCH_MATCHES {
+                            file_truncated = true;
+                            break;
+                        }
                         let before_start = idx.saturating_sub(context);
                         let before = lines[before_start..idx]
                             .iter()
@@ -441,21 +430,36 @@ pub fn search_file_contents(
                     }
                 }
                 if hits.is_empty() {
-                    None
+                    (None, None)
                 } else {
-                    Some(FileMatchGroup {
-                        path: rel_path_string(&file),
-                        matches: hits,
-                        truncated: file_truncated,
-                    })
+                    (
+                        Some(FileMatchGroup {
+                            path: rel_path_string(&file),
+                            matches: hits,
+                            truncated: file_truncated,
+                        }),
+                        None,
+                    )
                 }
             })
         })
         .collect();
 
+    let mut groups = Vec::new();
+    let mut incomplete_reasons = listing_reasons;
+    for (group, reason) in results {
+        if let Some(group) = group {
+            groups.push(group);
+        }
+        if let Some(reason) = reason {
+            incomplete_reasons.push(reason);
+        }
+    }
+    incomplete_reasons.sort();
     groups.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let mut truncated = groups.iter().any(|group| group.truncated);
+    let mut truncated =
+        !incomplete_reasons.is_empty() || groups.iter().any(|group| group.truncated);
     let mut total: usize = 0;
     let mut keep = groups.len();
     for (idx, group) in groups.iter().enumerate() {
@@ -474,64 +478,8 @@ pub fn search_file_contents(
         invalid_patterns,
         ambiguous_paths,
         unmatched_paths,
+        incomplete_reasons,
     }
-}
-
-pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFilesResult {
-    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
-    let mut files = Vec::new();
-    let mut not_found = Vec::new();
-    let mut ambiguous_paths = Vec::new();
-
-    for input in params.file_paths {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let file = match resolver.resolve_literal(trimmed) {
-            ResolvedFileInput::File(file) => file,
-            ResolvedFileInput::Ambiguous(item) => {
-                ambiguous_paths.push(item);
-                continue;
-            }
-            ResolvedFileInput::NotFound(item) => {
-                not_found.push(item);
-                continue;
-            }
-        };
-
-        let declarations: Vec<SkimDeclaration> = analyzer
-            .top_level_declarations(&file)
-            .into_iter()
-            .flat_map(|code_unit| {
-                analyzer
-                    .ranges(&code_unit)
-                    .into_iter()
-                    .map(move |range| SkimDeclaration {
-                        symbol: code_unit.short_name().to_string(),
-                        kind: code_unit_kind_label(&code_unit),
-                        start_line: range.start_line,
-                        end_line: range.end_line,
-                    })
-            })
-            .collect();
-
-        files.push(SkimFileEntry {
-            path: rel_path_string(&file),
-            declarations,
-        });
-    }
-
-    SkimFilesResult {
-        files,
-        not_found,
-        ambiguous_paths,
-    }
-}
-
-fn code_unit_kind_label(code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> String {
-    code_unit.kind().display_lowercase().to_string()
 }
 
 fn compile_regexes(patterns: &[String], case_insensitive: bool) -> (Vec<Regex>, Vec<String>) {
@@ -663,22 +611,6 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "#60: skim rejects an absolute host path and returns it as not found without panicking"
-    )]
-    fn skim_files_rejects_absolute_paths_without_panic() {
-        let fix = Fixture::new(&[("a.rs", "fn a() {}\n")]);
-        let result = skim_files(
-            fix.analyzer.analyzer(),
-            SkimFilesParams {
-                file_paths: vec!["/etc/passwd".to_string()],
-            },
-        );
-        assert!(result.files.is_empty());
-        assert_eq!(result.not_found, vec!["/etc/passwd"]);
-    }
-
-    #[test]
-    #[brokk_bifrost_test_macros::hardwon(
         "#60: Checks per-file match capping and the aggregate truncated status when one file has more than 50 hits"
     )]
     fn search_file_contents_marks_per_file_truncation() {
@@ -723,3 +655,7 @@ mod tests {
         assert!(result.matches[0].matches[0].before.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "file_tools_regressions.rs"]
+mod regressions;

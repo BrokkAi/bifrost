@@ -1493,9 +1493,10 @@ WITH files AS MATERIALIZED (
   AND source.rel_path=json_extract(request.value,'$[4]') AND source.input_kind='source'
   AND source.valid_from<=json_extract(request.value,'$[3]')
   AND (source.valid_until IS NULL OR json_extract(request.value,'$[3]')<source.valid_until)
+ LEFT JOIN csharp_file_version_decisions decisions ON decisions.file_version_id=source.file_version_id
  LEFT JOIN blobs blob ON blob.blob_oid=source.blob_oid
   AND blob.lang=source.lang AND blob.generation=source.generation
-  AND blob.parse_variant=x''
+  AND blob.parse_variant=COALESCE(decisions.decision_digest,x'')
 ), references_by_name AS (
  SELECT files.ordinal,
         CASE WHEN substr(name.spelling,1,2)='r#' THEN substr(name.spelling,3)

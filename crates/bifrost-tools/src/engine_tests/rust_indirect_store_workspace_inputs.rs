@@ -23,6 +23,7 @@ mod rust_indirect_table_tests {
         let workspace = WorkspaceId("a".repeat(64));
         let other_workspace = WorkspaceId("b".repeat(64));
         let source = WorkspaceFileRow {
+            decision: None,
             rel_path: "src/lib.rs".into(),
             blob_oid: Oid::hash_object(git2::ObjectType::Blob, b"pub fn run() {}").unwrap(),
         };
@@ -102,7 +103,7 @@ mod rust_indirect_table_tests {
                 &["rust".to_owned()],
                 &HashMap::from_iter([("rust".to_owned(), generation)]),
                 "src/other.rs",
-                Some(("rust", source.blob_oid)),
+                Some(("rust", source.blob_oid, None)),
                 None,
                 &[],
                 &[],

@@ -61,6 +61,44 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Match a resolver-owned callable and its selected external record, if any.
+pub fn selected_model_callable(
+    analyzer: &dyn IAnalyzer,
+    overlay: &SemanticModelOverlay,
+    key: SemanticModelCallableKey<'_>,
+    selected_descriptor: Option<&crate::analyzer::resolution::ExternalMemberIdentity>,
+    application: &SemanticModelCallApplication,
+) -> Option<SemanticModelCallableMatch> {
+    let selected_record =
+        match selected_descriptor {
+            Some(selected) => Some(analyzer.active_semantic_model_snapshot().and_then(
+                |snapshot| {
+                    crate::analyzer::store::active_models::selected_external_descriptor(
+                        snapshot.active_models(),
+                        selected,
+                    )
+                },
+            )?),
+            None => None,
+        };
+    Some(
+        overlay.callable_for_selected_application(
+            key,
+            application,
+            selected_record
+                .as_ref()
+                .map(|(provider, record)| (provider.as_str(), record.as_str())),
+        ),
+    )
+}
+
+// Request-local edge evidence, aligned with the legacy direct-record order.
+struct ModelAncestryStep {
+    flattened: SemanticModelAncestry,
+    boundaries: Vec<Option<usize>>,
+    alternatives: Vec<Vec<Arc<SemanticModelSymbol>>>,
+    missing: Vec<String>,
+}
 type DeclaredTypeNames = HashMap<
     String,
     (
@@ -2532,30 +2570,76 @@ impl SemanticModelOverlay {
     /// Resolve a model type's transitive ancestors without materializing
     /// universal-root edges for every declaration in the overlay.
     pub fn ancestors_of(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestry {
+        self.walk_ancestry(symbol).0
+    }
+
+    /// Project definite records and uncertainty without changing legacy readers.
+    pub fn ancestry_answer(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestryAnswer {
+        self.walk_ancestry(symbol).1
+    }
+
+    fn walk_ancestry(
+        &self,
+        symbol: &SemanticModelSymbol,
+    ) -> (SemanticModelAncestry, SemanticModelAncestryAnswer) {
         let mut records = Vec::new();
         let mut defects = Vec::new();
-        let mut queue = VecDeque::new();
-        let mut seed = Some(symbol);
+        let mut answer = SemanticModelAncestryAnswer::default();
+        let mut queue = VecDeque::from([(None, None)]);
         let mut seen = HashSet::from_iter([symbol.id.clone()]);
+        let mut definite = HashSet::from_iter([symbol.id.clone()]);
+        let mut projected = HashSet::default();
         let mut conflict = symbol.provenance.ambiguous;
-        while let Some(direct) = seed
-            .take()
-            .map(|s| self.direct_ancestors_of(s))
-            .or_else(|| {
-                queue
-                    .pop_front()
-                    .map(|s: Arc<SemanticModelSymbol>| self.direct_ancestors_of(&s))
-            })
-        {
-            conflict |= direct.disposition == SemanticModelOverlayDisposition::Conflict;
-            defects.extend(direct.defects);
-            for ancestor in direct.records {
-                if seen.insert(ancestor.id.clone()) {
-                    records.push(Arc::clone(&ancestor));
-                    queue.push_back(ancestor);
+        // Request-local evidence lets a later definite diamond path promote
+        // a previously ambiguous record without resolving its edges again.
+        // The first expansion alone contributes to the legacy projection.
+        let mut steps: HashMap<String, ModelAncestryStep> = HashMap::default();
+        while let Some((unit, inherited_boundary)) = queue.pop_front() {
+            let unit: &SemanticModelSymbol = unit.as_deref().unwrap_or(symbol);
+            let first = !steps.contains_key(&unit.id);
+            if first {
+                steps.insert(unit.id.clone(), self.direct_ancestry_step(unit));
+            }
+            let step = &steps[&unit.id];
+            if first {
+                conflict |= step.flattened.disposition == SemanticModelOverlayDisposition::Conflict;
+                defects.extend(step.flattened.defects.iter().cloned());
+            }
+            let clean = inherited_boundary.is_none() || definite.contains(&unit.id);
+            let project = clean && projected.insert(unit.id.clone());
+            let offset = answer.alternatives.len();
+            if project {
+                answer
+                    .alternatives
+                    .extend(step.alternatives.iter().cloned());
+                answer.missing.extend(step.missing.iter().cloned());
+            }
+            for (ancestor, boundary) in step.flattened.records.iter().zip(&step.boundaries) {
+                let fresh = first && seen.insert(ancestor.id.clone());
+                if fresh {
+                    records.push(Arc::clone(ancestor));
+                    let boundary = if clean {
+                        boundary.map(|index| offset + index)
+                    } else {
+                        inherited_boundary
+                    };
+                    queue.push_back((Some(Arc::clone(ancestor)), boundary));
+                }
+                if project
+                    && boundary.is_none()
+                    && definite.insert(ancestor.id.clone())
+                    && !fresh
+                    && steps.contains_key(&ancestor.id)
+                {
+                    queue.push_back((Some(Arc::clone(ancestor)), None));
                 }
             }
         }
+        answer.records = records
+            .iter()
+            .filter(|record| definite.contains(&record.id))
+            .cloned()
+            .collect();
         let disposition = if conflict {
             SemanticModelOverlayDisposition::Conflict
         } else if records.is_empty() {
@@ -2563,11 +2647,14 @@ impl SemanticModelOverlay {
         } else {
             SemanticModelOverlayDisposition::Unique
         };
-        SemanticModelAncestry {
-            records,
-            disposition,
-            defects,
-        }
+        (
+            SemanticModelAncestry {
+                records,
+                disposition,
+                defects,
+            },
+            answer,
+        )
     }
 
     /// One type's whole inherited surface, gated on the three conditions a
@@ -2621,6 +2708,10 @@ impl SemanticModelOverlay {
     }
 
     fn direct_ancestors_of(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestry {
+        self.direct_ancestry_step(symbol).flattened
+    }
+
+    fn direct_ancestry_step(&self, symbol: &SemanticModelSymbol) -> ModelAncestryStep {
         let hierarchy = self
             .relations_from(&symbol.id)
             .records
@@ -2635,9 +2726,31 @@ impl SemanticModelOverlay {
         let has_class_parent = hierarchy.iter().any(|relation| relation.kind == "extends");
         let mut records = Vec::new();
         let mut defects = Vec::new();
+        let mut boundaries = Vec::new();
+        let mut alternatives = Vec::new();
+        let mut missing = Vec::new();
         let mut conflict = hierarchy
             .iter()
             .any(|relation| relation.provenance.ambiguous);
+        let mut observe = |target: &str,
+                           resolved: &ResolvedEdgeTarget,
+                           relation: Option<&SemanticModelRelation>| {
+            // The universal root has no ancestors even without a model record.
+            // Keep the legacy flattened defects for member-surface readers.
+            if resolved.records.is_empty() && Some(target) != universal_root_name(symbol) {
+                missing.push(target.to_string());
+            }
+            let boundary = (!resolved.records.is_empty()
+                && (resolved.records.len() > 1
+                    || resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous)
+                    || relation.is_some_and(|relation| relation.provenance.ambiguous)))
+            .then(|| {
+                let index = alternatives.len();
+                alternatives.push(resolved.records.clone());
+                index
+            });
+            boundaries.extend(std::iter::repeat_n(boundary, resolved.records.len()));
+        };
         for relation in hierarchy {
             let target = self.ancestry_target_name(symbol, &relation.to);
             // Declaration IDs are not module-relative names.
@@ -2652,6 +2765,7 @@ impl SemanticModelOverlay {
             // Rust calls a trait implementation `implements`. The target is a
             // type either way, so ask for that and let the language's own kind
             // decide the rest.
+            let target_name = target;
             let resolved =
                 self.resolve_edge_target(target, &symbol.language, HierarchyTargetShape::Type);
             conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
@@ -2662,6 +2776,7 @@ impl SemanticModelOverlay {
                     defect,
                 });
             }
+            observe(target_name, &resolved, Some(&relation));
             records.extend(resolved.records);
         }
         // A declaration that names no class parent still inherits the
@@ -2672,6 +2787,7 @@ impl SemanticModelOverlay {
             && let Some(root_name) =
                 universal_root_name(symbol).filter(|root| *root != symbol.qualified_name)
         {
+            let target_name = root_name;
             let resolved =
                 self.resolve_edge_target(root_name, &symbol.language, HierarchyTargetShape::Type);
             conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
@@ -2682,20 +2798,36 @@ impl SemanticModelOverlay {
                     defect,
                 });
             }
+            observe(target_name, &resolved, None);
             records.extend(resolved.records);
         }
         let mut seen = HashSet::default();
-        records.retain(|record| seen.insert(record.id.clone()));
-        SemanticModelAncestry {
-            disposition: if conflict {
-                SemanticModelOverlayDisposition::Conflict
-            } else if records.is_empty() {
-                SemanticModelOverlayDisposition::Empty
-            } else {
-                SemanticModelOverlayDisposition::Unique
+        let mut kept_boundaries = Vec::new();
+        let mut index = 0;
+        records.retain(|record| {
+            let keep = seen.insert(record.id.clone());
+            if keep {
+                kept_boundaries.push(boundaries[index]);
+            }
+            index += 1;
+            keep
+        });
+        debug_assert_eq!(records.len(), kept_boundaries.len());
+        ModelAncestryStep {
+            boundaries: kept_boundaries,
+            alternatives,
+            missing,
+            flattened: SemanticModelAncestry {
+                disposition: if conflict {
+                    SemanticModelOverlayDisposition::Conflict
+                } else if records.is_empty() {
+                    SemanticModelOverlayDisposition::Empty
+                } else {
+                    SemanticModelOverlayDisposition::Unique
+                },
+                records,
+                defects,
             },
-            records,
-            defects,
         }
     }
 
@@ -7246,10 +7378,11 @@ pub mod go_extra_support_0 {
         }
         let mut records = vec![owner, callback];
         if conflict {
-            let mut other = records[1].clone();
-            other.id = "other.callback".to_owned();
-            other.provenance.pack_digest = "other pack".to_owned();
-            records.push(other);
+            let mut other_owner = records[0].clone();
+            other_owner.provenance.pack_digest = "other pack".to_owned();
+            let mut other_field = records[1].clone();
+            other_field.provenance.pack_digest = "other pack".to_owned();
+            records.extend([other_owner, other_field]);
         }
         overlay(records, Vec::new())
     }

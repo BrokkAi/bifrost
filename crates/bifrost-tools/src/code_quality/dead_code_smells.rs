@@ -15,8 +15,6 @@ use crate::code_quality::sanitize_table_cell;
 
 use brokk_bifrost_core::analyzer::common::language_for_target;
 
-pub(crate) use brokk_bifrost_analysis::analyzer::common::declaration_header;
-
 use brokk_bifrost_analysis::analyzer::languages::DeadCodeBulkEdges;
 
 use brokk_bifrost_analysis::analyzer::languages::DeadCodeBulkPreflight;
@@ -185,8 +183,8 @@ fn build_graph_dead_code_finding(
         kind: candidate.kind().display_lowercase().to_string(),
         symbol: candidate.fq_name(),
         file: candidate.source().clone(),
-        start_line: range.start_line + 1,
-        end_line: range.end_line + 1,
+        start_line: range.start_line,
+        end_line: range.end_line,
         total_usage_count,
         external_usage_count: details.external_usage_count,
         evidence: details.evidence,
@@ -734,7 +732,7 @@ fn dead_code_candidates(
                 {
                     continue;
                 }
-                if !is_dead_code_candidate(analyzer, &definition, skipped) {
+                if !is_dead_code_candidate(declaration_syntax, &definition, skipped) {
                     continue;
                 }
                 if code_unit_language(&definition) == Language::CSharp
@@ -764,7 +762,7 @@ fn dead_code_candidates(
     } else {
         for file in files {
             for declaration in analyzer.declarations(file) {
-                if !is_dead_code_candidate(analyzer, &declaration, skipped) {
+                if !is_dead_code_candidate(declaration_syntax, &declaration, skipped) {
                     continue;
                 }
                 if code_unit_language(&declaration) == Language::CSharp
@@ -1012,9 +1010,12 @@ mod tests {
                 .contains(&oid)
         );
         assert!(
-            reads
-                .keys()
-                .contains(&ReadKey::file(Language::Rust, "src/lib.rs", oid)),
+            reads.keys().contains(&ReadKey::file(
+                Language::Rust,
+                "src/lib.rs",
+                oid,
+                brokk_bifrost_core::gitblob::ParseVariant::Empty
+            )),
             "the lazily parsed root must remain a captured dependency: {:?}",
             reads.keys()
         );
@@ -1488,7 +1489,7 @@ mod tests {
 
         assert!(
             !crate::code_quality::dead_code_smells::is_dead_code_candidate(
-                &analyzer,
+                &mut super::DeclarationSyntaxCache::new(&analyzer),
                 &candidate,
                 &mut skipped
             )
@@ -1515,7 +1516,7 @@ mod tests {
 
         assert!(
             crate::code_quality::dead_code_smells::is_dead_code_candidate(
-                &analyzer,
+                &mut super::DeclarationSyntaxCache::new(&analyzer),
                 &candidate,
                 &mut skipped
             )
@@ -1544,7 +1545,7 @@ mod tests {
         );
         assert!(
             crate::code_quality::dead_code_smells::is_dead_code_candidate(
-                &analyzer,
+                &mut super::DeclarationSyntaxCache::new(&analyzer),
                 &candidate,
                 &mut skipped
             )
@@ -1574,7 +1575,7 @@ mod tests {
         assert_eq!(analyzer.package_clause_of(&file).as_deref(), Some("main"));
         assert!(
             !crate::code_quality::dead_code_smells::is_dead_code_candidate(
-                &analyzer,
+                &mut super::DeclarationSyntaxCache::new(&analyzer),
                 &candidate,
                 &mut skipped
             )
@@ -1598,7 +1599,7 @@ mod tests {
 
         assert!(
             !crate::code_quality::dead_code_smells::is_dead_code_candidate(
-                &analyzer,
+                &mut super::DeclarationSyntaxCache::new(&analyzer),
                 &candidate,
                 &mut skipped
             )
@@ -2117,10 +2118,11 @@ mod tests {
 }
 
 fn is_dead_code_candidate(
-    analyzer: &dyn IAnalyzer,
+    declaration_syntax: &mut DeclarationSyntaxCache<'_>,
     code_unit: &CodeUnit,
     skipped: &mut Vec<String>,
 ) -> bool {
+    let analyzer = declaration_syntax.analyzer;
     if code_unit.is_anonymous() {
         return false;
     }
@@ -2141,7 +2143,7 @@ fn is_dead_code_candidate(
             }
         }
     }
-    if language == Language::Kotlin && kotlin_implicit_entry_point(analyzer, code_unit) {
+    if language == Language::Kotlin && kotlin_implicit_entry_point(declaration_syntax, code_unit) {
         return false;
     }
     if brokk_bifrost_core::analyzer::model::SignatureMetadata::unit_is_declaration_only(
@@ -2177,19 +2179,26 @@ fn is_dead_code_candidate(
 /// `package main`, Kotlin has no per-file entry-point marker, so the check
 /// keys off the declaration's own shape instead: top-level (no owner) or
 /// `@JvmStatic`.
-fn kotlin_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+fn kotlin_implicit_entry_point(
+    declaration_syntax: &mut DeclarationSyntaxCache<'_>,
+    candidate: &CodeUnit,
+) -> bool {
     if !candidate.is_function() || candidate.identifier() != "main" {
         return false;
     }
-    if analyzer.parent_of(candidate).is_none() {
+    if declaration_syntax.analyzer.parent_of(candidate).is_none() {
         return true;
     }
-    kotlin_jvm_static_declaration(analyzer, candidate)
-}
-
-fn kotlin_jvm_static_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    let source = analyzer.get_source(candidate, true).unwrap_or_default();
-    declaration_header(&source).contains("@JvmStatic")
+    declaration_node_matches(declaration_syntax, candidate, |node, source| {
+        if node.kind() != "function_declaration" {
+            return false;
+        }
+        brokk_bifrost_jvm_analysis::analyzer::kotlin::kotlin_declaration_has_annotation(
+            node,
+            "JvmStatic",
+            source,
+        )
+    })
 }
 
 fn analyze_candidate(
@@ -2308,13 +2317,6 @@ fn analyze_candidate_usage_result(
         FuzzyResult::Incomplete { diagnostics, .. } => {
             skipped.push(format!(
                 "`{}`: usage analysis is incomplete: {diagnostics:?}; evidence is inconclusive",
-                candidate.fq_name()
-            ));
-            return None;
-        }
-        FuzzyResult::Ambiguous { .. } => {
-            skipped.push(format!(
-                "`{}`: usage analysis was ambiguous; evidence is inconclusive",
                 candidate.fq_name()
             ));
             return None;
@@ -2466,8 +2468,8 @@ fn analyze_candidate_usage_result(
         kind: candidate.kind().display_lowercase().to_string(),
         symbol: candidate.fq_name(),
         file: candidate.source().clone(),
-        start_line: range.start_line + 1,
-        end_line: range.end_line + 1,
+        start_line: range.start_line,
+        end_line: range.end_line,
         total_usage_count: non_self_hits.len(),
         external_usage_count: external_hits.len(),
         evidence,

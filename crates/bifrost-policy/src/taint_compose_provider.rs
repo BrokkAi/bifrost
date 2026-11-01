@@ -21,7 +21,8 @@
 //! except the frontier's endpoint matches and the call dispatches, which live
 //! in a [`CompositionMemo`] the policy run holds across its composed batches.
 
-use brokk_bifrost_rust_analysis::{RustStdBuiltinCall, rust_std_builtin_call};
+use super::taint_policy::language_intrinsic_call;
+use brokk_bifrost_analysis::analyzer::semantic::IntrinsicCall;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -46,15 +47,14 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     ObservationPhase, OracleCallContext, ProcedureHandle, ProcedureInvocationKind,
     ProcedurePortHandle, ProcedurePortKind, ProgramPointId, ProofStatus, SemanticArtifact,
     SemanticArtifactKey, SemanticCallSite, SemanticCapability, SemanticExecutionBudget,
-    SemanticGapId, SemanticLanguage, SemanticOutcome, SemanticRequest, StrictValueTypeBarriers,
-    ValueFlowEndpoint, ValueId, ValueTypeBarrierDecision, ValueTypeBarrierFilter,
-    ValueTypeBarrierReason, ValueTypePredicate,
+    SemanticGapId, SemanticOutcome, SemanticRequest, StrictValueTypeBarriers, ValueFlowEndpoint,
+    ValueId, ValueTypeBarrierDecision, ValueTypeBarrierFilter, ValueTypeBarrierReason,
+    ValueTypePredicate,
 };
-use brokk_bifrost_analysis::analyzer::usages::{
-    CallRelationLimits, CallRelationService, UsageProofAuthority,
-};
+use brokk_bifrost_analysis::analyzer::usages::call_relations::CallerInventoryCoverage;
+use brokk_bifrost_analysis::analyzer::usages::{CallRelationLimits, CallRelationService};
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerQueryScope, Language, ProjectFile, QueryScope, WorkspaceAnalyzer,
+    AnalyzerQueryScope, ProjectFile, QueryScope, WorkspaceAnalyzer,
 };
 use brokk_bifrost_flow::dataflow::{
     CuratedCallModel, ExternalSemanticSummarySet, SemanticInputStatus, SemanticProcedureSummary,
@@ -81,7 +81,7 @@ use crate::taint_policy::{
     BoundExternalModel, CallResolutionDiscoveryEvidence, CompiledTaintEndpoint,
     DiscoveryMaterializationCache, ExternalCallSeams, FrontierEndpoint, FrontierEndpointBinder,
     FrontierSelector, PolicyDiscoveryProvider, RefusalNotice, TaintPolicyCompileError,
-    UnjudgedSource, rust_format_result_identity, rust_std_builtin_model,
+    UnjudgedSource, intrinsic_call_model, intrinsic_format_result_identity,
 };
 use crate::units::WidenReason;
 
@@ -182,7 +182,7 @@ pub(crate) struct CompositionMemo {
         RefCell<HashMap<(PolicyId, SemanticArtifactKey, FrontierSelector), Arc<FrontierMatch>>>,
     widened: RefCell<HashMap<(PolicyId, FrontierSelector), Arc<WidenedRows>>>,
     dispatches: RefCell<HashMap<(PolicyId, DurableCallSiteKey), Arc<MemoizedDispatch>>>,
-    std_builtins: RefCell<HashMap<DurableCallSiteKey, Option<RustStdBuiltinCall>>>,
+    std_builtins: RefCell<HashMap<DurableCallSiteKey, Option<IntrinsicCall>>>,
     /// The evidence of each frontier matched-value source that reached a
     /// sink, by policy, endpoint and selected site. Judging one is a
     /// points-to question, so the run asks it once for a site however many
@@ -1242,10 +1242,11 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         // incomplete one leaves the enumeration incomplete, because the site
         // might still call the target. The dispatch's own uncertainty reaches
         // the search on the hop (`Hop::Caller { uncertain }`), so the reverse
-        // proof is not read here.
-        if sites.proof_authority != UsageProofAuthority::Native
-            && sites.sites.is_empty()
-            && handle.artifact().key().language() == SemanticLanguage::Standard(Language::Rust)
+        // proof is not read here. A truncated or cancelled enumeration also
+        // leaves the inventory uncertified; its reason above is the more
+        // specific one, so it is kept.
+        if matches!(completeness, Completeness::Complete)
+            && sites.caller_inventory != CallerInventoryCoverage::Complete
         {
             completeness = incomplete("no certified reverse inventory");
         }
@@ -1599,13 +1600,13 @@ impl PolicyCompositionProvider<'_> {
             .iter()
             .filter(|model| model.call.durable_key() == key)
             .collect::<Vec<_>>();
-        let format = rust_format_result_identity(answer);
+        let format = intrinsic_format_result_identity(answer);
         let universe = self.plan.universe();
         let curated = if !group.is_empty() || format.is_some() {
             Some(ExternalCallSeams::new(call, &group, format, universe).model(universe)?)
         } else {
             self.std_builtin(call)?
-                .map(|builtin| rust_std_builtin_model(&builtin))
+                .map(|builtin| intrinsic_call_model(&builtin))
                 .transpose()?
         };
         let Some(result) = answer.available_value() else {
@@ -1662,14 +1663,14 @@ impl PolicyCompositionProvider<'_> {
     fn std_builtin(
         &self,
         call: &CallSiteHandle,
-    ) -> Result<Option<RustStdBuiltinCall>, TaintPolicyCompileError> {
+    ) -> Result<Option<IntrinsicCall>, TaintPolicyCompileError> {
         let key = call.durable_key();
         if let Some(builtin) = self.memo.std_builtins.borrow().get(&key) {
             return Ok(builtin.clone());
         }
         let _timing =
             brokk_bifrost_analysis::profiling::scope("taint.compose.call_models.std_builtin");
-        let builtin = rust_std_builtin_call(self.workspace, call)
+        let builtin = language_intrinsic_call(self.workspace, call)
             .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
         self.memo
             .std_builtins
@@ -2280,10 +2281,9 @@ fn composition_candidate(
                     ));
                 }
             }
-            CallBinding::ImplicitArgument { source, formal, .. } => arguments.push((
-                actual_port(row, call_id, source.id())?,
-                formal_port(formal)?,
-            )),
+            CallBinding::ImplicitArgument { .. } => {
+                return Err("an implicit argument has no call port".to_owned());
+            }
             CallBinding::NormalReturn { formal, result, .. } => returns.push((
                 return_port(formal)?,
                 result_port(row, call_id, result.id())?,

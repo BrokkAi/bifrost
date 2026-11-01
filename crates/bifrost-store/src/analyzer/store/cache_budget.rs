@@ -519,9 +519,7 @@ pub fn retained_read_key(heap: &mut RetainedHeap, key: &crate::analyzer::read_le
                     heap.add_entries(1);
                 }
             }
-            LookupQuestion::File { rel_path }
-            | LookupQuestion::CallSite { rel_path, .. }
-            | LookupQuestion::ProcedureCallSite { rel_path, .. } => {
+            LookupQuestion::File { rel_path } | LookupQuestion::CallSite { rel_path, .. } => {
                 heap.add(rel_path.len());
                 heap.add_entries(1);
             }

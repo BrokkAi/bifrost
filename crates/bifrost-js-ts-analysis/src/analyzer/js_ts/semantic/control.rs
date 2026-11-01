@@ -63,6 +63,7 @@ pub(in crate::analyzer::js_ts::semantic) fn lower_procedure<'tree, 'targets>(
         plain_object_fields: HashMap::default(),
         array_locals: HashMap::default(),
         array_element_fields: HashMap::default(),
+        namespace_import_locations: HashMap::default(),
     };
     context.emit_procedure_inputs(&mut builder, spec)?;
     context.emit_capture_inputs(&mut builder, entry, spec, capture_binding_expected)?;
@@ -3453,14 +3454,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let awaited_node = node
             .child_by_field_name("argument")
             .or_else(|| first_named_child(node));
+        let awaited = awaited_node
+            .map(|awaited_node| self.node_value(builder, awaited_node))
+            .transpose()?;
+        let result = self.expression_value(builder, node, SemanticValueKind::AwaitResult)?;
         let AwaitScaffold {
             suspend,
             normal_resume: normal,
             exceptional_resume: exceptional,
-            ..
         } = self
             .session
-            .add_await_scaffold(builder, |session, builder| {
+            .add_await_scaffold(builder, awaited, result, |session, builder| {
                 session.add_node_mapping(builder, node)
             })?;
         self.edge(builder, normal, next)?;

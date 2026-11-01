@@ -4491,8 +4491,27 @@ mod native_point_identity {
         crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection,
         native_target_count,
         candidates,
-        complete
+        complete,
+        outcome,
+        identityless_shapes
     );
+    fields!(
+        crate::analyzer::store::resolution_operation::native_units::NativeInvocationShape,
+        parameter_count,
+        variadic
+    );
+    impl NativePointRegistryIndependent
+        for crate::analyzer::store::resolution_operation::native_units::NativeInvocationOutcome
+    {
+        fn registry_independent(&self) -> bool {
+            use crate::analyzer::store::resolution_operation::native_units::NativeInvocationContentCause;
+            match self {
+                Self::NoApplicable
+                | Self::Ambiguous
+                | Self::Unproven(NativeInvocationContentCause::OpenEvidence) => true,
+            }
+        }
+    }
     fields!(
         crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMember,
         member,

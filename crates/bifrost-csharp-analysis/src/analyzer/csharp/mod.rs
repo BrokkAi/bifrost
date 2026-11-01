@@ -273,6 +273,29 @@ pub struct CSharpAnalyzer {
 impl_forward_query_provider!(CSharpAnalyzer);
 
 impl CSharpAnalyzer {
+    pub(crate) fn prepared_syntax_for_path(
+        &self,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree>> {
+        let prepared = self.inner.prepared_syntax(token, file)?;
+        debug_assert_ne!(
+            prepared.parse_variant(),
+            brokk_bifrost_core::gitblob::ParseVariant::Empty,
+            "an indexed C# prepared tree carries its decision variant"
+        );
+        Some(prepared)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn identifier_candidate_query_executions_for_test(&self) -> usize {
+        self.inner
+            .query_read_cache_lock()
+            .identifier_candidate_query_executions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn update_all_with_progress(
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
@@ -283,6 +306,15 @@ impl CSharpAnalyzer {
             csharp_config: self.csharp_config.clone(),
             external_index: Self::empty_external_index(),
         })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_build_tiers_for_test(
+        &mut self,
+        observer: Arc<brokk_bifrost_analysis::analyzer::AnalyzerBuildTierAccess>,
+    ) {
+        self.inner.store_context.build_tier_access = observer;
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
@@ -1604,6 +1636,13 @@ impl CodeUnitIndex for CSharpAnalyzer {
 }
 
 impl IAnalyzer for CSharpAnalyzer {
+    fn selected_parse_variant(
+        &self,
+        file: &brokk_bifrost_core::analyzer::ProjectFile,
+    ) -> Option<brokk_bifrost_core::gitblob::ParseVariant> {
+        self.inner.selected_parse_variant(file)
+    }
+
     brokk_bifrost_analysis::forward_query_read_ledger!();
 
     fn dependency_file_evidence(
@@ -1631,11 +1670,13 @@ impl IAnalyzer for CSharpAnalyzer {
     ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
         use brokk_bifrost_core::analyzer::statement_facts::producer::capture_statement_facts;
         use brokk_bifrost_csharp::structural::CSHARP_STRUCTURAL_SPEC;
-        let snapshot = brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk(
-            self.inner.file_source(file)?,
-        );
-        let key = (snapshot.oid(), file.clone());
-        let source = snapshot.source();
+        let prepared =
+            brokk_bifrost_analysis::analyzer::i_analyzer::with_query_scope(self, |token| {
+                self.inner.prepared_syntax(token, file)
+            })?;
+        let source = prepared.source();
+        let oid = self.inner.content_oid_of(file, source)?;
+        let key = (oid, file.clone(), prepared.parse_variant());
         self.memo_caches
             .statement_facts
             .read(&memo_attribution(self), |memo, capture| -> Result<_, ()> {
@@ -1647,15 +1688,14 @@ impl IAnalyzer for CSharpAnalyzer {
                         brokk_bifrost_analysis::analyzer::read_ledger::ReadKey::file(
                             Language::CSharp,
                             brokk_bifrost_core::path_utils::rel_path_string(file),
-                            snapshot.oid(),
+                            oid,
+                            prepared.parse_variant(),
                         ),
                     );
-                    let (tree, scan) =
-                        brokk_bifrost_csharp::preprocessor::parse_csharp_scanned(source)
-                            .ok_or(())?;
+                    let scan = prepared.preprocessor().ok_or(())?;
                     let rows = Arc::new(capture_statement_facts(
                         &CSHARP_STRUCTURAL_SPEC,
-                        tree.root_node(),
+                        prepared.tree().root_node(),
                         source,
                         &scan.conditional_regions(source),
                     ));
@@ -1725,6 +1765,12 @@ impl IAnalyzer for CSharpAnalyzer {
         context: &Arc<brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext>,
     ) {
         self.inner.begin_query(context);
+        if let Some(snapshot) = self.inner.selected_workspace_snapshots().get("csharp")
+            && let Err(error) =
+                CSharpAdapter::validate_decisions(&self.inner.store_context.store, snapshot)
+        {
+            context.record_store_error(error);
+        }
     }
 
     fn end_query(
@@ -1736,6 +1782,7 @@ impl IAnalyzer for CSharpAnalyzer {
 
     delegate_inner_methods! {
         fn prefetch_definitions(&self, fq_names: &[String]);
+        fn prefetch_parse_variants(&self, files: &[ProjectFile]);
     }
 
     delegate_inner_methods! {
@@ -2790,6 +2837,236 @@ mod dead_code_cache_tests {
 
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges;
+
+    #[test]
+    fn reconstructed_mask_disagreement_makes_syntax_unreadable() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("Only.cs", "class Only {}")
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let snapshot = analyzer.inner.selected_workspace_snapshots()["csharp"].clone();
+        let changed = analyzer
+            .inner
+            .store_context
+            .store
+            .execute_selection_publication(move |conn| {
+                conn.execute(
+                    "UPDATE csharp_file_version_decisions SET decision_digest = zeroblob(32)
+                     WHERE file_version_id IN (SELECT file_version_id FROM workspace_file_versions
+                     WHERE workspace_id = ?1 AND lang = 'csharp' AND rel_path = 'Only.cs')",
+                    [snapshot.workspace_id.as_str()],
+                )
+            })
+            .unwrap();
+        assert_eq!(changed, 1);
+        let file = ProjectFile::new(fixture.project().root(), "Only.cs");
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        assert!(
+            analyzer
+                .inner
+                .prepared_syntax(scope.token(), &file)
+                .is_none()
+        );
+        let reason = scope
+            .read_completion()
+            .expect_err("persisted disagreement must make the caller incomplete");
+        assert!(
+            format!("{reason:?}").contains("disagrees with reconstructed mask"),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn missing_decision_before_first_count_makes_workspace_lookup_incomplete() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("Only.cs", "namespace Corrupt { public class Only {} }")
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let snapshot = analyzer.inner.selected_workspace_snapshots()["csharp"].clone();
+        let key = (snapshot.workspace_id.clone(), snapshot.generation);
+        assert!(
+            !adapter::MISSING_DECISION_COUNTS.contains_key(&key),
+            "count must be cold"
+        );
+        let workspace = snapshot.workspace_id.clone();
+        let deleted = analyzer
+            .inner
+            .store_context
+            .store
+            .execute_selection_publication(move |conn| {
+                conn.execute(
+                    "DELETE FROM csharp_file_version_decisions WHERE file_version_id IN
+                (SELECT file_version_id FROM workspace_file_versions WHERE workspace_id = ?1
+                 AND lang = 'csharp' AND rel_path = 'Only.cs')",
+                    [workspace.as_str()],
+                )
+            })
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        let _answer = analyzer.search_definitions("Only", true);
+        let reason = scope
+            .read_completion()
+            .expect_err("lookup must be incomplete");
+        assert!(
+            format!("{reason:?}").contains("1 source versions without decisions"),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_decision_withholds_file_facts_instead_of_proving_absence() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file(
+                "Only.cs",
+                "namespace Unreadable { public class Only { public void Work() {} } }",
+            )
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let unit = analyzer
+            .search_definitions("Only", true)
+            .into_iter()
+            .next()
+            .expect("published class");
+        assert!(
+            !analyzer
+                .inner
+                .direct_children_limited(&unit, 10)
+                .rows
+                .is_empty()
+        );
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        let snapshot = analyzer.inner.selected_workspace_snapshots()["csharp"].clone();
+        let deleted = analyzer
+            .inner
+            .store_context
+            .store
+            .execute_selection_publication(move |conn| {
+                conn.execute(
+                    "DELETE FROM csharp_file_version_decisions WHERE file_version_id IN
+                (SELECT file_version_id FROM workspace_file_versions WHERE workspace_id = ?1
+                 AND lang = 'csharp' AND rel_path = 'Only.cs')",
+                    [snapshot.workspace_id.as_str()],
+                )
+            })
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(analyzer.selected_parse_variant(unit.source()), None);
+        let answer = analyzer.inner.direct_children_limited(&unit, 10);
+        assert!(
+            !answer.complete,
+            "unreadable file must not prove an empty child set"
+        );
+        assert!(
+            answer.rows.is_empty(),
+            "unreadable file must not provide facts"
+        );
+        let reason = scope
+            .read_completion()
+            .expect_err("caller must report incompleteness");
+        assert!(
+            format!("{reason:?}").contains("no selected decision"),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn unavailable_path_does_not_hide_other_analyzed_files() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("Only.cs", "class Only {}")
+            .file("Good.cs", "class Good {}")
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+            assert_eq!(analyzer.inner.analyzed_live_files().len(), 2);
+            assert!(scope.read_completion().is_ok());
+        }
+        let snapshot = analyzer.inner.selected_workspace_snapshots()["csharp"].clone();
+        let deleted = analyzer
+            .inner
+            .store_context
+            .store
+            .execute_selection_publication(move |conn| {
+                conn.execute(
+                    "DELETE FROM workspace_file_versions WHERE workspace_id = ?1
+                AND lang = 'csharp' AND input_kind = 'source' AND rel_path = 'Only.cs'
+                AND valid_until IS NULL",
+                    [snapshot.workspace_id.as_str()],
+                )
+            })
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        let files = analyzer.inner.analyzed_live_files();
+        assert!(
+            files
+                .iter()
+                .any(|file| file.rel_path() == std::path::Path::new("Good.cs")),
+            "{files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.rel_path() == std::path::Path::new("Only.cs")),
+            "{files:?}"
+        );
+        assert!(
+            scope.read_completion().is_err(),
+            "unreadable path cannot prove absence"
+        );
+    }
+
+    #[test]
+    fn stale_refusal_does_not_authorize_unindexed_source() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("Only.cs", format!("//{}\n", "x".repeat(1_100_000)))
+            .file("Good.cs", "class Good {}")
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let file = fixture.file("Only.cs");
+        let snapshot = analyzer.inner.selected_workspace_snapshots()["csharp"].clone();
+        let refusals = analyzer
+            .inner
+            .store_context
+            .store
+            .csharp_selected_refusal_paths(&snapshot)
+            .expect("selected refusal rows");
+        let original_oid = fixture
+            .project()
+            .read_source_snapshot(&file)
+            .expect("original source")
+            .oid();
+        assert_eq!(refusals.get("Only.cs"), Some(&original_oid));
+
+        {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+            assert_eq!(analyzer.selected_parse_variant(&file), None);
+            assert!(scope.read_completion().is_ok());
+        }
+
+        file.write("class Only { public void Changed() {} }")
+            .expect("change refused source bytes");
+        assert_ne!(
+            fixture
+                .project()
+                .read_source_snapshot(&file)
+                .expect("changed source")
+                .oid(),
+            original_oid
+        );
+        assert_eq!(
+            analyzer.inner.selected_workspace_snapshots()["csharp"],
+            snapshot,
+            "the selected snapshot stays fixed across the disk edit"
+        );
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        assert_eq!(analyzer.selected_parse_variant(&file), None);
+        assert!(
+            scope.read_completion().is_err(),
+            "a refusal for old bytes cannot authorize missing source facts"
+        );
+    }
 
     #[test]
     fn update_all_update_and_overlay_clone_start_with_empty_dead_code_caches() {

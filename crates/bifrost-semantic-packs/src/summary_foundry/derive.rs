@@ -784,7 +784,9 @@ fn classify_boundary(
                 kind: format!("{kind:?}"),
             }
         }
-        DispatchBoundaryKind::Unresolved => FoundryDerivationBoundary::UnresolvedCall,
+        DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::HierarchyUnenumerated => {
+            FoundryDerivationBoundary::UnresolvedCall
+        }
         DispatchBoundaryKind::Truncated => FoundryDerivationBoundary::TruncatedDispatch,
     }
 }

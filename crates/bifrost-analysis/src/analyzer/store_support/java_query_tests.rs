@@ -129,6 +129,7 @@ pub fn publish_shared_jvm_consumer<A: LanguageAdapter>(
             storage,
             generation,
             &[WorkspaceFileRow {
+                decision: None,
                 rel_path: path.to_owned(),
                 blob_oid: oid,
             }],

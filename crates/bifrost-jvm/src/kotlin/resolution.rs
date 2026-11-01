@@ -10,10 +10,10 @@ use super::declarations::{
 use super::syntax::{
     KOTLIN_TYPE_NODE_KINDS, kotlin_binding_name_nodes, kotlin_binding_node,
     kotlin_call_with_callee, kotlin_callee, kotlin_enclosing_import_header, kotlin_first_token,
-    kotlin_import_header_segments, kotlin_is_declaration_name, kotlin_is_navigation_kind,
-    kotlin_literal_scalar_type, kotlin_named_argument_label, kotlin_navigation_member,
-    kotlin_navigation_receiver, kotlin_owner_label_matches, kotlin_parameter_default,
-    kotlin_user_type_segments,
+    kotlin_function_type_has_context_parameters, kotlin_import_header_segments,
+    kotlin_is_declaration_name, kotlin_is_navigation_kind, kotlin_literal_scalar_type,
+    kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
+    kotlin_owner_label_matches, kotlin_parameter_default, kotlin_user_type_segments,
 };
 use crate::constructor_site::ConstructorSite;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, DeclarationKind, ProjectFile};
@@ -552,6 +552,7 @@ impl<'source, 'collector, 'declarations>
                     self.pending_writes.push((node, context));
                 }
                 "parameter" | "class_parameter" => self.record_parameter(node, context),
+                "lambda_parameters" => self.record_lambda_parameters(node, context),
                 "type_parameter" => self.record_type_parameter(node, context),
                 "user_type" => {
                     self.record_user_type(node, context);
@@ -2035,6 +2036,60 @@ impl<'source, 'collector, 'declarations>
                 label,
                 has_default: kotlin_parameter_default(node).is_some(),
             });
+    }
+
+    fn record_lambda_parameters(&mut self, node: Node<'source>, context: WalkContext) {
+        for parameter in named_children(node) {
+            let declarations = match parameter.kind() {
+                "variable_declaration" => vec![parameter],
+                "multi_variable_declaration" => named_children(parameter)
+                    .into_iter()
+                    .filter(|child| child.kind() == "variable_declaration")
+                    .collect(),
+                _ => continue,
+            };
+            for declaration in declarations {
+                let Some(name_node) = first_named_child_of_kind(declaration, "simple_identifier")
+                else {
+                    continue;
+                };
+                let site = self.add_identifier(
+                    name_node,
+                    ResolutionSiteKind::ValueDeclaration,
+                    ResolutionNamespace::Value,
+                    ResolutionIdentifierRole::Declaration,
+                    context.scope,
+                    None,
+                );
+                let source = self.add_declaration_source(declaration, Some(name_node), site);
+                self.collector
+                    .mark_lexical(source, DeclarationKind::Parameter);
+                self.add_binder(site, context.scope, ResolutionBinderKind::Parameter, true);
+                if let Some(type_node) = super::syntax::kotlin_binding_type_node(declaration) {
+                    self.add_declared_type(
+                        site,
+                        type_node,
+                        context.scope,
+                        ResolutionTypeSlotRole::DeclaredValue,
+                        DeclarationTypeRole::Parameter,
+                        None,
+                    );
+                } else {
+                    let slot = self.add_slot(site, ResolutionTypeSlotRole::DeclaredValue);
+                    self.facts
+                        .declaration_type_slots
+                        .push(DeclarationTypeSlotFact {
+                            declaration: site,
+                            slot,
+                            role: DeclarationTypeRole::Parameter,
+                        });
+                    self.facts.gaps.push(ResolutionGapFact::new(
+                        site,
+                        ResolutionGapKind::InferredType,
+                    ));
+                }
+            }
+        }
     }
 
     fn record_type_parameter(&mut self, node: Node<'source>, context: WalkContext) {
@@ -4673,6 +4728,7 @@ impl<'source, 'collector, 'declarations>
                     let prefix = [self.intern_name("kotlin")];
                     crate::implicit_supertype::publish_implicit_supertype(
                         &mut self.facts,
+                        brokk_bifrost_core::analyzer::Language::Kotlin,
                         subtype,
                         reference,
                         name,
@@ -4737,7 +4793,10 @@ fn kotlin_expression_after_equals(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn annotation_user_types(annotation: Node<'_>) -> Vec<Node<'_>> {
+/// The `user_type` nodes one `annotation` node spells. A multi-annotation
+/// (`@[A B]`) holds several; the ordinary form holds one, either directly or
+/// inside the `constructor_invocation` an annotation with arguments uses.
+pub(crate) fn annotation_user_types(annotation: Node<'_>) -> Vec<Node<'_>> {
     named_children(annotation)
         .into_iter()
         .flat_map(|child| match child.kind() {
@@ -4769,7 +4828,18 @@ fn annotation_use_site(annotation: Node<'_>, source: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn annotation_has_simple_name(annotation: Node<'_>, expected: &str, source: &str) -> bool {
+/// Whether a declaration has an annotation with the given rightmost name.
+pub fn kotlin_declaration_has_annotation(node: Node<'_>, simple_name: &str, source: &str) -> bool {
+    declaration_annotations(node)
+        .into_iter()
+        .any(|annotation| annotation_has_simple_name(annotation, simple_name, source))
+}
+
+pub(crate) fn annotation_has_simple_name(
+    annotation: Node<'_>,
+    expected: &str,
+    source: &str,
+) -> bool {
     annotation_user_types(annotation)
         .into_iter()
         .any(|user_type| {
@@ -4836,6 +4906,9 @@ fn callable_parameter_nodes(callable: Node<'_>) -> Vec<Node<'_>> {
 
 fn kotlin_function_type_parts(node: Node<'_>) -> Option<(Vec<Node<'_>>, Node<'_>)> {
     assert_eq!(node.kind(), "function_type");
+    if kotlin_function_type_has_context_parameters(node) {
+        return None;
+    }
     let is_type = |node: &Node<'_>| {
         // `dynamic` is an anonymous grammar token, including in function results.
         KOTLIN_TYPE_NODE_KINDS.contains(&node.kind()) || node.kind() == "dynamic"
@@ -4993,6 +5066,62 @@ mod tests {
             "Kotlin fixture parses without recovery errors"
         );
         parse_kotlin_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn object_literal_property_names_follow_class_wide_rank() {
+        fn names(source: &str) -> Vec<String> {
+            let parsed = parse(source, "Properties.kt");
+            let facts = &parsed.resolution_facts;
+            facts
+                .identifiers
+                .iter()
+                .filter_map(|identifier| {
+                    let name = &facts.names[identifier.name.index()].spelling;
+                    name.starts_with("$anon$").then(|| name.to_string())
+                })
+                .collect()
+        }
+        let source = "class C { val a = object {}; val b = object {} }";
+        let original = names(source);
+        assert_eq!(original, ["$anon$0", "$anon$1"]);
+        assert_eq!(original, names(&format!("// shift\n{source}")));
+        assert_eq!(
+            names("class C { val earlier = object {}; val a = object {}; val b = object {} }"),
+            ["$anon$0", "$anon$1", "$anon$2"]
+        );
+    }
+
+    #[test]
+    fn anonymous_objects_keep_separate_overload_scopes() {
+        let parsed = parse(
+            "fun f(x: Int) = object {}\nfun f(x: String) = object {}\nfun Int.g() = object {}\nfun String.g() = object {}",
+            "Overloads.kt",
+        );
+        let facts = &parsed.resolution_facts;
+        let scopes: Vec<_> = facts
+            .identifiers
+            .iter()
+            .filter(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && spelling(facts, identifier.name) == "$anon$0"
+            })
+            .map(|identifier| facts.sites[identifier.site.index()].scope)
+            .collect();
+        assert_eq!(
+            scopes.len(),
+            4,
+            "both ordinary and extension overloads declare an object"
+        );
+        assert_eq!(
+            scopes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4,
+            "each overload owns a distinct executable lookup scope"
+        );
     }
 
     #[test]

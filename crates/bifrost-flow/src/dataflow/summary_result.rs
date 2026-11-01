@@ -693,7 +693,9 @@ fn summary_boundary_kind_heap_bytes(kind: &SummaryBoundaryKind) -> usize {
         }) => Some(locator),
         SummaryBoundaryKind::Semantic(_)
         | SummaryBoundaryKind::Dispatch(
-            DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::Truncated,
+            DispatchBoundaryKind::Unresolved
+            | DispatchBoundaryKind::HierarchyUnenumerated
+            | DispatchBoundaryKind::Truncated,
         )
         | SummaryBoundaryKind::Limit(_)
         | SummaryBoundaryKind::Continuation { .. } => None,
@@ -1438,6 +1440,7 @@ fn compare_dispatch_boundaries(
         DispatchBoundaryKind::Deferred { .. } => 2,
         DispatchBoundaryKind::Unresolved => 3,
         DispatchBoundaryKind::Truncated => 4,
+        DispatchBoundaryKind::HierarchyUnenumerated => 5,
     };
     rank(left)
         .cmp(&rank(right))

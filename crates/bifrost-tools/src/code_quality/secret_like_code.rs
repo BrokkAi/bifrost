@@ -169,6 +169,7 @@ struct SecretScanReport {
     non_text_entries_skipped: usize,
     findings: Vec<SecretFinding>,
     diagnostics: Vec<SecretScanDiagnostic>,
+    git_failures: Vec<String>,
 }
 
 struct GitContext {
@@ -190,6 +191,7 @@ struct BlobScanResult {
 struct CurrentScanResult {
     keys: HashSet<SecretKey>,
     diagnostics: Vec<SecretScanDiagnostic>,
+    git_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -201,6 +203,7 @@ struct HistoryScanAccumulator {
     missing_entries_skipped: usize,
     non_text_entries_skipped: usize,
     diagnostics: HashSet<SecretScanDiagnostic>,
+    git_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -440,6 +443,7 @@ fn scan_repository(
 
     let mut accumulator = SecretScanAccumulator::default();
     let mut diagnostics = current.diagnostics.into_iter().collect::<HashSet<_>>();
+    let mut git_failures = current.git_failures;
     for key in current.keys {
         accumulator.add(key, SecretLocation::Current, "", "", -1);
     }
@@ -457,6 +461,7 @@ fn scan_repository(
         }
     }
     diagnostics.extend(history.diagnostics);
+    git_failures.extend(history.git_failures);
 
     let mut findings = accumulator.findings();
     findings.retain(|finding| include_history_only || finding.location != SecretLocation::History);
@@ -474,6 +479,7 @@ fn scan_repository(
         non_text_entries_skipped: history.non_text_entries_skipped,
         findings,
         diagnostics,
+        git_failures,
     }
 }
 
@@ -506,21 +512,42 @@ fn scan_default_ref(
     ref_name: &str,
     include_low_confidence: bool,
 ) -> CurrentScanResult {
+    if matches!(ctx.repo.is_empty(), Ok(true)) {
+        return CurrentScanResult::default();
+    }
     let mut keys = HashSet::new();
     let mut diagnostics = Vec::new();
     let obj = match ctx.repo.revparse_single(ref_name) {
         Ok(obj) => obj,
-        Err(_) => return CurrentScanResult::default(),
+        Err(err) if err.code() == git2::ErrorCode::UnbornBranch => {
+            return CurrentScanResult::default();
+        }
+        Err(err) => {
+            return CurrentScanResult {
+                git_failures: vec![format!("current ref {ref_name}: {err}")],
+                ..Default::default()
+            };
+        }
     };
     let commit = match obj.peel_to_commit() {
         Ok(commit) => commit,
-        Err(_) => return CurrentScanResult::default(),
+        Err(err) => {
+            return CurrentScanResult {
+                git_failures: vec![format!("current ref {ref_name} is not a commit: {err}")],
+                ..Default::default()
+            };
+        }
     };
     let tree = match commit.tree() {
         Ok(tree) => tree,
-        Err(_) => return CurrentScanResult::default(),
+        Err(err) => {
+            return CurrentScanResult {
+                git_failures: vec![format!("current ref {ref_name} tree: {err}")],
+                ..Default::default()
+            };
+        }
     };
-    let _ = tree.walk(TreeWalkMode::PreOrder, |root, entry| {
+    let walk = tree.walk(TreeWalkMode::PreOrder, |root, entry| {
         if entry.kind() != Some(ObjectType::Blob) {
             return TreeWalkResult::Ok;
         }
@@ -546,7 +573,15 @@ fn scan_default_ref(
         }
         TreeWalkResult::Ok
     });
-    CurrentScanResult { keys, diagnostics }
+    let git_failures = walk
+        .err()
+        .map(|err| vec![format!("current ref {ref_name} tree walk: {err}")])
+        .unwrap_or_default();
+    CurrentScanResult {
+        keys,
+        diagnostics,
+        git_failures,
+    }
 }
 
 fn scan_history(
@@ -555,25 +590,44 @@ fn scan_history(
     include_low_confidence: bool,
 ) -> HistoryScanAccumulator {
     let mut accumulator = HistoryScanAccumulator::default();
+    if matches!(ctx.repo.is_empty(), Ok(true)) {
+        return accumulator;
+    }
     let mut blob_scan_cache: HashMap<(Oid, Option<tree_sitter::Language>), BlobScanResult> =
         HashMap::new();
     let mut walker = match ctx.repo.revwalk() {
         Ok(walker) => walker,
-        Err(_) => return accumulator,
+        Err(err) => {
+            accumulator
+                .git_failures
+                .push(format!("history walker: {err}"));
+            return accumulator;
+        }
     };
-    if walker
+    if let Err(err) = walker
         .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
         .and_then(|_| walker.push_head())
-        .is_err()
     {
+        if err.code() == git2::ErrorCode::UnbornBranch {
+            return accumulator;
+        }
+        accumulator
+            .git_failures
+            .push(format!("history HEAD: {err}"));
         return accumulator;
     }
 
     for (commit_index, oid_result) in walker.take(max_commits).enumerate() {
         let Ok(oid) = oid_result else {
+            accumulator
+                .git_failures
+                .push(format!("history commit walk: {}", oid_result.unwrap_err()));
             continue;
         };
         let Ok(commit) = ctx.repo.find_commit(oid) else {
+            accumulator
+                .git_failures
+                .push(format!("history commit {oid}: missing commit"));
             continue;
         };
         accumulator.commits_scanned += 1;
@@ -583,9 +637,12 @@ fn scan_history(
             .insert(commit_name.clone(), commit_index as isize);
         let Ok(tree) = commit.tree() else {
             accumulator.missing_entries_skipped += 1;
+            accumulator
+                .git_failures
+                .push(format!("history commit {oid}: missing tree"));
             continue;
         };
-        let _ = tree.walk(TreeWalkMode::PreOrder, |root, entry| {
+        let walk = tree.walk(TreeWalkMode::PreOrder, |root, entry| {
             if entry.kind() != Some(ObjectType::Blob) {
                 return TreeWalkResult::Ok;
             }
@@ -645,6 +702,11 @@ fn scan_history(
                 }));
             TreeWalkResult::Ok
         });
+        if let Err(err) = walk {
+            accumulator
+                .git_failures
+                .push(format!("history commit {oid} tree walk: {err}"));
+        }
     }
 
     accumulator
@@ -1313,6 +1375,12 @@ fn format_secret_scan_report(report: &SecretScanReport, max_findings: usize) -> 
         "- Assignment syntax diagnostics: {}",
         report.diagnostics.len()
     ));
+    if !report.git_failures.is_empty() {
+        lines.line("- Git scan incomplete:");
+        for failure in &report.git_failures {
+            lines.line(format!("  - {}", sanitize_table_cell(failure)));
+        }
+    }
     lines.line(format!(
         "- Findings shown: {} of {}{}",
         shown.len(),
@@ -1335,7 +1403,7 @@ fn format_secret_scan_report(report: &SecretScanReport, max_findings: usize) -> 
     }
 
     if shown.is_empty() {
-        if report.diagnostics.is_empty() {
+        if report.diagnostics.is_empty() && report.git_failures.is_empty() {
             lines.line("No secret-like code found.");
         } else {
             lines.line(

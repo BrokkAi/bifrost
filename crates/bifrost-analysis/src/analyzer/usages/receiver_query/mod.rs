@@ -723,6 +723,11 @@ impl<'a> ReceiverQueryService<'a> {
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
         let previous = self.reads.take();
         let (result, reads) = super::common::capture_memo_reads(self.analyzer, || {
+            let selected_variant = self.analyzer.selected_parse_variant(file).ok_or_else(|| {
+                ReceiverQueryError::SemanticProvider(SemanticProviderError::internal(
+                    "selected parse variant unreadable",
+                ))
+            })?;
             if let Some(previous) = previous {
                 crate::analyzer::usages::common::replay_memo_reads(&previous, self.analyzer);
             }
@@ -734,6 +739,7 @@ impl<'a> ReceiverQueryService<'a> {
                         file.language(),
                         crate::path_utils::rel_path_string(file),
                         blob,
+                        selected_variant,
                     ));
                 } else {
                     self.analyzer.record_unattributed_read();
@@ -2192,17 +2198,15 @@ fn apply_semantic_gate(
                 report.points_to = Some(points_to.clone());
             }
             // The neutral gate can only confirm a value it materialized
-            // itself. An exact modeled external identity is proven by the
-            // declaration the overlay owns (for example a DOM `Element`
-            // declared by an activated standard-library pack), and the
-            // neutral lowerer holds no heap row for the external type, so
-            // retaining only neutral-backed candidates would drop the one
-            // identity the query has. This is the retention half of the same
-            // exemption the downgrade below already applies.
-            let exact_modeled_identity =
-                legacy_external_model_identity_is_precise(analyzer, &report.analysis);
+            // itself. A unique static import proves its module identity even
+            // when the neutral lowerer represents its read as a Static load.
+            // A modeled external identity is likewise proven by its owning
+            // declaration even without a neutral heap row for that type.
+            let exact_external_identity =
+                legacy_external_module_identity_is_precise(&report.analysis)
+                    || legacy_external_model_identity_is_precise(analyzer, &report.analysis);
             let exact_current_receiver = is_exact_current_receiver(&report.analysis);
-            let removed = !exact_modeled_identity
+            let removed = !exact_external_identity
                 && retain_neutral_backed_values(&mut report.analysis, &points_to);
             report.candidates_truncated |= removed;
             report.candidates_truncated |= evidence.is_truncated();
@@ -2213,7 +2217,7 @@ fn apply_semantic_gate(
             // allocation at every call site.
             if !evidence.supports_precise()
                 && !evidence.legacy_provider_can_close()
-                && !exact_modeled_identity
+                && !exact_external_identity
                 && !exact_current_receiver
             {
                 neutral_incomplete(&mut report.analysis);

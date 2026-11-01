@@ -2447,8 +2447,18 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let namespace = ResolutionNamespace::TypeOrValue;
         let owner = self.declaration_owner(self.scope(scope).owner);
         let (prefix, qualifier) = if segments.len() > 1 {
-            let (prefix, qualifier) =
-                self.lower_qualified_prefixes(segments, scope, owner, namespace, anchor, true);
+            // An absolute `_root_` route already names the full package or
+            // object owner. Giving its terminal a typed qualifier as well
+            // would publish an invalid one-segment root reference. Lexical
+            // imports still need their typed prefix to test shadowing.
+            let (prefix, qualifier) = self.lower_qualified_prefixes(
+                segments,
+                scope,
+                owner,
+                namespace,
+                anchor,
+                anchor == ResolutionRootImportAnchor::Lexical,
+            );
             (Some(prefix), qualifier)
         } else {
             (None, None)
@@ -3047,6 +3057,30 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     .checked_add(1)
                     .expect("Scala parent count fits u32");
                 self.gap(reference, ResolutionGapKind::UnsupportedHierarchyTraversal);
+            }
+            if parent_ordinal == 0
+                && node.child_by_field_name("extend").is_none()
+                && matches!(
+                    node.kind(),
+                    "class_definition" | "trait_definition" | "object_definition"
+                )
+            {
+                let occurrence = self.site_occurrences[subtype.index()];
+                let scope = self.facts.sites[subtype.index()].scope;
+                let reference =
+                    self.push_site(occurrence, ResolutionSiteKind::SyntheticReference, scope);
+                let name = self.intern_name("AnyRef");
+                let prefix = [self.intern_name("scala")];
+                crate::implicit_supertype::publish_implicit_supertype(
+                    &mut self.facts,
+                    brokk_bifrost_core::analyzer::Language::Scala,
+                    subtype,
+                    reference,
+                    name,
+                    &prefix,
+                    ResolutionSupertypeKind::ImplicitSuperclass,
+                );
+                parent_ordinal = 1;
             }
             // The compiler mixes `Product with Serializable` into every case
             // class and case object after the written parents.
@@ -6799,8 +6833,8 @@ fn is_type_declaration(kind: &str) -> bool {
 }
 
 /// The parents every case class and case object has without writing them, as
-/// (type name, package route). The superclass is `AnyRef`, which the implicit
-/// root already supplies.
+/// (type name, package route). Parentless templates receive `AnyRef` before
+/// these compiler-added interfaces.
 const SCALA_CASE_IMPLICIT_PARENTS: [(&str, &[&str]); 2] =
     [("Product", &["scala"]), ("Serializable", &["java", "io"])];
 
@@ -8145,11 +8179,9 @@ mod tests {
                 .find(|value| value.declaration == alias.site)
                 .expect("self alias value type");
             assert_eq!(value.role, DeclarationTypeRole::Value);
-            if let Some(edge) = facts
-                .supertypes
-                .iter()
-                .find(|edge| Some(edge.subtype) == scope.owner)
-            {
+            if let Some(edge) = facts.supertypes.iter().find(|edge| {
+                Some(edge.subtype) == scope.owner && edge.kind == ResolutionSupertypeKind::SelfType
+            }) {
                 assert_eq!(edge.kind, ResolutionSupertypeKind::SelfType);
                 assert!(
                     facts.type_transfers.iter().any(|transfer| {
@@ -8177,7 +8209,9 @@ mod tests {
         let mut edges = facts
             .supertypes
             .iter()
-            .filter(|edge| edge.subtype == rules.site)
+            .filter(|edge| {
+                edge.subtype == rules.site && edge.kind == ResolutionSupertypeKind::SelfType
+            })
             .collect::<Vec<_>>();
         edges.sort_by_key(|edge| edge.parent_ordinal);
         assert_eq!(edges.len(), 2, "self-type edges: {edges:?}");
@@ -8795,7 +8829,7 @@ mod tests {
         );
         assert_eq!(
             facts.supertypes.len(),
-            1,
+            4,
             "supertypes={:?}",
             facts.supertypes
         );

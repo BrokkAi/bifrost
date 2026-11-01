@@ -8,6 +8,7 @@ use crate::analyzer::usages::get_definition::{
     resolve_value_identity_with_source_outcome as resolve_value_identity_with_source,
 };
 use crate::query::{CallIdentity, ResolvedCallIdentityKind, ResolvedValueFilter};
+use brokk_bifrost_core::analyzer::tree_walk::expression_target_node;
 use tree_sitter::Node;
 
 enum FilterOutcome {
@@ -186,7 +187,7 @@ pub(super) fn decorator_expansions(
             );
             return Vec::new();
         };
-        let Some(terminal_name) = csharp_attribute_terminal_name_node(name) else {
+        let Some(terminal_name) = csharp_type_name_terminal_node(name) else {
             record_incomplete(
                 diagnostics,
                 Incompleteness::Content,
@@ -195,27 +196,15 @@ pub(super) fn decorator_expansions(
             );
             return Vec::new();
         };
-        let request = DefinitionLookupRequest {
-            file: seed.file.clone(),
-            line: None,
-            column: None,
-            start_byte: Some(terminal_name.start_byte()),
-            end_byte: Some(terminal_name.end_byte()),
-        };
-        let identity = match resolve_value_identity_with_source(
+        let identity = match resolve_csharp_type_name(
             analyzer,
-            request,
-            seed.file.clone(),
-            Arc::<str>::from(source),
+            &seed.file,
+            source,
+            terminal_name,
             cancellation,
         ) {
-            Ok(Some(identity)) => identity,
-            result => {
-                let incompleteness = match result {
-                    Ok(None) => Incompleteness::Content,
-                    Err(cause) => Incompleteness::Operational(cause),
-                    Ok(Some(_)) => unreachable!("resolved identities returned above"),
-                };
+            Ok(identity) => identity,
+            Err(incompleteness) => {
                 record_incomplete(
                     diagnostics,
                     incompleteness,
@@ -324,6 +313,7 @@ fn expression_filter_outcome(
             "identifier",
             "string_literal",
             "character_literal",
+            "typeof_expression",
         ][..],
         _ => &[][..],
     };
@@ -365,6 +355,26 @@ fn expression_filter_outcome(
             | "set"
     ) {
         return FilterOutcome::Different;
+    }
+    if let Some(operand) = csharp_type_literal_operand(expression, source) {
+        let Some(terminal_name) =
+            csharp_type_name_terminal_node(operand).filter(|name| name.kind() == "identifier")
+        else {
+            return FilterOutcome::Incomplete(
+                Incompleteness::Content,
+                format!("typeof operand {} has no declaration name", operand.kind()),
+            );
+        };
+        return match resolve_csharp_type_name(analyzer, file, source, terminal_name, cancellation)
+        {
+            Ok(identity) if filter_matches(&identity, &filter.resolves_to) => FilterOutcome::Match,
+            Ok(_) => FilterOutcome::Different,
+            Err(incompleteness) => FilterOutcome::Incomplete(
+                incompleteness,
+                "C# type resolver could not prove one exact declaration identity for a typeof operand"
+                    .to_owned(),
+            ),
+        };
     }
     if !matches!(
         expression.kind(),
@@ -573,7 +583,58 @@ fn definition_focus_range(node: Node<'_>) -> Option<(usize, usize)> {
     (focus.start_byte() < focus.end_byte()).then_some((focus.start_byte(), focus.end_byte()))
 }
 
-fn csharp_attribute_terminal_name_node(mut name: Node<'_>) -> Option<Node<'_>> {
+/// The type operand of a C# `typeof(T)` expression, or of a
+/// `typeof(T).AssemblyQualifiedName` / `typeof(T).FullName` read: those
+/// `System.Type` members name the type itself, so the string value carries
+/// the operand's declaration identity.
+fn csharp_type_literal_operand<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let literal = match node.kind() {
+        "typeof_expression" => node,
+        "member_access_expression" => {
+            let name = node.child_by_field_name("name")?;
+            if !matches!(
+                name.utf8_text(source.as_bytes()).ok()?,
+                "AssemblyQualifiedName" | "FullName"
+            ) {
+                return None;
+            }
+            let object = expression_target_node(node.child_by_field_name("expression")?);
+            (object.kind() == "typeof_expression").then_some(object)?
+        }
+        _ => return None,
+    };
+    literal.child_by_field_name("type")
+}
+
+/// Resolve a C# type-name node to one exact declaration identity.
+fn resolve_csharp_type_name(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    name: Node<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ResolvedValueIdentity, Incompleteness> {
+    let request = DefinitionLookupRequest {
+        file: file.clone(),
+        line: None,
+        column: None,
+        start_byte: Some(name.start_byte()),
+        end_byte: Some(name.end_byte()),
+    };
+    match resolve_value_identity_with_source(
+        analyzer,
+        request,
+        file.clone(),
+        Arc::<str>::from(source),
+        cancellation,
+    ) {
+        Ok(Some(identity)) => Ok(identity),
+        Ok(None) => Err(Incompleteness::Content),
+        Err(cause) => Err(Incompleteness::Operational(cause)),
+    }
+}
+
+fn csharp_type_name_terminal_node(mut name: Node<'_>) -> Option<Node<'_>> {
     loop {
         let next = match name.kind() {
             "qualified_name" | "alias_qualified_name" => name

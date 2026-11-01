@@ -1453,6 +1453,147 @@ mod tests {
     }
 
     #[test]
+    fn changed_symbols_with_shared_end_line_keep_distinct_references() {
+        let score = score_two_commits(|root, repo| {
+            write(root, "Cargo.toml", MANIFEST);
+            write(root, "src/lib.rs", "pub mod core;\npub mod client;\n");
+            write(
+                root,
+                "src/core.rs",
+                "pub fn outer(x: i32) -> i32 {\n    x\n} pub fn sibling() -> i32 { 1 }\n",
+            );
+            write(
+                root,
+                "src/client.rs",
+                "use crate::core::outer;\npub fn run() -> i32 { outer(1) }\n",
+            );
+            test_repo::commit_all(repo, "base");
+            write(
+                root,
+                "src/core.rs",
+                "pub fn outer(x: i32, y: i32) -> i32 {\n    x + y\n} pub fn sibling() -> i32 { 2 }\n",
+            );
+            test_repo::commit_all(repo, "target");
+        });
+        let entry = score
+            .coordination
+            .external_callers_by_signature_change
+            .iter()
+            .find(|entry| entry.fqn.ends_with("outer"))
+            .expect("outer signature change");
+        assert_eq!(entry.external_caller_files, ["src/client.rs"]);
+        assert_eq!(entry.external_caller_sites, 1);
+        assert!(entry.incomplete_reason.is_none(), "{entry:?}");
+        assert_eq!(score.verification.changed_production_symbols, 2);
+        assert_eq!(score.verification.without_direct_test_reference.len(), 2);
+        assert!(
+            score
+                .verification
+                .without_direct_test_reference
+                .iter()
+                .any(|symbol| symbol.fqn.ends_with("sibling")),
+            "{:?}",
+            score.verification
+        );
+    }
+
+    #[test]
+    fn final_java_method_is_not_dispatch_extensible() {
+        let score = score_two_commits(|root, repo| {
+            write(
+                root,
+                "Example.java",
+                "class Example {\n  int open() { return 1; }\n  final int closed() { return 1; }\n}\n",
+            );
+            test_repo::commit_all(repo, "base");
+            write(
+                root,
+                "Example.java",
+                "class Example {\n  int open() { return 2; }\n  final int closed() { return 2; }\n}\n",
+            );
+            test_repo::commit_all(repo, "target");
+        });
+        assert_eq!(
+            score.coordination.dispatch_extensible_edited_symbols, 1,
+            "{:?}",
+            score.coordination
+        );
+    }
+
+    #[test]
+    fn production_caller_does_not_count_as_direct_test_reference() {
+        let score = score_two_commits(|root, repo| {
+            write(
+                root,
+                "app.py",
+                "# Example module.\n\ndef target(value):\n    return value\n",
+            );
+            write(
+                root,
+                "caller.py",
+                "from app import target\n\ndef caller():\n    return target(1)\n",
+            );
+            test_repo::commit_all(repo, "base");
+            write(
+                root,
+                "app.py",
+                "# Example module.\n\ndef target(value):\n    return value + 1\n",
+            );
+            test_repo::commit_all(repo, "target");
+        });
+        let entry = score
+            .verification
+            .without_direct_test_reference
+            .iter()
+            .find(|entry| entry.fqn.ends_with("target"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "production-only target is untested: {:?}",
+                    score.verification
+                )
+            });
+        assert_eq!(entry.non_test_reference_sites, 1);
+        assert!(
+            score
+                .verification
+                .unresolved_symbols
+                .iter()
+                .all(|entry| !entry.fqn.ends_with("target")),
+            "{:?}",
+            score.verification
+        );
+    }
+
+    #[test]
+    fn cognitive_max_belongs_to_one_edited_method() {
+        let score = score_two_commits(|root, repo| {
+            write(
+                root,
+                "example.py",
+                "class Example:\n    def first(self, x):\n        return x\n\n    def second(self, x, y):\n        return x + y\n",
+            );
+            test_repo::commit_all(repo, "base");
+            write(
+                root,
+                "example.py",
+                "class Example:\n    def first(self, x):\n        if x:\n            return x\n        return 0\n\n    def second(self, x, y):\n        if x:\n            if y:\n                return x + y\n        return 0\n",
+            );
+            test_repo::commit_all(repo, "target");
+        });
+        assert!(score.geometry.edited_symbols >= 3, "{:?}", score.geometry);
+        assert!(
+            score.baseline.max_cognitive_after > 0,
+            "{:?}",
+            score.baseline
+        );
+        assert!(
+            u64::from(score.baseline.max_cognitive_after) < score.baseline.cognitive_after,
+            "{:?}",
+            score.baseline
+        );
+    }
+
+    #[test]
     fn a_relocated_symbol_is_judged_by_verification_exactly_once() {
         fn seed(root: &Path, repo: &git2::Repository) {
             write(root, "Cargo.toml", MANIFEST);
@@ -1593,6 +1734,139 @@ mod tests {
             score.geometry.insertions > 0,
             "line counts are Git's and still cover every changed file, got {:?}",
             score.geometry
+        );
+    }
+
+    #[test]
+    fn changed_sibling_files_have_one_cluster_and_two_directory_steps() {
+        let score = score_two_commits(|root, repo| {
+            write(root, "Cargo.toml", MANIFEST);
+            write(root, "src/a/left.rs", "pub fn left() -> i32 { 1 }\n");
+            write(root, "src/b/right.rs", "pub fn right() -> i32 { 1 }\n");
+            test_repo::commit_all(repo, "base");
+            write(root, "src/a/left.rs", "pub fn left() -> i32 { 2 }\n");
+            write(root, "src/b/right.rs", "pub fn right() -> i32 { 2 }\n");
+            test_repo::commit_all(repo, "target");
+        });
+        assert_eq!(score.geometry.production_files_changed, 2);
+        assert_eq!(score.geometry.max_directory_distance, 2);
+        assert_eq!(score.geometry.mean_directory_distance, 2.0);
+        assert_eq!(score.geometry.edit_clusters, 2);
+    }
+
+    #[test]
+    fn changed_files_in_one_directory_form_one_cluster() {
+        let score = score_two_commits(|root, repo| {
+            write(root, "Cargo.toml", MANIFEST);
+            write(root, "src/left.rs", "pub fn left() -> i32 { 1 }\n");
+            write(root, "src/right.rs", "pub fn right() -> i32 { 1 }\n");
+            test_repo::commit_all(repo, "base");
+            write(root, "src/left.rs", "pub fn left() -> i32 { 2 }\n");
+            write(root, "src/right.rs", "pub fn right() -> i32 { 2 }\n");
+            test_repo::commit_all(repo, "target");
+        });
+        assert_eq!(score.geometry.production_files_changed, 2);
+        assert_eq!(score.geometry.edit_clusters, 1);
+    }
+
+    #[test]
+    fn python_file_import_connects_changed_files_in_different_directories() {
+        let score = score_two_commits(|root, repo| {
+            write(
+                root,
+                "client/consumer.py",
+                "from provider.value import value\n\ndef run():\n    return value()\n",
+            );
+            write(root, "provider/value.py", "def value():\n    return 1\n");
+            test_repo::commit_all(repo, "base");
+            write(
+                root,
+                "client/consumer.py",
+                "from provider.value import value\n\ndef run():\n    return value() + 1\n",
+            );
+            write(root, "provider/value.py", "def value():\n    return 2\n");
+            test_repo::commit_all(repo, "target");
+        });
+        assert_eq!(score.geometry.production_files_changed, 2);
+        assert_eq!(score.geometry.edit_clusters, 1, "{:?}", score.geometry);
+    }
+
+    #[test]
+    fn python_package_import_connects_changed_package_member() {
+        let score = score_two_commits(|root, repo| {
+            write(
+                root,
+                "client.py",
+                "import package\n\ndef run():\n    return package.member.value()\n",
+            );
+            write(root, "package/__init__.py", "from . import member\n");
+            write(root, "package/member.py", "def value():\n    return 1\n");
+            test_repo::commit_all(repo, "base");
+            write(
+                root,
+                "client.py",
+                "import package\n\ndef run():\n    return package.member.value() + 1\n",
+            );
+            write(root, "package/member.py", "def value():\n    return 2\n");
+            test_repo::commit_all(repo, "target");
+        });
+        assert_eq!(score.geometry.production_files_changed, 2);
+        assert_eq!(score.geometry.edit_clusters, 1, "{:?}", score.geometry);
+    }
+
+    #[test]
+    fn cognitive_baseline_uses_preimage_of_changed_function() {
+        let score = score_two_commits(|root, repo| {
+            write(root, "Cargo.toml", MANIFEST);
+            write(root, "src/lib.rs", "pub fn choose(x: i32) -> i32 { x }\n");
+            test_repo::commit_all(repo, "base");
+            write(
+                root,
+                "src/lib.rs",
+                "pub fn choose(x: i32) -> i32 { if x > 0 { x } else { 0 } }\n",
+            );
+            test_repo::commit_all(repo, "target");
+        });
+        assert!(
+            score.baseline.cognitive_after > score.baseline.cognitive_before,
+            "{:?}",
+            score.baseline
+        );
+        assert_eq!(
+            score.baseline.cognitive_delta,
+            score.baseline.cognitive_after as i64 - score.baseline.cognitive_before as i64
+        );
+    }
+
+    #[test]
+    fn score_diff_observes_caller_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        write(dir.path(), "Cargo.toml", MANIFEST);
+        write(dir.path(), "src/lib.rs", "pub fn answer() -> i32 { 1 }\n");
+        test_repo::commit_all(&repo, "base");
+        write(dir.path(), "src/lib.rs", "pub fn answer() -> i32 { 2 }\n");
+        test_repo::commit_all(&repo, "target");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let result = score_diff_at_root(
+            dir.path(),
+            ScoreDiffParams {
+                base: Some("HEAD~1".into()),
+                target: Some("HEAD".into()),
+            },
+            &DiffAnalysisOptions::default(),
+            &cancellation,
+        );
+        let score = result.expect("score diff reports incomplete symbols");
+        assert!(
+            score
+                .verification
+                .unresolved_symbols
+                .iter()
+                .any(|symbol| symbol.reason.contains("cancelled")),
+            "cancelled scan must be marked unresolved: {:?}",
+            score.verification
         );
     }
 }

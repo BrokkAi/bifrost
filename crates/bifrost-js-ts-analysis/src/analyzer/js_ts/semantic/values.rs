@@ -1327,6 +1327,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             None
         };
+        if source.is_none() && node.kind() == "identifier" {
+            return self.emit_namespace_import_load(builder, node, point, target);
+        }
         if let Some((source, kind)) = source
             && source != target
         {
@@ -1348,6 +1351,71 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         Ok(())
+    }
+
+    /// Load the module namespace object when the identifier `node` reads a
+    /// namespace import binding (`import * as ns`).
+    ///
+    /// The binding is an immutable module-scope binding, so every read of it
+    /// loads the same static storage, identified by the import binder. Field
+    /// accesses on the namespace then share a structured root. Only an exact
+    /// resolution through the import binder qualifies: a shadowed, reassigned,
+    /// ambiguous or unresolved name keeps its producer-less value.
+    fn emit_namespace_import_load(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), TsLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return Ok(());
+        };
+        let brokk_bifrost_js_ts::syntax::JsTsImportBindingResolution::Exact(binding) =
+            self.imports.binding_at(name, node.start_byte())
+        else {
+            return Ok(());
+        };
+        if !binding.is_static
+            || binding.binding.kind
+                != brokk_bifrost_core::analyzer::usages::model::ImportKind::Namespace
+        {
+            return Ok(());
+        }
+        let declaration = binding.provenance.declaration_range;
+        let location = if let Some(location) = self.namespace_import_locations.get(&declaration) {
+            *location
+        } else {
+            let binder = self
+                .prepared
+                .tree()
+                .root_node()
+                .named_descendant_for_byte_range(declaration.start_byte, declaration.end_byte)
+                .filter(|binder| {
+                    binder.start_byte() == declaration.start_byte
+                        && binder.end_byte() == declaration.end_byte
+                })
+                .expect("an exact import binding retains its binder node");
+            let anchor = source_anchor(binder, 0).map_err(TsLoweringError::Invalid)?;
+            let member = self.session.locator().memory_location_at(anchor);
+            let location = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Static { member },
+            )?;
+            self.namespace_import_locations
+                .insert(declaration, location);
+            location
+        };
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Static,
+                location,
+                result: target,
+            },
+        )
     }
 
     pub(in crate::analyzer::js_ts::semantic) fn resolution_gaps(

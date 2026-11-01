@@ -213,6 +213,7 @@ impl SelectedResolutionOperation<'_, '_> {
                      owner,
                      methods,
                      outcome,
+                     ..
                  }| {
                     if outcome == GoMethodSatisfaction::DoesNotSatisfy {
                         return None;

@@ -68,12 +68,13 @@ const MAX_DECLARATIONS_PER_FILE: usize = 50_000;
 ///
 /// **Recursion bound:** the walk aborts after [`MAX_DECLARATIONS_PER_FILE`]
 /// declarations have been visited, returning the partial findings collected
-/// so far. Pathological generated files cannot cause unbounded work.
-pub fn find_long_method_and_god_object_smells(
+/// so far and whether work was omitted. Pathological generated files cannot
+/// cause unbounded work.
+fn find_long_method_and_god_object_smells(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     weights: MaintainabilitySizeSmellWeights,
-) -> Vec<MaintainabilitySizeSmell> {
+) -> (Vec<MaintainabilitySizeSmell>, bool) {
     if let Some(projection) = analyzer.summary_file_projection(file)
         && let Some(source) = analyzer
             .indexed_source(file)
@@ -88,7 +89,7 @@ fn find_maintainability_size_smells_from_analyzer(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     weights: MaintainabilitySizeSmellWeights,
-) -> Vec<MaintainabilitySizeSmell> {
+) -> (Vec<MaintainabilitySizeSmell>, bool) {
     let mut findings: Vec<MaintainabilitySizeSmell> = Vec::new();
     // `visited` guards against cycles or shared sub-trees: if a CodeUnit is
     // reached via two paths, the second visit short-circuits and contributes
@@ -96,6 +97,7 @@ fn find_maintainability_size_smells_from_analyzer(
     // `IAnalyzer.collectMaintainabilitySizeSmells`'s `visited.add(cu)` guard.
     let mut visited: HashSet<CodeUnit> = HashSet::new();
     let mut metrics: HashMap<CodeUnit, MaintainabilitySizeMetrics> = HashMap::new();
+    let mut truncated = false;
 
     enum Frame {
         Enter(CodeUnit, bool),
@@ -117,6 +119,7 @@ fn find_maintainability_size_smells_from_analyzer(
                 if visited.len() > MAX_DECLARATIONS_PER_FILE {
                     // Stop expanding; already-queued Exit frames will still
                     // run and produce findings for the partial subtree.
+                    truncated = true;
                     continue;
                 }
                 let children = analyzer.direct_children(&cu);
@@ -142,14 +145,14 @@ fn find_maintainability_size_smells_from_analyzer(
             }
         }
     }
-    findings
+    (findings, truncated)
 }
 
 fn find_maintainability_size_smells_from_projection(
     projection: &SummaryFileProjection,
     source: &str,
     weights: MaintainabilitySizeSmellWeights,
-) -> Vec<MaintainabilitySizeSmell> {
+) -> (Vec<MaintainabilitySizeSmell>, bool) {
     let complexities: HashMap<CodeUnit, u32> =
         cyclomatic_complexities_from_projection(projection, source)
             .into_iter()
@@ -162,6 +165,7 @@ fn find_maintainability_size_smells_from_projection(
     let mut findings = Vec::new();
     let mut visited = HashSet::new();
     let mut metrics = HashMap::new();
+    let mut truncated = false;
 
     enum Frame {
         Enter(CodeUnit, bool),
@@ -179,6 +183,7 @@ fn find_maintainability_size_smells_from_projection(
                     continue;
                 }
                 if visited.len() > MAX_DECLARATIONS_PER_FILE {
+                    truncated = true;
                     continue;
                 }
                 stack.push(Frame::Exit(code_unit.clone(), top_level));
@@ -214,7 +219,7 @@ fn find_maintainability_size_smells_from_projection(
             }
         }
     }
-    findings
+    (findings, truncated)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -593,17 +598,19 @@ pub fn report_long_method_and_god_object_smells(
         if !seen_files.insert(file.clone()) {
             continue;
         }
-        selected_files.push(file);
-        if selected_files.len() >= file_cap {
+        if selected_files.len() == file_cap {
+            input_truncated = true;
             break;
         }
+        selected_files.push(file);
     }
 
     let mut findings: Vec<MaintainabilitySizeSmell> = Vec::new();
     for file in &selected_files {
-        findings.extend(find_long_method_and_god_object_smells(
-            analyzer, file, weights,
-        ));
+        let (file_findings, file_truncated) =
+            find_long_method_and_god_object_smells(analyzer, file, weights);
+        findings.extend(file_findings);
+        input_truncated |= file_truncated;
     }
     let selected_set: HashSet<ProjectFile> = selected_files.iter().cloned().collect();
     findings.retain(|smell| selected_set.contains(smell.code_unit.source()));
@@ -650,8 +657,8 @@ pub fn report_long_method_and_god_object_smells(
         };
     }
     for smell in findings.iter().take(shown) {
-        let display_start_line = smell.range.start_line + 1;
-        let display_end_line = smell.range.end_line + 1;
+        let display_start_line = smell.range.start_line;
+        let display_end_line = smell.range.end_line;
         lines.line(format!(
             "- `{fq}` in `{source}:{display_start_line}-{display_end_line}` [score {score}]",
             fq = smell.code_unit.fq_name(),
@@ -690,6 +697,7 @@ mod tests {
     use crate::code_quality::maintainability_size::*;
 
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn java_statements(count: usize) -> String {
         (0..count)
@@ -778,6 +786,471 @@ mod tests {
         assert!(
             !result.report.contains("`com.example.BetaController`"),
             "Beta should have been excluded by max_files=1; report: {}",
+            result.report
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "f5ff17edf170: file cap hid a skipped distinct file without marking the report truncated"
+    )]
+    fn file_cap_reports_only_actual_cuts() {
+        let fix = AnalyzerFixture::new(&[("a/A.java", "class A {}"), ("b/B.java", "class B {}")]);
+        let paths = vec!["a/A.java".to_string(), "b/B.java".to_string()];
+        let request = |file_paths, max_files| {
+            report_long_method_and_god_object_smells(
+                fix.analyzer.analyzer(),
+                ReportLongMethodAndGodObjectSmellsParams {
+                    file_paths,
+                    max_files,
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(!request(paths.clone(), 2).truncated);
+        assert!(request(paths.clone(), 1).truncated);
+        assert!(!request(vec![paths[0].clone(), paths[0].clone()], 1).truncated);
+    }
+
+    #[test]
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[hardwon(
+        "f5ff17edf170: declaration cap hid skipped declarations without marking the report truncated"
+    )]
+    fn declaration_cap_reports_only_actual_cuts() {
+        for (methods, expected_truncated) in [(49_999, false), (50_000, true)] {
+            let mut source = String::from("class Boundary {\n");
+            for i in 0..methods {
+                source.push_str(&format!("void m{i}() {{}}\n"));
+            }
+            source.push_str("}\n");
+            let fix = AnalyzerFixture::new(&[("Boundary.java", source.as_str())]);
+            let result = report_long_method_and_god_object_smells(
+                fix.analyzer.analyzer(),
+                ReportLongMethodAndGodObjectSmellsParams {
+                    file_paths: vec!["Boundary.java".to_string()],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(result.truncated, expected_truncated, "methods: {methods}");
+        }
+    }
+
+    #[test]
+    fn size_report_includes_each_top_level_declaration_at_threshold() {
+        let fix = AnalyzerFixture::new(&[(
+            "Both.java",
+            "class Alpha { void run() {} }\nclass Beta { void run() {} }\n",
+        )]);
+        let result = report_long_method_and_god_object_smells(
+            fix.analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: vec!["Both.java".to_string()],
+                long_method_span_lines: 1,
+                max_findings: 2,
+                ..Default::default()
+            },
+        );
+        assert!(result.report.contains("Alpha.run"), "{}", result.report);
+        assert!(result.report.contains("Beta.run"), "{}", result.report);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn size_report_exact_findings_cap_and_zero_threshold_use_defaults() {
+        let fix = AnalyzerFixture::new(&[("Short.java", "class Short { void run() {} }\n")]);
+        let paths = vec!["Short.java".to_string()];
+        let ordinary = report_long_method_and_god_object_smells(
+            fix.analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: paths.clone(),
+                long_method_span_lines: 0,
+                ..Default::default()
+            },
+        );
+        assert!(!ordinary.truncated);
+        assert!(
+            ordinary
+                .report
+                .contains("No long method or god object smells found.")
+        );
+        let exact = report_long_method_and_god_object_smells(
+            fix.analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: paths,
+                long_method_span_lines: 1,
+                max_findings: 1,
+                ..Default::default()
+            },
+        );
+        assert!(exact.report.contains("Short.run"), "{}", exact.report);
+        assert!(!exact.truncated);
+    }
+
+    #[test]
+    fn path_input_cap_accepts_exactly_two_hundred_valid_paths() {
+        let fix = AnalyzerFixture::new(&[("A.java", "class A {}\n")]);
+        let request = |count| {
+            report_long_method_and_god_object_smells(
+                fix.analyzer.analyzer(),
+                ReportLongMethodAndGodObjectSmellsParams {
+                    file_paths: vec!["A.java".to_string(); count],
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(!request(200).truncated);
+        assert!(request(201).truncated);
+    }
+
+    #[test]
+    fn ambiguous_basename_reports_the_requested_input_without_a_missing_note() {
+        let fix = AnalyzerFixture::new(&[
+            ("left/Same.java", "class Same {}\n"),
+            ("right/Same.java", "class Same {}\n"),
+        ]);
+        let result = report_long_method_and_god_object_smells(
+            fix.analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: vec!["Same.java".to_string()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.ambiguous_paths.len(), 1);
+        assert!(
+            result.report.contains("ambiguous input `Same.java`"),
+            "{}",
+            result.report
+        );
+        assert!(
+            !result.report.contains("skipped 1 input"),
+            "{}",
+            result.report
+        );
+    }
+
+    #[test]
+    fn long_method_uses_its_own_threshold_when_god_object_threshold_differs() {
+        let body = (0..58).map(|_| "int x = 1;\n").collect::<String>();
+        let source = format!("class Tall {{ void run() {{\n{body}}} }}\n");
+        let fix = AnalyzerFixture::new(&[("Tall.java", source.as_str())]);
+        let result = report_long_method_and_god_object_smells(
+            fix.analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: vec!["Tall.java".to_string()],
+                long_method_span_lines: 50,
+                god_object_span_lines: 200,
+                ..Default::default()
+            },
+        );
+        assert!(result.report.contains("Tall.run"), "{}", result.report);
+    }
+
+    #[test]
+    fn complexity_at_high_threshold_does_not_add_a_high_reason() {
+        let source = "class Boundary { void run() { if (true) {} } }\n";
+        let fix = AnalyzerFixture::new(&[("Boundary.java", source)]);
+        let result = report_long_method_and_god_object_smells(
+            fix.analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: vec!["Boundary.java".to_string()],
+                long_method_span_lines: 1,
+                high_complexity_threshold: 2,
+                ..Default::default()
+            },
+        );
+        assert!(result.report.contains("Boundary.run"), "{}", result.report);
+        assert!(
+            !result.report.contains("high cyclomatic complexity"),
+            "{}",
+            result.report
+        );
+    }
+
+    #[test]
+    fn cyclomatic_report_visits_both_methods_of_a_class() {
+        use crate::code_quality::{
+            ComputeCyclomaticComplexityParams, compute_cyclomatic_complexity,
+        };
+
+        let fix = AnalyzerFixture::new(&[(
+            "Both.java",
+            "class Both { void first() { if (true) {} } void second() { if (true) {} } }\n",
+        )]);
+        let result = compute_cyclomatic_complexity(
+            fix.analyzer.analyzer(),
+            ComputeCyclomaticComplexityParams {
+                file_paths: vec!["Both.java".to_string()],
+                threshold: 1,
+            },
+        );
+        assert!(result.report.contains("Both.first"), "{}", result.report);
+        assert!(result.report.contains("Both.second"), "{}", result.report);
+    }
+
+    #[test]
+    fn explicit_zero_exception_weight_disables_generic_exception_signal() {
+        use crate::code_quality::{
+            ReportExceptionHandlingSmellsParams, report_exception_handling_smells,
+        };
+
+        let source = "class Catcher { void run() { try { throw new Exception(); } catch (Exception e) {} } }\n";
+        let fix = AnalyzerFixture::new(&[("Catcher.java", source)]);
+        let request = |weight| {
+            report_exception_handling_smells(
+                fix.analyzer.analyzer(),
+                ReportExceptionHandlingSmellsParams {
+                    file_paths: vec!["Catcher.java".to_string()],
+                    min_score: 1,
+                    generic_exception_weight: weight,
+                    empty_body_weight: 0,
+                    small_body_weight: 0,
+                    ..Default::default()
+                },
+            )
+        };
+        let enabled = request(10);
+        let disabled = request(0);
+        assert!(
+            enabled.report.contains("Catcher.java"),
+            "{}",
+            enabled.report
+        );
+        assert!(
+            !disabled.report.contains("| `Catcher.java`"),
+            "{}",
+            disabled.report
+        );
+    }
+
+    #[test]
+    fn empty_dead_code_scope_discovers_a_second_analyzed_file() {
+        use crate::code_quality::{
+            ReportDeadCodeAndUnusedAbstractionSmellsParams,
+            report_dead_code_and_unused_abstraction_smells,
+        };
+
+        let fix = AnalyzerFixture::new(&[
+            (
+                "Alpha.java",
+                "class Alpha { private void unusedAlpha() {} }\n",
+            ),
+            ("Beta.java", "class Beta { private void unusedBeta() {} }\n"),
+        ]);
+        let result = report_dead_code_and_unused_abstraction_smells(
+            fix.analyzer.analyzer(),
+            ReportDeadCodeAndUnusedAbstractionSmellsParams {
+                file_paths: vec![],
+                min_score: 1,
+                ..Default::default()
+            },
+        );
+        assert!(result.report.contains("unusedAlpha"), "{}", result.report);
+        assert!(result.report.contains("unusedBeta"), "{}", result.report);
+    }
+
+    #[test]
+    fn cyclomatic_report_line_cap_counts_all_flagged_functions() {
+        use crate::code_quality::{
+            ComputeCognitiveComplexityParams, ComputeCyclomaticComplexityParams,
+            compute_cognitive_complexity, compute_cyclomatic_complexity,
+        };
+
+        for (count, cut) in [(499, false), (501, true)] {
+            let mut source = String::from("class Many {\n");
+            for i in 0..count {
+                source.push_str(&format!(
+                    "void method{i}() {{ if (true) {{ if (true) {{}} }} }}\n"
+                ));
+            }
+            source.push_str("}\n");
+            let fix = AnalyzerFixture::new(&[("Many.java", source.as_str())]);
+            let result = compute_cyclomatic_complexity(
+                fix.analyzer.analyzer(),
+                ComputeCyclomaticComplexityParams {
+                    file_paths: vec!["Many.java".to_string()],
+                    threshold: 1,
+                },
+            );
+            assert_eq!(result.truncated, cut, "count: {count}");
+            assert_eq!(
+                result
+                    .report
+                    .lines()
+                    .filter(|line| line.starts_with("- "))
+                    .count(),
+                count.min(500)
+            );
+            let cognitive = compute_cognitive_complexity(
+                fix.analyzer.analyzer(),
+                ComputeCognitiveComplexityParams {
+                    file_paths: vec!["Many.java".to_string()],
+                    threshold: 1,
+                },
+            );
+            assert_eq!(cognitive.truncated, cut, "count: {count}");
+            assert_eq!(
+                cognitive
+                    .report
+                    .lines()
+                    .filter(|line| line.starts_with("- "))
+                    .count(),
+                count.min(500)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_quality_report_keeps_incomplete_input_caveat() {
+        use crate::code_quality::{ReportTestAssertionSmellsParams, report_test_assertion_smells};
+
+        let fix = AnalyzerFixture::new(&[("Present.java", "class Present {}\n")]);
+        let result = report_test_assertion_smells(
+            fix.analyzer.analyzer(),
+            ReportTestAssertionSmellsParams {
+                file_paths: vec!["Missing.java".to_string()],
+                ..Default::default()
+            },
+        );
+        assert!(result.truncated);
+        assert!(
+            result.report.contains("truncated before completion"),
+            "{}",
+            result.report
+        );
+    }
+
+    #[test]
+    fn quality_excerpt_pipe_stays_inside_one_markdown_cell() {
+        use crate::code_quality::{ReportTestAssertionSmellsParams, report_test_assertion_smells};
+
+        let fix = AnalyzerFixture::new(&[(
+            "SampleTest.java",
+            "import org.junit.jupiter.api.Test; import static org.junit.jupiter.api.Assertions.assertEquals; class SampleTest { @Test void sameValue() { assertEquals(\"a|b\", \"a|b\"); } }\n",
+        )]);
+        let result = report_test_assertion_smells(
+            fix.analyzer.analyzer(),
+            ReportTestAssertionSmellsParams {
+                file_paths: vec!["SampleTest.java".to_string()],
+                min_score: 1,
+                ..Default::default()
+            },
+        );
+        assert!(result.report.contains("a\\|b"), "{}", result.report);
+        for line in result
+            .report
+            .lines()
+            .filter(|line| line.starts_with("| ") && line.contains("SampleTest"))
+        {
+            assert_eq!(line.matches(" | ").count(), 6, "{line}");
+        }
+    }
+
+    #[test]
+    fn cyclomatic_source_byte_cap_accepts_exact_boundary() {
+        use crate::code_quality::{
+            ComputeCyclomaticComplexityParams, compute_cyclomatic_complexity,
+        };
+
+        for (size, expected_finding) in [(1_000_000, true), (1_000_001, false)] {
+            let mut method = String::from("void run() { if (true) {} ");
+            while method.len() + 10_000 < size - 1 {
+                method.push_str(&" ".repeat(9_999));
+                method.push('\n');
+            }
+            method.push_str(&" ".repeat(size - 1 - method.len()));
+            method.push('}');
+            assert_eq!(method.len(), size);
+            let source = format!("class Boundary {{ {method} }}\n");
+            let fix = AnalyzerFixture::new(&[("Boundary.java", source.as_str())]);
+            let result = compute_cyclomatic_complexity(
+                fix.analyzer.analyzer(),
+                ComputeCyclomaticComplexityParams {
+                    file_paths: vec!["Boundary.java".to_string()],
+                    threshold: 1,
+                },
+            );
+            assert_eq!(
+                result.report.contains("Boundary.run"),
+                expected_finding,
+                "size: {size}; report: {}",
+                result.report
+            );
+        }
+    }
+
+    #[test]
+    fn cyclomatic_report_keeps_overlay_functions_without_a_summary_projection() {
+        use crate::code_quality::{
+            ComputeCyclomaticComplexityParams, compute_cyclomatic_complexity,
+        };
+        use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+        use brokk_bifrost_core::analyzer::model::Language;
+        use brokk_bifrost_core::analyzer::project::{OverlayProject, Project};
+        use std::sync::Arc;
+
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("lib.rs", "fn branch() { if true {} }\n")
+            .build();
+        let base = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(overlay.set(
+            fixture.root().join("lib.rs"),
+            "fn branch() { if true {} }\n".to_string()
+        ));
+        let analyzer = base.clone_with_project(overlay as Arc<dyn Project>);
+        let result = compute_cyclomatic_complexity(
+            analyzer.analyzer(),
+            ComputeCyclomaticComplexityParams {
+                file_paths: vec!["lib.rs".to_string()],
+                threshold: 1,
+            },
+        );
+        assert!(result.report.contains("branch"), "{}", result.report);
+        let size = report_long_method_and_god_object_smells(
+            analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: vec!["lib.rs".to_string()],
+                long_method_span_lines: 1,
+                high_complexity_threshold: 1,
+                ..Default::default()
+            },
+        );
+        assert!(
+            size.report.contains("high cyclomatic complexity 2"),
+            "{}",
+            size.report
+        );
+    }
+
+    #[test]
+    fn overlay_long_method_uses_method_threshold() {
+        use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+        use brokk_bifrost_core::analyzer::model::Language;
+        use brokk_bifrost_core::analyzer::project::{OverlayProject, Project};
+        use std::sync::Arc;
+
+        let source = "fn tall() {\n let a = 1;\n let b = 2;\n let c = 3;\n}\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("lib.rs", source)
+            .build();
+        let base = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(overlay.set(fixture.root().join("lib.rs"), source.to_string()));
+        let analyzer = base.clone_with_project(overlay as Arc<dyn Project>);
+        let result = report_long_method_and_god_object_smells(
+            analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: vec!["lib.rs".to_string()],
+                long_method_span_lines: 3,
+                god_object_span_lines: 200,
+                ..Default::default()
+            },
+        );
+        assert!(result.report.contains("tall"), "{}", result.report);
+        assert!(
+            result.report.contains("long function spans 5 lines"),
+            "{}",
             result.report
         );
     }

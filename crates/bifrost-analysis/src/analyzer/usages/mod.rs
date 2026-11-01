@@ -199,7 +199,6 @@ pub use member_family::nominal_member_family_capability;
 pub use member_family::scala_member_family;
 pub use member_family::scala_member_family_capability;
 
-pub use model::CONFIDENCE_THRESHOLD;
 pub use model::ExportEntry;
 pub use model::ExportIndex;
 pub use model::FuzzyResult;

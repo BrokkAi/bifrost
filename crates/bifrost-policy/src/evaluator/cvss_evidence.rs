@@ -52,3 +52,6 @@ pub(super) const fn cvss_evidence_scope_labels(
         CvssEvidenceScope::System { system } => ("system", Some(system.label())),
     }
 }
+
+#[cfg(test)]
+mod contract_tests;

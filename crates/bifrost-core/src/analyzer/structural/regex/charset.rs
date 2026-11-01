@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CharacterSet {
     pub ranges: Vec<(u32, u32)>,
 }
@@ -50,6 +50,15 @@ impl CharacterSet {
             }
         }
         self.ranges = merged;
+    }
+
+    /// The characters of `self` that are not in `other`, as merged ranges.
+    pub fn difference(&self, other: &Self) -> Self {
+        let mut merged = Self { ranges: Vec::new() };
+        merged.union_with(self);
+        let mut excluded = merged.complement();
+        excluded.union_with(other);
+        excluded.complement()
     }
 
     pub fn intersects(&self, other: &Self) -> bool {

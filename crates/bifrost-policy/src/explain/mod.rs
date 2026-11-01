@@ -82,6 +82,8 @@ fn serialize_json<T: serde::Serialize>(value: &T, message: &'static str) -> Stri
 }
 
 #[cfg(test)]
+mod host_bounds_contract;
+#[cfg(test)]
 mod tests;
 
 pub use host::{

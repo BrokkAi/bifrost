@@ -311,7 +311,12 @@ mod render_tests {
         assert_eq!(skipped.unattributed_reads(), 0);
         assert!(cache.retain_source_snapshot(&file, source));
         let blob = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap();
-        let key = ReadKey::file(Language::Rust, "lib.rs", blob);
+        let key = ReadKey::file(
+            Language::Rust,
+            "lib.rs",
+            blob,
+            brokk_bifrost_core::gitblob::ParseVariant::Empty,
+        );
         let (first_range, first) = capture_query_reads(base.analyzer(), || {
             assert_eq!(cache.source_snapshot(base.analyzer(), &file), Some(source));
             cache.range_for_declaration(base.analyzer(), &declaration)

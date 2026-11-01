@@ -530,6 +530,8 @@ pub struct CallRelationDiagnostic {
     /// Structured usage-analysis reason when this originated below the call
     /// relation layer.
     pub reason_kind: Option<String>,
+    /// Structured omission or ambiguity count when the producer reports one.
+    pub semantic_count: Option<usize>,
 }
 
 impl CallRelationDiagnostic {
@@ -540,7 +542,13 @@ impl CallRelationDiagnostic {
             message,
             context,
             reason_kind: None,
+            semantic_count: None,
         }
+    }
+
+    fn with_count(mut self, count: usize) -> Self {
+        self.semantic_count = Some(count);
+        self
     }
 
     #[doc(hidden)]
@@ -550,12 +558,28 @@ impl CallRelationDiagnostic {
             message,
             context,
             reason_kind: Some(reason_kind),
+            semantic_count: None,
         }
     }
 }
 
+/// Coverage of the candidate inventory, independent of candidate binding proof.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallerInventoryCoverage {
+    #[default]
+    Unknown,
+    Complete,
+    Incomplete,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CallRelationResult {
+    /// Complete means every site in the analyzed workspace sources that could
+    /// call the selected target was enumerated. Callers outside those sources
+    /// are not counted: an entry point such as Rust `main`, a `#[no_mangle]`
+    /// `extern "C"` function, a test function, or a Go `init`, `//export` or
+    /// `TestX` function has no named caller and can still be Complete.
+    pub caller_inventory: CallerInventoryCoverage,
     pub sites: Vec<CallSite>,
     pub truncated: bool,
     pub cancelled: bool,
@@ -628,6 +652,9 @@ fn record_call_relation_read(
     if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return;
     }
+    for site in &result.sites {
+        crate::analyzer::record_position_read(analyzer, &site.file);
+    }
     analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
         kind,
         crate::analyzer::read_ledger::LookupQuestion::declaration(subject),
@@ -664,14 +691,46 @@ pub(crate) fn call_relation_answer_digest(
     // from a complete one that happens to hold the same sites.
     hasher.field("truncated", &[u8::from(result.truncated)]);
     hasher.field("cancelled", &[u8::from(result.cancelled)]);
-    let mut diagnostics = result.diagnostics.iter().collect::<Vec<_>>();
+    hasher.field(
+        "caller_inventory",
+        &[match result.caller_inventory {
+            CallerInventoryCoverage::Unknown => 0,
+            CallerInventoryCoverage::Complete => 1,
+            CallerInventoryCoverage::Incomplete => 2,
+        }],
+    );
+    // #8407 will replace diagnostic text with structured semantic payloads.
+    // Until then keep the text: it exposes counts, targets and other observable
+    // facts even when incomplete or ambiguous diagnostics also carry positions.
+    let mut diagnostics = result
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.code,
+                diagnostic.reason_kind.as_deref(),
+                diagnostic.context.as_str(),
+                diagnostic.message.as_str(),
+                diagnostic.semantic_count,
+            )
+        })
+        .collect::<Vec<_>>();
     diagnostics.sort();
-    for diagnostic in diagnostics {
-        hasher.field("diagnostic", format!("{diagnostic:?}").as_bytes());
+    for (code, reason, context, message, count) in diagnostics {
+        hasher.field("diagnostic", format!("{code:?}").as_bytes());
+        hasher.field("reason", reason.unwrap_or("").as_bytes());
+        hasher.field("context", context.as_bytes());
+        hasher.field("message", message.as_bytes());
+        hasher.field(
+            "count",
+            &count
+                .map(|value| value as u64)
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
     }
-    for (path, start, end, caller, callee) in sites {
-        hasher.field(&path, &(start as u64).to_be_bytes());
-        hasher.value(&(end as u64).to_be_bytes());
+    for (rank, (path, _, _, caller, callee)) in sites.into_iter().enumerate() {
+        hasher.field(&path, &(rank as u64).to_be_bytes());
         hasher.field("caller", caller.as_bytes());
         hasher.field("callee", callee.as_bytes());
     }
@@ -1345,18 +1404,21 @@ fn append_outgoing_candidate_diagnostics(
                 if ambiguous == 1 { "" } else { "s" }
             ),
             caller.fq_name().to_string(),
-        ));
+        ).with_count(ambiguous));
     }
     if omitted > 0 {
-        diagnostics.push(CallRelationDiagnostic::new(
-            CallRelationDiagnosticCode::CandidatesOmitted,
-            format!(
-                "omitted {omitted} unresolved call candidate{} for {}",
-                if omitted == 1 { "" } else { "s" },
-                caller.fq_name()
-            ),
-            caller.fq_name().to_string(),
-        ));
+        diagnostics.push(
+            CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::CandidatesOmitted,
+                format!(
+                    "omitted {omitted} unresolved call candidate{} for {}",
+                    if omitted == 1 { "" } else { "s" },
+                    caller.fq_name()
+                ),
+                caller.fq_name().to_string(),
+            )
+            .with_count(omitted),
+        );
     }
 }
 
@@ -1547,7 +1609,7 @@ pub fn append_incoming_projection_omission(
             target.fq_name()
         ),
         target.fq_name().to_string(),
-    ));
+    ).with_count(omitted));
 }
 
 impl CallDispatchSession {
@@ -2347,6 +2409,7 @@ impl CallRelationService {
         if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
             let context = target.fq_name().to_string();
             return Some(CallRelationResult {
+                caller_inventory: CallerInventoryCoverage::Incomplete,
                 truncated: true,
                 diagnostics: vec![CallRelationDiagnostic::new(
                     CallRelationDiagnosticCode::BudgetExhausted,
@@ -2533,6 +2596,7 @@ impl CallRelationService {
             truncated,
             cancelled,
             diagnostics,
+            caller_inventory: CallerInventoryCoverage::Unknown,
             proof_authority: UsageProofAuthority::Legacy,
             work,
         }
@@ -2781,6 +2845,7 @@ impl CallRelationService {
             truncated,
             cancelled: batch.cancelled,
             diagnostics,
+            caller_inventory: CallerInventoryCoverage::Unknown,
             proof_authority: UsageProofAuthority::Legacy,
             work: CallRelationWork {
                 scanned_files: 1,
@@ -3203,7 +3268,10 @@ fn apply_call_target_outcome(
         truncated,
     } = outcome;
     lookup.native_resolution = native_resolution;
-    lookup.model_member_selection = model_member_selection;
+    // A selection with a native invocation outcome is diagnostic evidence for
+    // call bindings only (#8167); it never reaches a dispatch decision.
+    lookup.model_member_selection =
+        model_member_selection.filter(|selection| selection.outcome.is_none());
     let exact_external_callee = exact_external_call
         .as_ref()
         .map(|proof| Box::<str>::from(proof.canonical_callee()));
@@ -3743,30 +3811,13 @@ fn call_hits(
                         ),
                         target.fq_name().to_string(),
                     )
+                    .with_count(omitted)
                 })
                 .into_iter()
                 .chain(semantic_diagnostics)
                 .collect();
             (hits, false, diagnostics)
         }
-        FuzzyResult::Ambiguous {
-            hits_by_overload, ..
-        } => (
-            hits_by_overload
-                .into_values()
-                .flatten()
-                .map(|hit| (hit, UsageProof::Unproven))
-                .collect(),
-            false,
-            vec![CallRelationDiagnostic::new(
-                CallRelationDiagnosticCode::TargetsAmbiguous,
-                format!(
-                    "call targets for {} are ambiguous; candidates are unproven",
-                    target.fq_name()
-                ),
-                target.fq_name().to_string(),
-            )],
-        ),
         FuzzyResult::TooManyCallsites {
             total_callsites,
             limit,
@@ -4528,12 +4579,14 @@ pub fn native_incoming_preflight(
     if cancellation.is_cancelled() {
         return Some(CallRelationResult {
             cancelled: true,
+            caller_inventory: CallerInventoryCoverage::Incomplete,
             proof_authority: UsageProofAuthority::Native,
             ..CallRelationResult::default()
         });
     }
     if !is_call_relation_unit(target) {
         return Some(CallRelationResult {
+            caller_inventory: CallerInventoryCoverage::Incomplete,
             proof_authority: UsageProofAuthority::Native,
             ..CallRelationResult::default()
         });
@@ -4541,6 +4594,7 @@ pub fn native_incoming_preflight(
     if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
         return Some(CallRelationResult {
             truncated: true,
+            caller_inventory: CallerInventoryCoverage::Incomplete,
             proof_authority: UsageProofAuthority::Native,
             diagnostics: vec![budget_diagnostic()],
             ..CallRelationResult::default()

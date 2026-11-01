@@ -211,7 +211,8 @@ use std::sync::Arc;
 // bounded call resolver reaches declaration_visible_at through it, so
 // resolved calls change for unchanged bytes. Also covers #7074, which changed
 // the same checks without a bump.
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v55";
+// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v56";
 
 /// Procedure-local source roles for both C and C++. The two dialects share
 /// tree-sitter syntax for the control constructs covered by B2 and B3; their

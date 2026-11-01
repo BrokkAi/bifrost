@@ -453,14 +453,6 @@ pub use crate::analyzer::go::semantic::reference_assertion_payload_type_is_exact
 
 pub use crate::analyzer::go::semantic::workspace_reference_assertion_accepts_payload;
 
-pub use crate::analyzer::go::type_identity_proof::GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES;
-
-pub use crate::analyzer::go::type_identity_proof::GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS;
-
-pub use crate::analyzer::go::type_identity_proof::go_modeled_result_binding_type_identity_is_exact;
-
-pub use crate::analyzer::go::type_identity_proof::go_modeled_result_binding_type_identity_proof_work;
-
 pub use crate::analyzer::go::type_identity_proof::go_native_error_function_value_obligation;
 
 pub use crate::analyzer::go::type_identity_proof::go_native_error_result_obligation;
@@ -750,6 +742,15 @@ impl brokk_bifrost_go::source_facts::GoSourceFactProvider for GoAnalyzer {
 }
 
 impl GoAnalyzer {
+    pub(crate) fn prepared_result_shape_syntax(
+        &self,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<std::sync::Arc<brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree>>
+    {
+        self.inner.prepared_syntax(token, file)
+    }
+
     fn profile_read(&self) -> std::sync::RwLockReadGuard<'_, Option<[u8; 32]>> {
         self.active_base_profile.read(
             &memo_attribution(self),
@@ -1171,10 +1172,11 @@ impl GoAnalyzer {
         let value = self.memo_caches.workspace_path_index.read(
             &memo_attribution(self),
             |memo| {
-                brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(
+                brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
                     self,
                     memo,
                     || {
+                        let completion_scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
                         self.memo_caches
                             .workspace_path_index_build_count
                             .fetch_add(1, Ordering::Relaxed);
@@ -1190,11 +1192,14 @@ impl GoAnalyzer {
                             .into_iter()
                             .map(|row| row.file)
                             .collect();
-                        let index = packages::GoWorkspacePathIndex::build(
+                        let mut index = packages::GoWorkspacePathIndex::build(
                             self.project(),
                             |file| self.package_clause_of(file),
                             &refused,
                         );
+                        index.set_completion(workspace_facts::stable_completion(
+                            completion_scope.captured_read_incompleteness(),
+                        ));
                         let answer = StableDigest::from_array(index.read_answer());
                         (Arc::new(index), answer)
                     },
@@ -3895,6 +3900,8 @@ mod hierarchy_tests {
     use brokk_bifrost_core::analyzer::project::TestProject;
 
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    use brokk_bifrost_test_macros::hardwon;
     use std::fs;
     use tempfile::tempdir;
 
@@ -3914,6 +3921,47 @@ mod hierarchy_tests {
             fs::write(path, source).unwrap();
         }
         GoAnalyzer::from_project(TestProject::new(root, Language::Go))
+    }
+
+    #[hardwon(
+        "#8790: a stable StructureUnavailable made the complete-only path index refuse and rebuild on every use"
+    )]
+    #[test]
+    fn workspace_path_index_replays_structural_refusal() {
+        // The default structural line bound is 16,000 bytes. Go does not
+        // admit a source line above it as structural data.
+        let source = format!("package app\n//{}\n", "x".repeat(16_001));
+        let go = analyzer(&[("oversized.go", &source)]);
+        let file = ProjectFile::new(go.project().root(), "oversized.go");
+        for _ in 0..3 {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&go);
+            go.workspace_path_index();
+            assert!(
+                scope
+                    .captured_read_incompleteness()
+                    .contains(&QueryReadIncomplete::StructureUnavailable(file.clone())),
+                "path index must replay the structural refusal"
+            );
+        }
+        assert_eq!(go.workspace_path_index_build_count_for_test(), 1);
+
+        fs::write(file.abs_path(), "package app\n").unwrap();
+        let updated = IAnalyzer::update(&go, &BTreeSet::from([file.clone()]));
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&updated);
+        updated.workspace_path_index();
+        assert!(
+            !scope
+                .captured_read_incompleteness()
+                .contains(&QueryReadIncomplete::StructureUnavailable(file))
+        );
+        // An update creates a fresh analyzer and memo counter: one build in
+        // each snapshot is two real builds across the edit.
+        assert_eq!(updated.workspace_path_index_build_count_for_test(), 1);
+        assert_eq!(
+            go.workspace_path_index_build_count_for_test()
+                + updated.workspace_path_index_build_count_for_test(),
+            2
+        );
     }
 
     #[test]
@@ -4663,3 +4711,6 @@ pub fn go_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -
         .flatten();
     brokk_bifrost_go::entry_point::go_implicit_entry_point(candidate, package_clause.as_deref())
 }
+pub use type_identity_proof::{
+    go_explicit_binding_type_identity, go_selected_callable_result_type_identities,
+};

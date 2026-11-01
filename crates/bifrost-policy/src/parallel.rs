@@ -105,6 +105,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod contract_tests;
     use super::*;
 
     #[test]

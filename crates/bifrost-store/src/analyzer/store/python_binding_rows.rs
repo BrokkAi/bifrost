@@ -1,3 +1,4 @@
+// Python-only binding rows use the empty parse variant.
 //! Retained source inputs for one selected Python blob. All returned collections
 //! are read through the store budget; no module or workspace index is retained.
 use super::{AnalyzerStore, WorkspaceSnapshotId};

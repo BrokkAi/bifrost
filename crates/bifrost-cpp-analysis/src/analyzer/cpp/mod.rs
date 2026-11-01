@@ -63,8 +63,6 @@ use brokk_bifrost_analysis::analyzer::workspace_authority::{
     AuthorityInputs, CaptureScopedMemo, WorkspaceAuthorityMemo, memo_attribution,
     workspace_authority_file_input,
 };
-use brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant;
-use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 use brokk_bifrost_core::analyzer::capabilities::TestDetectionProvider;
 use brokk_bifrost_core::analyzer::capabilities::TypeAliasProvider;
@@ -185,19 +183,6 @@ impl<T> CachedFileRead<T> {
             analyzer.record_query_incomplete(reason.clone());
         }
         Arc::clone(&self.value)
-    }
-
-    fn complete(
-        value: Arc<T>,
-        reads: &brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            value,
-            reads: reads.keys().into(),
-            unattributed_reads: reads.unattributed_reads(),
-            execution_dependences: reads.execution_dependences(),
-            incompleteness: Box::default(),
-        })
     }
 }
 type CAssignmentCandidateKey = (
@@ -347,17 +332,10 @@ pub struct CppAnalyzer {
     /// (#2899). Backs [`Self::header_language_attribution`].
     transitive_reverse_tu_index:
         WorkspaceAuthorityMemo<Arc<PoolSafeMemo<TransitiveReverseTuIndex>>>,
-    /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
-    /// from rayon workers during cold scans, and a blocking `get_or_init` parks
-    /// every one of them behind the single initializer for its full duration.
-    ///
-    /// Keyed by [`DescendantIndexVariant`], so a request that excluded test
-    /// files gets an index that was never built over them (issue #1748: 52.3%
-    /// of the include-closure builds in the incident trace were test-side, and
-    /// the request had already said `include_tests: false`). Two cells at most:
-    /// the exclusion verdict is a pure function of the analyzer and the file.
+    /// Byte-bounded outcomes and read receipts, separated by test-filter
+    /// variant (#1748). Cold builds do not wait behind another query's deadline.
     direct_descendant_index: WorkspaceAuthorityMemo<
-        Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+        Arc<brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo>,
     >,
     compile_contexts: WorkspaceAuthorityMemo<
         Arc<brokk_bifrost_analysis::analyzer::common::QueryCacheCell<Arc<CppCompileContexts>>>,
@@ -1129,7 +1107,9 @@ impl CppAnalyzer {
             ),
             direct_descendant_index: WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::CppDirectDescendants,
-                Arc::new(KeyedPoolSafeMemo::new()),
+                Arc::new(
+                    brokk_bifrost_analysis::analyzer::common::new_replayable_descendant_memo(),
+                ),
             ),
             compile_contexts: WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::CppCompileContexts,

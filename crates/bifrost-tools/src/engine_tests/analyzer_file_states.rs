@@ -13,10 +13,10 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-struct ForcedParseTimeoutPathsGuard(Vec<PathBuf>);
+pub(super) struct ForcedParseTimeoutPathsGuard(Vec<PathBuf>);
 
 impl ForcedParseTimeoutPathsGuard {
-    fn push(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+    pub(super) fn push(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         let paths = paths.into_iter().collect::<Vec<_>>();
         FORCED_PARSE_TIMEOUT_PATHS
             .lock()

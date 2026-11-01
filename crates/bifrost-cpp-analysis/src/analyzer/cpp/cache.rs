@@ -449,13 +449,16 @@ where
             std::mem::size_of::<CachedFileRead<T>>() as u64,
             |bytes, reason| {
                 use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
-                let QueryReadIncomplete::StructureUnavailable(file) = reason else {
-                    unreachable!("transient read failures must not enter file caches");
+                let payload_bytes = match reason {
+                    QueryReadIncomplete::StructureUnavailable(file) => {
+                        file.rel_path().as_os_str().len() + file.root().as_os_str().len()
+                    }
+                    QueryReadIncomplete::ArtifactUnavailable(reason)
+                    | QueryReadIncomplete::SemanticEvidenceGap(reason) => reason.len(),
+                    _ => unreachable!("transient read failures must not enter file caches"),
                 };
                 bytes.saturating_add(
-                    (std::mem::size_of::<QueryReadIncomplete>()
-                        + file.rel_path().as_os_str().len()
-                        + file.root().as_os_str().len()) as u64,
+                    (std::mem::size_of::<QueryReadIncomplete>() + payload_bytes) as u64,
                 )
             },
         );

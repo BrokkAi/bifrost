@@ -1,4 +1,9 @@
+use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
 use brokk_bifrost_analysis::analyzer::i_analyzer::{IAnalyzer, SearchSymbolPatternBatch};
+use brokk_bifrost_analysis::analyzer::read_ledger::{
+    FactSubject, LookupQuestion, ReadKey, WorkspaceFactFamily,
+};
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 use brokk_bifrost_core::analyzer::model::{CodeUnitType, Language};
@@ -6,6 +11,74 @@ use brokk_bifrost_core::analyzer::project::OverlayProject;
 use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 use brokk_bifrost_test_macros::hardwon;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+#[test]
+fn overlay_identifier_candidate_memo_replays_overlay_authority() {
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+        .file("Worker.java", "class Worker {}\n")
+        .build();
+    let disk = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+    let overlay = OverlayProject::new(fixture.project_dyn());
+    assert!(overlay.set(
+        fixture.file("Worker.java").abs_path(),
+        "class Worker { int edited; }\n".to_string()
+    ));
+    let request = disk.clone_with_project(Arc::new(overlay.snapshot()));
+    let _scope = AnalyzerQueryScope::for_identifier_candidate_memo(&request);
+    let (first, first_reads) = capture_query_reads(&request, || {
+        request.lookup_declarations_by_identifier_limited("Worker", 100, || true)
+    });
+    let (second, second_reads) = capture_query_reads(&request, || {
+        request.lookup_declarations_by_identifier_limited("Worker", 100, || true)
+    });
+    let executions = request
+        .query_read_cache_lock()
+        .identifier_candidate_query_executions
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        executions, 1,
+        "the overlay fill must be memoized within its request"
+    );
+    let first_keys = first_reads.keys();
+    assert_eq!(
+        first_keys,
+        second_reads.keys(),
+        "the overlay hit must replay every fill read"
+    );
+    assert!(first_keys.iter().any(|key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "Worker.java")), "{first_keys:?}");
+    assert!(
+        first_keys.iter().any(|key| matches!(
+            key,
+            ReadKey::Lookup {
+                question: LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::WorkspaceOverlayMembership,
+                    subject: FactSubject::Whole,
+                    ..
+                },
+                ..
+            }
+        )),
+        "{first_keys:?}"
+    );
+    assert_eq!(first, second);
+    drop(_scope);
+
+    // A later disk request has a separate memo and cannot inherit the
+    // overlay-specific file and membership receipt.
+    let _disk_scope = AnalyzerQueryScope::for_identifier_candidate_memo(&disk);
+    let (disk_rows, disk_reads) = capture_query_reads(&disk, || {
+        disk.lookup_declarations_by_identifier_limited("Worker", 100, || true)
+    });
+    assert!(disk_rows.complete);
+    assert_eq!(
+        disk.query_read_cache_lock()
+            .identifier_candidate_query_executions
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_ne!(first_keys, disk_reads.keys());
+}
 
 #[test]
 #[hardwon("#7821: bounded declaration lookups and hierarchy facts ignored unsaved-buffer overlays")]

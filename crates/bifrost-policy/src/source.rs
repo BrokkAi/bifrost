@@ -559,7 +559,7 @@ fn collection_order(multiplicity: ValueMultiplicity) -> Option<CollectionOrder> 
 fn recovery_scalar_key(expr: &Expr) -> Option<String> {
     match &expr.kind {
         ExprKind::String(value) => Some(format!("string:{value}")),
-        ExprKind::Symbol(value) => Some(format!("symbol:{value}")),
+        ExprKind::Symbol(value) => Some(format!("string:{value}")),
         ExprKind::Number(value) => Some(format!("number:{value}")),
         ExprKind::List(_) | ExprKind::Vector(_) => None,
     }
@@ -1874,11 +1874,7 @@ impl Decoder {
         crate::assertion_policy::validate_relational_assertion_plan(&plan).map_err(|error| {
             let range = relational_error_range(&plan, &error)
                 .unwrap_or_else(|| fields.required("type").range.clone());
-            source_error(
-                "invalid-relational-assertion-plan",
-                range,
-                error.to_string(),
-            )
+            relational_plan_source_error(error, range)
         })?;
         Ok(AssertionPolicySpec {
             subject,
@@ -1894,7 +1890,15 @@ impl Decoder {
     ) -> Result<RowBinding, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Assertion);
         let fields = RecordCursor::parse(expr, PolicyRecord::Bind, context)?;
-        let name = parse_identifier(fields.required("name"), "row binding name")?;
+        let name: RowBindingName = parse_identifier(fields.required("name"), "row binding name")?;
+        if earlier.iter().any(|binding| binding.name == name) {
+            return Err(relational_plan_source_error(
+                crate::relational::RelationalAssertionPlanError::DuplicateBinding {
+                    name: name.as_str().to_owned(),
+                },
+                expr.range.clone(),
+            ));
+        }
         let selector_path = relational_binding_selector_path(&name);
         let query = fields.required("query");
         let selector = match select_record(
@@ -3669,17 +3673,7 @@ impl Decoder {
         let mut event_names = HashSet::with_capacity(event_values.len());
         let mut event_graph = Vec::with_capacity(event_values.len());
         for value in event_values {
-            let (event, graph_node) = self.decode_typestate_event(value, path)?;
-            if !event_names.insert(event.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-event-id",
-                    raw_keyword_value(value, "id")?
-                        .expect("decoded event has an ID")
-                        .range
-                        .clone(),
-                    format!("duplicate typestate event ID `{}`", event.id),
-                ));
-            }
+            let (event, graph_node) = self.decode_typestate_event(value, path, &mut event_names)?;
             events.push(event);
             event_graph.push(graph_node);
         }
@@ -3786,10 +3780,18 @@ impl Decoder {
         &mut self,
         expr: &Expr,
         path: &str,
+        event_names: &mut HashSet<String>,
     ) -> Result<(TypestateEventSpec, NamedGraphNode), PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Typestate);
         let fields = RecordCursor::parse(expr, PolicyRecord::Event, context)?;
         let id: TypestateEventId = parse_identifier(fields.required("id"), "typestate event ID")?;
+        if !event_names.insert(id.as_str().to_owned()) {
+            return Err(source_error(
+                "duplicate-event-id",
+                fields.required("id").range.clone(),
+                format!("duplicate typestate event ID `{id}`"),
+            ));
+        }
         let event_path = format!("{path}/events/{}", json_pointer_segment(id.as_str()));
         self.map(event_path.clone(), expr);
         let trigger = match (fields.get("calls"), fields.get("matches"), fields.get("on")) {
@@ -5043,6 +5045,17 @@ impl Decoder {
     }
 }
 
+fn relational_plan_source_error(
+    error: crate::relational::RelationalAssertionPlanError,
+    range: Range<usize>,
+) -> PolicySourceError {
+    source_error(
+        "invalid-relational-assertion-plan",
+        range,
+        error.to_string(),
+    )
+}
+
 /// Select the authored expression that owns one structured relational
 /// lowering failure.
 ///
@@ -5856,7 +5869,7 @@ fn expect_vector<'a>(
     Ok(values)
 }
 
-fn decode_unique_values<T, F, K>(
+fn decode_unique_values<T, F, K, Key>(
     expr: &Expr,
     what: &str,
     min: usize,
@@ -5866,7 +5879,8 @@ fn decode_unique_values<T, F, K>(
 ) -> Result<Vec<T>, PolicySourceError>
 where
     F: FnMut(&Expr) -> Result<T, PolicySourceError>,
-    K: FnMut(&T) -> String,
+    K: FnMut(&T) -> Key,
+    Key: Eq + std::hash::Hash + Ord,
 {
     let values = expect_vector(expr, what, min, max)?;
     let mut decoded = Vec::with_capacity(values.len());
@@ -6619,6 +6633,7 @@ fn decode_row_join(expr: &Expr) -> Result<RowJoin, PolicySourceError> {
         None => RowJoinKind::Inner,
         Some(value) => match expect_atom(value, AtomDomain::RowJoinKind, "row join kind")? {
             PolicyAtomValue::RowJoinInner => RowJoinKind::Inner,
+            PolicyAtomValue::RowJoinLeft => RowJoinKind::Left,
             PolicyAtomValue::RowJoinSemi => RowJoinKind::Semi,
             PolicyAtomValue::RowJoinAnti => RowJoinKind::Anti,
             value => unreachable!("RowJoinKind registry returned {value:?}"),
@@ -6975,7 +6990,7 @@ fn lower_selected_in_winning_tier(
     joins.push(RowJoin {
         left: site.clone(),
         right: candidates.clone(),
-        kind: RowJoinKind::Inner,
+        kind: RowJoinKind::Left,
         on: vec![RowJoinCondition {
             left_field: "site_ast_id".to_string(),
             right_field: "site_ast_id".to_string(),
@@ -8005,8 +8020,11 @@ fn endpoint_ref_key(reference: &EndpointRef) -> String {
     }
 }
 
-fn taxonomy_key(classification: &TaxonomyClassificationSpec) -> String {
-    format!("{}:{}", classification.taxonomy, classification.identifier)
+fn taxonomy_key(classification: &TaxonomyClassificationSpec) -> (String, String) {
+    (
+        classification.taxonomy.to_string(),
+        classification.identifier.to_string(),
+    )
 }
 
 fn evidence_ref_key(reference: &PolicyEvidenceRef) -> String {

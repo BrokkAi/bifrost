@@ -625,6 +625,11 @@ struct GoInterfaceMethodOrigin {
     completion: ResolutionCompletion,
 }
 
+struct GoReceiverInterfaceCheck {
+    outcome: GoMethodSatisfaction,
+    selections: Vec<(SemanticId, SemanticId)>,
+}
+
 struct GoInterfaceOwnerPaths {
     paths: Vec<Vec<SemanticId>>,
     complete: bool,
@@ -1738,6 +1743,20 @@ pub(crate) struct GoInterfaceSatisfaction {
     pub(crate) owner: SemanticId,
     pub(crate) methods: Vec<SemanticId>,
     pub(crate) outcome: GoMethodSatisfaction,
+    pub(crate) satisfying_receivers: Vec<ResolutionTypeRef>,
+    pub(crate) candidate_receivers: Vec<ResolutionTypeRef>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GoInterfaceMethodInventory {
+    pub(crate) methods: Vec<super::super::fact_source::GoInterfaceMethod>,
+    pub(crate) complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GoTypeSatisfaction {
+    pub(crate) outcome: GoMethodSatisfaction,
+    pub(crate) selections: Vec<(SemanticId, SemanticId)>,
 }
 
 // Receiver-only applicability markers do not change the written signature.
@@ -1955,6 +1974,118 @@ impl FactResolutionOperation<'_> {
         Ok(result)
     }
 
+    pub(crate) fn go_type_satisfaction(
+        &mut self,
+        receiver: ResolutionTypeRef,
+        interface: SemanticId,
+        mut method_identity: impl FnMut(SemanticId) -> StoreResult<Option<(String, i64)>>,
+    ) -> StoreResult<GoTypeSatisfaction> {
+        let mut provider = self
+            .demand_provider
+            .take()
+            .expect("Go type satisfaction requires its demand provider");
+        let mut evaluation = FactEvaluation::from_lexical_answer(
+            &mut self.session,
+            &mut self.hierarchy,
+            receiver.identity(),
+            ResolutionAnswer::new([receiver.identity()], [], ResolutionCompletion::Complete),
+        )
+        .with_candidate_paths(&mut self.candidate_paths);
+        evaluation.forward_candidate_artifacts = Some(&mut self.forward_candidate_artifacts);
+        if !evaluation
+            .close_hierarchy_owner_roots(&BTreeSet::from([interface]), provider.as_mut())?
+        {
+            self.demand_provider = Some(provider);
+            return Ok(GoTypeSatisfaction {
+                outcome: GoMethodSatisfaction::Inconclusive(
+                    "interface endpoint closure is incomplete",
+                ),
+                selections: Vec::new(),
+            });
+        }
+        let provider = std::cell::RefCell::new(provider);
+        let mut outcome = GoTypeSatisfaction {
+            outcome: GoMethodSatisfaction::Inconclusive("type satisfaction is incomplete"),
+            selections: Vec::new(),
+        };
+        let result = evaluation.run_with_rounds_and_inspection(
+            |evaluation, answers, states| {
+                evaluation.evaluate_round_with_dependencies(
+                    answers,
+                    states,
+                    provider.borrow_mut().as_mut(),
+                )
+            },
+            |evaluation, states| {
+                let Some((required, complete)) = evaluation
+                    .go_interface_method_set(interface, provider.borrow_mut().as_mut())?
+                else {
+                    return Ok(());
+                };
+                if let Some(check) = evaluation.go_check_receiver_interface(
+                    ResolutionSlotValue::type_object(receiver),
+                    &required,
+                    complete,
+                    states,
+                    &mut method_identity,
+                    provider.borrow_mut().as_mut(),
+                )? {
+                    outcome = GoTypeSatisfaction {
+                        outcome: check.outcome,
+                        selections: check.selections,
+                    };
+                }
+                Ok(())
+            },
+        );
+        self.demand_provider = Some(provider.into_inner());
+        result?;
+        if evaluation.cancellation_observed
+            || evaluation.cancellation.is_cancelled()
+            || evaluation.session.resolution_stopped()
+        {
+            return Ok(GoTypeSatisfaction {
+                outcome: GoMethodSatisfaction::Inconclusive(
+                    "type satisfaction was cancelled or exhausted its budget",
+                ),
+                selections: Vec::new(),
+            });
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn go_interface_method_inventory(
+        &mut self,
+        owner: SemanticId,
+    ) -> StoreResult<Option<GoInterfaceMethodInventory>> {
+        let mut provider = self
+            .demand_provider
+            .take()
+            .expect("Go interface method inventory requires its demand provider");
+        let result = {
+            let mut evaluation = FactEvaluation::from_lexical_answer(
+                &mut self.session,
+                &mut self.hierarchy,
+                owner,
+                ResolutionAnswer::new([owner], [], ResolutionCompletion::Complete),
+            )
+            .with_candidate_paths(&mut self.candidate_paths);
+            evaluation.forward_candidate_artifacts = Some(&mut self.forward_candidate_artifacts);
+            evaluation.go_interface_method_set(owner, provider.as_mut())?
+        };
+        self.demand_provider = Some(provider);
+        Ok(
+            result.map(|(origins, complete)| GoInterfaceMethodInventory {
+                complete: complete
+                    && origins.iter().all(|origin| {
+                        origin.completion == ResolutionCompletion::Complete
+                            && origin.method.definition.is_some()
+                    }),
+                methods: origins.into_iter().map(|origin| origin.method).collect(),
+            }),
+        )
+    }
+
     pub(crate) fn go_method_satisfaction(
         &mut self,
         target: SemanticId,
@@ -1987,6 +2118,8 @@ impl FactResolutionOperation<'_> {
                 unclosed_interfaces.push(GoInterfaceSatisfaction {
                     owner,
                     methods: Vec::new(),
+                    satisfying_receivers: Vec::new(),
+                    candidate_receivers: Vec::new(),
                     outcome: GoMethodSatisfaction::Inconclusive(
                         "interface method-set endpoint closure is incomplete or cancelled",
                     ),
@@ -2033,6 +2166,8 @@ impl FactResolutionOperation<'_> {
                         .find(|interface| interface.owner == owner)
                         .map(|interface| interface.methods.clone())
                         .unwrap_or_default(),
+                    satisfying_receivers: Vec::new(),
+                    candidate_receivers: Vec::new(),
                     outcome: GoMethodSatisfaction::Inconclusive(
                         "method-family endpoint closure was cancelled or exhausted its budget",
                     ),
@@ -2479,6 +2614,112 @@ impl FactEvaluation<'_, '_> {
         })
     }
 
+    fn go_check_receiver_interface(
+        &mut self,
+        receiver: ResolutionSlotValue,
+        required_methods: &[GoInterfaceMethodOrigin],
+        complete: bool,
+        states: &StateMap,
+        method_identity: &mut impl FnMut(SemanticId) -> StoreResult<Option<(String, i64)>>,
+        provider: &mut dyn DemandRootProvider,
+    ) -> StoreResult<Option<GoReceiverInterfaceCheck>> {
+        use GoMethodSatisfaction::*;
+        let mut unknown = !complete;
+        let mut unknown_reason =
+            (!complete).then_some("interface method-set inventory is incomplete");
+        let mut mismatch = false;
+        let mut selections = Vec::new();
+        for origin in required_methods {
+            let required_method = &origin.method;
+            let Some(required) = required_method.definition else {
+                unknown = true;
+                continue;
+            };
+            let read = self.session.deferred_member_owners_for_lookup_names(&[
+                DeferredMemberOwnerLookupName::new(required_method.callable_lookup),
+            ])?;
+            let Some(rows) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            let rows = rows
+                .into_iter()
+                .map(|row| *row.get(self.session).row())
+                .collect::<Vec<_>>();
+            for row in &rows {
+                self.demand_slot(row.owner_frontier());
+            }
+            let definitions = rows.iter().map(|row| row.definition()).collect::<Vec<_>>();
+            if !self.session.ensure_go_member_declarations(&definitions)? {
+                return Ok(None);
+            }
+            let search = loop {
+                match self.go_receiver_members(
+                    self.root,
+                    required_method.callable_lookup,
+                    receiver,
+                    &rows,
+                    states,
+                )? {
+                    GoMemberSearchPreparation::Ready(search) => break Some(search),
+                    GoMemberSearchPreparation::Missing | GoMemberSearchPreparation::Pending => {
+                        break None;
+                    }
+                    GoMemberSearchPreparation::AwaitingHierarchy(roots) => {
+                        if !self.close_hierarchy_owner_roots(&roots, provider)? {
+                            break None;
+                        }
+                    }
+                }
+            };
+            let Some(search) = search else {
+                unknown = true;
+                continue;
+            };
+            let member = match search.method_for_satisfaction() {
+                GoSatisfactionMember::Method(member) => member,
+                GoSatisfactionMember::Excluded => {
+                    mismatch = true;
+                    continue;
+                }
+                GoSatisfactionMember::Open(reason) => {
+                    unknown = true;
+                    unknown_reason = Some(reason);
+                    continue;
+                }
+            };
+            selections.push((required_method.callable_lookup, member.target));
+            match self.go_signature_satisfaction(
+                member.target,
+                required,
+                states,
+                method_identity,
+            )? {
+                DoesNotSatisfy => mismatch = true,
+                Inconclusive(reason) => {
+                    unknown = true;
+                    unknown_reason = Some(reason);
+                }
+                Satisfies if search.completion != ResolutionCompletion::Complete => {
+                    unknown = true;
+                    unknown_reason = Some("method-family endpoint closure is incomplete");
+                }
+                Satisfies => {}
+            }
+        }
+        Ok(Some(GoReceiverInterfaceCheck {
+            outcome: if mismatch {
+                DoesNotSatisfy
+            } else if unknown {
+                Inconclusive(
+                    unknown_reason.unwrap_or("method-family endpoint closure is incomplete"),
+                )
+            } else {
+                Satisfies
+            },
+            selections,
+        }))
+    }
+
     fn go_check_method_interfaces(
         &mut self,
         target: SemanticId,
@@ -2516,6 +2757,8 @@ impl FactEvaluation<'_, '_> {
                             owner,
                             methods: vec![target],
                             outcome: Satisfies,
+                            satisfying_receivers: Vec::new(),
+                            candidate_receivers: Vec::new(),
                         })
                 })
                 .collect());
@@ -2557,102 +2800,30 @@ impl FactEvaluation<'_, '_> {
                 continue;
             }
             let mut outcome = Inconclusive("receiver or interface method set is unavailable");
+            let mut satisfying_receivers = Vec::new();
             for receiver in &receivers {
-                let mut unknown = !complete;
-                let mut unknown_reason =
-                    (!complete).then_some("interface method-set inventory is incomplete");
-                let mut mismatch = false;
-                let mut selects_target = false;
-                for origin in &required_methods {
-                    let required_method = &origin.method;
-                    let Some(required) = required_method.definition else {
-                        unknown = true;
-                        continue;
-                    };
-                    let read = self.session.deferred_member_owners_for_lookup_names(&[
-                        DeferredMemberOwnerLookupName::new(required_method.callable_lookup),
-                    ])?;
-                    let Some(rows) = self.accept_session_read(read) else {
-                        return Ok(result);
-                    };
-                    let rows = rows
-                        .into_iter()
-                        .map(|row| *row.get(self.session).row())
-                        .collect::<Vec<_>>();
-                    for row in &rows {
-                        self.demand_slot(row.owner_frontier());
-                    }
-                    let definitions = rows.iter().map(|row| row.definition()).collect::<Vec<_>>();
-                    if !self.session.ensure_go_member_declarations(&definitions)? {
-                        return Ok(result);
-                    }
-                    let search = loop {
-                        match self.go_receiver_members(
-                            target,
-                            required_method.callable_lookup,
-                            *receiver,
-                            &rows,
-                            states,
-                        )? {
-                            GoMemberSearchPreparation::Ready(search) => break Some(search),
-                            GoMemberSearchPreparation::Missing
-                            | GoMemberSearchPreparation::Pending => break None,
-                            GoMemberSearchPreparation::AwaitingHierarchy(roots) => {
-                                if !self.close_hierarchy_owner_roots(&roots, provider)? {
-                                    break None;
-                                }
-                            }
-                        }
-                    };
-                    let Some(search) = search else {
-                        unknown = true;
-                        continue;
-                    };
-                    let member = match search.method_for_satisfaction() {
-                        GoSatisfactionMember::Method(member) => member,
-                        GoSatisfactionMember::Excluded => {
-                            mismatch = true;
-                            continue;
-                        }
-                        GoSatisfactionMember::Open(reason) => {
-                            unknown = true;
-                            unknown_reason = Some(reason);
-                            continue;
-                        }
-                    };
-                    if member.target == target && required_method.callable_lookup == lookup {
-                        selects_target = true;
-                    }
-                    match self.go_signature_satisfaction(
-                        member.target,
-                        required,
-                        states,
-                        method_identity,
-                    )? {
-                        DoesNotSatisfy => mismatch = true,
-                        Inconclusive(reason) => {
-                            unknown = true;
-                            unknown_reason = Some(reason);
-                        }
-                        Satisfies => {
-                            if search.completion != ResolutionCompletion::Complete {
-                                unknown = true;
-                                unknown_reason =
-                                    Some("method-family endpoint closure is incomplete");
-                            }
-                        }
-                    }
-                }
-                let checked = if mismatch || (!unknown && !selects_target) {
+                let Some(check) = self.go_check_receiver_interface(
+                    *receiver,
+                    &required_methods,
+                    complete,
+                    states,
+                    method_identity,
+                    provider,
+                )?
+                else {
+                    return Ok(result);
+                };
+                let selects_target = check
+                    .selections
+                    .iter()
+                    .any(|&(name, selected)| name == lookup && selected == target);
+                let checked = if check.outcome == Satisfies && !selects_target {
                     DoesNotSatisfy
-                } else if unknown {
-                    Inconclusive(
-                        unknown_reason.unwrap_or("method-family endpoint closure is incomplete"),
-                    )
                 } else {
-                    Satisfies
+                    check.outcome
                 };
                 if checked == Satisfies {
+                    satisfying_receivers.push(receiver.ty());
                     outcome = checked;
                     break;
                 }
@@ -2670,6 +2841,8 @@ impl FactEvaluation<'_, '_> {
                 owner,
                 methods: matches,
                 outcome,
+                satisfying_receivers,
+                candidate_receivers: receivers.iter().map(|receiver| receiver.ty()).collect(),
             });
         }
         Ok(result)

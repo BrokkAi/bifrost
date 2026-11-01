@@ -61,10 +61,9 @@ pub use brokk_bifrost_rust_analysis::{
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 pub use brokk_bifrost_semantic_packs as semantic_packs;
-pub use brokk_bifrost_tools::{RenderedSummary, SummaryInput, summarize_inputs};
 pub use brokk_bifrost_tools::{
     code_quality, cyclomatic_complexity_diff, diff_analysis, file_tools, function_sources,
-    model_context, relevance, searchtools, searchtools_render, summary, symbol_rename,
+    model_context, relevance, searchtools, searchtools_render, symbol_rename,
 };
 
 use std::sync::OnceLock;

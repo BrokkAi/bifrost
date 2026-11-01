@@ -317,6 +317,8 @@ typed_fact_relations! {
     /// name has a row when parsing is complete; consumers confirm ownership from
     /// the candidate blob's own rows. Implicit roots have no row.
     SupertypeNameLookup = 43,
+    /// Candidate blobs declaring an alias with this spelled target terminal.
+    AliasTargetLookup = 44,
 }
 
 impl TypedFactRelation {
@@ -794,8 +796,11 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // assignments.
         // v55 reverts #8261's v54 record and annotation parents (#8361); the
         // epoch moves forward so no v54 bundle replays without those rows.
+        // #8387: regenerate bundles containing ranked synthetic identities.
+        // v58 re-lands implicit Java record and annotation roots on #8427,
+        // above master v57 and the earlier v55 revert.
         Language::Java => {
-            "resolution-bundle-java-v55-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
         // v71: v70 (#7509) and v70 (#7391) landed together.
         // v70 (#7509): persist SpreadArgument type frontiers (role ordinal 8).
@@ -803,10 +808,15 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // v69 (#7509): publish embedding and interface method candidate names.
         // v68 (#7509): an initialized type-switch clause binder no longer
         // carries an InferredType gap row.
+        // #8387: regenerate bundles containing ranked synthetic identities.
+        // v73 (#7509): publish alias target terminal lookup rows.
         Language::Go => {
-            "resolution-bundle-go-v71-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
+            "resolution-bundle-go-v73-7509-alias-target-lookup-8387-ranked-synthetic-names-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
         }
-        Language::Cpp => "resolution-bundle-cpp-v26-opaque-guard-implication-6902-2026-10",
+        // #8387: regenerate bundles containing ranked synthetic identities.
+        Language::Cpp => {
+            "resolution-bundle-cpp-v27-8387-ranked-synthetic-names-opaque-guard-implication-6902-2026-10"
+        }
         Language::JavaScript => {
             "resolution-bundle-javascript-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
@@ -850,17 +860,22 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // function-type bump (#8200) landed together.
         // v87 reverts #8261's v86 implicit AnyRef parents (#8361); the epoch
         // moves forward so no v86 bundle replays the unbound AnyRef slots.
+        // #8387: regenerate bundles containing ranked synthetic identities.
+        // v91: Scala imports bind at the enclosing body's choice (#8279),
+        // changing precedence steps in resolution_paths.body.
+        // v92 re-lands implicit Scala AnyRef roots above master v91.
         Language::Scala => {
-            "resolution-bundle-scala-v87-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10"
+            "resolution-bundle-scala-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10"
         }
         Language::CSharp => {
-            "resolution-bundle-csharp-v30-preprocessor-decisions-8147-m4a-bare-lexical-roots-7314-c1-4b2p-2026-10"
+            "resolution-bundle-csharp-v41-multi-target-razor-paths-8845-target-property-scope-8831-nuget-build-asset-folders-8830-get-path-of-file-above-7314-ad3b-unseen-branches-8147-m4c-parent-relative-open-items-8632-parse-variants-8147-m4b-per-file-membership-7314-c1-4e-ad2-qualified-heads-7314-c1-4d1-preprocessor-decisions-8147-m4a-bare-lexical-roots-7314-c1-4b2p-2026-10"
         }
         Language::Ruby => {
             "resolution-bundle-ruby-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
+        // #8387: regenerate bundles containing ranked synthetic identities.
         Language::Kotlin => {
-            "resolution-bundle-kotlin-v63-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
+            "resolution-bundle-kotlin-v67-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
         }
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }
@@ -2973,6 +2988,36 @@ struct SharedNameAliases {
     to_persisted: HashMap<SharedNameId, SharedNameId>,
 }
 
+/// One completed build's minted shared names, as rows: (per-request ordinal,
+/// digest) for each minted name, (persisted id, request id) for each alias,
+/// and the minted counter. Seeding an unminted request with these reproduces
+/// the build's numbering exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MintedSharedNames {
+    names: Vec<(u32, [u8; 32])>,
+    aliases: Vec<(SharedNameId, SharedNameId)>,
+    minted: u32,
+}
+
+impl MintedSharedNames {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn first_digest_for_test(&self) -> [u8; 32] {
+        self.names.first().expect("fixture minted a shared name").1
+    }
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.names.capacity() * std::mem::size_of::<(u32, [u8; 32])>()
+            + self.aliases.capacity() * std::mem::size_of::<(SharedNameId, SharedNameId)>()
+    }
+}
+
+/// The highest `resolution_identities.id`. Interned ids are never reused, so
+/// an unchanged maximum proves the store interned no new name in between.
+pub(crate) fn max_interned_shared_name_id(connection: &Connection) -> Result<i64> {
+    Ok(connection
+        .prepare_cached("SELECT coalesce(max(id), 0) FROM resolution_identities")?
+        .query_row([], |row| row.get(0))?)
+}
+
 impl SharedNameTable {
     #[doc(hidden)]
     pub fn new(cache: SharedNameCache) -> Self {
@@ -2992,6 +3037,67 @@ impl SharedNameTable {
             table: self,
             connection,
         }
+    }
+
+    /// Whether this request has minted no shared name and admitted no alias,
+    /// so a build's minted numbering can be reproduced here exactly.
+    pub(crate) fn is_unminted(&self) -> bool {
+        self.minted.get() == 0 && self.aliases.borrow().from_persisted.is_empty()
+    }
+
+    /// The names this request minted and the aliases it admitted, as rows.
+    /// Interned ids are store facts and need no capture: another request that
+    /// meets the same digest receives the same id.
+    pub(crate) fn minted_names(&self) -> MintedSharedNames {
+        let mut names = self
+            .digests_by_id
+            .borrow()
+            .iter()
+            .filter(|(id, _)| !id.is_interned())
+            .map(|(id, digest)| (id.get() - SharedNameId::PER_REQUEST_BASE, *digest))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut aliases = self
+            .aliases
+            .borrow()
+            .from_persisted
+            .iter()
+            .map(|(&stored, &request)| (stored, request))
+            .collect::<Vec<_>>();
+        aliases.sort_unstable();
+        MintedSharedNames {
+            names,
+            aliases,
+            minted: self.minted.get(),
+        }
+    }
+
+    /// Reproduce a build's minted numbering in this unminted request, so every
+    /// shared-name id a snapshot carries denotes the same name here. Returns
+    /// false, changing nothing, when this request already holds one of the
+    /// digests: the numbering could then not be reproduced.
+    pub(crate) fn seed_minted_names(&self, minted: &MintedSharedNames) -> bool {
+        assert!(
+            self.is_unminted(),
+            "minted names seed only a request that has minted none"
+        );
+        if minted
+            .names
+            .iter()
+            .any(|(_, digest)| self.ids.borrow().contains_key(digest))
+        {
+            return false;
+        }
+        for &(ordinal, digest) in &minted.names {
+            self.remember_identity(digest, SharedNameId::per_request(ordinal));
+        }
+        let mut aliases = self.aliases.borrow_mut();
+        for &(stored, request) in &minted.aliases {
+            assert!(aliases.from_persisted.insert(stored, request).is_none());
+            assert!(aliases.to_persisted.insert(request, stored).is_none());
+        }
+        self.minted.set(minted.minted);
+        true
     }
 
     pub(crate) fn remember_identity(&self, digest: [u8; 32], id: SharedNameId) {

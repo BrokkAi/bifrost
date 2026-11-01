@@ -2161,10 +2161,40 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
 
     let files = collector.join().expect("file-collector thread panicked");
 
-    if let Some(err) = first_error.lock().expect("walk error lock poisoned").take() {
-        return Err(err);
+    if let Some(error) = first_error.lock().expect("walk error lock poisoned").take() {
+        return Err(io::Error::other(PartialWorkspaceListing { files, error }));
     }
     Ok(files)
+}
+
+/// The error of a workspace walk that failed under part of the tree, carrying
+/// the files the rest of the walk enumerated. A caller that can report an
+/// incomplete answer recovers them with [`PartialWorkspaceListing::files_of`];
+/// every other caller sees an ordinary listing error.
+#[derive(Debug)]
+pub struct PartialWorkspaceListing {
+    pub files: BTreeSet<ProjectFile>,
+    pub error: io::Error,
+}
+
+impl PartialWorkspaceListing {
+    pub fn files_of(err: &io::Error) -> Option<&BTreeSet<ProjectFile>> {
+        err.get_ref()?
+            .downcast_ref::<Self>()
+            .map(|partial| &partial.files)
+    }
+}
+
+impl std::fmt::Display for PartialWorkspaceListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for PartialWorkspaceListing {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// The content of every unsaved overlay a project currently layers over its

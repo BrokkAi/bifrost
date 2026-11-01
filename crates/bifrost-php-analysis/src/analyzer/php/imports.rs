@@ -82,7 +82,7 @@ impl ImportAnalysisProvider for PhpAnalyzer {
                     )
                 ) {
                     let mut edges = HashMap::default();
-                    if let Some(target) = php_include_target(&project_files, file, import) {
+                    if let Some(target) = self.include_target(&project_files, file, import) {
                         edges.insert(
                             target,
                             vec![
@@ -131,7 +131,7 @@ impl ImportAnalysisProvider for PhpAnalyzer {
         let project_files = self.inner.project().all_files_shared().ok()?;
         let mut edges: HashMap<ProjectFile, Vec<serde_json::Value>> = HashMap::default();
         for import in imports {
-            if let Some(target) = php_include_target(&project_files, file, import) {
+            if let Some(target) = self.include_target(&project_files, file, import) {
                 edges
                     .entry(target)
                     .or_default()
@@ -164,7 +164,7 @@ impl ImportAnalysisProvider for PhpAnalyzer {
         imported.extend(
             imports
                 .iter()
-                .filter_map(|import| php_include_target(&project_files, file, import)),
+                .filter_map(|import| self.include_target(&project_files, file, import)),
         );
         Some(imported)
     }
@@ -258,19 +258,34 @@ impl ImportAnalysisProvider for PhpAnalyzer {
     }
 }
 
-fn php_include_target(
-    project_files: &BTreeSet<ProjectFile>,
-    importer: &ProjectFile,
-    import: &ImportInfo,
-) -> Option<ProjectFile> {
-    let path = import.path.as_ref()?;
-    if path.kind != Some(StructuredImportPathKind::FileInclude) {
-        return None;
+impl PhpAnalyzer {
+    fn include_target(
+        &self,
+        project_files: &BTreeSet<ProjectFile>,
+        importer: &ProjectFile,
+        import: &ImportInfo,
+    ) -> Option<ProjectFile> {
+        let path = import.path.as_ref()?;
+        if path.kind != Some(StructuredImportPathKind::FileInclude) {
+            return None;
+        }
+        // A PHP include's lexical prefix is the namespace of an unqualified
+        // `dirname` call its path was folded through. A declared
+        // `<namespace>.dirname` is the function PHP calls instead, so the
+        // folded path is not the target. `read_dynamic_import_sources`
+        // reports the same includes as dynamic.
+        if path.lexical_prefixes.iter().any(|namespace| {
+            self.get_definitions(&format!("{namespace}.dirname"))
+                .iter()
+                .any(CodeUnit::is_function)
+        }) {
+            return None;
+        }
+        let target = brokk_bifrost_core::path_utils::normalize_relative_path_from(
+            importer.rel_path().parent().unwrap_or(Path::new("")),
+            Path::new(&path.segments.join("/")),
+        )?;
+        let target_file = importer.with_rel_path(target);
+        project_files.contains(&target_file).then_some(target_file)
     }
-    let target = brokk_bifrost_core::path_utils::normalize_relative_path_from(
-        importer.rel_path().parent().unwrap_or(Path::new("")),
-        Path::new(&path.segments.join("/")),
-    )?;
-    let target_file = importer.with_rel_path(target);
-    project_files.contains(&target_file).then_some(target_file)
 }

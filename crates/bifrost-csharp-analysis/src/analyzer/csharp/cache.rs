@@ -5,10 +5,6 @@ use brokk_bifrost_analysis::analyzer::workspace_authority::WorkspaceAuthorityMem
 use brokk_bifrost_analysis::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry};
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
-use brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant;
-
-use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
-
 use brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo;
 
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
@@ -157,7 +153,14 @@ pub(crate) struct CSharpMemoCaches {
     /// Source-local rows, capped at memo budget / 16 bytes (16 MiB by default),
     /// with the same key and retained-byte weighting as Java's statement cache.
     pub(crate) statement_facts: ReplayingMemo<
-        Cache<(brokk_bifrost_analysis::analyzer::Oid, ProjectFile), StatementFactsEntry>,
+        Cache<
+            (
+                brokk_bifrost_analysis::analyzer::Oid,
+                ProjectFile,
+                brokk_bifrost_core::gitblob::ParseVariant,
+            ),
+            StatementFactsEntry,
+        >,
     >,
     /// Immutable candidate and target facts, shared by all queries in this
     /// generation. Updates and project overlays replace the entire memo bundle.
@@ -200,16 +203,10 @@ pub(crate) struct CSharpMemoCaches {
     pub(crate) referencing_files:
         WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(crate) direct_ancestors: ReplayingMemo<Cache<CodeUnit, AncestorMemoEntry>>,
-    /// `PoolSafeMemo`, not `QueryCacheCell`, for the same reason as the two sibling
-    /// cells below: this whole-workspace build is reached from rayon workers
-    /// during cold scans, and a blocking `get_or_init` parks every one of them
-    /// behind the single initializer for its full duration.
-    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
-    /// gets an index that was never built over them (issue #1748). Two cells at
-    /// most, because the exclusion verdict is a pure function of the analyzer
-    /// and the file.
+    /// Byte-bounded outcomes and read receipts, separated by test-filter
+    /// variant (#1748). Cold builds do not wait behind another query's deadline.
     pub(crate) direct_descendant_index:
-        WorkspaceAuthorityMemo<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+        WorkspaceAuthorityMemo<brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo>,
     pub(crate) reverse_import_index:
         WorkspaceAuthorityMemo<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     pub(crate) implicit_reference_index:
@@ -259,7 +256,11 @@ impl CSharpMemoCaches {
             budget_bytes,
             statement_facts: ReplayingMemo::new(build_weighted_cache(
                 budget_bytes / 16,
-                |key: &(brokk_bifrost_analysis::analyzer::Oid, ProjectFile),
+                |key: &(
+                    brokk_bifrost_analysis::analyzer::Oid,
+                    ProjectFile,
+                    brokk_bifrost_core::gitblob::ParseVariant,
+                ),
                  rows: &StatementFactsEntry| {
                     weight_bytes(
                         estimate_project_file(&key.1)
@@ -338,7 +339,7 @@ impl CSharpMemoCaches {
             )),
             direct_descendant_index: WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::CSharpDirectDescendantIndex,
-                KeyedPoolSafeMemo::new(),
+                brokk_bifrost_analysis::analyzer::common::new_replayable_descendant_memo(),
             ),
             reverse_import_index: WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::CSharpReverseImportIndex,

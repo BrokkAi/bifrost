@@ -141,7 +141,8 @@ use brokk_bifrost_core::hash::HashSet;
 // the lowerer imports (ExportedMacroDefinitions,
 // macro_invocation_is_locally_bound) but does not reach, so it kept v51.
 // #6844: standard-path proofs use lexical identity, including for ? residuals.
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v52";
+// #8306: .await binds its operand and result values in the shared scaffold.
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v53";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
@@ -7662,15 +7663,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
         let awaited_node = first_named_child(node);
+        let awaited = awaited_node
+            .map(|awaited_node| {
+                self.expression_value(builder, awaited_node, expression_value_kind(awaited_node))
+            })
+            .transpose()?;
+        let result = self.expression_value(builder, node, SemanticValueKind::AwaitResult)?;
         let structural_node_index = self.structural_node_index;
         let AwaitScaffold {
             suspend,
             normal_resume: normal,
             exceptional_resume: exceptional,
-            ..
         } = self
             .session
-            .add_await_scaffold(builder, |session, builder| {
+            .add_await_scaffold(builder, awaited, result, |session, builder| {
                 let range = node.byte_range();
                 let occurrence = session.next_source_occurrence(range.start, range.end);
                 let anchor = source_anchor(node, occurrence).map_err(RustLoweringError::Invalid)?;

@@ -902,10 +902,6 @@ pub struct AwaitScaffold {
     pub normal_resume: ProgramPointId,
     #[doc(hidden)]
     pub exceptional_resume: ProgramPointId,
-    #[doc(hidden)]
-    pub awaited: ValueId,
-    #[doc(hidden)]
-    pub result: ValueId,
 }
 
 pub(crate) type ScheduledControlNode<T> = (T, ProgramPointId);
@@ -2013,10 +2009,22 @@ impl<'a> ProcedureLoweringSession<'a> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'_>,
     ) -> Result<PointMetadata, ProcedureLoweringError> {
+        self.add_node_mapping_with_ast_identity(builder, node, None)
+    }
+
+    /// Add an exact node mapping that also names the node's structural fact,
+    /// so `program-point-of` can select the point from a structural row.
+    #[doc(hidden)]
+    pub fn add_node_mapping_with_ast_identity(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'_>,
+        ast_identity: Option<StructuralNodeIdentity>,
+    ) -> Result<PointMetadata, ProcedureLoweringError> {
         let range = node.byte_range();
         let occurrence = self.next_source_occurrence(range.start, range.end);
         let anchor = source_anchor(node, occurrence).map_err(ProcedureLoweringError::Invalid)?;
-        self.add_mapping(builder, anchor, SourceMappingKind::Exact)
+        self.add_mapping_with_ast_identity(builder, anchor, SourceMappingKind::Exact, ast_identity)
     }
 
     /// Add a synthetic cleanup mapping at the exact source range of its owner.
@@ -2306,12 +2314,20 @@ impl<'a> ProcedureLoweringSession<'a> {
 
     /// Emit the language-neutral suspend and two-resume core of an await.
     ///
+    /// `awaited` is the operand expression's own value and `result` the await
+    /// expression's own value, so the suspend reads exactly what the operand
+    /// evaluated to and the normal resume establishes exactly what the
+    /// enclosing expression reads. The workspace oracle derives the
+    /// awaited-to-result dependence from that pair.
+    ///
     /// Operand selection, exceptional completion routing, and any
     /// runtime-specific uncertainty remain adapter-owned.
     #[doc(hidden)]
     pub fn add_await_scaffold(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        awaited: Option<ValueId>,
+        result: ValueId,
         mut add_mapping: impl FnMut(
             &mut ProcedureLoweringSession<'_>,
             &mut ProcedureCfgBuilder,
@@ -2323,13 +2339,11 @@ impl<'a> ProcedureLoweringSession<'a> {
         let normal_resume = self.add_point(builder, normal_metadata, Vec::new())?;
         let exceptional_metadata = add_mapping(self, builder)?;
         let exceptional_resume = self.add_point(builder, exceptional_metadata, Vec::new())?;
-        let awaited = self.add_value(builder, suspend, SemanticValueKind::Temporary)?;
-        let result = self.add_value(builder, normal_resume, SemanticValueKind::AwaitResult)?;
         self.append_effect(
             builder,
             suspend,
             SemanticEffect::AsyncSuspend {
-                awaited: Some(awaited),
+                awaited,
                 normal_resume: ControlContinuation::Target(normal_resume),
                 exceptional_resume: ControlContinuation::Target(exceptional_resume),
             },
@@ -2368,8 +2382,6 @@ impl<'a> ProcedureLoweringSession<'a> {
             suspend,
             normal_resume,
             exceptional_resume,
-            awaited,
-            result,
         })
     }
 

@@ -1040,8 +1040,9 @@ impl std::fmt::Display for SemanticModelUnresolvedEdge {
 /// A model type's ancestors, plus every hierarchy edge the walk could not
 /// cross cleanly.
 ///
-/// `records` stays best effort so navigation keeps every ancestor candidate it
-/// had before. `defects` is what a proof must consult: it is the complete list
+/// `records` preserves the legacy candidate union for member and type-flow
+/// readers. Navigation uses [`SemanticModelAncestryAnswer`] instead.
+/// `defects` is what a proof must consult: it is the complete list
 /// of edges whose target the overlay could not pin to one published
 /// declaration, which is exactly the difference between "this type has no base"
 /// and "nothing published this type's base".
@@ -1050,6 +1051,14 @@ pub struct SemanticModelAncestry {
     pub records: Vec<Arc<SemanticModelSymbol>>,
     pub disposition: SemanticModelOverlayDisposition,
     pub defects: Vec<SemanticModelUnresolvedEdge>,
+}
+
+/// Definite navigation projection of the shared ancestry walk.
+#[derive(Debug, Default)]
+pub struct SemanticModelAncestryAnswer {
+    pub records: Vec<Arc<SemanticModelSymbol>>,
+    pub alternatives: Vec<Vec<Arc<SemanticModelSymbol>>>,
+    pub missing: Vec<String>,
 }
 
 /// What one hierarchy edge target resolved to, and whether the resolution is

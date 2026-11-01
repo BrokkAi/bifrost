@@ -2437,6 +2437,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.edge(builder, entry, next)
                 }
             }
+            "field_access" if is_qualified_this(node) => {
+                // A qualified `Outer.this` denotes the enclosing instance,
+                // not a field load or a null-checked dereference.
+                let receiver = named_children(node).pop().expect("qualified this child");
+                let terminal = self.point(builder, node, Vec::new())?;
+                let inner =
+                    self.expression_value(builder, receiver, expression_value_kind(receiver))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source: inner,
+                        target: result,
+                    },
+                )?;
+                self.edge(builder, terminal, next)?;
+                stack.push(Work::Expression {
+                    node: receiver,
+                    entry,
+                    next: EdgeTarget::normal(terminal),
+                    scope,
+                });
+                Ok(())
+            }
             "field_access" if self.field_access_is_type_qualifier(node) => {
                 // A package-or-type qualifier (`java.net.URLDecoder`) denotes
                 // no runtime value (#2363). Do not mint a Field location or
@@ -3326,7 +3351,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         });
         let default_point = default_arm.map(|index| arm_entries[index]);
         let mut no_match = if let Some(default_point) = default_point {
-            EdgeTarget::normal(default_point)
+            // With no other label, dispatch reaches default directly, and the
+            // default fact names this edge as a switch case.
+            EdgeTarget {
+                point: default_point,
+                kind: ControlEdgeKind::SwitchCase,
+            }
         } else if expression_mode {
             let missing_match = self.point(builder, node, Vec::new())?;
             self.add_gap(
@@ -3373,6 +3403,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     self.point(builder, *switch_label, Vec::new())?
                 };
+                // The comparison's false edge reaches the default arm whether
+                // or not the label is guarded, so it is the one edge the
+                // default row can always name.
+                if default_point == Some(no_match.point) {
+                    default_edge_source = Some(comparison);
+                }
                 let case_edge_source = if let Some(guard) = switch_label_guard(*switch_label) {
                     let guard_entry = self.point(builder, guard, Vec::new())?;
                     self.edge(
@@ -3383,12 +3419,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: ControlEdgeKind::ConditionalTrue,
                         },
                     )?;
+                    // A guard branches from wherever its lowering ends (after a
+                    // call, or from each operand of `||`), so the case edge
+                    // leaves a dedicated point that every true outcome joins
+                    // (#7750).
+                    let guard_passed = self.point(builder, guard, Vec::new())?;
+                    self.edge(
+                        builder,
+                        guard_passed,
+                        EdgeTarget {
+                            point: arm_entries[arm_index],
+                            kind: ControlEdgeKind::SwitchCase,
+                        },
+                    )?;
                     stack.push(Work::Condition {
                         node: guard,
                         entry: guard_entry,
                         when_true: EdgeTarget {
-                            point: arm_entries[arm_index],
-                            kind: ControlEdgeKind::SwitchCase,
+                            point: guard_passed,
+                            kind: ControlEdgeKind::ConditionalTrue,
                         },
                         when_false: EdgeTarget {
                             point: no_match.point,
@@ -3396,10 +3445,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         },
                         scope: switch_scope,
                     });
-                    if default_point == Some(no_match.point) {
-                        default_edge_source = Some(guard_entry);
-                    }
-                    guard_entry
+                    guard_passed
                 } else {
                     self.edge(
                         builder,
@@ -3409,9 +3455,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: ControlEdgeKind::SwitchCase,
                         },
                     )?;
-                    if default_point == Some(no_match.point) {
-                        default_edge_source = Some(comparison);
-                    }
                     selected
                 };
                 if selected != comparison {
@@ -4106,8 +4149,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let qualifier = (!constructor_reference)
             .then(|| method_reference_qualifier(node))
             .flatten();
+        let type_qualifier =
+            qualifier.is_some_and(|qualifier| self.method_reference_name_is_type(qualifier));
         let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
         let receiver = qualifier
+            .filter(|_| !type_qualifier)
             .map(|qualifier| {
                 self.expression_value(builder, qualifier, expression_value_kind(qualifier))
             })
@@ -4141,19 +4187,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "method-reference target and receiver binding require dispatch refinement",
         )?;
-        if qualifier.is_some() {
-            self.add_gap(
-                builder,
-                reference,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unsupported,
-                "bound method-reference creation can fail its implicit receiver null check",
-            )?;
-        }
         self.edge(builder, reference, next)?;
+        // JLS 15.13.3 checks a bound receiver when the reference is created.
+        // This is the same implicit throw as a field access on a null receiver.
+        // `this` and `Outer.this` are non-null; type syntax has no receiver, and `super` has no
+        // named qualifier in tree-sitter-java's method_reference production.
+        if receiver.is_some()
+            && qualifier.is_some_and(|qualifier| {
+                qualifier.kind() != "this" && !is_qualified_this(qualifier)
+            })
+        {
+            self.implicit_abort_edge(builder, node, reference, scope, None, stack)?;
+        }
 
-        if let Some(qualifier) = qualifier {
+        if let Some(qualifier) = qualifier.filter(|_| !type_qualifier) {
             stack.push(Work::Expression {
                 node: qualifier,
                 entry,
@@ -4164,6 +4211,145 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.edge(builder, entry, EdgeTarget::normal(reference))?;
         }
         Ok(())
+    }
+
+    /// A name before `::` is a type only after every file-local source of a
+    /// variable binding has been ruled out. Inherited fields and static imports
+    /// are deliberately treated as possible variables when they are unknown.
+    fn method_reference_name_is_type(&self, qualifier: Node<'tree>) -> bool {
+        // A qualified name can end in a static field (System.out::println).
+        if qualifier.kind() != "identifier" {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), qualifier) else {
+            return false;
+        };
+
+        let mut ancestor = qualifier.parent();
+        while let Some(node) = ancestor {
+            if node.kind() == "lambda_expression"
+                && node
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| {
+                        parameters.kind() == "identifier"
+                            && node_text(self.prepared.source(), parameters) == Some(name)
+                    })
+            {
+                return false;
+            }
+            // Scan the containing type-body member, regardless of its kind.
+            // Field initializers and instance initializer blocks can bind names too.
+            if node.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "class_body"
+                        | "interface_body"
+                        | "enum_body"
+                        | "enum_body_declarations"
+                        | "record_body"
+                        | "annotation_type_body"
+                )
+            }) {
+                let mut scan = vec![node];
+                while let Some(candidate) = scan.pop() {
+                    let binder = candidate
+                        .child_by_field_name("name")
+                        .filter(|_| {
+                            matches!(
+                                candidate.kind(),
+                                "variable_declarator"
+                                    | "formal_parameter"
+                                    | "catch_formal_parameter"
+                                    | "enhanced_for_statement"
+                                    | "resource"
+                            )
+                        })
+                        .or_else(|| {
+                            brokk_bifrost_jvm::java::structural::java_pattern_binding_name(
+                                candidate,
+                            )
+                        });
+                    if binder.and_then(|binder| node_text(self.prepared.source(), binder))
+                        == Some(name)
+                    {
+                        return false;
+                    }
+                    // Inferred lambda parameters and spread parameters have
+                    // identifier children rather than a `name` field.
+                    if matches!(candidate.kind(), "inferred_parameters" | "spread_parameter")
+                        && named_children(candidate).into_iter().any(|child| {
+                            child.kind() == "identifier"
+                                && node_text(self.prepared.source(), child) == Some(name)
+                        })
+                    {
+                        return false;
+                    }
+                    scan.extend(named_children(candidate));
+                }
+            }
+            if matches!(node.kind(), "object_creation_expression" | "enum_constant")
+                && has_child_kind(node, "class_body")
+            {
+                return false;
+            }
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            ) {
+                if node.child_by_field_name("superclass").is_some()
+                    || node.child_by_field_name("interfaces").is_some()
+                    || has_child_kind(node, "extends_interfaces")
+                    || self
+                        .field_declaration_anchors
+                        .contains_key(&(node.id(), name.into()))
+                {
+                    return false;
+                }
+                if node.kind() == "record_declaration"
+                    && node
+                        .child_by_field_name("parameters")
+                        .is_some_and(|parameters| {
+                            named_children(parameters).into_iter().any(|parameter| {
+                                parameter.child_by_field_name("name").and_then(|name_node| {
+                                    node_text(self.prepared.source(), name_node)
+                                }) == Some(name)
+                            })
+                        })
+                {
+                    return false;
+                }
+                if node.kind() == "enum_declaration"
+                    && node.child_by_field_name("body").is_some_and(|body| {
+                        named_children(body).into_iter().any(|constant| {
+                            constant.kind() == "enum_constant"
+                                && constant.child_by_field_name("name").and_then(|name_node| {
+                                    node_text(self.prepared.source(), name_node)
+                                }) == Some(name)
+                        })
+                    })
+                {
+                    return false;
+                }
+            }
+            ancestor = node.parent();
+        }
+        named_children(self.prepared.tree().root_node())
+            .into_iter()
+            .filter(|node| node.kind() == "import_declaration" && has_child_kind(*node, "static"))
+            .all(|import| {
+                if has_child_kind(import, "asterisk") {
+                    return false;
+                }
+                let Some(path) = named_children(import).into_iter().next() else {
+                    return false;
+                };
+                let member = path.child_by_field_name("name").unwrap_or(path);
+                node_text(self.prepared.source(), member) != Some(name)
+            })
     }
 
     /// Lower the abort edge of a runtime operation that can fault implicitly:

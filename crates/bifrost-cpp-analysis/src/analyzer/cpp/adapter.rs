@@ -206,6 +206,13 @@ impl LanguageAdapter for CppAdapter {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for CppAdapter {
+    // This legacy engine does not produce parse-time semantic IR.
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        None
+    }
+
     /// C++ is the one language that adopts files by include (#1837): `.inc`
     /// translation-unit fragments (abseil's `absl/.../*.inc`) hold real
     /// declarations but carry an extension no language owns, so nothing would

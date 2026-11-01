@@ -421,18 +421,24 @@ impl<'a> JavaResolutionSession<'a> {
 
     fn direct_ancestors(
         &self,
+        analyzer: &dyn IAnalyzer,
         provider: &dyn brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider,
         unit: &CodeUnit,
-    ) -> Vec<CodeUnit> {
+    ) -> Result<Vec<CodeUnit>, JavaHierarchyFactError> {
         if !self.charge_hierarchy_expansion() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let ancestors = provider.get_direct_ancestors(unit);
         if !self.observe_cancellation() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        // S2b: Receiver row tracking has no incomplete hierarchy channel.
-        self.track_rows(ancestors.definite().to_vec())
+        if !ancestors.is_complete() {
+            analyzer.record_query_incomplete(brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                format!("Java hierarchy metadata for {unit:?}: {ancestors:?}").into_boxed_str(),
+            ));
+            return Err(JavaHierarchyFactError::MetadataUnavailable);
+        }
+        Ok(self.track_rows(ancestors.edges))
     }
 
     fn charge(&self, limit: ReceiverBudgetLimit) -> bool {
@@ -4742,7 +4748,11 @@ fn java_qualified_nested_type(
         return Some(unit);
     }
     let provider = analyzer.type_hierarchy_provider()?;
-    let mut queue = VecDeque::from(session.direct_ancestors(provider, &qualifier_type));
+    let mut queue = VecDeque::from(
+        session
+            .direct_ancestors(analyzer, provider, &qualifier_type)
+            .ok()?,
+    );
     let mut seen = HashSet::default();
     seen.insert(qualifier_type);
     while let Some(ancestor) = queue.pop_front() {
@@ -4755,7 +4765,11 @@ fn java_qualified_nested_type(
         if let Some(unit) = nested(&ancestor) {
             return Some(unit);
         }
-        queue.extend(session.direct_ancestors(provider, &ancestor));
+        queue.extend(
+            session
+                .direct_ancestors(analyzer, provider, &ancestor)
+                .ok()?,
+        );
     }
     None
 }
@@ -6045,6 +6059,17 @@ enum JavaMemberHierarchyResolution {
     Incomplete,
 }
 
+fn java_hierarchy_unavailable(owner: &CodeUnit) -> DefinitionLookupOutcome {
+    diagnostic_outcome(
+        DefinitionLookupStatus::Unavailable,
+        "unavailable_java_hierarchy_facts",
+        format!(
+            "hierarchy metadata for `{}` is incomplete or ambiguous",
+            owner.fq_name()
+        ),
+    )
+}
+
 fn java_member_declared_in_hierarchy(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
@@ -6068,7 +6093,9 @@ fn java_member_declared_in_hierarchy(
     };
     let mut seen = HashSet::default();
     seen.insert(owner.clone());
-    let mut level = session.direct_ancestors(provider, owner);
+    let Ok(mut level) = session.direct_ancestors(analyzer, provider, owner) else {
+        return JavaMemberHierarchyResolution::Incomplete;
+    };
     if session.is_stopped() {
         return JavaMemberHierarchyResolution::Incomplete;
     }
@@ -6090,7 +6117,10 @@ fn java_member_declared_in_hierarchy(
             if session.is_stopped() {
                 return JavaMemberHierarchyResolution::Incomplete;
             }
-            next.extend(session.direct_ancestors(provider, &current));
+            let Ok(ancestors) = session.direct_ancestors(analyzer, provider, &current) else {
+                return JavaMemberHierarchyResolution::Incomplete;
+            };
+            next.extend(ancestors);
             if session.is_stopped() {
                 return JavaMemberHierarchyResolution::Incomplete;
             }
@@ -6128,15 +6158,19 @@ fn java_member_candidates(
     let owner_site = call_site.filter(|_| {
         candidates.len() > 1
             && hierarchy.is_some_and(|provider| {
-                java_overload_set_is_complete(
-                    analyzer,
-                    token,
-                    session,
-                    owner,
-                    session.direct_ancestors(provider, owner),
-                    &HashSet::from_iter([owner.clone()]),
-                    member,
-                )
+                session
+                    .direct_ancestors(analyzer, provider, owner)
+                    .is_ok_and(|ancestors| {
+                        java_overload_set_is_complete(
+                            analyzer,
+                            token,
+                            session,
+                            owner,
+                            ancestors,
+                            &HashSet::from_iter([owner.clone()]),
+                            member,
+                        )
+                    })
             })
     });
     let applicability =
@@ -6163,7 +6197,12 @@ fn java_member_candidates(
 
     if let Some(provider) = analyzer.type_hierarchy_provider() {
         let mut seen = HashSet::default();
-        let mut level = session.direct_ancestors(provider, owner);
+        let mut level = match session.direct_ancestors(analyzer, provider, owner) {
+            Ok(ancestors) => ancestors,
+            Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                return java_hierarchy_unavailable(owner);
+            }
+        };
         if let Some(state) = member_trace.as_mut() {
             for ancestor in &level {
                 state
@@ -6201,7 +6240,12 @@ fn java_member_candidates(
                     declaring_owner_by_candidate.insert(candidate.clone(), ancestor.clone());
                 }
                 level_candidates.extend(found);
-                let expanded = session.direct_ancestors(provider, &ancestor);
+                let expanded = match session.direct_ancestors(analyzer, provider, &ancestor) {
+                    Ok(ancestors) => ancestors,
+                    Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                        return java_hierarchy_unavailable(&ancestor);
+                    }
+                };
                 if let Some(state) = member_trace.as_mut() {
                     for next in &expanded {
                         state
@@ -6392,7 +6436,10 @@ fn java_hierarchy_crosses_unindexed_supertype(
                 return true;
             }
         }
-        for ancestor in session.direct_ancestors(provider, &unit) {
+        let Ok(ancestors) = session.direct_ancestors(analyzer, provider, &unit) else {
+            return true;
+        };
+        for ancestor in ancestors {
             if seen.insert(ancestor.clone()) {
                 queue.push_back(ancestor);
             }
@@ -6450,7 +6497,10 @@ fn java_overload_set_is_complete(
         {
             return false;
         }
-        queue.extend(session.direct_ancestors(provider, &ancestor));
+        let Ok(ancestors) = session.direct_ancestors(analyzer, provider, &ancestor) else {
+            return false;
+        };
+        queue.extend(ancestors);
     }
     !java_hierarchy_crosses_unindexed_supertype(analyzer, token, session, owner)
 }

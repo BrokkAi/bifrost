@@ -534,7 +534,11 @@ impl<A: LanguageAdapter> CanonicalPhpSourceFacts for TreeSitterAnalyzer<A> {
         }
         let generation = self.language_generation("php")?;
         let oid = self.resolve_live_oid_for_file(file)?;
-        self.record_read_key(self.file_read_key(file, oid));
+        self.record_read_key(self.file_read_key(
+            file,
+            oid,
+            brokk_bifrost_core::gitblob::ParseVariant::Empty,
+        ));
         let key = Self::transient_cache_key(oid, file);
         if let Some(state) = self.retained_file_state(file, &key)
             && let Some(source) = state.source_facts.as_ref()
@@ -558,7 +562,13 @@ impl<A: LanguageAdapter> CanonicalPhpSourceFacts for TreeSitterAnalyzer<A> {
             return keep_going().then_some(facts);
         }
         let facts = self.store_query_or_record(
-            |sink| sink.push(self.file_read_key(file, oid)),
+            |sink| {
+                sink.push(self.file_read_key(
+                    file,
+                    oid,
+                    brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                ))
+            },
             self.store_context.store.php_source_facts(
                 oid,
                 generation,

@@ -62,6 +62,13 @@ pub(crate) mod jvm_adapter_helper {
         }
     }
     impl StoreLanguageAdapter for LegacyJavaFixtureAdapter {
+        // Test adapter.
+        fn parse_time_semantic_lowerer(
+            &self,
+        ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer>
+        {
+            None
+        }
         fn source_fact_storage(
             &self,
         ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>

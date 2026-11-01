@@ -293,6 +293,7 @@ mod jvm_extraction_tests {
         let mut content = SelectedResolutionContentMountRequest::new(
             fixture.content_witness("0000000000000000000000000000000000000001"),
             WorkspaceFileRow {
+                decision: None,
                 rel_path: "src/cached.java".into(),
                 blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
             },
@@ -549,6 +550,7 @@ mod jvm_extraction_tests {
         let request = SelectedResolutionContentMountRequest::new(
             fixture.content_witness("0000000000000000000000000000000000000080"),
             WorkspaceFileRow {
+                decision: None,
                 rel_path: "src/0000.java".to_owned(),
                 blob_oid: Oid::from_str("0000000000000000000000000000000000000080").unwrap(),
             },
@@ -615,6 +617,7 @@ mod jvm_extraction_tests {
         let content_mount = SelectedResolutionContentMountRequest::new(
             fixture.content_witness("0000000000000000000000000000000000000001"),
             WorkspaceFileRow {
+                decision: None,
                 rel_path: "src/cached.java".to_owned(),
                 blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
             },
@@ -1559,12 +1562,25 @@ mod jvm_extraction_tests {
     }
     #[test]
     fn selected_queries_are_context_first_keyed_and_sort_free() {
+        for statistics in brokk_bifrost_core::cache_gc::PlannerStatisticsState::BOTH {
+            assert_selected_query_plans(statistics);
+        }
+    }
+
+    fn assert_selected_query_plans(
+        statistics: brokk_bifrost_core::cache_gc::PlannerStatisticsState,
+    ) {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::with_language(
             257,
             "java",
             Language::Java,
             true,
         );
+        fixture
+            .store
+            .execute_selection_publication(move |conn| statistics.install(conn));
+        fixture.store.recycle_readers_for_new_statistics();
+        eprintln!("selected-resolution query plan assertions {statistics}");
         let mut masks = (0..256)
             .map(|index| {
                 SelectedResolutionOverlayMask::replacement("java", format!("src/{index:04}.java"))
@@ -1670,6 +1686,8 @@ mod jvm_extraction_tests {
                 true,
             ),
         ] {
+            let label = format!("{statistics}: {label}");
+            let label = label.as_str();
             let plan = explain_plan(ready.connection(), sql, parameters);
             let position = required_plan_step(
                 &plan,
@@ -1754,6 +1772,8 @@ mod jvm_extraction_tests {
                 true,
             ),
         ] {
+            let label = format!("{statistics}: {label}");
+            let label = label.as_str();
             let plan = explain_plan(ready.connection(), sql, parameters);
             assert_plan_order(
                 &plan,
@@ -2046,6 +2066,7 @@ mod jvm_extraction_tests {
         let content_mount = SelectedResolutionContentMountRequest::new(
             fixture.content_witness("0000000000000000000000000000000000000001"),
             WorkspaceFileRow {
+                decision: None,
                 rel_path: "src/cached.java".to_owned(),
                 blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
             },
@@ -2057,6 +2078,7 @@ mod jvm_extraction_tests {
         let second_content_mount = SelectedResolutionContentMountRequest::new(
             fixture.content_witness("0000000000000000000000000000000000000001"),
             WorkspaceFileRow {
+                decision: None,
                 rel_path: "src/cached-again.java".to_owned(),
                 blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
             },
@@ -2115,6 +2137,7 @@ mod jvm_extraction_tests {
         let content_mount = SelectedResolutionContentMountRequest::new(
             fixture.content_witness("0000000000000000000000000000000000000001"),
             WorkspaceFileRow {
+                decision: None,
                 rel_path: "src/cached.java".to_owned(),
                 blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
             },

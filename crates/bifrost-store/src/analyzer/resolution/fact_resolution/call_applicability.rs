@@ -5,7 +5,9 @@
 //! evidence. All values are query-local; no call assessment is persisted.
 
 use brokk_bifrost_core::analyzer::Language;
-use brokk_bifrost_core::analyzer::resolution_facts::{IntrinsicTypeKind, ResolutionScopeKind};
+use brokk_bifrost_core::analyzer::resolution_facts::{
+    IntrinsicTypeKind, ResolutionScopeKind, ResolutionSupertypeKind,
+};
 use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason, FailingArgument, InvocationPhase,
 };
@@ -1801,6 +1803,7 @@ impl FactEvaluation<'_, '_> {
                     member_names,
                     request.call,
                     request.previous_states,
+                    completion,
                 )?
                 else {
                     return Ok(None);
@@ -1816,7 +1819,7 @@ impl FactEvaluation<'_, '_> {
                         .iter()
                         .all(|result_type| members_by_owner[&result_type.identity()].is_empty())
                         && !adapter.extensions_can_supply_value_application()
-                        && self.result_types_prove_non_callable(&owners)?
+                        && self.result_types_prove_non_callable(&owners, member_names)?
                     {
                         return Ok(Some(ResultApplicationAssessment::Inapplicable(
                             CallableRejectionReason::ListShapeMismatch,
@@ -1833,7 +1836,7 @@ impl FactEvaluation<'_, '_> {
                 members.dedup();
                 if members.is_empty() {
                     if adapter.extensions_can_supply_value_application()
-                        || !self.result_types_prove_non_callable(&owners)?
+                        || !self.result_types_prove_non_callable(&owners, member_names)?
                     {
                         return Ok(Some(ResultApplicationAssessment::Unknown));
                     }
@@ -1956,7 +1959,11 @@ impl FactEvaluation<'_, '_> {
             result_slot: final_result,
         }))
     }
-    fn result_types_prove_non_callable(&mut self, owners: &[SemanticId]) -> StoreResult<bool> {
+    fn result_types_prove_non_callable(
+        &mut self,
+        owners: &[SemanticId],
+        member_names: &[&str],
+    ) -> StoreResult<bool> {
         let intrinsic_read = self.session.intrinsics_for_type_identities(owners)?;
         let Some(intrinsics) = self.accept_session_read(intrinsic_read) else {
             return Ok(false);
@@ -1984,7 +1991,15 @@ impl FactEvaluation<'_, '_> {
         let Some(supertypes) = self.accept_session_read(supertype_read) else {
             return Ok(false);
         };
-        Ok(supertypes.is_empty())
+        // A present root member still needs applicability evidence, even when
+        // the earlier search found no member declaration.
+        if super::implicit_roots_supply_any(member_names) {
+            return Ok(false);
+        }
+        Ok(supertypes.iter().all(|edge| {
+            edge.get(self.session).row().source_kind()
+                == Some(ResolutionSupertypeKind::ImplicitSuperclass)
+        }))
     }
 }
 

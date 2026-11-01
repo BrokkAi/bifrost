@@ -195,6 +195,94 @@ pub fn duration(label: impl AsRef<str>, duration: Duration) {
     });
 }
 
+/// Timing-only provenance for the first read that prevents unit reuse.
+/// This is diagnostic metadata, never an input to admission or identity.
+#[derive(Clone, Debug)]
+pub struct ReadRefusal {
+    pub kind: &'static str,
+    pub reason: String,
+    pub origin: &'static std::panic::Location<'static>,
+}
+
+type RefusalSlot = std::thread::LocalKey<std::cell::RefCell<Option<ReadRefusal>>>;
+thread_local! {
+    static READ_REFUSAL: std::cell::RefCell<Option<ReadRefusal>> = const { std::cell::RefCell::new(None) };
+    static EXECUTION_READ_REFUSAL: std::cell::RefCell<Option<ReadRefusal>> = const { std::cell::RefCell::new(None) };
+}
+
+pub struct ReadRefusalScope {
+    previous: Option<Option<ReadRefusal>>,
+    slot: &'static RefusalSlot,
+    // Restoring thread-local state must happen on the recording thread.
+    _thread_bound: std::marker::PhantomData<*mut ()>,
+}
+impl Drop for ReadRefusalScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            self.slot.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+}
+
+fn refusal_scope(slot: &'static RefusalSlot, refusal: Option<ReadRefusal>) -> ReadRefusalScope {
+    let previous =
+        (enabled() && refusal.is_some()).then(|| slot.with(|slot| slot.replace(refusal)));
+    ReadRefusalScope {
+        previous,
+        slot,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// Carry the first refusing read through synchronous recording and receipt replay.
+pub fn read_refusal_scope(refusal: Option<ReadRefusal>) -> ReadRefusalScope {
+    refusal_scope(&READ_REFUSAL, refusal)
+}
+
+/// Keep execution provenance separate when a resolver subsumes input reads.
+pub fn read_execution_refusal_scope(refusal: Option<ReadRefusal>) -> ReadRefusalScope {
+    refusal_scope(&EXECUTION_READ_REFUSAL, refusal)
+}
+
+#[track_caller]
+pub fn current_read_refusal(kind: &'static str) -> Option<ReadRefusal> {
+    if !enabled() {
+        return None;
+    }
+    let origin = std::panic::Location::caller();
+    Some(
+        READ_REFUSAL
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(|| ReadRefusal {
+                kind,
+                reason: kind.to_owned(),
+                origin,
+            }),
+    )
+}
+
+#[track_caller]
+pub fn current_execution_read_refusal() -> Option<ReadRefusal> {
+    if !enabled() {
+        return None;
+    }
+    let origin = std::panic::Location::caller();
+    Some(
+        EXECUTION_READ_REFUSAL
+            .with(|slot| slot.borrow().clone())
+            .or_else(|| {
+                READ_REFUSAL
+                    .with(|slot| slot.borrow().clone())
+                    .filter(|reason| reason.kind == "execution_dependent")
+            })
+            .unwrap_or_else(|| ReadRefusal {
+                kind: "execution_dependent",
+                reason: "execution_dependent".to_owned(),
+                origin,
+            }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::timing_enabled;

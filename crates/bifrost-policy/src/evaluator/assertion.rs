@@ -19,6 +19,7 @@ use crate::relational::{
 };
 
 use super::super::finding::InconclusiveScope;
+use super::super::unit_execution::{UnitSlice, evaluate_reusable_slice};
 use super::super::units::AssertFileProduct;
 use super::*;
 
@@ -408,6 +409,86 @@ impl AssertionRunTotals {
     }
 }
 
+/// The per-subject-file cut. The generic evaluator owns reuse and read proof;
+/// this contract owns the file product, ordered merge, and finalization.
+struct AssertFileSlice<'a, F> {
+    rows: &'a ExecutedQueryRows,
+    policy: &'a LoadedPolicy,
+    budget: &'a PolicyBudget,
+    execute: F,
+}
+
+impl<'a, F> UnitSlice for AssertFileSlice<'a, F>
+where
+    F: Fn(
+        (&'a str, &'a [&'a AssertionSubject]),
+    ) -> Result<AssertFileProduct, Box<AssertFileFailure>>,
+{
+    type Capture<'b> = ();
+    type Seed = (&'a str, &'a [&'a AssertionSubject]);
+    type Prefix = (&'a str, AssertFileProduct);
+    type Error = Box<AssertFileFailure>;
+    type BudgetState = ();
+    type Allowance = ();
+    type Merged = AssertionRunTotals;
+    type Output = Result<PolicyRun, PolicyRunError>;
+
+    fn capture<'b>(&self, _analyzer: &'b dyn IAnalyzer) -> Self::Capture<'b> {}
+
+    fn remaining(&self, _state: &Self::BudgetState) -> Option<Self::Allowance> {
+        Some(())
+    }
+
+    fn prefix(
+        &self,
+        (path, subjects): &Self::Seed,
+        _allowance: Self::Allowance,
+    ) -> Result<Self::Prefix, Self::Error> {
+        (self.execute)((path, subjects)).map(|product| (*path, product))
+    }
+
+    fn decode(
+        &self,
+        (path, _): &Self::Seed,
+        product: PolicyUnitProduct,
+    ) -> Result<Self::Prefix, WidenReason> {
+        product
+            .into_assert_file()
+            .map(|product| (*path, product))
+            .ok_or(WidenReason::ProductLoadFailed)
+    }
+
+    fn encode(&self, (_, product): &Self::Prefix) -> PolicyUnitProduct {
+        PolicyUnitProduct::AssertFile(product.clone())
+    }
+
+    fn validate(&self, (_, product): &Self::Prefix) -> Result<(), WidenReason> {
+        check_exhaustive_assert_file(product)
+    }
+
+    fn missing_reads(&self, attempt: &mut UnitAttempt) -> Result<(), WidenReason> {
+        attempt.unbounded();
+        Err(WidenReason::UnitUnbounded)
+    }
+
+    fn failure(&self, failure: Self::Error, products: Vec<Self::Prefix>) -> Self::Output {
+        let mut totals = self.merge(products);
+        assert_file_failure_run(self.policy, *failure, &mut totals, self.budget)
+    }
+
+    fn merge(&self, products: impl IntoIterator<Item = Self::Prefix>) -> Self::Merged {
+        let mut totals = AssertionRunTotals::of_subject(self.rows);
+        for (path, product) in products {
+            totals.merge(path, product);
+        }
+        totals
+    }
+
+    fn suffix(&self, totals: Self::Merged, _skipped: usize) -> Self::Output {
+        finish_assertion_run(self.policy, &self.rows.completion, totals, self.budget)
+    }
+}
+
 /// The run-level values every subject file's iteration reads.
 struct AssertionRun<'a> {
     plan: AssertRunPlan<'a>,
@@ -579,13 +660,11 @@ fn sliced_assertion_run(
     let execution = UnitQueryExecution {
         flow_state: context.flow_resources(),
         analyzer: context.analyzer,
-        // The whole subject execution is analyzer-only, so its units are too.
-        workspace: None,
+        // Subject units need the same semantic services as whole_assertion_run.
+        workspace: context.workspace,
         cancellation: context.cancellation,
         limits,
         workspace_files: &workspace_files,
-        // Shared units are executed with the workspace oracles, which these
-        // units do not hold.
         subject_batch: None,
     };
     let mut reuse = UnitReuse::new(policy, incremental, budget, &context.flow_resources());
@@ -639,85 +718,44 @@ fn sliced_assertion_run(
     attempt.enumerated(assert_keys.len());
     reuse.prefetch(&assert_keys, None)?;
 
-    let mut totals = AssertionRunTotals::of_subject(&rows);
     let presentation = run.plan.presentation(policy);
-    for ((path, file_subjects), key) in subjects_by_path.iter().zip(assert_keys.iter()) {
-        let product = match reuse.published(key)? {
-            Some(product) => {
-                attempt.reused();
-                let Some(product) = product.into_assert_file() else {
-                    // One key names one product shape; anything else is a store
-                    // that answered a different question.
-                    return Err(WidenReason::ProductLoadFailed);
-                };
-                product
-            }
-            None => {
-                attempt.recomputed();
-                // Each unit gets its own caches. Every one of them is a memo
-                // keyed by a declaration, a file or a path, so starting empty
-                // computes exactly what a whole run's shared caches would have
-                // answered; only the memo hits are lost.
-                let mut caches = AssertFileCaches::new(
-                    &run.plan,
-                    context,
-                    active_semantic_model_snapshot.clone(),
-                );
-                let (product, reads, elapsed) =
-                    recompute_unit(context.analyzer, context.cancellation, || {
-                        evaluate_assert_file(
-                            path,
-                            file_subjects,
-                            &run.plan,
-                            &presentation,
-                            &run.subject_diagnostics,
-                            &run.files_by_rel,
-                            &mut caches,
-                            context,
-                            budget,
-                        )
-                    });
-                reuse.record_recompute(elapsed);
-                let product = match product {
-                    Ok(product) => product,
-                    // A file that cannot be evaluated fails the whole run,
-                    // exactly as it does today; it is not a widening.
-                    Err(failure) => {
-                        return Ok(assert_file_failure_run(
-                            policy,
-                            *failure,
-                            &mut totals,
-                            budget,
-                        ));
-                    }
-                };
-                let Some(reads) = reads else {
-                    attempt.unbounded();
-                    return Err(WidenReason::UnitUnbounded);
-                };
-                check_exhaustive_assert_file(&product)?;
-                reuse.publish(
-                    key.clone(),
-                    PolicyUnitProduct::AssertFile(product.clone()),
-                    reads,
-                );
-                product
-            }
-        };
-        check_exhaustive_assert_file(&product)?;
-        totals.merge(path, product);
-    }
+    let slice = AssertFileSlice {
+        rows: &rows,
+        policy,
+        budget,
+        execute: |(path, file_subjects): (&str, &[&AssertionSubject])| {
+            let mut caches =
+                AssertFileCaches::new(&run.plan, context, active_semantic_model_snapshot.clone());
+            evaluate_assert_file(
+                path,
+                file_subjects,
+                &run.plan,
+                &presentation,
+                &run.subject_diagnostics,
+                &run.files_by_rel,
+                &mut caches,
+                context,
+                budget,
+            )
+        },
+    };
+    let result = evaluate_reusable_slice(
+        &slice,
+        subjects_by_path
+            .iter()
+            .zip(assert_keys.iter())
+            .map(|((path, subjects), key)| ((*path, subjects.as_slice()), key)),
+        &mut reuse,
+        attempt,
+        context.analyzer,
+        context.cancellation,
+    )?;
 
     keys.extend(assert_keys);
     // Every unit of this policy is published and merged, so this list is what
     // another run replays to reproduce the product without executing anything.
     incremental.record_units(policy.definition().metadata.id.clone(), keys);
-    Ok(finish_assertion_run(
-        policy,
-        &run.subject_completion,
-        totals,
-        budget,
-    ))
+    Ok(result)
 }
 
 fn check_exhaustive_assert_file(product: &AssertFileProduct) -> Result<(), WidenReason> {
@@ -3793,7 +3831,7 @@ fn edge_description(row: &ReferenceEdgeRow) -> String {
 }
 
 fn derivation_file_location(file: &ProjectFile) -> Option<PolicySourceLocation> {
-    WorkspaceRelativePath::new(file.rel_path().to_string_lossy())
+    WorkspaceRelativePath::try_from_path(file.rel_path())
         .ok()
         .map(PolicySourceLocation::artifact)
 }

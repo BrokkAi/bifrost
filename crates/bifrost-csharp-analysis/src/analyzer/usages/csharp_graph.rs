@@ -33,8 +33,6 @@ use crate::analyzer::usages::csharp_graph::shared::CSharpQueryResolver;
 
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 
-use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
-
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::EdgeNodeDomain;
 
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::UsageEdgeBuildOutput;
@@ -50,8 +48,6 @@ use brokk_bifrost_core::analyzer::usages::inverted_edges::PerFileEdges;
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::build_edge_output;
 
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::build_edge_output_with_completeness;
-
-use brokk_bifrost_analysis::analyzer::usages::inverted_edges::parse_and_collect_with_domain;
 
 use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
 
@@ -257,14 +253,28 @@ fn scan_csharp_file(
     token: QueryToken<'_>,
     file: &ProjectFile,
     domain: EdgeNodeDomain<'_>,
-    language: &tree_sitter::Language,
+    _language: &tree_sitter::Language,
 ) -> Option<PerFileEdges> {
-    parse_and_collect_with_domain(
-        analyzer,
-        file,
-        domain,
-        brokk_bifrost_csharp::preprocessor::csharp_parse_spec(language),
-        |input| brokk_bifrost_csharp::graph::inverted::scan_file(graph, csharp, token, file, input),
+    let prepared = csharp.prepared_syntax_for_path(token, file)?;
+    let parsed = brokk_bifrost_core::analyzer::usages::parsed_tree::ParsedTreeFile {
+        source: prepared.source().to_owned(),
+        tree: prepared.tree().clone(),
+        line_starts: prepared.line_starts().to_vec(),
+    };
+    let declarations =
+        brokk_bifrost_analysis::analyzer::usages::inverted_edges::build_file_declarations(
+            analyzer, file,
+        );
+    Some(
+        brokk_bifrost_analysis::analyzer::usages::inverted_edges::collect_file_edges_with_domain(
+            file,
+            domain,
+            &parsed,
+            declarations,
+            |input| {
+                brokk_bifrost_csharp::graph::inverted::scan_file(graph, csharp, token, file, input)
+            },
+        ),
     )
 }
 
@@ -397,9 +407,19 @@ fn csharp_test_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bo
     let Some(source) = analyzer.indexed_source(candidate.source()) else {
         return false;
     };
-    let Some(tree) = parse_tree_for_language(candidate.source(), Language::CSharp, &source) else {
+    let Some(csharp) = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+        CSharpAnalyzer,
+    >(analyzer) else {
         return false;
     };
+    let prepared =
+        brokk_bifrost_analysis::analyzer::i_analyzer::with_query_scope(analyzer, |token| {
+            csharp.prepared_syntax_for_path(token, candidate.source())
+        });
+    let Some(prepared) = prepared else {
+        return false;
+    };
+    let tree = prepared.tree();
     analyzer.ranges_of(candidate).into_iter().any(|range| {
         node_for_exact_range(tree.root_node(), &range).is_some_and(|method| {
             csharp_implicit_entry_point_at_declaration(analyzer, candidate, method, &source)

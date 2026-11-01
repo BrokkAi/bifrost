@@ -340,6 +340,7 @@ pub trait ErasedReadAttribution: Send + Sync {
     fn is_capturing(&self) -> bool;
     fn record(&self, project: &dyn Project, read: ProjectRead<'_>, receipt: ProjectReadReceipt);
     fn capture_identity(&self) -> Option<super::memo_attribution::CaptureIdentity>;
+    #[track_caller]
     fn record_unattributed(&self);
     fn capture(&self, build: &mut dyn FnMut()) -> ErasedCapturedReads;
     fn capture_authority(&self, build: &mut dyn FnMut()) -> ErasedCapturedReads;
@@ -376,6 +377,8 @@ pub struct ErasedCapturedReads {
     pub receipt: OpaqueReadReceipt,
     pub unattributed_reads: usize,
     pub execution_dependences: usize,
+    pub first_refusal: Option<crate::profiling::ReadRefusal>,
+    pub first_execution_refusal: Option<crate::profiling::ReadRefusal>,
     pub forwarded_to: Option<super::memo_attribution::CaptureIdentity>,
 }
 
@@ -754,6 +757,7 @@ impl super::memo_attribution::MemoAttribution for ErasedMemoAttribution {
     fn capture_identity(&self) -> Option<super::memo_attribution::CaptureIdentity> {
         self.0.0.capture_identity()
     }
+    #[track_caller]
     fn record_unattributed(&self) {
         self.0.0.record_unattributed();
     }
@@ -776,6 +780,9 @@ impl super::memo_attribution::MemoAttribution for ErasedMemoAttribution {
         (value, reads)
     }
     fn replay(&self, reads: &super::memo_attribution::CapturedMemoReads<Self::Key>) {
+        let _refusal = crate::profiling::read_refusal_scope(reads.first_refusal.clone());
+        let _execution_refusal =
+            crate::profiling::read_execution_refusal_scope(reads.first_execution_refusal.clone());
         self.0.0.replay(
             &reads.keys,
             reads.unattributed_reads,
@@ -807,6 +814,8 @@ impl ErasedMemoAttribution {
                 keys: Arc::from([reads.receipt]),
                 unattributed_reads: reads.unattributed_reads,
                 execution_dependences: reads.execution_dependences,
+                first_refusal: reads.first_refusal,
+                first_execution_refusal: reads.first_execution_refusal,
             },
             reads.forwarded_to,
         )

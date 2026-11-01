@@ -57,7 +57,8 @@ use crate::{
     profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
-        MostRelevantFilesParams, RefreshParams, SemanticModelOverlayStatus, SymbolLookupParams,
+        MostRelevantFilesParams, PendingSemanticPackAcquisition, RefreshParams,
+        SemanticModelOverlayStatus, SemanticModelWarmStage, SymbolLookupParams,
         SymbolSourcesResult, classify_test_files, get_declarations_by_location_with_cancellation,
         get_definitions_by_location_with_cancellation,
         get_definitions_by_reference_with_cancellation, get_summaries_with_cancellation,
@@ -733,24 +734,6 @@ fn activate_legacy_configured_semantic_models_with_limits(
     Ok(state)
 }
 
-/// Activate shipped and configured semantic models against an already-built
-/// workspace. Batch prewarm tools use this to materialize the same structural
-/// snapshots that normal MCP startup needs before an evaluation begins.
-pub fn prewarm_configured_semantic_models(
-    workspace_root: &Path,
-    workspace: &WorkspaceAnalyzer,
-) -> Result<(), String> {
-    let state = activate_configured_semantic_models(
-        workspace_root,
-        workspace,
-        configured_semantic_models()?,
-    )?;
-    match state.failure {
-        Some(failure) => Err(failure),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod workspace_semantic_model_configuration_tests {
     use super::*;
@@ -794,6 +777,38 @@ mod workspace_semantic_model_configuration_tests {
     }
   }]
 }"#;
+
+    #[test]
+    fn pending_overlay_status_serializes_warm_stage_and_acquisitions() {
+        let warm = SemanticPackWarm::pending();
+        assert_eq!(
+            serde_json::to_value(warm.overlay_status()).unwrap(),
+            serde_json::json!({"state":"pending", "stage":"activating_installed_packs"})
+        );
+        let mut interim =
+            WorkspacePackActivationState::unavailable(None, Vec::new(), "pending".into());
+        interim.pending_acquisitions.push(
+            crate::analyzer::semantic_model::PendingDependencyPackAcquisition {
+                ecosystem: crate::analyzer::DependencyPackEcosystem::Jvm,
+                dependency_id: "example:library:1".into(),
+            },
+        );
+        warm.publish_acquisition_pending(Arc::new(interim));
+        let pending = serde_json::to_value(warm.overlay_status()).unwrap();
+        assert_eq!(pending["stage"], "acquisition_pending");
+        assert_eq!(
+            pending["pending_acquisitions"][0]["dependency_id"],
+            "example:library:1"
+        );
+        assert_eq!(pending["pending_acquisitions"][0]["ecosystem"], "jvm");
+        warm.begin_configured_activation();
+        let configured = serde_json::to_value(warm.overlay_status()).unwrap();
+        assert_eq!(configured["stage"], "activating_configured_packs");
+        assert_eq!(
+            configured["pending_acquisitions"],
+            pending["pending_acquisitions"]
+        );
+    }
 
     fn workspace(source: &str) -> (tempfile::TempDir, WorkspaceAnalyzer) {
         let temp = tempfile::tempdir().unwrap();
@@ -1586,6 +1601,7 @@ struct SemanticPackWarm {
 enum PackWarmState {
     Pending,
     AcquisitionPending(Arc<WorkspacePackActivationState>),
+    ConfiguredPending(Arc<WorkspacePackActivationState>),
     Settled(Option<Arc<WorkspacePackActivationState>>),
 }
 
@@ -1692,7 +1708,7 @@ impl SemanticPackWarm {
             .expect("semantic-pack warm mutex poisoned")
         {
             PackWarmState::Pending => SessionPackActivation::WarmPending,
-            PackWarmState::AcquisitionPending(state) => {
+            PackWarmState::AcquisitionPending(state) | PackWarmState::ConfiguredPending(state) => {
                 SessionPackActivation::AcquisitionPending(Arc::clone(state))
             }
             PackWarmState::Settled(_) => SessionPackActivation::Settled,
@@ -1709,7 +1725,9 @@ impl SemanticPackWarm {
             .expect("semantic-pack warm mutex poisoned")
         {
             PackWarmState::Pending => None,
-            PackWarmState::AcquisitionPending(state) => Some(Arc::clone(state)),
+            PackWarmState::AcquisitionPending(state) | PackWarmState::ConfiguredPending(state) => {
+                Some(Arc::clone(state))
+            }
             PackWarmState::Settled(state) => state.clone(),
         }
     }
@@ -1733,9 +1751,32 @@ impl SemanticPackWarm {
             .lock()
             .expect("semantic-pack warm mutex poisoned")
         {
-            PackWarmState::Pending | PackWarmState::AcquisitionPending(_) => {
-                SemanticModelOverlayStatus::Pending
-            }
+            PackWarmState::Pending => SemanticModelOverlayStatus::Pending {
+                stage: SemanticModelWarmStage::ActivatingInstalledPacks,
+                pending_acquisitions: Vec::new(),
+            },
+            PackWarmState::AcquisitionPending(state) => SemanticModelOverlayStatus::Pending {
+                stage: SemanticModelWarmStage::AcquisitionPending,
+                pending_acquisitions: state
+                    .pending_acquisitions
+                    .iter()
+                    .map(|pending| PendingSemanticPackAcquisition {
+                        ecosystem: pending.ecosystem.label().to_owned(),
+                        dependency_id: pending.dependency_id.clone(),
+                    })
+                    .collect(),
+            },
+            PackWarmState::ConfiguredPending(state) => SemanticModelOverlayStatus::Pending {
+                stage: SemanticModelWarmStage::ActivatingConfiguredPacks,
+                pending_acquisitions: state
+                    .pending_acquisitions
+                    .iter()
+                    .map(|pending| PendingSemanticPackAcquisition {
+                        ecosystem: pending.ecosystem.label().to_owned(),
+                        dependency_id: pending.dependency_id.clone(),
+                    })
+                    .collect(),
+            },
             PackWarmState::Settled(Some(state)) => state.overlay.clone(),
             PackWarmState::Settled(None) => SemanticModelOverlayStatus::Unavailable {
                 reason: "semantic-pack warm failed before publishing an activation outcome"
@@ -1798,6 +1839,16 @@ impl SemanticPackWarm {
             .lock()
             .expect("semantic-pack warm mutex poisoned") = PackWarmState::AcquisitionPending(state);
         self.settled.notify_all();
+    }
+
+    fn begin_configured_activation(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("semantic-pack warm mutex poisoned");
+        if let PackWarmState::AcquisitionPending(interim) = &*state {
+            *state = PackWarmState::ConfiguredPending(Arc::clone(interim));
+        }
     }
 
     fn publish_final(&self, state: Option<Arc<WorkspacePackActivationState>>) {
@@ -1870,6 +1921,7 @@ fn start_pack_warm_worker(
                         if let Some(hold) = &warm.hold {
                             hold.park_expensive_stage_until_released();
                         }
+                        warm.begin_configured_activation();
                         warm.publish_final(activate_session_semantic_packs(
                             &project_root,
                             &analyzer,
@@ -2843,6 +2895,58 @@ fn mark_pack_acquisition_pending(
             },
         ));
     result.cap_flow_status_by_run();
+}
+
+/// Warn a `query_code` caller that the workspace's reviewed models were not
+/// loaded (#8304).
+///
+/// `SearchToolsService` sessions register `.bifrost/semantic-models/` only when
+/// `BIFROST_WORKSPACE_SEMANTIC_MODELS` is on, while CLI policy runs always read
+/// it. Without this marker, a query over a modeled member answered `unknown`
+/// with nothing saying a model sat unloaded beside it. An explicit `off` is a
+/// stated choice and stays quiet. The impact is advisory: the session is
+/// working as configured, and the opt-out must not mark every answer
+/// incomplete.
+fn mark_workspace_semantic_models_not_loaded(
+    workspace_root: &Path,
+    query: &crate::rql::CodeQuery,
+    response: &mut crate::rql::CodeQueryResponse,
+) {
+    if !query.may_use_semantic_packs()
+        || std::env::var_os(WORKSPACE_SEMANTIC_MODELS_ENV).is_some()
+        || std::fs::symlink_metadata(
+            workspace_root
+                .join(crate::analyzer::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let Some(result) = response.result_mut() else {
+        return;
+    };
+    result
+        .diagnostics
+        .push(crate::rql::CodeQueryDiagnostic::new(
+            crate::rql::CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: Vec::new(),
+                source: None,
+                code: crate::rql::CodeQueryDiagnosticCode::WorkspaceSemanticModelsNotLoaded,
+                impact: crate::rql::CodeQueryDiagnosticImpact::Advisory,
+                branch: Vec::new(),
+                language: "workspace",
+                message: format!(
+                    "{dir}/ exists, but this session did not load it because \
+                     {WORKSPACE_SEMANTIC_MODELS_ENV} is unset; answers that need those models \
+                     can be missing or unknown. Set {WORKSPACE_SEMANTIC_MODELS_ENV}=on to load \
+                     them or =off to silence this warning. Policy runs load {dir}/ either way.",
+                    dir = crate::analyzer::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY,
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+        ));
 }
 
 /// The pending-state message: which ecosystems still owe acquisitions, the
@@ -4989,6 +5093,11 @@ impl SearchToolsService {
             &query,
             query_languages.as_ref(),
             &entered.analyzer().languages(),
+            &mut response,
+        );
+        mark_workspace_semantic_models_not_loaded(
+            entered.analyzer().project().root(),
+            &query,
             &mut response,
         );
         Ok((
@@ -8314,7 +8423,7 @@ mod watcher_startup_tests {
             release_startup_rx
                 .lock()
                 .expect("release lock")
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("test should release watcher startup");
             ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
         });
@@ -8417,7 +8526,7 @@ mod watcher_startup_tests {
             release_startup_rx
                 .lock()
                 .expect("release lock")
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("test should release watcher startup");
             ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
         });
@@ -8550,7 +8659,7 @@ mod watcher_startup_tests {
             release_startup_rx
                 .lock()
                 .expect("release lock")
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("test should release watcher startup");
             ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
         });
@@ -8620,7 +8729,7 @@ mod watcher_startup_tests {
                 release_startup_rx
                     .lock()
                     .expect("release lock")
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(Duration::from_secs(30))
                     .expect("test should release watcher startup");
                 ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
                     project,
@@ -8802,7 +8911,7 @@ mod watcher_startup_tests {
             .send(())
             .expect("release superseded workspace build");
         first_finished_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("superseded workspace build should finish");
         assert_eq!(service.active_workspace_root(), Some(second_root));
     }

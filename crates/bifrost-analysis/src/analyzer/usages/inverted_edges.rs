@@ -237,7 +237,19 @@ pub fn weight_usage_edge_contents(key_bytes: usize, edges: &UsageEdges) -> u32 {
                     .sum::<usize>()
         })
         .sum::<usize>();
-    (key_bytes + edge_bytes + summary_bytes + unresolved_bytes).clamp(1, u32::MAX as usize) as u32
+    let missing_import_bytes = edges
+        .unresolved_relative_imports
+        .iter()
+        .map(|(path, targets)| {
+            path.len()
+                + targets
+                    .iter()
+                    .map(|gap| gap.target.len() + std::mem::size_of_val(&gap.kind))
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    (key_bytes + edge_bytes + summary_bytes + unresolved_bytes + missing_import_bytes)
+        .clamp(1, u32::MAX as usize) as u32
 }
 
 /// Cache a dead-code bulk graph only when its builder explicitly reports that
@@ -820,6 +832,10 @@ pub struct EdgeSitesPartial<K: NodeKey> {
     callsites: BTreeMap<K, usize>,
     unproven_inbound: BTreeMap<K, usize>,
     unproven_sites: BTreeMap<(Option<K>, String), Vec<UnprovenCallSite>>,
+    unresolved_relative_imports: BTreeMap<
+        String,
+        Vec<brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportGap>,
+    >,
 }
 
 impl<K: NodeKey> Default for EdgeSitesPartial<K> {
@@ -829,12 +845,19 @@ impl<K: NodeKey> Default for EdgeSitesPartial<K> {
             callsites: BTreeMap::new(),
             unproven_inbound: BTreeMap::new(),
             unproven_sites: BTreeMap::new(),
+            unresolved_relative_imports: BTreeMap::new(),
         }
     }
 }
 
 impl<K: NodeKey> EdgeSitesPartial<K> {
     fn absorb(&mut self, file: PerFileEdges<K>) {
+        if !file.unresolved_relative_imports.is_empty() {
+            self.unresolved_relative_imports
+                .entry(file.path.clone())
+                .or_default()
+                .extend(file.unresolved_relative_imports.iter().cloned());
+        }
         for (key, lines) in file.edge_lines {
             let sites = self.edge_sites.entry(key).or_default();
             sites.extend(lines.into_iter().map(|(line, mut evidence)| {
@@ -870,6 +893,12 @@ impl<K: NodeKey> EdgeSitesPartial<K> {
     }
 
     fn combine(&mut self, other: Self) {
+        for (path, targets) in other.unresolved_relative_imports {
+            self.unresolved_relative_imports
+                .entry(path)
+                .or_default()
+                .extend(targets);
+        }
         for (key, sites) in other.unproven_sites {
             self.unproven_sites.entry(key).or_default().extend(sites);
         }
@@ -885,12 +914,18 @@ impl<K: NodeKey> EdgeSitesPartial<K> {
     }
 
     fn finish(self) -> UsageEdges<K> {
-        cap_edge_sites(
+        let mut result = cap_edge_sites(
             self.edge_sites,
             self.callsites,
             self.unproven_inbound,
             self.unproven_sites,
-        )
+        );
+        result.unresolved_relative_imports = self.unresolved_relative_imports;
+        for targets in result.unresolved_relative_imports.values_mut() {
+            targets.sort();
+            targets.dedup();
+        }
+        result
     }
 }
 
@@ -936,6 +971,7 @@ fn cap_edge_sites<K: NodeKey>(
         unproven_inbound,
         unproven_sites,
         unproven_sites_complete,
+        unresolved_relative_imports: BTreeMap::new(),
     }
 }
 

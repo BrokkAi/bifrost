@@ -18660,8 +18660,8 @@ fn canonical_cpp_name_matches(unit: &CodeUnit, expected: &str) -> bool {
 /// name, so retain the parser only as that explicit fallback.
 ///
 /// Only a terminal member is not a scope. A callable that encloses a
-/// function-local class (`run$block@3:12$Local`) is one of that class's scope
-/// components, exactly as its canonical name spells it.
+/// function-local class (with a synthetic block owner) is one of that class's
+/// scope components, exactly as its canonical name spells it.
 pub fn canonical_cpp_scope_components(unit: &CodeUnit) -> Vec<String> {
     let fq = unit.fq();
     if !fq.is_empty() {

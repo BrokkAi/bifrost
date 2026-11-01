@@ -689,6 +689,8 @@ impl RetainedSize for PolicyScopeEntry {
     fn retained_size(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.path.as_str().len())
+            .saturating_add(std::mem::size_of_val(self.policy_ids.as_ref()))
+            .saturating_add(std::mem::size_of_val(self.policy_categories.as_ref()))
             .saturating_add(retained_extra(&self.reason))
             .saturating_add(
                 self.policy_ids

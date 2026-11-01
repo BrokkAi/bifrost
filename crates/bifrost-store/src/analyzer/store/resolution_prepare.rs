@@ -2583,6 +2583,7 @@ fn prepare_typed_fact_lookups(
             ResolutionNameLookupKind::EmbeddedType => TypedFactRelation::EmbeddedTypeLookup,
             ResolutionNameLookupKind::InterfaceMethod => TypedFactRelation::InterfaceMethodLookup,
             ResolutionNameLookupKind::SupertypeName => TypedFactRelation::SupertypeNameLookup,
+            ResolutionNameLookupKind::AliasTarget => TypedFactRelation::AliasTargetLookup,
         };
         push_typed_fact_lookup(rows, identities, relation, property.lookup);
     }

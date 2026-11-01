@@ -101,6 +101,117 @@ mod rust_departing_wave2_root_tests {
         for schema in &registry.schemas {
             conn.execute_batch(schema).unwrap();
         }
+        let (_, package_members_sql) = registry
+            .statements
+            .iter()
+            .find(|(name, _)| name.ends_with("::JVM_ACTIVE_PACKAGE_MEMBERS_SQL"))
+            .expect("active package-member SQL is registered");
+        assert!(
+            package_members_sql.contains("member INDEXED BY jvm_external_owner_members_by_name")
+        );
+        assert!(
+            package_members_sql
+                .contains("CROSS JOIN jvm_external_owners owner USING(provider_id,owner_fqn)")
+        );
+        assert!(package_members_sql.contains("CROSS JOIN json_each(?1) AS provider"));
+        // The selected inventory is read-only. Recreate these exact current
+        // schema objects in a writable fixture so the populated plan is real.
+        let plan_conn = rusqlite::Connection::open_in_memory().unwrap();
+        for name in [
+            "jvm_external_owners",
+            "jvm_external_owner_members",
+            "jvm_external_owner_members_by_name",
+        ] {
+            let ddl: String = conn
+                .query_row(
+                    "SELECT sql FROM main.sqlite_schema WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            plan_conn.execute_batch(&ddl).unwrap();
+        }
+        for provider in ["plan-provider", "other-provider"] {
+            for owner in ["plan.package", "plan.other", "plan.third"] {
+                plan_conn.execute(
+                    "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES(?1,?2,1,1,0,0)",
+                    rusqlite::params![provider, owner],
+                ).unwrap();
+                for ordinal in 0..32 {
+                    let name = if ordinal == 0 { "listOf" } else { "other" };
+                    plan_conn.execute(
+                        "INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,parameters_jsonb) VALUES(?1,?2,?3,?4,'function','public',1,1,1,jsonb('[]'))",
+                        rusqlite::params![provider, owner, ordinal, name],
+                    ).unwrap();
+                }
+            }
+        }
+        let params = rusqlite::params!["[\"plan-provider\"]", "[[\"plan.package\",\"listOf\"]]"];
+        let matched: i64 = plan_conn
+            .query_row(
+                &format!("SELECT count(*) FROM ({package_members_sql})"),
+                params,
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched, 1, "populated package-member plan fixture");
+        let plan = plan_conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {package_members_sql}"))
+            .unwrap()
+            .query_map(params, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let position = |prefix: &str| {
+            plan.iter()
+                .position(|detail| detail.starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing {prefix} in package-member plan: {plan:?}"))
+        };
+        let demand = position("SCAN demand VIRTUAL TABLE");
+        let provider = position("SCAN provider VIRTUAL TABLE");
+        let member = position(
+            "SEARCH member USING INDEX jvm_external_owner_members_by_name (provider_id=? AND owner_fqn=? AND member_name=?)",
+        );
+        let owner = position("SEARCH owner USING PRIMARY KEY");
+        assert!(
+            demand < provider && provider < member && member < owner,
+            "package-member loop order: {plan:?}"
+        );
+        let (_, package_owners_sql) = registry
+            .statements
+            .iter()
+            .find(|(name, _)| name.ends_with("::JVM_ACTIVE_PACKAGE_OWNERS_SQL"))
+            .expect("active package-owner SQL is registered");
+        let owner_params =
+            rusqlite::params!["[\"plan-provider\"]", "[\"plan.package\",\"plan.other\"]"];
+        let matched: i64 = plan_conn
+            .query_row(
+                &format!("SELECT count(*) FROM ({package_owners_sql})"),
+                owner_params,
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched, 2, "populated package-owner plan fixture");
+        let owner_plan = plan_conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {package_owners_sql}"))
+            .unwrap()
+            .query_map(owner_params, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            owner_plan.iter().any(|detail| detail
+                == "SEARCH jvm_external_owners USING PRIMARY KEY (provider_id=? AND owner_fqn=?)"),
+            "package-owner read must seek the full primary key: {owner_plan:?}"
+        );
+        assert!(
+            owner_plan
+                .iter()
+                .filter(|detail| detail.contains("json_each VIRTUAL TABLE"))
+                .count()
+                == 2,
+            "package-owner read must use both bounded input lists: {owner_plan:?}"
+        );
         if let Some(path) = std::env::var_os("BIFROST_NATIVE_SQL_REPORT") {
             std::fs::write(
                 path,

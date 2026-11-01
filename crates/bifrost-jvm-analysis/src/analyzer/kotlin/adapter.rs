@@ -61,7 +61,20 @@ impl LanguageAdapter for KotlinAdapter {
         Some(&KOTLIN_COGNITIVE_CONFIG)
     }
 }
+static KOTLIN_SEMANTIC_LOWERER: super::semantic::KotlinSemanticLowerer =
+    super::semantic::KotlinSemanticLowerer;
+
 impl StoreLanguageAdapter for KotlinAdapter {
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        Some(
+            brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer::new(
+                &KOTLIN_SEMANTIC_LOWERER,
+            ),
+        )
+    }
+
     fn language(&self) -> Language {
         Language::Kotlin
     }

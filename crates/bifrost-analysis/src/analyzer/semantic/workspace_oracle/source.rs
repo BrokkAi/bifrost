@@ -93,27 +93,83 @@ impl<'a> PreparedSourceDispatchSession<'a> {
         range: Range,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<SourceDispatchResult>, SemanticProviderError> {
-        // Only computed when a ledger will read it: the question names the
-        // artifact, and an Arc bump on every dispatch is a cost runs that
-        // record nothing should not pay.
-        let question = (crate::analyzer::read_attribution_records_reads(|| {
-            self.oracle.workspace.analyzer().read_ledger_attached()
-        }))
-        .then(|| {
-            self.materialized
-                .available_value()
-                .map(|artifact| dispatch_question(artifact, range))
-        })
-        .flatten();
-        let outcome = self.resolve_at_source(range, request)?;
-        if let Some(question) = question {
-            self.oracle.workspace.analyzer().record_read(
-                crate::analyzer::read_ledger::ReadKey::lookup(
-                    crate::analyzer::read_ledger::LookupKind::Dispatch,
-                    question,
-                    dispatch_answer_digest(outcome.available_value()),
-                ),
-            );
+        let workspace = self.oracle.workspace;
+        let analyzer = workspace.analyzer();
+        let recording =
+            crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached());
+        let refusals_before = request.budget.refusal_count();
+        let (resolved, operationally_incomplete) = if recording {
+            // This shared classifier preserves content reasons and rejects
+            // typed operational failures, including failures folded into an
+            // otherwise available provider answer.
+            match crate::analyzer::common::replayable_query_cache_fill(analyzer, || {
+                self.resolve_at_source(range, request)
+            }) {
+                Ok(outcome) => (outcome, false),
+                Err(outcome) => (outcome, true),
+            }
+        } else {
+            (self.resolve_at_source(range, request), false)
+        };
+        let outcome = match resolved {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                analyzer.record_unattributed_read();
+                return Err(error);
+            }
+        };
+        if recording {
+            // Source-range selection itself is an input even when it finds no
+            // mapped calls. The ranked questions certify each selected answer.
+            if let Some(artifact) = self.materialized.available_value() {
+                self.oracle.workspace.analyzer().record_read(
+                    crate::analyzer::read_ledger::ReadKey::artifact(
+                        crate::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
+                            artifact.key().public_fingerprint(),
+                        ),
+                        Some(artifact.key().path().as_str()),
+                    ),
+                );
+            }
+            // Semantic openness is snapshot content. Only interrupted work or
+            // an omitted range/candidate suffix prevents a reusable certificate.
+            if operationally_incomplete
+                || matches!(
+                    &outcome,
+                    SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. }
+                )
+                || request.cancellation.is_cancelled()
+                || request.budget.refusal_count() > refusals_before
+                || outcome
+                    .available_value()
+                    .is_some_and(|result| result.coverage().is_truncated())
+            {
+                self.oracle.workspace.analyzer().record_unattributed_read();
+                return Ok(outcome);
+            }
+            if let Some(result) = outcome.available_value() {
+                for observation in result.observations() {
+                    let Some(question) = procedure_dispatch_question(observation.call()) else {
+                        self.oracle.workspace.analyzer().record_unattributed_read();
+                        continue;
+                    };
+                    let single = SourceDispatchResult {
+                        observations: Box::new([observation.clone()]),
+                        coverage: projected_source_coverage(
+                            observation.quality,
+                            observation.dispatch().coverage().is_truncated(),
+                            observation.dispatch().coverage().is_exhaustive(),
+                        ),
+                    };
+                    self.oracle.workspace.analyzer().record_read(
+                        crate::analyzer::read_ledger::ReadKey::lookup(
+                            crate::analyzer::read_ledger::LookupKind::Dispatch,
+                            question,
+                            procedure_dispatch_answer_digest(observation.quality, Some(&single)),
+                        ),
+                    );
+                }
+            }
         }
         Ok(outcome)
     }
@@ -208,6 +264,7 @@ impl<'a> PreparedSourceDispatchSession<'a> {
                 any_result_truncated |= result.coverage().is_truncated();
                 observations.push(SourceDispatchObservation {
                     call,
+                    quality: SourceOutcomeQuality::from_outcome(&outcome),
                     dispatch: result.clone(),
                 });
             } else {
@@ -643,14 +700,19 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<SourceDispatchResult>, SemanticProviderError> {
         if request.cancellation.is_cancelled() {
+            self.workspace.analyzer().record_unattributed_read();
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
                 work: SemanticWork::default(),
             });
         }
-        let materialized = self
-            .workspace
-            .materialize_program_semantics(file, request)?;
+        let materialized = match self.workspace.materialize_program_semantics(file, request) {
+            Ok(materialized) => materialized,
+            Err(error) => {
+                self.workspace.analyzer().record_unattributed_read();
+                return Err(error);
+            }
+        };
         self.dispatch_at_source_in_artifact(materialized, range, request)
     }
 
@@ -705,45 +767,12 @@ pub fn one_call_dispatch_answer_digest(
         Some(&SourceDispatchResult {
             observations: Box::new([SourceDispatchObservation {
                 call: call.clone(),
+                quality,
                 dispatch: dispatch.clone(),
             }]),
             coverage,
         }),
     )
-}
-
-/// The canonical digest of a dispatch answer: its targets by public artifact
-/// fingerprint and procedure id, plus its coverage.
-///
-/// A target is never named by its `SemanticArtifactKey` or its
-/// `SemanticLocator`: both fold the workspace mount, so the same answer at two
-/// roots would digest differently and no base unit could ever verify.
-pub(crate) fn dispatch_answer_digest(
-    result: Option<&SourceDispatchResult>,
-) -> crate::analyzer::semantic::ids::StableDigest {
-    let mut hasher = crate::analyzer::canonical_hash::CanonicalHasher::new(DISPATCH_ANSWER_DOMAIN);
-    let Some(result) = result else {
-        hasher.value(b"unavailable");
-        return crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish());
-    };
-    hasher.field("coverage", result.coverage().label().as_bytes());
-    let mut targets = result
-        .target_candidates()
-        .map(|candidate| {
-            let target = candidate.target();
-            (
-                *target.artifact().key().public_fingerprint().as_bytes(),
-                target.id().index(),
-            )
-        })
-        .collect::<Vec<_>>();
-    targets.sort();
-    targets.dedup();
-    for (artifact, procedure) in targets {
-        hasher.value(&artifact);
-        hasher.value(&(procedure as u64).to_be_bytes());
-    }
-    crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish())
 }
 
 /// Canonical answer for a procedure-local dispatch question.
@@ -819,7 +848,9 @@ pub fn procedure_dispatch_boundary_digest(boundary: &DispatchBoundary) -> Stable
             push_locator(&mut digest, target);
             digest.push(kind.label().as_bytes());
         }
-        DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::Truncated => {}
+        DispatchBoundaryKind::Unresolved
+        | DispatchBoundaryKind::HierarchyUnenumerated
+        | DispatchBoundaryKind::Truncated => {}
     }
 
     match boundary.external_callee_identity() {
@@ -901,6 +932,9 @@ pub fn procedure_dispatch_boundary_digest(boundary: &DispatchBoundary) -> Stable
 pub struct SourceDispatchObservation {
     #[doc(hidden)]
     pub call: CallSiteHandle,
+    /// The delegated call's quality, before range-wide quality is merged.
+    #[doc(hidden)]
+    pub quality: SourceOutcomeQuality,
     #[doc(hidden)]
     pub dispatch: DispatchResult,
 }

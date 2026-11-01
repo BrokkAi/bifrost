@@ -5,9 +5,9 @@
 //! on one revision. Missing members become authoritative only after a bounded
 //! class-wide survey proves that the runtime surface is closed.
 
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
@@ -49,6 +49,8 @@ use brokk_bifrost_analysis::analyzer::semantic::AdapterSemanticsVersion;
 use brokk_bifrost_analysis::analyzer::semantic::AllocationKind;
 
 use brokk_bifrost_analysis::analyzer::semantic::AllocationSite;
+use brokk_bifrost_analysis::analyzer::semantic::MemoryLocation;
+use brokk_bifrost_analysis::analyzer::semantic::MemoryLocationKind;
 
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::ClassHierarchy;
 
@@ -1457,7 +1459,7 @@ struct JsTsMemberSurfaceMemoKey {
 
 #[derive(Debug, Default)]
 pub(crate) struct JsTsMemberSurfaceRequestMemo {
-    summaries: KeyedPoolSafeMemo<JsTsMemberSurfaceMemoKey, JsTsMemberSurfaceSummary>,
+    summaries: KeyedPoolSafeMemo<JsTsMemberSurfaceMemoKey, JsTsMemberSurfaceMemoEntry>,
     #[cfg(test)]
     survey_count: AtomicUsize,
 }
@@ -1466,7 +1468,8 @@ impl JsTsMemberSurfaceRequestMemo {
     fn cell(
         &self,
         key: &JsTsMemberSurfaceMemoKey,
-    ) -> Arc<brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo<JsTsMemberSurfaceSummary>> {
+    ) -> Arc<brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo<JsTsMemberSurfaceMemoEntry>>
+    {
         self.summaries.cell(key)
     }
 
@@ -1479,6 +1482,12 @@ impl JsTsMemberSurfaceRequestMemo {
     fn survey_count(&self) -> usize {
         self.survey_count.load(Ordering::Relaxed)
     }
+}
+
+#[derive(Debug)]
+struct JsTsMemberSurfaceMemoEntry {
+    summary: Arc<JsTsMemberSurfaceSummary>,
+    stable_reasons: Box<[QueryReadIncomplete]>,
 }
 
 impl JsTsMemberSurfaceSummary {
@@ -2424,28 +2433,69 @@ fn unrecorded_member_surface_summary(
     let build_cancellation = request.cancellation;
     let semantic_snapshot = request.semantic_snapshot;
     let memo = Arc::clone(&request.memo);
+    let built_here = std::sync::atomic::AtomicBool::new(false);
+    let incomplete_build = Mutex::new(None);
     let keep_going = || {
         wait_cancellation
             .as_ref()
             .is_none_or(|token| !token.is_cancelled())
     };
-    let summary = cell.get_or_build_on_dedicated_pool_while(&keep_going, move || {
+    let summary = cell.get_or_build_on_dedicated_pool_while(&keep_going, || {
         let _semantic_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
             workspace.analyzer(),
-            semantic_snapshot,
+            semantic_snapshot.clone(),
         );
         let _cancellation_scope = build_cancellation
             .as_ref()
             .map(|token| AnalyzerQueryScope::with_cancellation(workspace.analyzer(), token));
+        built_here.store(true, std::sync::atomic::Ordering::Relaxed);
         memo.record_survey();
-        member_surface_survey(workspace, language, max_nodes, build_cancellation.as_ref())
+        let (summary, receipt) =
+            brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(
+                workspace.analyzer(),
+                || {
+                    member_surface_survey(
+                        workspace,
+                        language,
+                        max_nodes,
+                        build_cancellation.as_ref(),
+                    )
+                },
+            );
+        let summary = Arc::new(summary?);
+        // Unattributed reads cannot be replayed by this lightweight memo.
+        if receipt.has_execution_dependences() || receipt.unattributed_reads() > 0 {
+            *incomplete_build
+                .lock()
+                .expect("member surface result mutex poisoned") = Some(summary);
+            return None;
+        }
+        Some(JsTsMemberSurfaceMemoEntry {
+            summary,
+            stable_reasons: receipt.stable_reasons().to_vec().into_boxed_slice(),
+        })
     });
-    summary.unwrap_or_else(|| {
+    if let Some(entry) = summary {
+        if !built_here.load(std::sync::atomic::Ordering::Relaxed) {
+            brokk_bifrost_analysis::analyzer::common::replay_query_cache_stable_reasons(
+                &entry.stable_reasons,
+            );
+        }
+        return Arc::clone(&entry.summary);
+    }
+    if let Some(summary) = incomplete_build
+        .lock()
+        .expect("member surface result mutex poisoned")
+        .take()
+    {
+        return summary;
+    }
+    {
         workspace
             .analyzer()
             .record_query_incomplete(QueryReadIncomplete::Cancelled);
         truncated_member_surface_summary()
-    })
+    }
 }
 
 fn member_surface_summary(
@@ -2757,6 +2807,13 @@ macro_rules! impl_js_ts_type_flow_adapter {
                 class_hierarchy(workspace, $language, class)
             }
 
+            fn memory_load_presents_name_read(&self, location: &MemoryLocation) -> bool {
+                // The lowering emits a static load only for a namespace import
+                // binding's read; the namespace value stays classified from
+                // the name.
+                matches!(location.kind, MemoryLocationKind::Static { .. })
+            }
+
             // ToBoolean has no hook: no getter, `valueOf`, proxy trap or
             // symbol method runs when any value is tested for truth.
             fn truthiness_is_pure(
@@ -2771,17 +2828,18 @@ macro_rules! impl_js_ts_type_flow_adapter {
 }
 
 // #7240: imported constructor receivers change member-surface mutation targets.
+// #8025: namespace import reads are static loads that type flow looks through.
 impl_js_ts_type_flow_adapter!(
     JavascriptSupport,
     Language::JavaScript,
     "javascript-type-flow",
-    b"javascript-type-flow-imported-constructor-mutations-v8"
+    b"javascript-type-flow-imported-constructor-mutations-v8-8025-namespace-name-loads"
 );
 impl_js_ts_type_flow_adapter!(
     TypescriptSupport,
     Language::TypeScript,
     "typescript-type-flow",
-    b"typescript-type-flow-imported-constructor-mutations-v8"
+    b"typescript-type-flow-imported-constructor-mutations-v8-8025-namespace-name-loads"
 );
 
 #[cfg(test)]

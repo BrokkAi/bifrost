@@ -551,4 +551,5 @@ mod tests {
             "the same set in a different order is not parity"
         );
     }
+    mod authoring_boundary;
 }

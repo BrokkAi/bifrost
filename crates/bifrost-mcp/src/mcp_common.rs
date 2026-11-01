@@ -7,9 +7,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::path_normalization::NormalizePath;
 pub(crate) use brokk_bifrost_analysis::path_utils::contains_glob_syntax;
 
 pub(crate) fn absolute_path_outside_workspace_error(raw: &str, workspace_root: &Path) -> String {
@@ -29,6 +30,62 @@ pub(crate) fn strip_workspace_root<'a>(
         return Some("");
     }
     absolute_path.strip_prefix(&format!("{root}/"))
+}
+
+/// The workspace-relative slash spelling of the absolute glob `raw`, judged by
+/// canonical paths, or `None` when the glob's literal prefix does not exist.
+///
+/// The components before the first one with glob syntax are canonicalized and
+/// compared with the canonical root, as a literal absolute path is. Comparing
+/// the raw text instead rejects a glob inside the workspace whenever the caller
+/// spells the root differently from its canonical form: a Windows 8.3 short
+/// name or a drive path against the verbatim `\\?\` root (#8802), or a
+/// symlinked temporary directory.
+pub(crate) fn canonical_relative_glob(
+    raw: &str,
+    workspace_root: &Path,
+) -> Option<Result<String, String>> {
+    // Inside a verbatim `\\?\` path `/` is not a separator, so a slash glob
+    // appended to the canonical root (`\\?\C:\root/src/**/*.java`) would
+    // parse as one component naming the whole tail. Re-spell the prefix in its
+    // ordinary form, where both separators split.
+    let mut components = Path::new(raw).components();
+    let raw_path = match components.next() {
+        Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim() => {
+            let mut ordinary = PathBuf::from(prefix.as_os_str()).normalize();
+            ordinary.push(components.as_path());
+            ordinary
+        }
+        _ => PathBuf::from(raw),
+    };
+    let mut prefix = PathBuf::new();
+    let mut pattern = Vec::new();
+    for component in raw_path.components() {
+        let part = component.as_os_str().to_string_lossy();
+        // A verbatim `\\?\` prefix is not glob syntax.
+        let is_glob = matches!(component, Component::Normal(_)) && contains_glob_syntax(&part);
+        if pattern.is_empty() && !is_glob {
+            prefix.push(component);
+        } else {
+            pattern.push(part.into_owned());
+        }
+    }
+    let canonical_prefix = prefix.canonicalize().ok()?;
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let Ok(relative) = canonical_prefix.strip_prefix(&canonical_root) else {
+        return Some(Err(absolute_path_outside_workspace_error(
+            raw,
+            workspace_root,
+        )));
+    };
+    let parts: Vec<String> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .chain(pattern)
+        .collect();
+    Some(Ok(parts.join("/")))
 }
 
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
@@ -271,13 +328,6 @@ pub(crate) fn request_correlation_id(id: &Value) -> String {
     format!("sha256:{:x}", Sha256::digest(encoded.as_bytes()))
 }
 
-pub fn build_server_spec(
-    instructions: impl Into<String>,
-    tool_descriptors: Vec<Value>,
-) -> Result<McpServerSpec, String> {
-    build_server_spec_with_hidden(instructions, tool_descriptors, Vec::new())
-}
-
 pub fn build_server_spec_with_hidden(
     instructions: impl Into<String>,
     mut tool_descriptors: Vec<Value>,
@@ -333,30 +383,6 @@ pub fn build_server_spec_with_hidden(
         tool_names,
         tool_descriptors,
     })
-}
-
-pub fn run_stdio_server(
-    root: Option<PathBuf>,
-    render_options: McpRenderOptions,
-    spec: &McpServerSpec,
-    diff_snapshot_object_dir: Option<PathBuf>,
-) -> Result<(), String> {
-    crate::rmcp_host::run_stdio_server_with_build_identity(
-        root,
-        render_options,
-        spec,
-        diff_snapshot_object_dir,
-        env!("CARGO_PKG_VERSION"),
-    )
-}
-
-pub(crate) fn run_named_stdio_server(
-    root: PathBuf,
-    render_options: McpRenderOptions,
-    server_name: &str,
-) -> Result<(), String> {
-    let spec = crate::mcp_registry::resolve_server_spec(server_name)?;
-    run_stdio_server(Some(root), render_options, &spec, None)
 }
 
 pub(crate) fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
@@ -1095,20 +1121,6 @@ pub fn symbol_names_schema() -> Value {
             }
         },
         "required": ["symbols"]
-    })
-}
-
-pub fn file_patterns_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "file_patterns": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Project-relative file paths or glob patterns, or absolute paths/globs inside the active workspace."
-            }
-        },
-        "required": ["file_patterns"]
     })
 }
 

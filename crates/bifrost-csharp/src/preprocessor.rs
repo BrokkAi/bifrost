@@ -34,6 +34,8 @@ pub const CSHARP_INACTIVE_BRANCHES_DETAIL: &str =
 #[derive(Debug)]
 pub struct PreprocessorScan {
     pub decisions: PreprocessorDecisions,
+    pub undecided_chains: Vec<UndecidedChain>,
+    pub has_unseen_branch: bool,
     /// Byte ranges the parser may read, or `None` when the file has no
     /// directives at all and must simply be parsed whole.
     pub included_ranges: Option<Vec<tree_sitter::Range>>,
@@ -76,6 +78,22 @@ impl brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor for Prepr
                 .iter()
                 .map(|d| d.symbol.capacity())
                 .sum::<usize>()
+            + self.undecided_chains.capacity() * std::mem::size_of::<UndecidedChain>()
+            + self
+                .undecided_chains
+                .iter()
+                .map(|chain| {
+                    strings(&chain.reason.unknown_symbols)
+                        + strings(&chain.reason.open_reasons)
+                        + chain.reason.disagreeing_owners.capacity() * std::mem::size_of::<String>()
+                        + chain
+                            .reason
+                            .disagreeing_owners
+                            .iter()
+                            .map(String::capacity)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
             + self.decisions.chains.capacity() * std::mem::size_of::<ChainDecision>()
             + strings(&self.decisions.referenced_symbols)
             + self
@@ -116,6 +134,16 @@ pub struct ConditionalBranch {
     pub kept: bool,
     /// Whether all owners prove this branch unreachable.
     pub definitely_inactive: bool,
+}
+
+/// One undecided chain in the selected source reading.
+#[derive(Debug, Clone)]
+pub struct UndecidedChain {
+    pub chain: u32,
+    pub directive_start: u32,
+    pub directive_end: u32,
+    pub omitted_nonblank: bool,
+    pub reason: DecisionReason,
 }
 
 impl PreprocessorScan {
@@ -461,22 +489,80 @@ fn merge_decision(owners: &[OwnerState<'_>], chain: usize) -> ChainDecision {
     ChainDecision::Undecided(reason)
 }
 
-fn finish_decisions(
-    owners: &[OwnerState<'_>],
-    count: usize,
-    referenced_symbols: std::collections::BTreeSet<String>,
-) -> PreprocessorDecisions {
+/// Owner membership is either proven by a compilation set or unavailable.
+#[derive(Clone, Copy)]
+pub enum OwnerEnvironments<'a> {
+    Known(&'a [SymbolEnvironment]),
+    Unknown,
+}
+
+fn with_owner_environments<T>(
+    ownership: OwnerEnvironments<'_>,
+    read: impl FnOnce(&[&SymbolEnvironment]) -> T,
+) -> T {
+    let unowned = SymbolEnvironment {
+        compilation_key: String::new(),
+        defined: Default::default(),
+        closed: false,
+        open_reason: Some(
+            match ownership {
+                OwnerEnvironments::Known(_) => "no_owning_compilation",
+                OwnerEnvironments::Unknown => "owning_compilations_unknown",
+            }
+            .to_owned(),
+        ),
+    };
+    let mut owners: Vec<_> = match ownership {
+        OwnerEnvironments::Known(owners) => owners.iter().collect(),
+        OwnerEnvironments::Unknown => Vec::new(),
+    };
+    owners.sort_by(|a, b| a.compilation_key.cmp(&b.compilation_key));
+    assert!(owners.iter().all(|o| !o.compilation_key.is_empty()));
+    assert!(
+        owners
+            .windows(2)
+            .all(|w| w[0].compilation_key != w[1].compilation_key)
+    );
+    if owners.is_empty() {
+        owners.push(&unowned);
+    }
+    read(&owners)
+}
+
+/// Recompute exactly the assignment used by a prior reading without source bytes.
+pub fn assignment_digest(
+    ownership: OwnerEnvironments<'_>,
+    referenced_symbols: &std::collections::BTreeSet<String>,
+    has_chains: bool,
+) -> [u8; 32] {
+    with_owner_environments(ownership, |owners| {
+        assignment_digest_for_owners(owners.iter().copied(), referenced_symbols, has_chains)
+    })
+}
+
+/// The decision digest of a source with no conditional chains.
+pub fn empty_decision_digest() -> [u8; 32] {
+    brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+        b"csharp-preprocessor-decisions-v1",
+    )
+    .finish()
+}
+
+fn assignment_digest_for_owners<'a>(
+    owners: impl IntoIterator<Item = &'a SymbolEnvironment>,
+    referenced_symbols: &std::collections::BTreeSet<String>,
+    has_chains: bool,
+) -> [u8; 32] {
     use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
     let mut assignment = CanonicalHasher::new(b"csharp-preprocessor-assignment-v1");
-    for state in owners.iter().filter(|_| count != 0) {
-        let owner = state.owner;
+    for owner in owners.into_iter().filter(|_| has_chains) {
         assignment.value(owner.compilation_key.as_bytes());
         assignment.value(&[u8::from(owner.closed)]);
         assignment.value(&[u8::from(owner.open_reason.is_some())]);
         if let Some(reason) = &owner.open_reason {
             assignment.value(reason.as_bytes());
         }
-        for symbol in &referenced_symbols {
+        for symbol in referenced_symbols {
             assignment.value(symbol.as_bytes());
             assignment.value(&[if owner.defined.contains(symbol) {
                 1
@@ -487,6 +573,20 @@ fn finish_decisions(
             }]);
         }
     }
+    assignment.finish()
+}
+
+fn finish_decisions(
+    owners: &[OwnerState<'_>],
+    count: usize,
+    referenced_symbols: std::collections::BTreeSet<String>,
+) -> PreprocessorDecisions {
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+    let assignment_digest = assignment_digest_for_owners(
+        owners.iter().map(|state| state.owner),
+        &referenced_symbols,
+        count != 0,
+    );
     let chains: Vec<_> = (0..count)
         .map(|chain| {
             if owners[0].decisions.len() <= chain {
@@ -520,7 +620,7 @@ fn finish_decisions(
         chains,
         referenced_symbols,
         decision_digest: digest.finish(),
-        assignment_digest: assignment.finish(),
+        assignment_digest,
     }
 }
 /// Lexical mode carried across lines while scanning for directive lines.
@@ -563,27 +663,15 @@ struct ChainState {
 /// outside this contract; the default reading retains the undecided obligation.
 pub fn scan_and_decide_preprocessor(
     source: &str,
-    owners: &[SymbolEnvironment],
+    ownership: OwnerEnvironments<'_>,
 ) -> PreprocessorScan {
-    let unowned = SymbolEnvironment {
-        compilation_key: String::new(),
-        defined: Default::default(),
-        closed: false,
-        open_reason: Some("no_owning_compilation".to_owned()),
-    };
-    let mut owners: Vec<_> = owners.iter().collect();
-    owners.sort_by(|a, b| a.compilation_key.cmp(&b.compilation_key));
-    assert!(owners.iter().all(|o| !o.compilation_key.is_empty()));
-    assert!(
-        owners
-            .windows(2)
-            .all(|w| w[0].compilation_key != w[1].compilation_key)
-    );
-    if owners.is_empty() {
-        owners.push(&unowned);
-    }
+    with_owner_environments(ownership, |owners| scan_with_owners(source, owners))
+}
+
+fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> PreprocessorScan {
     let mut owners: Vec<_> = owners
-        .into_iter()
+        .iter()
+        .copied()
         .map(|owner| OwnerState {
             owner,
             local: Default::default(),
@@ -759,6 +847,8 @@ pub fn scan_and_decide_preprocessor(
     if !any_directive {
         return PreprocessorScan {
             decisions,
+            undecided_chains: Vec::new(),
+            has_unseen_branch: false,
             included_ranges: None,
             has_inactive_regions: false,
             branches,
@@ -766,8 +856,37 @@ pub fn scan_and_decide_preprocessor(
         };
     }
 
+    let undecided_chains: Vec<_> = decisions
+        .chains
+        .iter()
+        .enumerate()
+        .filter_map(|(chain, decision)| {
+            let ChainDecision::Undecided(reason) = decision else {
+                return None;
+            };
+            let first = branches.iter().find(|branch| branch.chain == chain)?;
+            let omitted_nonblank = branches
+                .iter()
+                .filter(|branch| branch.chain == chain && !branch.kept)
+                .any(|branch| {
+                    contains_noncomment_text(&source[branch.directive_end..branch.end_byte])
+                });
+            Some(UndecidedChain {
+                chain: u32::try_from(chain).expect("C# chain index exceeds u32"),
+                directive_start: u32::try_from(first.directive_start)
+                    .expect("C# source offset exceeds u32"),
+                directive_end: u32::try_from(first.directive_end)
+                    .expect("C# source offset exceeds u32"),
+                omitted_nonblank,
+                reason: reason.clone(),
+            })
+        })
+        .collect();
+    let has_unseen_branch = undecided_chains.iter().any(|chain| chain.omitted_nonblank);
     PreprocessorScan {
         decisions,
+        undecided_chains,
+        has_unseen_branch,
         included_ranges: Some(build_ranges(bytes, &kept)),
         has_inactive_regions,
         branches,
@@ -818,7 +937,7 @@ fn build_ranges(bytes: &[u8], kept: &[(usize, usize)]) -> Vec<tree_sitter::Range
 /// The unowned case uses the reserved open compilation, including file-local
 /// assignments and literal expression proofs.
 pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
-    scan_and_decide_preprocessor(source, &[])
+    scan_and_decide_preprocessor(source, OwnerEnvironments::Known(&[]))
 }
 
 /// Advance the cross-line lexical mode across one source line.
@@ -910,6 +1029,37 @@ fn advance_lex_mode(line: &str, mut mode: LexMode) -> LexMode {
         }
     }
     mode
+}
+
+/// Check source text using the same comment delimiters as the directive lexer.
+fn contains_noncomment_text(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    let mut in_block = false;
+    while index < bytes.len() {
+        if in_block {
+            if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                in_block = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            in_block = true;
+            index += 2;
+        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+        } else {
+            let ch = source[index..].chars().next().expect("index within source");
+            if !ch.is_whitespace() {
+                return true;
+            }
+            index += ch.len_utf8();
+        }
+    }
+    false
 }
 
 /// Length of the run of `"` starting at `index`.
@@ -1197,6 +1347,17 @@ mod tests {
     fn literal_false_condition_activates_the_next_branch() {
         let source = "#if false\nint a;\n#elif false\nint b;\n#else\nint c;\n#endif\n";
         assert_eq!(kept_text(source), "int c;\n");
+        let comment_only = scan_preprocessor(
+            "#if UNKNOWN\nint kept;\n#else\n// omitted\n/* only comment */\n#endif\n",
+        );
+        assert_eq!(comment_only.undecided_chains.len(), 1);
+        assert!(!comment_only.undecided_chains[0].omitted_nonblank);
+        assert!(!comment_only.has_unseen_branch);
+        let code =
+            scan_preprocessor("#if UNKNOWN\nint kept;\n#else\n// omitted\nint unseen;\n#endif\n");
+        assert_eq!(code.undecided_chains.len(), 1);
+        assert!(code.undecided_chains[0].omitted_nonblank);
+        assert!(code.has_unseen_branch);
     }
 
     #[test]

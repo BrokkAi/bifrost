@@ -26,6 +26,10 @@ impl<K: Eq + Hash, V> Default for RequestContextMemo<K, V> {
 }
 
 impl<K: Eq + Hash, V: Clone> RequestContextMemo<K, V> {
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.borrow().is_empty()
+    }
+
     pub(super) fn clear(&self) {
         self.entries.replace(ExactReadMemo::default());
     }
@@ -65,6 +69,15 @@ impl<K: Eq + Hash, V: Clone> RequestContextMemo<K, V> {
         Ok(value)
     }
 
+    /// Admit a preparation restored from a published snapshot into this
+    /// still-empty slot, so the first named lookup does not derive again.
+    pub(super) fn admit(&self, key: K, value: V) {
+        assert!(
+            self.entries.borrow_mut().insert(key, value).is_none(),
+            "a restored preparation enters an empty slot"
+        );
+    }
+
     pub(super) fn read(
         &self,
         key: K,
@@ -85,6 +98,35 @@ impl<K: Eq + Hash, V: Clone> RequestContextMemo<K, V> {
 /// a memo access, never a language derivation, SQL read, or session observation.
 pub(super) struct ContextPlanMemo<K, V> {
     entries: Mutex<HashMap<K, V>>,
+}
+
+// Clone the ledger while its lock is held. The destination owns its mutex;
+// later named demands cannot mutate the source preparation's memo.
+impl<K: Clone, V: Clone> Clone for ContextPlanMemo<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: Mutex::new(
+                self.entries
+                    .lock()
+                    .expect("context plan memo is not poisoned")
+                    .clone(),
+            ),
+        }
+    }
+}
+
+impl<K, V> ContextPlanMemo<K, V> {
+    /// Visit every entry under one lock, for a retained-size census.
+    pub(super) fn for_each_entry(&self, mut visit: impl FnMut(&K, &V)) {
+        for (key, value) in self
+            .entries
+            .lock()
+            .expect("context plan memo is not poisoned")
+            .iter()
+        {
+            visit(key, value);
+        }
+    }
 }
 
 impl<K, V> Default for ContextPlanMemo<K, V> {
@@ -136,6 +178,33 @@ impl<K: Eq + Hash, V: Clone> ContextPlanMemo<K, V> {
 /// One lazy invariant has no demand key and needs no allocated map.
 pub(super) struct ContextPlanCell<V> {
     value: Mutex<Option<V>>,
+}
+
+impl<V: Clone> Clone for ContextPlanCell<V> {
+    fn clone(&self) -> Self {
+        Self {
+            value: Mutex::new(
+                self.value
+                    .lock()
+                    .expect("context plan cell is not poisoned")
+                    .clone(),
+            ),
+        }
+    }
+}
+
+impl<V> ContextPlanCell<V> {
+    /// Visit the filled value, if any, for a retained-size census.
+    pub(super) fn with_value(&self, visit: impl FnOnce(&V)) {
+        if let Some(value) = self
+            .value
+            .lock()
+            .expect("context plan cell is not poisoned")
+            .as_ref()
+        {
+            visit(value);
+        }
+    }
 }
 
 impl<V> Default for ContextPlanCell<V> {

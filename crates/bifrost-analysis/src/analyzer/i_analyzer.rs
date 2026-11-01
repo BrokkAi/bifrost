@@ -152,6 +152,17 @@ pub use crate::forward_relational_definition_batch;
 #[macro_export]
 macro_rules! forward_query_read_ledger {
     () => {
+        fn project_parse_variant_reader(
+            &self,
+        ) -> Option<$crate::analyzer::tree_sitter_analyzer::ProjectVariantReader> {
+            $crate::analyzer::IAnalyzer::project_parse_variant_reader(&self.inner)
+        }
+        fn set_project_parse_variant_reader(
+            &self,
+            reader: $crate::analyzer::tree_sitter_analyzer::ProjectVariantReader,
+        ) {
+            $crate::analyzer::IAnalyzer::set_project_parse_variant_reader(&self.inner, reader);
+        }
         fn current_query_read_completion(
             &self,
         ) -> Result<(), $crate::analyzer::QueryReadIncomplete> {
@@ -174,10 +185,12 @@ macro_rules! forward_query_read_ledger {
             $crate::analyzer::IAnalyzer::record_read_capture(&self.inner, reads);
         }
 
+        #[track_caller]
         fn record_unattributed_reads(&self, count: usize) {
             $crate::analyzer::IAnalyzer::record_unattributed_reads(&self.inner, count);
         }
 
+        #[track_caller]
         fn mark_execution_dependent_reads(&self, count: usize) {
             $crate::analyzer::IAnalyzer::mark_execution_dependent_reads(&self.inner, count);
         }
@@ -745,11 +758,89 @@ impl QueryReadIncomplete {
     /// recorded inputs. Unclassified semantic failures remain conservative;
     /// typed producers use SemanticEvidenceGap only for deterministic gaps.
     pub fn is_execution_dependent(&self) -> bool {
+        self.execution_cause().is_some()
+    }
+
+    /// Operational provenance of an incomplete read, independent of its value.
+    pub fn execution_cause(
+        &self,
+    ) -> Option<crate::analyzer::read_ledger::DerivationExecutionCause> {
+        use crate::analyzer::read_ledger::DerivationExecutionCause;
         match self {
             Self::StructureUnavailable(_)
             | Self::ArtifactUnavailable(_)
-            | Self::SemanticEvidenceGap(_) => false,
-            Self::Cancelled | Self::StoreFailure(_) | Self::SemanticEvidenceUnavailable(_) => true,
+            | Self::SemanticEvidenceGap(_) => None,
+            Self::Cancelled => Some(DerivationExecutionCause::Cancelled),
+            Self::StoreFailure(_) | Self::SemanticEvidenceUnavailable(_) => {
+                Some(DerivationExecutionCause::Provider)
+            }
+        }
+    }
+}
+
+/// Capture operational read failures while retaining the producer's ordinary value.
+pub fn capture_read_execution_cause<T>(
+    analyzer: &dyn IAnalyzer,
+    run: impl FnOnce() -> T,
+) -> (
+    T,
+    Option<crate::analyzer::read_ledger::DerivationExecutionCause>,
+) {
+    let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+    let value = run();
+    let cause = scope
+        .captured_read_incompleteness()
+        .into_iter()
+        .find_map(|reason| reason.execution_cause());
+    if cause.is_some() {
+        analyzer.mark_execution_dependent();
+    }
+    (value, cause)
+}
+
+/// Owns analyzer caches shared by retained fills in one request.
+#[derive(Debug)]
+pub(crate) struct RequestCacheDomain {
+    pub(crate) id: u64,
+    registries:
+        Mutex<Vec<std::sync::Weak<std::sync::RwLock<super::tree_sitter_analyzer::QueryReadCache>>>>,
+}
+impl RequestCacheDomain {
+    pub(crate) fn register(
+        &self,
+        registry: &Arc<std::sync::RwLock<super::tree_sitter_analyzer::QueryReadCache>>,
+    ) {
+        let weak = Arc::downgrade(registry);
+        let mut registries = self
+            .registries
+            .lock()
+            .expect("fill retirement registry poisoned");
+        if !registries.iter().any(|entry| entry.ptr_eq(&weak)) {
+            // One handle per distinct analyzer cache owner the fill reaches (each
+            // language analyzer and its realm peers, a few dozen at most). The
+            // bound is per fill, not per workspace; exceeding it means peers are
+            // registering without deduplication.
+            assert!(
+                registries.len() < 256,
+                "a fill exceeded 256 analyzer cache owners"
+            );
+            registries.push(weak);
+        }
+    }
+}
+impl Drop for RequestCacheDomain {
+    fn drop(&mut self) {
+        for registry in self
+            .registries
+            .get_mut()
+            .expect("fill retirement registry poisoned")
+        {
+            if let Some(registry) = registry.upgrade() {
+                registry
+                    .write()
+                    .expect("query cache poisoned")
+                    .retire_domain(self.id);
+            }
         }
     }
 }
@@ -776,8 +867,17 @@ pub struct AnalyzerQueryContext {
     /// The scope whose request memos this scope may reuse. Transported with
     /// ReadAttribution, never inferred from the analyzer-wide registry.
     enclosing: Option<Arc<AnalyzerQueryContext>>,
+    // Transported independently of ancestry: retained fills cannot consume
+    // request memos built under their caller's unrelated failures.
+    request_cache_domain: Option<Arc<RequestCacheDomain>>,
+    retained_fill_domain: Arc<std::sync::OnceLock<Arc<RequestCacheDomain>>>,
     first_store_error: Mutex<Option<StoreError>>,
     first_read_incomplete: Mutex<Option<QueryReadIncomplete>>,
+    /// The first execution-dependent reason (cancellation, budget, transient
+    /// store or provider failure). Fills inherit only this class: a stable
+    /// content gap recorded earlier in the query says nothing about a fill's
+    /// own reads, which the fill's capture records itself (#8618).
+    first_execution_dependent_read_incomplete: Mutex<Option<QueryReadIncomplete>>,
     /// Only file-cache builders capture every reason, so a stable first reason
     /// cannot conceal a later transient failure when deciding cache admission.
     captured_read_incompleteness: Option<Mutex<Vec<QueryReadIncomplete>>>,
@@ -818,6 +918,8 @@ impl AnalyzerQueryContext {
     pub fn root() -> Self {
         Self {
             enclosing: None,
+            retained_fill_domain: Arc::default(),
+            request_cache_domain: None,
             ..Self::default()
         }
     }
@@ -825,6 +927,10 @@ impl AnalyzerQueryContext {
     /// Enter this request on the thread performing its work.
     pub fn enter(self: &Arc<Self>) -> ReadAttributionGuard {
         query_attribution(self)
+    }
+
+    pub(crate) fn request_cache_domain(&self) -> Option<u64> {
+        self.request_cache_domain.as_ref().map(|domain| domain.id)
     }
 
     pub(crate) fn assert_current(&self) {
@@ -838,9 +944,15 @@ impl AnalyzerQueryContext {
 impl Default for AnalyzerQueryContext {
     fn default() -> Self {
         Self {
+            request_cache_domain: current_query_context()
+                .and_then(|c| c.request_cache_domain.clone()),
+            retained_fill_domain: current_query_context()
+                .map(|context| context.retained_fill_domain.clone())
+                .unwrap_or_default(),
             enclosing: current_query_context(),
             first_store_error: Mutex::new(None),
             first_read_incomplete: Mutex::new(None),
+            first_execution_dependent_read_incomplete: Mutex::new(None),
             captured_read_incompleteness: None,
             cancellation: None,
             identifier_candidate_memo_owner: None,
@@ -1299,11 +1411,13 @@ impl AnalyzerQueryContext {
     }
 
     /// Records one funnel crossing this request could not name.
+    #[track_caller]
     pub fn record_unattributed_read(&self) {
         self.record_unattributed_reads(1);
     }
 
     /// Records a batch of crossings this request could not name.
+    #[track_caller]
     pub fn record_unattributed_reads(&self, count: usize) {
         if let Some(ledger) = &self.read_ledger {
             ledger.record_unattributed_reads(count);
@@ -1311,6 +1425,7 @@ impl AnalyzerQueryContext {
     }
 
     /// Marks a batch of crossings that depended on transient execution state.
+    #[track_caller]
     pub fn mark_execution_dependent_reads(&self, count: usize) {
         if let Some(ledger) = &self.read_ledger {
             ledger.mark_execution_dependent_reads(count);
@@ -1379,6 +1494,15 @@ impl AnalyzerQueryContext {
             ledger.mark_execution_dependent();
         }
         self.capture_read_incomplete(reason.clone());
+        if reason.is_execution_dependent() {
+            let mut slot = self
+                .first_execution_dependent_read_incomplete
+                .lock()
+                .expect("analyzer query incompleteness mutex poisoned");
+            if slot.is_none() {
+                *slot = Some(reason.clone());
+            }
+        }
         let mut slot = self
             .first_read_incomplete
             .lock()
@@ -1424,23 +1548,27 @@ pub(crate) fn decrement_attached_read_ledger(
     }
 }
 
-pub(crate) fn innermost_query_context_value<T>(
-    contexts: &[Arc<AnalyzerQueryContext>],
-    mut select: impl FnMut(&AnalyzerQueryContext) -> Option<T>,
-) -> Option<T> {
-    contexts.iter().rev().find_map(|context| select(context))
-}
-
 /// Only the actual enclosing scope can have supplied request-memo values.
-pub(crate) fn inherit_query_incompleteness(
-    context: &AnalyzerQueryContext,
-    registered: &[Arc<AnalyzerQueryContext>],
-) {
+/// A peer may have been accessed lazily without registering that parent here;
+/// transported domain identity, rather than the analyzer registry, owns reuse.
+pub(crate) fn inherit_query_incompleteness(context: &AnalyzerQueryContext) {
     context.assert_current();
     if let Some(parent) = &context.enclosing
-        && registered.iter().any(|active| Arc::ptr_eq(active, parent))
+        && context.request_cache_domain() == parent.request_cache_domain()
     {
-        if let Err(reason) = parent.read_completion() {
+        // A stable content gap in the parent (SemanticEvidenceGap,
+        // ArtifactUnavailable, StructureUnavailable) is deterministic for the
+        // snapshot and belongs to the parent's answer; inheriting it made every
+        // later fill in the query refuse and rebuild (#8618). Only the
+        // execution-dependent class can make a fill's own reads unreliable.
+        // Request-domain memos must retain only complete builds or replay
+        // their build's stable reasons on a hit: later fills do not inherit them.
+        let inherited = parent
+            .first_execution_dependent_read_incomplete
+            .lock()
+            .expect("analyzer query incompleteness mutex poisoned")
+            .clone();
+        if let Some(reason) = inherited {
             context.record_read_incomplete(reason);
         }
         // A stable first reason must not conceal a later transient store
@@ -1449,6 +1577,22 @@ pub(crate) fn inherit_query_incompleteness(
             context.record_store_error(error);
         }
     }
+}
+
+pub(crate) fn current_request_cache_domain() -> Option<u64> {
+    current_query_context().and_then(|context| context.request_cache_domain())
+}
+
+pub(crate) fn current_request_cache_domain_owner() -> Option<Arc<RequestCacheDomain>> {
+    current_query_context().and_then(|context| context.request_cache_domain.clone())
+}
+
+pub(crate) fn current_domain_read_completion() -> Result<(), QueryReadIncomplete> {
+    let domain = current_request_cache_domain();
+    current_query_contexts()
+        .take_while(|context| context.request_cache_domain() == domain)
+        .find_map(|context| context.read_completion().err())
+        .map_or(Ok(()), Err)
 }
 
 fn current_query_contexts() -> impl Iterator<Item = Arc<AnalyzerQueryContext>> {
@@ -1462,11 +1606,19 @@ fn for_each_current_query_context(mut record: impl FnMut(&AnalyzerQueryContext))
 }
 
 pub(crate) fn current_query_context_value<T>(
-    registered: &[Arc<AnalyzerQueryContext>],
+    mut select: impl FnMut(&AnalyzerQueryContext) -> Option<T>,
+) -> Option<T> {
+    current_query_contexts().find_map(|context| select(&context))
+}
+
+/// A model override belongs only to analyzers that registered its scope.
+/// Retained-fill domains still share their analyzer's registered ancestry.
+pub(crate) fn registered_query_context_value<T>(
+    mut registered: impl FnMut(&Arc<AnalyzerQueryContext>) -> bool,
     mut select: impl FnMut(&AnalyzerQueryContext) -> Option<T>,
 ) -> Option<T> {
     current_query_contexts()
-        .filter(|context| registered.iter().any(|active| Arc::ptr_eq(active, context)))
+        .filter(|context| registered(context))
         .find_map(|context| select(&context))
 }
 
@@ -1575,6 +1727,32 @@ pub struct ReferenceNamesInFilesResult {
 }
 
 pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
+    #[doc(hidden)]
+    fn project_parse_variant_reader(
+        &self,
+    ) -> Option<crate::analyzer::tree_sitter_analyzer::ProjectVariantReader> {
+        None
+    }
+    #[doc(hidden)]
+    fn set_project_parse_variant_reader(
+        &self,
+        _reader: crate::analyzer::tree_sitter_analyzer::ProjectVariantReader,
+    ) {
+    }
+
+    /// The variant of the bytes this analyzer currently serves for the path, overlay included.
+    /// Other languages return Some(Empty). None is unreadable, with the read
+    /// failure recorded on the request; it certifies neither facts nor absence.
+    fn selected_parse_variant(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<brokk_bifrost_core::gitblob::ParseVariant> {
+        if file.language().uses_configured_parse_variants() {
+            return None;
+        }
+        Some(brokk_bifrost_core::gitblob::ParseVariant::Empty)
+    }
+
     /// Read live dynamic import source paths from the selected workspace
     /// publication. `seed_files` scopes `imports-of`; `None` asks for every
     /// live source, which is the scope required by `importers-of`.
@@ -1783,10 +1961,12 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// unattributed count makes every unit produced under it `Unbounded`. A
     /// silent crossing would leave the read set looking complete while an
     /// input it never named could move.
+    #[track_caller]
     fn record_unattributed_read(&self) {
         self.record_unattributed_reads(1);
     }
 
+    #[track_caller]
     fn record_unattributed_reads(&self, _count: usize) {}
 
     /// Owned capability for static relational frontier handles. Unsupported
@@ -1799,10 +1979,12 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
 
     /// Mark transient execution state through the same worker broadcasting and
     /// nested-capture attribution used by reads.
+    #[track_caller]
     fn mark_execution_dependent(&self) {
         self.mark_execution_dependent_reads(1);
     }
 
+    #[track_caller]
     fn mark_execution_dependent_reads(&self, _count: usize) {}
 
     /// Whether read recording reaches the active attribution frame. Wrappers
@@ -1841,6 +2023,9 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
 
     /// Best-effort batch-warm the request-scoped `definitions()` memo for
     /// names the caller already knows it will query.
+    /// Prime selected readings for the paths an operation is about to scan.
+    fn prefetch_parse_variants(&self, _files: &[ProjectFile]) {}
+
     fn prefetch_definitions(&self, fq_names: &[String]) {
         CodeUnitIndex::prefetch_definitions(self, fq_names);
     }
@@ -3044,6 +3229,7 @@ enum AttributionFrame {
 use brokk_bifrost_core::analyzer::carried_context::{self, CarriedContextGuard};
 
 impl carried_context::ExecutionAttribution for AttributionFrame {
+    #[track_caller]
     fn mark_execution_dependent(&self) {
         if let Self::Ledgers(ledgers) = self {
             for (ledger, _) in ledgers {
@@ -3134,6 +3320,13 @@ fn query_attribution(context: &Arc<AnalyzerQueryContext>) -> ReadAttributionGuar
         AttributionFrame::Ledgers(ledgers)
     });
     let path_modules = carried_context::request_state::<AnalyzerRequestState>()
+        .filter(|state| {
+            state
+                .context
+                .as_ref()
+                .and_then(|parent| parent.request_cache_domain())
+                == context.request_cache_domain()
+        })
         .map(|state| Arc::clone(&state.path_modules))
         .unwrap_or_default();
     ReadAttributionGuard {
@@ -3202,6 +3395,28 @@ pub fn read_attribution_records_reads(analyzer_has_ledger: impl FnOnce() -> bool
     })
 }
 
+/// A public site result exposes positions even when its semantic read is ranked.
+/// Keep the source identity as a separate dependency for such consumers.
+#[doc(hidden)]
+pub fn record_position_read(analyzer: &dyn IAnalyzer, file: &ProjectFile) {
+    if !read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
+        return;
+    }
+    match analyzer.indexed_blob_oid(file) {
+        Some(blob) => {
+            if let Some(variant) = analyzer.selected_parse_variant(file) {
+                analyzer.record_read(crate::analyzer::read_ledger::ReadKey::file(
+                    crate::analyzer::common::language_for_file(file),
+                    crate::path_utils::rel_path_string(file),
+                    blob,
+                    variant,
+                ));
+            }
+        }
+        None => analyzer.record_unattributed_read(),
+    }
+}
+
 /// True when recording can use the thread frame without analyzer contexts.
 pub(crate) fn has_read_attribution_ledgers() -> bool {
     with_attribution_frame(|frame| matches!(frame, Some(AttributionFrame::Ledgers(_))))
@@ -3227,6 +3442,27 @@ impl<'a> AnalyzerQueryScope<'a> {
             attribution,
             _request_state: request_state,
         }
+    }
+
+    /// Retained fills share request memos isolated from the ordinary request domain.
+    #[doc(hidden)]
+    pub fn for_retained_fill(analyzer: &'a dyn IAnalyzer) -> Self {
+        static NEXT_DOMAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut context = AnalyzerQueryContext::default();
+        context.request_cache_domain = Some(
+            context
+                .retained_fill_domain
+                .get_or_init(|| {
+                    let id = NEXT_DOMAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    assert_ne!(id, 0, "request cache domain identity exhausted");
+                    Arc::new(RequestCacheDomain {
+                        id,
+                        registries: Mutex::new(Vec::new()),
+                    })
+                })
+                .clone(),
+        );
+        Self::with_context(analyzer, context)
     }
 
     pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
@@ -3445,6 +3681,8 @@ pub fn capture_nested_reads<T>(
         return (read(), Vec::new());
     };
     let (result, captured) = capture_with_read_ledger_scope(analyzer, Some(&enclosing), read);
+    let _refusal =
+        brokk_bifrost_core::profiling::read_refusal_scope(captured.first_execution_refusal());
     enclosing.mark_execution_dependent_reads(captured.execution_dependences());
     (result, captured.unordered_keys())
 }
@@ -3495,6 +3733,10 @@ pub(super) fn capture_with_read_registration<T, G>(
 /// Replay all dependencies of a completed query into its current caller.
 #[doc(hidden)]
 pub fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::ReadLedger) {
+    let _refusal = brokk_bifrost_core::profiling::read_refusal_scope(reads.first_refusal());
+    let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
+        reads.first_execution_refusal(),
+    );
     analyzer.record_read_capture(reads);
     replay_query_read_receipt(
         analyzer,
@@ -3617,8 +3859,15 @@ pub fn capture_subsumed_query_read_receipt<T>(
         keys: Arc::from([]),
         unattributed_reads: captured.unattributed_reads(),
         execution_dependences: captured.execution_dependences(),
+        first_refusal: captured.first_refusal(),
+        first_execution_refusal: captured.first_execution_refusal(),
     };
     if let Some(enclosing) = enclosing {
+        let _refusal =
+            brokk_bifrost_core::profiling::read_refusal_scope(reads.first_refusal.clone());
+        let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
+            reads.first_execution_refusal.clone(),
+        );
         replay_read_channels(
             [],
             reads.unattributed_reads,
@@ -3635,6 +3884,10 @@ pub(crate) fn forward_captured_query_reads(
     enclosing: &crate::analyzer::ReadLedger,
     captured: &crate::analyzer::ReadLedger,
 ) {
+    let _refusal = brokk_bifrost_core::profiling::read_refusal_scope(captured.first_refusal());
+    let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
+        captured.first_execution_refusal(),
+    );
     enclosing.absorb_capture(captured);
     enclosing.record_unattributed_reads(captured.unattributed_reads());
     enclosing.mark_execution_dependent_reads(captured.execution_dependences());
@@ -3758,10 +4011,14 @@ fn for_each_unshadowed_active_ledger(
 
 /// Record one unattributed funnel crossing under the same shadowing contract
 /// as [`record_read_on_active_ledgers`].
+#[track_caller]
 pub(crate) fn record_unattributed_on_active_ledgers(
     contexts: &[Arc<AnalyzerQueryContext>],
     count: usize,
 ) {
+    let _refusal = brokk_bifrost_core::profiling::read_refusal_scope(
+        brokk_bifrost_core::profiling::current_read_refusal("unattributed"),
+    );
     if count == 0 {
         return;
     }
@@ -3770,6 +4027,7 @@ pub(crate) fn record_unattributed_on_active_ledgers(
 }
 
 /// Admit unattributed reads before acquiring caller-specific fallback contexts.
+#[track_caller]
 pub(crate) fn record_unattributed_reads(
     count: usize,
     ledger_attached: impl FnOnce() -> bool,
@@ -3785,6 +4043,7 @@ pub(crate) fn record_unattributed_reads(
 }
 
 /// Acquire owner contexts only when recording needs a fallback registry.
+#[track_caller]
 pub(crate) fn record_execution_dependence(
     count: usize,
     ledger_attached: impl FnOnce() -> bool,
@@ -3805,10 +4064,17 @@ pub(crate) fn record_execution_dependence(
 }
 
 /// Execution dependence follows the same frame routing as input attribution.
+#[track_caller]
 pub(crate) fn record_execution_dependence_on_active_ledgers(
     contexts: &[Arc<AnalyzerQueryContext>],
     count: usize,
 ) {
+    let _refusal = brokk_bifrost_core::profiling::read_refusal_scope(
+        brokk_bifrost_core::profiling::current_read_refusal("execution_dependent"),
+    );
+    let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
+        brokk_bifrost_core::profiling::current_execution_read_refusal(),
+    );
     if count == 0 {
         return;
     }
@@ -3832,6 +4098,21 @@ pub(crate) fn record_usage_lookup(
 ) {
     if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return;
+    }
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        }
+        | FuzzyResult::Incomplete {
+            hits_by_overload, ..
+        } => {
+            for hits in hits_by_overload.values() {
+                for hit in hits {
+                    crate::analyzer::record_position_read(analyzer, &hit.file);
+                }
+            }
+        }
+        _ => {}
     }
     for overload in overloads {
         analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
@@ -3879,9 +4160,6 @@ pub(crate) fn usage_answer_digest(
         }
         | FuzzyResult::Incomplete {
             hits_by_overload, ..
-        }
-        | FuzzyResult::Ambiguous {
-            hits_by_overload, ..
         } => {
             hasher.value(b"hits");
             let mut sites = hits_by_overload
@@ -3898,9 +4176,8 @@ pub(crate) fn usage_answer_digest(
                 .collect::<Vec<_>>();
             sites.sort();
             sites.dedup();
-            for (path, start, end) in sites {
-                hasher.field(&path, &(start as u64).to_be_bytes());
-                hasher.value(&(end as u64).to_be_bytes());
+            for (rank, (path, _, _)) in sites.into_iter().enumerate() {
+                hasher.field(&path, &(rank as u64).to_be_bytes());
             }
         }
         FuzzyResult::Failure { reason_kind, .. } => hasher.field("failure", reason_kind.as_bytes()),
@@ -4200,6 +4477,31 @@ mod read_ledger_scope_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8618: an earlier stable content gap made every later fill in the query refuse and rebuild"
+    )]
+    fn nested_queries_inherit_only_execution_dependent_incompleteness() {
+        use super::{AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete};
+        use crate::analyzer::MultiAnalyzer;
+
+        let analyzer = MultiAnalyzer::default();
+        let _outer = AnalyzerQueryScope::new(&analyzer);
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+            "nested-call result arity unavailable".into(),
+        ));
+        {
+            let fill = AnalyzerQueryScope::new(&analyzer);
+            assert_eq!(fill.read_completion(), Ok(()));
+        }
+        // A cancellation recorded after the gap is not hidden by it.
+        analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+        {
+            let fill = AnalyzerQueryScope::new(&analyzer);
+            assert_eq!(fill.read_completion(), Err(QueryReadIncomplete::Cancelled));
+        }
+    }
+
+    #[test]
     fn nested_queries_inherit_their_transported_parent_and_record_into_ancestors() {
         use super::{AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete};
         use crate::analyzer::{
@@ -4250,6 +4552,94 @@ mod read_ledger_scope_tests {
             "outer retains the child's failure"
         );
         assert!(delegate.end(&outer.context));
+    }
+
+    #[test]
+    fn retained_fills_share_one_isolated_request_domain() {
+        use super::AnalyzerQueryScope;
+        let analyzer = crate::analyzer::MultiAnalyzer::default();
+        let request = AnalyzerQueryScope::new(&analyzer);
+        let domain;
+        {
+            let fill = AnalyzerQueryScope::for_retained_fill(&analyzer);
+            domain = fill.context.request_cache_domain();
+            assert_ne!(domain, request.context.request_cache_domain());
+            let nested = AnalyzerQueryScope::for_retained_fill(&analyzer);
+            assert_eq!(domain, nested.context.request_cache_domain());
+        }
+        let later = AnalyzerQueryScope::for_retained_fill(&analyzer);
+        assert_eq!(domain, later.context.request_cache_domain());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8546: a retained fill borrowed another analyzer's pinned model absence"
+    )]
+    fn retained_fill_uses_only_its_analyzers_model_override() {
+        use super::{AnalyzerQueryScope, IAnalyzer};
+        let head = crate::analyzer::MultiAnalyzer::default();
+        let base = crate::analyzer::MultiAnalyzer::default();
+        let _head = AnalyzerQueryScope::with_active_semantic_model_snapshot(&head, None);
+        assert!(matches!(
+            head.active_query_semantic_model_snapshot(),
+            Some(None)
+        ));
+
+        let _fill = AnalyzerQueryScope::for_retained_fill(&base);
+        assert!(base.active_query_semantic_model_snapshot().is_none());
+        assert!(base.active_query_semantic_model_overlay().is_none());
+
+        let _base = AnalyzerQueryScope::with_active_semantic_model_snapshot(&base, None);
+        let _base_fill = AnalyzerQueryScope::for_retained_fill(&base);
+        assert!(matches!(
+            base.active_query_semantic_model_snapshot(),
+            Some(None)
+        ));
+        // An analyzer that registered no scope must not borrow the innermost
+        // (base's) override, which the unfiltered lookup returned.
+        let other = crate::analyzer::MultiAnalyzer::default();
+        assert!(other.active_query_semantic_model_snapshot().is_none());
+        assert!(other.active_query_semantic_model_overlay().is_none());
+    }
+
+    #[test]
+    fn retained_fill_path_module_failures_are_isolated_both_ways() {
+        use super::{AnalyzerQueryScope, path_module_request_failure_cell};
+        use crate::analyzer::store::StoreError;
+        let analyzer = crate::analyzer::MultiAnalyzer::default();
+        let _outer = AnalyzerQueryScope::new(&analyzer);
+        let outer = path_module_request_failure_cell(crate::Language::JavaScript).unwrap();
+        *outer.lock().unwrap() = Some(StoreError::new("enclosing failure"));
+        {
+            let _fill = AnalyzerQueryScope::for_retained_fill(&analyzer);
+            let own = path_module_request_failure_cell(crate::Language::JavaScript).unwrap();
+            assert!(!Arc::ptr_eq(&outer, &own));
+            assert!(own.lock().unwrap().is_none());
+            *own.lock().unwrap() = Some(StoreError::new("fill failure"));
+            let _nested = AnalyzerQueryScope::new(&analyzer);
+            assert!(Arc::ptr_eq(
+                &own,
+                &path_module_request_failure_cell(crate::Language::JavaScript).unwrap()
+            ));
+        }
+        assert!(Arc::ptr_eq(
+            &outer,
+            &path_module_request_failure_cell(crate::Language::JavaScript).unwrap()
+        ));
+        assert_eq!(
+            outer.lock().unwrap().as_ref().unwrap().to_string(),
+            "enclosing failure"
+        );
+        {
+            let _fill = AnalyzerQueryScope::for_retained_fill(&analyzer);
+            assert!(
+                path_module_request_failure_cell(crate::Language::JavaScript)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

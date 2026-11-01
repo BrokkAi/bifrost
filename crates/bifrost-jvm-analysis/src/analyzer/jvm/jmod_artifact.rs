@@ -663,11 +663,20 @@ fn load_jmod_entry(
     // which inserts them in source-entry order.
     let mut surfaces = Vec::new();
     let mut parsed = Vec::new();
+    let mut enclosing_scopes = super::java_artifact::EnclosingScopeResolver::default();
     for (class_entry, class_bytes) in class_entries {
         let surface = match class_surface(
             relative_path,
             &class_entry,
             &class_bytes,
+            &mut |outer| {
+                enclosing_scopes.parameters(
+                    outer,
+                    &mut archive,
+                    "classes/",
+                    limits.max_signature_depth,
+                )
+            },
             limits.max_signature_depth,
             &mut budget.remaining,
             &mut budget.exhausted,

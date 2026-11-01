@@ -161,6 +161,10 @@ where
     let mut truncated: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
     let mut unproven_inbound: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
     let mut unproven_sites: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut unresolved_relative_imports: BTreeMap<
+        String,
+        Vec<brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportGap>,
+    > = BTreeMap::new();
     let mut unproven_sites_complete = true;
     let mut any = false;
 
@@ -203,6 +207,12 @@ where
             )
         });
         unproven_sites_complete &= result.unproven_sites_complete;
+        for (path, targets) in result.unresolved_relative_imports {
+            unresolved_relative_imports
+                .entry(path)
+                .or_default()
+                .extend(targets);
+        }
         for (key, sites) in result.unproven_sites {
             unproven_sites.entry(key).or_default().extend(sites);
         }
@@ -226,6 +236,7 @@ where
         unproven_inbound,
         unproven_sites,
         unproven_sites_complete,
+        unresolved_relative_imports,
     })
 }
 

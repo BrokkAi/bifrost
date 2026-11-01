@@ -4590,7 +4590,7 @@ struct PythonClassLookupRequestMemo {
             PythonClassLookupKey,
             (
                 ClassSeed,
-                Arc<brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger>,
+                Arc<brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt>,
             ),
         >,
     >,
@@ -4640,33 +4640,26 @@ fn resolve_class_at_span(
         .expect("class lookup memo lock poisoned")
         .get(&key)
         .cloned();
-    if let Some((answer, reads)) = cached {
-        brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(
-            workspace.analyzer(),
-            &reads,
-        );
-        debug_assert!(reads.keys_satisfy(|key| {
-            brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers(
-                workspace.analyzer(),
-                key,
-            )
-        }));
+    if let Some((answer, receipt)) = cached {
+        receipt.replay();
         return answer;
     }
     #[cfg(test)]
     memo.lookups
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (answer, reads) = brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(
+    let (answer, receipt) = brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(
         workspace.analyzer(),
         || resolve_indexed_class_at_span(workspace, file, span, prepared),
     );
     // A stopped lookup is not a completed answer. Later work must retain the
     // opportunity to resolve it, rather than inherit a prior exhausted walk.
-    if answer != ClassSeed::Unknown(UnknownReason::SemanticBudget) {
+    if answer != ClassSeed::Unknown(UnknownReason::SemanticBudget)
+        && !receipt.has_execution_dependences()
+    {
         memo.answers
             .lock()
             .expect("class lookup memo lock poisoned")
-            .insert(key, (answer.clone(), reads));
+            .insert(key, (answer.clone(), Arc::new(receipt)));
     }
     answer
 }

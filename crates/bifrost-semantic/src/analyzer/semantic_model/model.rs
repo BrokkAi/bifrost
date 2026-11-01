@@ -29,8 +29,10 @@ use serde::{Deserialize, Serialize};
 /// carries Rust generic defaults, implemented traits and receiver forms. Version
 /// nineteen carries implementation inventories, conditions and extraction authority.
 /// Version twenty carries assembly identities and type-forwarding records.
+/// Version twenty-one carries lexically enclosing type parameters on JVM owner
+/// inventories.
 pub const VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION: u32 = 8;
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 20;
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 21;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -41,7 +43,7 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 20;
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
 pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
 ];
 /// Explicit unknown type knowledge first appeared in schema nine.
 pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
@@ -3018,6 +3020,9 @@ pub fn additional_implementation_may_apply(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JvmOwnerInventory {
+    /// Lexically enclosing type parameters, nearest scope first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enclosing_type_parameters: Vec<String>,
     pub callables_complete: bool,
     pub values_complete: bool,
     pub types_complete: bool,

@@ -133,7 +133,7 @@ use super::resolved::{LoadedPolicy, ResolvedTaintPolicySpec, ResolvedTypestatePo
 use super::retained::RetainedSize;
 use super::unit_execution::{
     SeedPartition, UnitAttempt, UnitQueryExecution, UnitReuse, query_slicing_widen_reason,
-    recompute_unit, sliced_query_units,
+    sliced_query_units,
 };
 use super::units::{
     PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnitProduct, UnitPartition, WidenReason,
@@ -3533,8 +3533,15 @@ fn terminal_presentation(
         return Err(());
     };
     let (certainty, proof_state, proof_reason) = match terminal {
-        UnitRowItemTerminal::StructuralMatch { .. } => (
-            Vec::new(),
+        // The heuristic relation itself held at this exact span; what the
+        // finding claims about it (a typo, say) is only possible.
+        UnitRowItemTerminal::StructuralMatch { heuristic, .. } => (
+            heuristic
+                .iter()
+                .map(|reason| CertaintyReason::MayEvidence {
+                    reason: reason.to_string(),
+                })
+                .collect(),
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
@@ -6196,7 +6203,8 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
             PolicyIncompleteReason::ImportGraphBudget
         }
         CodeQueryDiagnosticCode::ResultLimitReached => PolicyIncompleteReason::QueryResultLimit,
-        CodeQueryDiagnosticCode::SemanticResultsOmitted
+        CodeQueryDiagnosticCode::HierarchyIncomplete
+        | CodeQueryDiagnosticCode::SemanticResultsOmitted
         | CodeQueryDiagnosticCode::SemanticAnalysisPartial
         | CodeQueryDiagnosticCode::CallBindingDispatchPartial
         | CodeQueryDiagnosticCode::CallBindingSelectorRejected
@@ -6242,6 +6250,7 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
         | CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
         | CodeQueryDiagnosticCode::UsesTargetsAmbiguous
+        | CodeQueryDiagnosticCode::WorkspaceSemanticModelsNotLoaded
         | CodeQueryDiagnosticCode::BroadQuery => PolicyIncompleteReason::PartialDiscovery,
         CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
             PolicyIncompleteReason::PartialDiscovery
@@ -6440,5 +6449,7 @@ fn relational_work_report(
     )
 }
 
+#[cfg(test)]
+mod cvss_overlay_contract;
 #[cfg(test)]
 mod tests;

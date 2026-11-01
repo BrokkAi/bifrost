@@ -148,7 +148,9 @@ pub fn classify_summary_boundary(kind: &SummaryBoundaryKind) -> BlockerBoundaryK
         SummaryBoundaryKind::Dispatch(dispatch) => match dispatch {
             DispatchBoundaryKind::External(_) => BlockerBoundaryKind::ExternalCallThrough,
             DispatchBoundaryKind::Unmaterialized(_) => BlockerBoundaryKind::UnmaterializedCallee,
-            DispatchBoundaryKind::Unresolved => BlockerBoundaryKind::UnresolvedDispatch,
+            DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::HierarchyUnenumerated => {
+                BlockerBoundaryKind::UnresolvedDispatch
+            }
             DispatchBoundaryKind::Truncated => BlockerBoundaryKind::TruncatedDispatch,
             DispatchBoundaryKind::Deferred { .. } => BlockerBoundaryKind::DeferredContinuation,
         },

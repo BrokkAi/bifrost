@@ -18,8 +18,8 @@ use super::{
     push_deduplicated_diagnostic,
 };
 use crate::analyzer::semantic::{
-    DispatchBoundaryKind, IcfgProvider, IcfgProviderBehaviorIdentity, LengthDelimitedDigest,
-    ProcedureHandle, ProgramPointHandle, SemanticBudget, SemanticLocator, WorkspaceIcfgProvider,
+    IcfgProvider, IcfgProviderBehaviorIdentity, LengthDelimitedDigest, ProcedureHandle,
+    ProgramPointHandle, SemanticBudget, SemanticLocator, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
@@ -1177,7 +1177,7 @@ pub(crate) fn public_witness_step(
         target_symbol: None,
         origin: step.origin().map(|call| public_call_site(workspace, call)),
         origin_symbol: None,
-        boundary: step.boundary().map(boundary_label),
+        boundary: step.boundary().map(|kind| kind.label().to_string()),
         input: None,
         output: None,
         evidence: public_evidence(step.proof(), step.completeness()),
@@ -1402,17 +1402,6 @@ pub(super) fn public_symbol_site(
         occurrence: anchor.occurrence(),
         range: locator_range(workspace, locator),
     }
-}
-
-fn boundary_label(boundary: &DispatchBoundaryKind) -> String {
-    match boundary {
-        DispatchBoundaryKind::External(_) => "external",
-        DispatchBoundaryKind::Unmaterialized(_) => "unmaterialized",
-        DispatchBoundaryKind::Deferred { .. } => "deferred",
-        DispatchBoundaryKind::Unresolved => "unresolved",
-        DispatchBoundaryKind::Truncated => "truncated",
-    }
-    .to_string()
 }
 
 pub(super) fn point_symbol_site(

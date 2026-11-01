@@ -141,6 +141,7 @@ pub fn js_ts_configuration_read_recorder<A: super::LanguageAdapter>(
                         rel_path,
                         git2::Oid::hash_object(git2::ObjectType::Blob, &bytes)
                             .expect("hashing configuration bytes"),
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty,
                     )),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         Some(ReadKey::path_absent(language, rel_path))
@@ -259,6 +260,7 @@ impl MemoAttribution for AnalyzerMemoAttribution<'_> {
         checked_read_ledger_attachment(self.analyzer);
         super::i_analyzer::innermost_read_ledger().map(|ledger| ledger.capture_identity())
     }
+    #[track_caller]
     fn record_unattributed(&self) {
         checked_read_ledger_attachment(self.analyzer);
         self.analyzer.record_unattributed_read();
@@ -280,6 +282,8 @@ impl MemoAttribution for AnalyzerMemoAttribution<'_> {
                 keys: Arc::from(reads.unordered_keys()),
                 unattributed_reads: reads.unattributed_reads(),
                 execution_dependences: reads.execution_dependences(),
+                first_refusal: reads.first_refusal(),
+                first_execution_refusal: reads.first_execution_refusal(),
             },
             forwarded_to,
         )
@@ -300,10 +304,17 @@ impl MemoAttribution for AnalyzerMemoAttribution<'_> {
                 keys: Arc::from(reads.unordered_keys()),
                 unattributed_reads: reads.unattributed_reads(),
                 execution_dependences: reads.execution_dependences(),
+                first_refusal: reads.first_refusal(),
+                first_execution_refusal: reads.first_execution_refusal(),
             },
         )
     }
     fn replay(&self, reads: &CapturedMemoReads<ReadKey>) {
+        let _refusal =
+            brokk_bifrost_core::profiling::read_refusal_scope(reads.first_refusal.clone());
+        let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
+            reads.first_execution_refusal.clone(),
+        );
         checked_read_ledger_attachment(self.analyzer);
         super::i_analyzer::replay_shared_query_read_receipt(
             self.analyzer,
@@ -322,6 +333,11 @@ impl<'a> AuthorityRecorder<WorkspaceFactFamily, AuthorityInputs<'a>>
         inputs: AuthorityInputs<'a>,
         reads: CapturedMemoReads<ReadKey>,
     ) {
+        let _refusal =
+            brokk_bifrost_core::profiling::read_refusal_scope(reads.first_refusal.clone());
+        let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
+            reads.first_execution_refusal.clone(),
+        );
         if matches!(&inputs, AuthorityInputs::Fact { .. }) {
             super::i_analyzer::replay_query_read_receipt(
                 self.analyzer,
@@ -345,7 +361,12 @@ pub fn workspace_authority_file_input(
 ) -> Option<ReadKey> {
     let file = super::ProjectFile::new(analyzer.project().root().to_path_buf(), rel_path);
     match analyzer.project().read_file_snapshot(&file) {
-        Ok(snapshot) => Some(ReadKey::file(language, rel_path, snapshot.oid())),
+        Ok(snapshot) => Some(ReadKey::file(
+            language,
+            rel_path,
+            snapshot.oid(),
+            analyzer.selected_parse_variant(&file)?,
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Some(ReadKey::path_absent(language, rel_path))
         }
@@ -746,6 +767,7 @@ impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for Owne
     fn capture_identity(&self) -> Option<CaptureIdentity> {
         memo_attribution(self.analyzer.as_ref()).capture_identity()
     }
+    #[track_caller]
     fn record_unattributed(&self) {
         memo_attribution(self.analyzer.as_ref()).record_unattributed();
     }
@@ -795,7 +817,13 @@ impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for Owne
         read: brokk_bifrost_core::analyzer::project_reads::ProjectRead<'_>,
         receipt: brokk_bifrost_core::analyzer::project_reads::ProjectReadReceipt,
     ) {
-        match project_read_keys(project, self.analyzer.project().root(), read, receipt) {
+        match project_read_keys(
+            &|file| self.analyzer.selected_parse_variant(file),
+            project,
+            self.analyzer.project().root(),
+            read,
+            receipt,
+        ) {
             Ok(keys) => {
                 for key in keys {
                     self.analyzer.record_read(key);
@@ -844,6 +872,8 @@ fn erased_memo_receipt(
     brokk_bifrost_core::analyzer::project_reads::ErasedCapturedReads {
         unattributed_reads: reads.unattributed_reads,
         execution_dependences: reads.execution_dependences,
+        first_refusal: reads.first_refusal.clone(),
+        first_execution_refusal: reads.first_execution_refusal.clone(),
         receipt: OpaqueReadReceipt::new(
             Arc::new(reads),
             retained_bytes + std::mem::size_of::<CapturedMemoReads<ReadKey>>(),
@@ -860,6 +890,8 @@ pub(super) fn erased_captured_reads(
             keys: Arc::from(reads.unordered_keys()),
             unattributed_reads: reads.unattributed_reads(),
             execution_dependences: reads.execution_dependences(),
+            first_refusal: reads.first_refusal(),
+            first_execution_refusal: reads.first_execution_refusal(),
         },
         forwarded_to,
     )
@@ -870,6 +902,29 @@ pub(super) fn replay_erased_reads(
     unattributed_reads: usize,
     execution_dependences: usize,
 ) {
+    // Refusal provenance is timing-only; with timing off, scan nothing.
+    let timing = brokk_bifrost_core::profiling::enabled();
+    let first_refusal = timing
+        .then(|| {
+            receipts.iter().find_map(|receipt| {
+                receipt
+                    .downcast_ref::<CapturedMemoReads<ReadKey>>()
+                    .and_then(|reads| reads.first_refusal.clone())
+            })
+        })
+        .flatten();
+    let _refusal = brokk_bifrost_core::profiling::read_refusal_scope(first_refusal);
+    let first_execution = timing
+        .then(|| {
+            receipts.iter().find_map(|receipt| {
+                receipt
+                    .downcast_ref::<CapturedMemoReads<ReadKey>>()
+                    .and_then(|reads| reads.first_execution_refusal.clone())
+            })
+        })
+        .flatten();
+    let _execution_refusal =
+        brokk_bifrost_core::profiling::read_execution_refusal_scope(first_execution);
     for receipt in receipts {
         let reads = receipt
             .downcast_ref::<CapturedMemoReads<ReadKey>>()
@@ -888,6 +943,9 @@ pub(super) fn replay_erased_reads(
 }
 
 pub(super) fn project_read_keys(
+    variant_for_file: &dyn Fn(
+        &super::ProjectFile,
+    ) -> Option<brokk_bifrost_core::gitblob::ParseVariant>,
     project: &dyn super::Project,
     workspace_root: &std::path::Path,
     read: brokk_bifrost_core::analyzer::project_reads::ProjectRead<'_>,
@@ -936,7 +994,7 @@ pub(super) fn project_read_keys(
             )]),
             ProjectRead::GitIgnore { rel_path } => {
                 let mut keys = if receipt.inventory.is_some() {
-                    project_read_keys(project, workspace_root, ProjectRead::Inventory, receipt.clone())?
+                    project_read_keys(variant_for_file, project, workspace_root, ProjectRead::Inventory, receipt.clone())?
                 } else if receipt.git_ignore_presence_only {
                     Vec::new()
                 } else {
@@ -945,7 +1003,7 @@ pub(super) fn project_read_keys(
                     ));
                 };
                 keys.extend(project_read_keys(
-                    project,
+                    variant_for_file, project,
                     workspace_root,
                     ProjectRead::Path { rel_path },
                     receipt,
@@ -984,7 +1042,7 @@ pub(super) fn project_read_keys(
             }
             ProjectRead::AbsolutePath { abs_path } => match abs_path.strip_prefix(project.root()) {
                 Ok(rel_path) => project_read_keys(
-                    project,
+                    variant_for_file, project,
                     workspace_root,
                     ProjectRead::Path { rel_path },
                     receipt,
@@ -1003,7 +1061,7 @@ pub(super) fn project_read_keys(
                 let mut membership_receipt = receipt.clone();
                 membership_receipt.overlay_membership = receipt.path_overlay_membership;
                 keys.extend(project_read_keys(
-                    project,
+                    variant_for_file, project,
                     workspace_root,
                     ProjectRead::OverlayMembership { rel_path },
                     membership_receipt,
@@ -1012,7 +1070,7 @@ pub(super) fn project_read_keys(
                 // Physical projects leave this empty and need only the path kind.
                 if receipt.inventory.is_some() {
                     keys.extend(project_read_keys(
-                        project,
+                        variant_for_file, project,
                         workspace_root,
                         ProjectRead::Inventory,
                         receipt,
@@ -1034,6 +1092,7 @@ pub(super) fn project_read_keys(
                             file.language(),
                             path_in_workspace(&file.abs_path())?,
                             blob,
+                            variant_for_file(file).ok_or_else(|| std::io::Error::other("selected parse variant is unreadable"))?,
                         ));
                     }
                 }
@@ -1046,6 +1105,7 @@ pub(super) fn project_read_keys(
                 file.language(),
                 path_in_workspace(&file.abs_path())?,
                 blob,
+                variant_for_file(file).ok_or_else(|| std::io::Error::other("selected parse variant is unreadable"))?,
             )]),
             ProjectRead::Content { file, blob: None } => Ok(vec![ReadKey::path_absent(
                 file.language(),

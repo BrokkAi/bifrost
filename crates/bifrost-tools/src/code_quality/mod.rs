@@ -405,8 +405,6 @@ pub use crate::code_quality::maintainability_size::ReportLongMethodAndGodObjectS
 
 pub use crate::code_quality::maintainability_size::ReportLongMethodAndGodObjectSmellsResult;
 
-pub use crate::code_quality::maintainability_size::find_long_method_and_god_object_smells;
-
 pub use crate::code_quality::maintainability_size::report_long_method_and_god_object_smells;
 
 pub use crate::code_quality::secret_like_code::ReportSecretLikeCodeParams;

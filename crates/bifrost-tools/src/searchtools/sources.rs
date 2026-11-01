@@ -916,14 +916,6 @@ fn semantic_model_source_outcome_with_anchor(
     if records.is_empty() {
         records = overlay.symbols_named(symbol).records;
     }
-    if records.is_empty() {
-        records = overlay
-            .symbols_named(symbol)
-            .records
-            .into_iter()
-            .filter(|model| model.qualified_name == symbol)
-            .collect();
-    }
     if let Some(required_path) = required_path {
         records.retain(|model| {
             matches!(
@@ -1283,7 +1275,7 @@ pub(crate) fn include_fallback_source_block(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
 ) -> Option<SourceBlock> {
-    let elements = include_fallback_elements(analyzer, file);
+    let elements = include_fallback_elements(analyzer, file).unwrap_or_default();
     if elements.is_empty() {
         return None;
     }

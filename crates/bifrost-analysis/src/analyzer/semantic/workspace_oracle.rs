@@ -44,8 +44,8 @@ pub(crate) use dispatch::{
 pub use source::PreparedSourceDispatchSession;
 #[doc(hidden)]
 pub use source::one_call_dispatch_answer_digest;
+pub(crate) use source::procedure_dispatch_question;
 pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsToResult};
-pub(crate) use source::{dispatch_answer_digest, procedure_dispatch_question};
 use std::fmt;
 use std::sync::Arc;
 pub use value_flow::{

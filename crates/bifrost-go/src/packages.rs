@@ -48,14 +48,17 @@ pub struct GoWorkspacePathIndex {
     representative_by_directory: HashMap<PathBuf, ProjectFile>,
     exact_import_paths: HashSet<String>,
     complete: bool,
+    completion: Vec<(u8, String)>,
 }
 
 impl GoWorkspacePathIndex {
     /// Complete path authority, excluding source positions and host mounts.
+    /// The answer certifies the cached value, so it covers the stable
+    /// completion as well as the index data: a changed gap set changes it.
     pub fn read_answer(&self) -> [u8; 32] {
         use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
         use brokk_bifrost_core::path_utils::{rel_path_string, workspace_relative_slash_path};
-        let mut hash = CanonicalHasher::new(b"go-workspace-paths-v1");
+        let mut hash = CanonicalHasher::new(b"go-workspace-paths-v2");
         hash.value(&[u8::from(self.complete)]);
         for root in &self.module_roots {
             hash.value(root.import_path.as_bytes());
@@ -77,7 +80,15 @@ impl GoWorkspacePathIndex {
             hash.value(dir.as_bytes());
             hash.value(file.as_bytes());
         });
+        hash.sequence("completion", &self.completion, |hash, (kind, detail)| {
+            hash.value(&[*kind]);
+            hash.value(detail.as_bytes());
+        });
         hash.finish()
+    }
+
+    pub fn set_completion(&mut self, completion: Vec<(u8, String)>) {
+        self.completion = completion;
     }
 
     /// `refused_sources` are the sources that source admission refused at the
@@ -124,6 +135,7 @@ impl GoWorkspacePathIndex {
             representative_by_directory,
             exact_import_paths: HashSet::default(),
             complete: complete && module_roots_complete,
+            completion: Vec::new(),
         };
         let mut exact_import_paths = HashSet::default();
         for file in &go_files {

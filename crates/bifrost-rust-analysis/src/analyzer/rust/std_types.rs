@@ -37,6 +37,9 @@
 //! with the query; all other facts come from the prepared trees and point
 //! resolver lookups.
 
+use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use brokk_bifrost_core::cancellation::CancellationToken;
 use std::ops::Range as ByteRange;
 use std::sync::{Arc, OnceLock};
 #[cfg(test)]
@@ -117,6 +120,7 @@ pub(crate) enum RustProofAttempt<T> {
     Incomplete {
         value: Option<T>,
         reason: &'static str,
+        cause: Option<DerivationExecutionCause>,
     },
 }
 
@@ -128,36 +132,149 @@ impl<T> RustProofAttempt<T> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProofStop {
+    reason: &'static str,
+    cause: Option<DerivationExecutionCause>,
+}
+
 thread_local! {
-    // Each entry belongs to one synchronous proof attempt. Nested external
-    // identity proofs run on the same worker and poison every enclosing
-    // attempt when they encounter an unfinished path. Nothing survives a query.
-    static PROOF_ATTEMPTS: RefCell<Vec<Option<&'static str>>> = const { RefCell::new(Vec::new()) };
+    // Nested attempts propagate stops to all enclosing proofs; nothing survives a query.
+    static PROOF_ATTEMPTS: RefCell<Vec<Option<ProofStop>>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn incomplete_proof(reason: &'static str) {
+    record_proof_stop(ProofStop {
+        reason,
+        cause: None,
+    });
+}
+
+pub(crate) fn operational_proof_stop(reason: &'static str, cause: DerivationExecutionCause) {
+    record_proof_stop(ProofStop {
+        reason,
+        cause: Some(cause),
+    });
+}
+
+fn record_proof_stop(stop: ProofStop) {
     PROOF_ATTEMPTS.with(|attempts| {
         for attempt in attempts.borrow_mut().iter_mut() {
-            attempt.get_or_insert(reason);
+            if attempt.is_none()
+                || (stop.cause.is_some()
+                    && attempt.is_some_and(|previous| previous.cause.is_none()))
+            {
+                *attempt = Some(stop);
+            }
         }
     });
 }
 
+pub(crate) fn cargo_route_execution_cause(
+    error: &brokk_bifrost_rust::graph_support::RustCargoRouteError,
+) -> DerivationExecutionCause {
+    use brokk_bifrost_rust::graph_support::RustCargoRouteError;
+    match error {
+        RustCargoRouteError::Cancelled => DerivationExecutionCause::Cancelled,
+        RustCargoRouteError::Unavailable => DerivationExecutionCause::Provider,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static NATIVE_PROOF_LIMITS: RefCell<Option<(ReceiverAnalysisBudget, Option<CancellationToken>)>> = const { RefCell::new(None) };
+}
+
+/// Restrict only native declaration proofs, leaving dispatch able to finish.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_rust_native_result_obligation_limits_for_test<T>(
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<CancellationToken>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NATIVE_PROOF_LIMITS.with(|limits| *limits.borrow_mut() = None);
+        }
+    }
+    NATIVE_PROOF_LIMITS.with(|limits| {
+        assert!(
+            limits
+                .borrow_mut()
+                .replace((budget, cancellation))
+                .is_none(),
+            "nested native proof limits"
+        );
+    });
+    let _reset = Reset;
+    run()
+}
+
+fn native_proof_limits(
+    analyzer: &dyn IAnalyzer,
+) -> (ReceiverAnalysisBudget, Option<CancellationToken>) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(limits) = NATIVE_PROOF_LIMITS.with(|limits| limits.borrow().clone()) {
+        return limits;
+    }
+    (
+        INTERACTIVE_TYPE_LOOKUP_BUDGET,
+        analyzer.active_query_cancellation(),
+    )
+}
+
+fn completed_native_proof<T>(
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+    proof: impl FnOnce() -> T,
+) -> (T, Option<DerivationExecutionCause>) {
+    let (attempt, read_cause) =
+        brokk_bifrost_analysis::analyzer::i_analyzer::capture_read_execution_cause(
+            analyzer,
+            || completed_proof(cancellation, || Some(proof())),
+        );
+    let (value, cause) = match attempt {
+        RustProofAttempt::Complete(value) => (value, read_cause),
+        RustProofAttempt::Incomplete { value, cause, .. } => (value, cause.or(read_cause)),
+    };
+    if cause.is_some() {
+        analyzer.mark_execution_dependent();
+    }
+    (
+        value.expect("a native proof always returns its value"),
+        cause,
+    )
+}
+
 pub(crate) fn observe_proof_resolution(resolution: &BoundedResolution<DefinitionLookupOutcome>) {
     match resolution {
-        BoundedResolution::Exceeded { .. } => incomplete_proof("exceeded"),
-        BoundedResolution::Cancelled { .. } => incomplete_proof("cancelled"),
-        BoundedResolution::Complete { value, .. } => {
-            if !matches!(
-                value.status,
-                DefinitionLookupStatus::Resolved
-                    | DefinitionLookupStatus::NoDefinition
-                    | DefinitionLookupStatus::UnresolvableImportBoundary
-                    | DefinitionLookupStatus::Ambiguous
-            ) {
-                incomplete_proof(value.status.as_str());
-            }
+        BoundedResolution::Exceeded { .. } => {
+            operational_proof_stop("exceeded", DerivationExecutionCause::Budget)
         }
+        BoundedResolution::Cancelled { .. } => {
+            operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled)
+        }
+        BoundedResolution::Complete { value, .. } => match value.status {
+            DefinitionLookupStatus::Resolved
+            | DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::UnresolvableImportBoundary
+            | DefinitionLookupStatus::Ambiguous => {}
+            DefinitionLookupStatus::Unavailable => {
+                operational_proof_stop("unavailable", DerivationExecutionCause::Provider)
+            }
+            DefinitionLookupStatus::Cancelled => {
+                operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled)
+            }
+            DefinitionLookupStatus::ExceededBudget(_) => {
+                operational_proof_stop("exceeded_budget", DerivationExecutionCause::Budget)
+            }
+            DefinitionLookupStatus::Incomplete => incomplete_proof("incomplete"),
+            DefinitionLookupStatus::UnsupportedLanguage => incomplete_proof("unsupported_language"),
+            DefinitionLookupStatus::InvalidLocation => incomplete_proof("invalid_location"),
+            DefinitionLookupStatus::NotFound => incomplete_proof("not_found"),
+        },
     }
 }
 
@@ -179,14 +296,23 @@ pub(crate) fn completed_proof<T>(
     PROOF_ATTEMPTS.with(|attempts| attempts.borrow_mut().push(None));
     let guard = Attempt;
     let value = proof();
-    if cancellation.is_some_and(|token| token.is_cancelled() || token.soft_deadline_passed()) {
-        incomplete_proof("cancelled_or_deadline");
+    // A soft deadline is a time budget; explicit cancellation is its own cause.
+    if let Some(token) = cancellation {
+        if token.is_cancelled() {
+            operational_proof_stop("cancelled_or_deadline", DerivationExecutionCause::Cancelled);
+        } else if token.soft_deadline_passed() {
+            operational_proof_stop("cancelled_or_deadline", DerivationExecutionCause::Budget);
+        }
     }
     let reason = PROOF_ATTEMPTS
         .with(|attempts| *attempts.borrow().last().expect("active Rust proof attempt"));
     drop(guard);
     match reason {
-        Some(reason) => RustProofAttempt::Incomplete { value, reason },
+        Some(stop) => RustProofAttempt::Incomplete {
+            value,
+            reason: stop.reason,
+            cause: stop.cause,
+        },
         None => RustProofAttempt::Complete(value),
     }
 }
@@ -284,12 +410,18 @@ pub(crate) trait RustTypeProofResolver {
     ) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>;
 
     fn cancellation(&self) -> Option<&brokk_bifrost_core::cancellation::CancellationToken>;
+
+    fn budget(&self) -> ReceiverAnalysisBudget {
+        INTERACTIVE_TYPE_LOOKUP_BUDGET
+    }
 }
 
 pub(crate) struct FactoryRustTypeProofResolver<'a> {
     analyzer: &'a dyn IAnalyzer,
     definition_operation_factory:
         OnceLock<Option<crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'a>>>,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<CancellationToken>,
 }
 
 impl<'a> FactoryRustTypeProofResolver<'a> {
@@ -301,7 +433,7 @@ impl<'a> FactoryRustTypeProofResolver<'a> {
                 let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
                 crate::analyzer::rust::native_points::RustDefinitionOperationFactory::new(
                     self.analyzer,
-                    &cancellation,
+                    self.cancellation.as_ref().unwrap_or(&cancellation),
                 )
             })
             .as_ref()
@@ -341,7 +473,11 @@ impl RustTypeProofResolver for FactoryRustTypeProofResolver<'_> {
     }
 
     fn cancellation(&self) -> Option<&brokk_bifrost_core::cancellation::CancellationToken> {
-        None
+        self.cancellation.as_ref()
+    }
+
+    fn budget(&self) -> ReceiverAnalysisBudget {
+        self.budget
     }
 }
 
@@ -484,7 +620,9 @@ pub(crate) fn rust_standard_result_variant(
     let proof = RustTypeProof::new(analyzer)?;
     let rust_source = proof.source(file)?;
     if rust_source.text() != source {
-        incomplete_proof("source_mismatch");
+        // Within one snapshot the caller's text equals the prepared text, so a
+        // mismatch means one side is stale: an operational state, not content.
+        operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
         return None;
     }
     let node = rust_source
@@ -595,6 +733,8 @@ impl<'a> RustTypeProof<'a, FactoryRustTypeProofResolver<'a>> {
             resolver: FactoryRustTypeProofResolver {
                 analyzer,
                 definition_operation_factory: OnceLock::new(),
+                budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                cancellation: None,
             },
         })
     }
@@ -644,7 +784,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             source: source.text(),
             tree: Some(source.tree()),
             site: &site,
-            budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            budget: self.resolver.budget(),
             cancellation: None,
         };
         let resolution = self.resolver.resolve(BoundedReceiverQuery {
@@ -709,7 +849,17 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             scope.token(),
             target,
         )
-        .map_err(|_| "native_trait_signature_unknown")?;
+        .map_err(|error| {
+            use brokk_bifrost_rust::graph_support::RustCargoRouteError;
+            operational_proof_stop(
+                match error {
+                    RustCargoRouteError::Cancelled => "Cancelled",
+                    RustCargoRouteError::Unavailable => "Unavailable",
+                },
+                cargo_route_execution_cause(&error),
+            );
+            "native_trait_signature_unknown"
+        })?;
         let Some(trait_owner) = trait_owner else {
             return Ok(None);
         };
@@ -2147,11 +2297,17 @@ pub fn rust_native_result_obligation(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
     result_ordinal: u32,
-) -> RustNativeObligationProof {
-    let Some(proof) = RustTypeProof::new(analyzer) else {
-        return RustNativeObligationProof::Open("native_rust_analyzer");
-    };
-    proof.native_obligation_for_target(target, result_ordinal)
+) -> (RustNativeObligationProof, Option<DerivationExecutionCause>) {
+    let (budget, cancellation) = native_proof_limits(analyzer);
+    completed_native_proof(analyzer, cancellation.as_ref(), || {
+        let Some(mut proof) = RustTypeProof::new(analyzer) else {
+            incomplete_proof("analyzer_unavailable");
+            return RustNativeObligationProof::Open("native_rust_analyzer");
+        };
+        proof.resolver.budget = budget;
+        proof.resolver.cancellation = cancellation.clone();
+        proof.native_obligation_for_target(target, result_ordinal)
+    })
 }
 
 /// Whether `call` is the resolver-proven prelude `drop` wrapper. The wrapper
@@ -2162,10 +2318,25 @@ pub fn rust_call_is_standard_drop(
     file: &ProjectFile,
     source: &str,
     range: Range,
+) -> (bool, Option<DerivationExecutionCause>) {
+    let (budget, cancellation) = native_proof_limits(analyzer);
+    completed_native_proof(analyzer, cancellation.as_ref(), || {
+        let Some(mut proof) = RustTypeProof::new(analyzer) else {
+            incomplete_proof("analyzer_unavailable");
+            return false;
+        };
+        proof.resolver.budget = budget;
+        proof.resolver.cancellation = cancellation.clone();
+        standard_drop_with_proof(&proof, file, source, range)
+    })
+}
+
+fn standard_drop_with_proof(
+    proof: &RustTypeProof<'_>,
+    file: &ProjectFile,
+    source: &str,
+    range: Range,
 ) -> bool {
-    let Some(proof) = RustTypeProof::new(analyzer) else {
-        return false;
-    };
     let Some(rust_source) = proof.source(file) else {
         return false;
     };
@@ -2356,7 +2527,7 @@ pub(crate) fn rust_nominal_receiver_application_with_operation<'analyzer, 'tree>
         let prove = |proof: &RustTypeProof<'_, _>| {
             let rust_source = proof.source(file)?;
             if rust_source.text() != source {
-                incomplete_proof("source_mismatch");
+                operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
                 return None;
             }
             proof.nominal_type_owner(&rust_source, ty)
@@ -2380,7 +2551,7 @@ pub(crate) fn rust_nominal_receiver_application_with_operation<'analyzer, 'tree>
                 // The factory resolver owns its operation when no selection is supplied.
                 let rust_source = proof.source(file)?;
                 if rust_source.text() != source {
-                    incomplete_proof("source_mismatch");
+                    operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
                     return None;
                 }
                 proof.nominal_type_owner(&rust_source, ty)
@@ -2398,7 +2569,7 @@ fn rust_method_receiver_owner_with_proof<R: RustTypeProofResolver>(
 ) -> Option<(RustReceiverOwner, usize)> {
     let rust_source = proof.source(file)?;
     if rust_source.text() != source {
-        incomplete_proof("source_mismatch");
+        operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
         return None;
     }
     let name = rust_source
@@ -2957,12 +3128,25 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#8411: an earlier static gap hid a later operational proof stop")]
     fn nested_receiver_completion_preserves_values_and_unwinds() {
-        for status in [
-            DefinitionLookupStatus::Unavailable,
-            DefinitionLookupStatus::Cancelled,
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+        for (status, expected) in [
+            (
+                DefinitionLookupStatus::Unavailable,
+                DerivationExecutionCause::Provider,
+            ),
+            (
+                DefinitionLookupStatus::Cancelled,
+                DerivationExecutionCause::Cancelled,
+            ),
+            (
+                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+                DerivationExecutionCause::Budget,
+            ),
         ] {
             let attempt = completed_proof(None, || {
+                incomplete_proof("depth_limit");
                 let nested = completed_proof(None, || {
                     observe_proof_resolution(&BoundedResolution::Complete {
                         value: DefinitionLookupOutcome {
@@ -2980,14 +3164,19 @@ mod tests {
                 assert_eq!(nested.into_value(), Some(7));
                 Some(9)
             });
-            assert!(matches!(
-                attempt,
-                RustProofAttempt::Incomplete { value: Some(9), .. }
-            ));
+            let RustProofAttempt::Incomplete {
+                value: Some(9),
+                reason,
+                cause,
+            } = attempt
+            else {
+                panic!("an operational stop must preserve the retained value");
+            };
+            assert_eq!(cause, Some(expected), "{reason}");
         }
         let panic = std::panic::catch_unwind(|| {
             completed_proof::<()>(None, || {
-                incomplete_proof("cancelled");
+                operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled);
                 panic!("proof interrupted");
             })
         });

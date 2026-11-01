@@ -553,10 +553,20 @@ pub(in crate::analyzer::java::semantic) fn java_local_scope(
     .map(|scope| (scope.start_byte(), scope.end_byte()))
 }
 
+pub(in crate::analyzer::java::semantic) fn is_qualified_this(node: Node<'_>) -> bool {
+    node.kind() == "field_access"
+        && named_children(node)
+            .last()
+            .is_some_and(|child| child.kind() == "this")
+}
+
 pub(in crate::analyzer::java::semantic) fn expression_value_kind(
     node: Node<'_>,
 ) -> SemanticValueKind {
     match node.kind() {
+        "field_access" if is_qualified_this(node) => {
+            SemanticValueKind::LanguageDefined("java.qualified_this".into())
+        }
         "lambda_expression" | "method_reference" => SemanticValueKind::Callable,
         "null_literal" => SemanticValueKind::Null,
         "decimal_integer_literal"

@@ -117,7 +117,8 @@ use std::sync::Arc;
 // invalidate artifacts that reached the former module-scope rule.
 // #7182: native member-operation names change on the uncached import-read path.
 // #5658: native lexical presentation changes reparsing reachable from lowering.
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v53";
+// #8306: await binds its operand and result values in the shared scaffold.
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v54";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -8059,14 +8060,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
         let awaited_node = first_named_child(node);
+        let awaited = awaited_node
+            .map(|awaited_node| {
+                let kind = self.expression_value_kind(awaited_node);
+                self.expression_value(builder, awaited_node, kind)
+            })
+            .transpose()?;
+        let result = self.expression_value(builder, node, SemanticValueKind::AwaitResult)?;
         let AwaitScaffold {
             suspend,
             normal_resume: normal,
             exceptional_resume: exceptional,
-            ..
         } = self
             .session
-            .add_await_scaffold(builder, |session, builder| {
+            .add_await_scaffold(builder, awaited, result, |session, builder| {
                 session.add_node_mapping(builder, node)
             })?;
         self.session.add_target_edge(builder, normal, next)?;

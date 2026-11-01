@@ -1819,6 +1819,7 @@ impl CSharpAssemblyPackProducer {
                 generic_trait_impls_complete: false,
                 jvm_inventory: Some(
                     brokk_bifrost_analysis::analyzer::semantic_model::JvmOwnerInventory {
+                        enclosing_type_parameters: Vec::new(),
                         supertypes,
                         supertypes_complete,
                         nested_types: nested_types_by_owner

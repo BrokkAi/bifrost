@@ -13,7 +13,9 @@ use crate::analyzer::{
     TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
+use brokk_bifrost_core::analyzer::capabilities::{
+    Cancelled, DescendantIndexScope, HierarchyAnswer, HierarchyQuery, MemberFamilyAncestors,
+};
 
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -1255,7 +1257,274 @@ impl ImportAnalysisProvider for MultiAnalyzer {
     }
 }
 
+impl MultiAnalyzer {
+    fn complete_workspace_descendants(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+        token: QueryToken<'_>,
+        mut descendants: HierarchyAnswer,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        for language in self.languages() {
+            let support = crate::analyzer::languages::language_support_for_hook(
+                language,
+                "workspace_additional_direct_descendants",
+            )
+            .expect("registered delegate has language support");
+            match support.workspace_additional_direct_descendants(self, token, code_unit, scope) {
+                Some(edges) => descendants.merge(HierarchyAnswer::complete(edges.into_iter().collect())),
+                None if scope.cancellation().is_cancelled() => return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled),
+                None => descendants.open.push(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable),
+            }
+        }
+        descendants.edges.sort();
+        descendants.edges.dedup();
+        if !descendants.is_complete() {
+            crate::analyzer::record_descendant_query_failure(self);
+            return Ok(descendants);
+        }
+        if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
+        {
+            // Descendants are a cross-file answer: a subclass added in a file
+            // the reader never mentions changes it, and no per-file key the
+            // reader recorded moves.
+            self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+                crate::analyzer::read_ledger::LookupKind::Descendants,
+                crate::analyzer::read_ledger::LookupQuestion::declaration(code_unit),
+                crate::analyzer::read_ledger::declaration_set_digest(&descendants.edges),
+            ));
+        }
+        Ok(descendants)
+    }
+
+    fn with_selected_hierarchy_queries(
+        &self,
+        root: Option<&CodeUnit>,
+        run: &mut dyn FnMut(&mut dyn HierarchyQuery),
+    ) {
+        let root_language = root.map(|unit| language_for_file(unit.source()));
+        let is_jvm = |language| {
+            matches!(
+                language,
+                Language::Java | Language::Kotlin | Language::Scala
+            )
+        };
+        // Callback borrows require eager nesting. A known root enters only its
+        // delegate and, for JVM roots, the other JVM realm delegates. A rootless
+        // walk enters every delegate. The nesting depth is bounded by languages,
+        // not workspace declarations; all query steps remain sequential.
+        let providers = self
+            .delegates
+            .iter()
+            .filter_map(|(language, delegate)| {
+                let selected = root_language
+                    .is_none_or(|root| root == *language || (is_jvm(root) && is_jvm(*language)));
+                selected
+                    .then(|| {
+                        delegate
+                            .type_hierarchy_provider()
+                            .map(|provider| (*language, provider))
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        let mut fallback = UnenteredHierarchyQuery(self);
+        nest_hierarchy_queries(&providers, root, &mut fallback, &mut |query| {
+            run(&mut WorkspaceHierarchyQuery {
+                workspace: self,
+                query,
+            });
+        });
+    }
+}
+
+// Each level retains one delegate callback borrow until the outer walk ends.
+fn nest_hierarchy_queries(
+    providers: &[(Language, &dyn TypeHierarchyProvider)],
+    root: Option<&CodeUnit>,
+    previous: &mut dyn HierarchyQuery,
+    run: &mut dyn FnMut(&mut dyn HierarchyQuery),
+) {
+    if let Some(((language, provider), rest)) = providers.split_first() {
+        let mut enter = |query: &mut dyn HierarchyQuery| {
+            let mut routed = DelegateHierarchyQuery {
+                language: *language,
+                query,
+                previous,
+            };
+            nest_hierarchy_queries(rest, root, &mut routed, run);
+        };
+        match root {
+            Some(root) => provider.with_hierarchy_query_for(root, &mut enter),
+            None => provider.with_hierarchy_query(&mut enter),
+        }
+    } else {
+        run(previous);
+    }
+}
+
+struct DelegateHierarchyQuery<'a> {
+    language: Language,
+    query: &'a mut dyn HierarchyQuery,
+    previous: &'a mut dyn HierarchyQuery,
+}
+impl DelegateHierarchyQuery<'_> {
+    fn for_unit(&mut self, unit: &CodeUnit) -> &mut dyn HierarchyQuery {
+        if language_for_file(unit.source()) == self.language {
+            self.query
+        } else {
+            self.previous
+        }
+    }
+}
+impl HierarchyQuery for DelegateHierarchyQuery<'_> {
+    fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+        self.for_unit(unit).direct_ancestors(unit)
+    }
+    fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+        self.for_unit(unit).direct_descendants(unit)
+    }
+    fn member_family_ancestors(&mut self, unit: &CodeUnit) -> MemberFamilyAncestors {
+        self.for_unit(unit).member_family_ancestors(unit)
+    }
+    fn direct_ancestors_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        self.for_unit(unit).direct_ancestors_within(unit, scope)
+    }
+    fn direct_descendants_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        self.for_unit(unit).direct_descendants_within(unit, scope)
+    }
+}
+
+struct UnenteredHierarchyQuery<'a>(&'a MultiAnalyzer);
+impl UnenteredHierarchyQuery<'_> {
+    fn provider(&self, unit: &CodeUnit) -> Option<&dyn TypeHierarchyProvider> {
+        self.0
+            .delegate_for_code_unit(unit)
+            .and_then(AnalyzerDelegate::type_hierarchy_provider)
+    }
+}
+impl HierarchyQuery for UnenteredHierarchyQuery<'_> {
+    fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+        self.provider(unit)
+            .map(|provider| provider.get_direct_ancestors(unit))
+            .unwrap_or_default()
+    }
+    fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+        let cancellation = crate::cancellation::CancellationToken::new();
+        self.direct_descendants_within(unit, &DescendantIndexScope::whole_workspace(&cancellation))
+            .expect("uncancelled hierarchy completes")
+    }
+    fn member_family_ancestors(&mut self, unit: &CodeUnit) -> MemberFamilyAncestors {
+        self.provider(unit)
+            .map(|provider| provider.member_family_ancestors(unit))
+            .unwrap_or_default()
+    }
+    fn direct_ancestors_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        self.provider(unit)
+            .map(|provider| provider.get_direct_ancestors_within(unit, scope))
+            .unwrap_or_else(|| Ok(HierarchyAnswer::default()))
+    }
+    fn direct_descendants_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        match self.provider(unit) {
+            Some(provider) => provider.get_direct_descendants_within(unit, scope),
+            None if scope.cancellation().is_cancelled() => Err(Cancelled),
+            None => Ok(HierarchyAnswer { open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable], ..Default::default() }),
+        }
+    }
+}
+
+struct WorkspaceHierarchyQuery<'a> {
+    workspace: &'a MultiAnalyzer,
+    query: &'a mut dyn HierarchyQuery,
+}
+impl HierarchyQuery for WorkspaceHierarchyQuery<'_> {
+    fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+        let scope = AnalyzerQueryScope::new(self.workspace);
+        let support = crate::analyzer::languages::language_support_for_hook(
+            language_for_file(unit.source()),
+            "workspace_direct_ancestors",
+        );
+        if let Some(ancestors) = support.and_then(|support| {
+            support.workspace_direct_ancestors(self.workspace, scope.token(), unit)
+        }) {
+            return HierarchyAnswer::complete(ancestors);
+        }
+        self.query.direct_ancestors(unit)
+    }
+    fn member_family_ancestors(&mut self, unit: &CodeUnit) -> MemberFamilyAncestors {
+        let mut ancestors = self.query.member_family_ancestors(unit);
+        let answer = self.direct_ancestors(unit);
+        ancestors.resolved = answer.edges;
+        ancestors.ambiguous = answer.ambiguous;
+        ancestors
+    }
+    fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+        let cancellation = crate::cancellation::CancellationToken::new();
+        self.direct_descendants_within(unit, &DescendantIndexScope::whole_workspace(&cancellation))
+            .expect("uncancelled hierarchy completes")
+    }
+    fn direct_ancestors_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        let query_scope = AnalyzerQueryScope::new(self.workspace);
+        if let Some(answer) = crate::analyzer::languages::language_support_for_hook(
+            language_for_file(unit.source()),
+            "workspace_direct_ancestors_within",
+        )
+        .and_then(|support| {
+            support.workspace_direct_ancestors_within(
+                self.workspace,
+                query_scope.token(),
+                unit,
+                scope,
+            )
+        }) {
+            return answer.map(HierarchyAnswer::complete).ok_or(Cancelled);
+        }
+        self.query.direct_ancestors_within(unit, scope)
+    }
+    fn direct_descendants_within(
+        &mut self,
+        unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Result<HierarchyAnswer, Cancelled> {
+        let query_scope = AnalyzerQueryScope::new(self.workspace);
+        let descendants = self.query.direct_descendants_within(unit, scope)?;
+        self.workspace
+            .complete_workspace_descendants(unit, scope, query_scope.token(), descendants)
+    }
+}
+
 impl TypeHierarchyProvider for MultiAnalyzer {
+    fn with_hierarchy_query(&self, run: &mut dyn FnMut(&mut dyn HierarchyQuery)) {
+        self.with_selected_hierarchy_queries(None, run);
+    }
+    fn with_hierarchy_query_for(
+        &self,
+        root: &CodeUnit,
+        run: &mut dyn FnMut(&mut dyn HierarchyQuery),
+    ) {
+        self.with_selected_hierarchy_queries(Some(root), run);
+    }
+
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
@@ -1288,7 +1557,9 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
             .map(|provider| provider.member_family_ancestors(owner))
             .unwrap_or_default();
-        ancestors.resolved = self.get_direct_ancestors(owner).edges;
+        let answer = self.get_direct_ancestors(owner);
+        ancestors.resolved = answer.edges;
+        ancestors.ambiguous = answer.ambiguous;
         ancestors
     }
 
@@ -1345,7 +1616,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        let mut descendants = match self
+        let descendants = match self
             .delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
         {
@@ -1355,36 +1626,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             }
             None => HierarchyAnswer { open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable], ..HierarchyAnswer::default() },
         };
-        for language in self.languages() {
-            let support = crate::analyzer::languages::language_support_for_hook(
-                language,
-                "workspace_additional_direct_descendants",
-            )
-            .expect("registered delegate has language support");
-            match support.workspace_additional_direct_descendants(self, token, code_unit, scope) {
-                Some(edges) => descendants.merge(HierarchyAnswer::complete(edges.into_iter().collect())),
-                None if scope.cancellation().is_cancelled() => return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled),
-                None => descendants.open.push(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable),
-            }
-        }
-        descendants.edges.sort();
-        descendants.edges.dedup();
-        if !descendants.is_complete() {
-            crate::analyzer::record_descendant_query_failure(self);
-            return Ok(descendants);
-        }
-        if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
-        {
-            // Descendants are a cross-file answer: a subclass added in a file
-            // the reader never mentions changes it, and no per-file key the
-            // reader recorded moves.
-            self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
-                crate::analyzer::read_ledger::LookupKind::Descendants,
-                crate::analyzer::read_ledger::LookupQuestion::declaration(code_unit),
-                crate::analyzer::read_ledger::declaration_set_digest(&descendants.edges),
-            ));
-        }
-        Ok(descendants)
+        self.complete_workspace_descendants(code_unit, scope, token, descendants)
     }
 }
 
@@ -1894,6 +2136,19 @@ impl CodeUnitIndex for MultiAnalyzer {
 }
 
 impl IAnalyzer for MultiAnalyzer {
+    fn selected_parse_variant(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<brokk_bifrost_core::gitblob::ParseVariant> {
+        if !file.language().uses_configured_parse_variants() {
+            return Some(brokk_bifrost_core::gitblob::ParseVariant::Empty);
+        }
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().selected_parse_variant(file),
+            None => None,
+        }
+    }
+
     fn dynamic_import_sources(
         &self,
         seed_files: Option<&[ProjectFile]>,
@@ -2156,7 +2411,7 @@ impl IAnalyzer for MultiAnalyzer {
             .lock()
             .expect("multi-analyzer query context mutex poisoned");
         if !contexts.iter().any(|active| Arc::ptr_eq(active, context)) {
-            crate::analyzer::i_analyzer::inherit_query_incompleteness(context, &contexts);
+            crate::analyzer::i_analyzer::inherit_query_incompleteness(context);
             contexts.push(Arc::clone(context));
             if context.read_ledger().is_some() {
                 self.attached_read_ledgers.fetch_add(1, Ordering::Relaxed);
@@ -2166,6 +2421,37 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegates
             .values()
             .for_each(|delegate| delegate.analyzer().begin_query(context));
+        // Readers retain selected snapshots and weak owners, never an analyzer/project cycle.
+        let readers = self
+            .delegates
+            .iter()
+            .filter_map(|(language, delegate)| {
+                language
+                    .uses_configured_parse_variants()
+                    .then(|| {
+                        delegate
+                            .analyzer()
+                            .project_parse_variant_reader()
+                            .map(|reader| (*language, reader))
+                    })
+                    .flatten()
+            })
+            .collect::<BTreeMap<_, _>>();
+        let reader: crate::analyzer::tree_sitter_analyzer::ProjectVariantReader =
+            Arc::new(move |file| {
+                if !file.language().uses_configured_parse_variants() {
+                    return Ok(Some(brokk_bifrost_core::gitblob::ParseVariant::Empty));
+                }
+                let Some(reader) = readers.get(&file.language()) else {
+                    return Ok(None);
+                };
+                reader(file)
+            });
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .set_project_parse_variant_reader(Arc::clone(&reader));
+        }
     }
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
@@ -2274,12 +2560,23 @@ impl IAnalyzer for MultiAnalyzer {
         self.prefetch_delegates(fq_names);
     }
 
+    fn prefetch_parse_variants(&self, files: &[ProjectFile]) {
+        let mut groups: HashMap<Language, Vec<ProjectFile>> = HashMap::default();
+        for file in files {
+            groups
+                .entry(self.dispatch_language(file))
+                .or_default()
+                .push(file.clone());
+        }
+        for (language, paths) in groups {
+            if let Some(delegate) = self.delegates.get(&language) {
+                delegate.analyzer().prefetch_parse_variants(&paths);
+            }
+        }
+    }
+
     fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
-        let contexts = self
-            .query_contexts
-            .lock()
-            .expect("multi-analyzer query context mutex poisoned");
-        crate::analyzer::i_analyzer::current_query_context_value(&contexts, |context| {
+        crate::analyzer::i_analyzer::current_query_context_value(|context| {
             context.cancellation().cloned()
         })
     }
@@ -2291,9 +2588,14 @@ impl IAnalyzer for MultiAnalyzer {
             .query_contexts
             .lock()
             .expect("multi-analyzer query context mutex poisoned");
-        crate::analyzer::i_analyzer::innermost_query_context_value(&contexts, |context| {
-            context.semantic_model_overlay_override_for_current_thread()
-        })
+        crate::analyzer::i_analyzer::registered_query_context_value(
+            |context| {
+                contexts
+                    .iter()
+                    .any(|registered| Arc::ptr_eq(registered, context))
+            },
+            |context| context.semantic_model_overlay_override_for_current_thread(),
+        )
     }
 
     fn active_query_semantic_model_snapshot(
@@ -2303,9 +2605,14 @@ impl IAnalyzer for MultiAnalyzer {
             .query_contexts
             .lock()
             .expect("multi-analyzer query context mutex poisoned");
-        crate::analyzer::i_analyzer::innermost_query_context_value(&contexts, |context| {
-            context.active_semantic_model_snapshot_override_for_current_thread()
-        })
+        crate::analyzer::i_analyzer::registered_query_context_value(
+            |context| {
+                contexts
+                    .iter()
+                    .any(|registered| Arc::ptr_eq(registered, context))
+            },
+            |context| context.active_semantic_model_snapshot_override_for_current_thread(),
+        )
     }
 
     fn relational_definition_batch(
@@ -2424,14 +2731,7 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn current_query_read_completion(&self) -> Result<(), QueryReadIncomplete> {
-        let contexts = self
-            .query_contexts
-            .lock()
-            .expect("multi-analyzer query context mutex poisoned");
-        crate::analyzer::i_analyzer::current_query_context_value(&contexts, |context| {
-            context.read_completion().err()
-        })
-        .map_or(Ok(()), Err)
+        crate::analyzer::i_analyzer::current_domain_read_completion()
     }
 
     fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
@@ -3583,7 +3883,104 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    struct Provider {
+        language: Language,
+        entries: AtomicUsize,
+        active: AtomicBool,
+    }
+    struct Query<'a>(&'a Provider);
+    impl Drop for Query<'_> {
+        fn drop(&mut self) {
+            assert!(self.0.active.swap(false, Ordering::SeqCst));
+        }
+    }
+    impl HierarchyQuery for Query<'_> {
+        fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+            assert!(self.0.active.load(Ordering::SeqCst));
+            assert_eq!(language_for_file(unit.source()), self.0.language);
+            HierarchyAnswer::complete(vec![unit.clone()])
+        }
+        fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
+            self.direct_ancestors(unit)
+        }
+        fn member_family_ancestors(&mut self, unit: &CodeUnit) -> MemberFamilyAncestors {
+            assert_eq!(language_for_file(unit.source()), self.0.language);
+            MemberFamilyAncestors {
+                resolved: vec![unit.clone()],
+                ..Default::default()
+            }
+        }
+    }
+    impl TypeHierarchyProvider for Provider {
+        fn with_hierarchy_query(&self, run: &mut dyn FnMut(&mut dyn HierarchyQuery)) {
+            self.entries.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.active.swap(true, Ordering::SeqCst));
+            run(&mut Query(self));
+        }
+        fn get_direct_ancestors(&self, _unit: &CodeUnit) -> HierarchyAnswer {
+            panic!("entered delegates must use their retained query")
+        }
+        fn get_direct_descendants(&self, _unit: &CodeUnit) -> HierarchyAnswer {
+            panic!("entered delegates must use their retained query")
+        }
+    }
+
+    #[test]
+    fn nested_delegate_queries_remain_live_and_enter_once_across_steps() {
+        let provider = |language| Provider {
+            language,
+            entries: AtomicUsize::new(0),
+            active: AtomicBool::new(false),
+        };
+        let java = provider(Language::Java);
+        let scala = provider(Language::Scala);
+        let delegates = [
+            (Language::Java, &java as &dyn TypeHierarchyProvider),
+            (Language::Scala, &scala as &dyn TypeHierarchyProvider),
+        ];
+        // The base adapter must never be reached for either selected language.
+        let mut fallback =
+            brokk_bifrost_core::analyzer::capabilities::ForwardingHierarchyQuery(&java);
+        let unit = |path| {
+            CodeUnit::new(
+                ProjectFile::new(std::env::temp_dir(), path),
+                brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
+                "",
+                "Child",
+            )
+        };
+        let java_unit = unit("Child.java");
+        let scala_unit = unit("Child.scala");
+        nest_hierarchy_queries(&delegates, None, &mut fallback, &mut |query| {
+            assert!(java.active.load(Ordering::SeqCst));
+            assert!(scala.active.load(Ordering::SeqCst));
+            assert_eq!(
+                query.direct_ancestors(&java_unit).edges,
+                vec![java_unit.clone()]
+            );
+            assert_eq!(
+                query.direct_descendants(&scala_unit).edges,
+                vec![scala_unit.clone()]
+            );
+            assert_eq!(
+                query.member_family_ancestors(&java_unit).resolved,
+                vec![java_unit.clone()]
+            );
+            assert_eq!(
+                query.direct_ancestors(&scala_unit).edges,
+                vec![scala_unit.clone()]
+            );
+        });
+        assert_eq!(java.entries.load(Ordering::SeqCst), 1);
+        assert_eq!(scala.entries.load(Ordering::SeqCst), 1);
+        assert!(!java.active.load(Ordering::SeqCst));
+        assert!(!scala.active.load(Ordering::SeqCst));
+    }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

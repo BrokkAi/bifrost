@@ -1377,6 +1377,7 @@ mod jvm_extraction_tests {
                 "java",
                 GenerationId::BOOTSTRAP,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: brokk_bifrost_core::path_utils::rel_path_string(&file),
                     blob_oid: oid,
                 }],
@@ -1519,6 +1520,7 @@ mod jvm_extraction_tests {
                 "java",
                 GenerationId::BOOTSTRAP,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: "src/demo/Sample.java".to_string(),
                     blob_oid: old_oid,
                 }],
@@ -1534,6 +1536,7 @@ mod jvm_extraction_tests {
                 "java",
                 GenerationId::BOOTSTRAP,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: "src/demo/Sample.java".to_string(),
                     blob_oid: new_oid,
                 }],
@@ -1810,6 +1813,7 @@ mod jvm_extraction_tests {
                 .unwrap();
             oids.push((package, oid));
             workspace_files.push(WorkspaceFileRow {
+                decision: None,
                 rel_path: brokk_bifrost_core::path_utils::rel_path_string(&file),
                 blob_oid: oid,
             });
@@ -2195,6 +2199,7 @@ mod jvm_extraction_tests {
                 "java",
                 b,
                 &[WorkspaceFileRow {
+                    decision: None,
                     rel_path: row.rel_path.clone(),
                     blob_oid: row.blob_oid,
                 }],
@@ -2211,6 +2216,7 @@ mod jvm_extraction_tests {
                     "java",
                     a,
                     &[WorkspaceFileRow {
+                        decision: None,
                         rel_path: row.rel_path.clone(),
                         blob_oid: row.blob_oid,
                     }],
@@ -3382,6 +3388,7 @@ mod jvm_extraction_tests {
                 )
                 .unwrap();
             workspace_files.push(WorkspaceFileRow {
+                decision: None,
                 rel_path: format!("src/demo/Sample_{index}.java"),
                 blob_oid: oid,
             });

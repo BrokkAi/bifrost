@@ -1,5 +1,12 @@
 //! Revision publication shared by source projections and retained configuration.
 
+pub(super) const OPEN_PARTITION_DECISIONS_SQL: &str = "SELECT files.file_version_id, files.rel_path, files.blob_oid, files.projection_digest,
+                    decisions.decision_digest, decisions.assignment_digest
+             FROM workspace_file_versions AS files
+             LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+             WHERE files.workspace_id = ?1 AND files.lang = ?2 AND files.generation = ?3
+               AND files.input_kind = ?4 AND files.valid_until IS NULL";
+
 use git2::Oid;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -189,6 +196,7 @@ impl WorkspaceConfigurationInput {
             relative_path: &self.relative_path,
             content_oid: self.content_oid(),
             projection_digest: None,
+            csharp_decision: None,
         }
     }
 
@@ -416,6 +424,7 @@ pub(super) struct WorkspaceInputRow<'a> {
     pub relative_path: &'a str,
     pub content_oid: Oid,
     pub projection_digest: Option<&'a str>,
+    pub csharp_decision: Option<super::csharp_compilation::FileVersionDecision>,
 }
 
 /// A live source that source admission refused. It has no source row; this
@@ -637,12 +646,7 @@ pub(super) fn replace_workspace_input_partitions(
                 row.relative_path
             );
         }
-        let mut statement = tx.prepare_cached(
-            "SELECT file_version_id, rel_path, blob_oid, projection_digest
-             FROM workspace_file_versions
-             WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
-               AND input_kind = ?4 AND valid_until IS NULL",
-        )?;
+        let mut statement = tx.prepare_cached(OPEN_PARTITION_DECISIONS_SQL)?;
         let rows = statement.query_map(
             params![
                 workspace_id.as_str(),
@@ -656,17 +660,20 @@ pub(super) fn replace_workspace_input_partitions(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    super::csharp_compilation::decode_file_decision(row, 4)?,
                 ))
             },
         )?;
         for row in rows {
-            let (id, path, oid, digest) = row?;
+            let (id, path, oid, digest, decision) = row?;
             if partition.foreign_paths.contains(&path) {
                 continue;
             }
             let old_oid = Oid::from_str(&oid)?;
             let unchanged = incoming.get(path.as_str()).is_some_and(|new| {
-                new.content_oid == old_oid && new.projection_digest == digest.as_deref()
+                new.content_oid == old_oid
+                    && new.projection_digest == digest.as_deref()
+                    && new.csharp_decision == decision
             });
             if unchanged {
                 incoming.remove(path.as_str());
@@ -747,10 +754,19 @@ pub(super) fn publish_workspace_input_changes(
                         row.projection_digest,
                         revision,
                     ])?;
-                    inserted.insert(
-                        (*kind, row.relative_path.to_owned()),
-                        tx.last_insert_rowid(),
-                    );
+                    let file_version_id = tx.last_insert_rowid();
+                    if let Some(decision) = row.csharp_decision {
+                        assert!(
+                            lang == "csharp" && *kind == WorkspaceInputKind::Source,
+                            "only C# source file versions carry decisions"
+                        );
+                        tx.execute(
+                            "INSERT INTO csharp_file_version_decisions(file_version_id, decision_digest, assignment_digest)
+                             VALUES(?1, ?2, ?3)",
+                            params![file_version_id, decision.decision_digest.as_slice(), decision.assignment_digest.as_slice()],
+                        )?;
+                    }
+                    inserted.insert((*kind, row.relative_path.to_owned()), file_version_id);
                 }
             }
             {
@@ -807,6 +823,14 @@ pub(super) fn publish_workspace_input_changes(
     };
     super::dependency_file_evidence::publish(tx, &snapshot)?;
     super::csharp_compilation::publish(tx, &snapshot)?;
+    if lang == super::csharp_compilation::STORAGE_LANGUAGE {
+        let changed = closed_ids
+            .iter()
+            .copied()
+            .chain(inserted.values().copied())
+            .collect::<Vec<_>>();
+        super::csharp_compilation::extent::publish(tx, &snapshot, head, &changed)?;
+    }
     Ok((snapshot, inserted))
 }
 

@@ -177,31 +177,31 @@ Conditional: assembly=None
     namespace Shared.Targets alias=None origin=item
   friends complete=false: []
 gaps:
-  unsupported_project_items Blazor/Blazor.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Blazor/Blazor.csproj Microsoft.NET.Sdk.BlazorWebAssembly generated Razor component declarations and SDK Compile effects: BaseIntermediateOutputPath=obj/ (inside project); Configuration=Debug (inside project); TargetFramework=net8.0 (inside project); IntermediateOutputPath=obj/Debug/net8.0/ (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Blazor/Blazor.csproj a non-SDK project's transitive reference flow is not modeled
-  unsupported_project_items Browser/Browser.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Browser/Browser.csproj Microsoft.NET.Sdk.Web generated Razor/cshtml declarations and SDK Compile effects: AppDesignerFolder=Properties (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Browser/Browser.csproj a non-SDK project's transitive reference flow is not modeled
   unresolved_assembly_name Conditional/Conditional.csproj AssemblyName has a dynamic value or condition
   unresolved_global_usings Conditional/Conditional.csproj ImplicitUsings has a dynamic value or condition
   unresolved_global_usings Conditional/Conditional.csproj unsupported using item: [("Include", "Conditional.Namespace")]
   unresolved_internals_visible_to Conditional/Conditional.csproj unsupported internalsvisibleto item: [("Include", "Conditional.Friend")]
-  unsupported_project_items Desktop/Desktop.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Desktop/Desktop.csproj Microsoft.NET.Sdk.WindowsDesktop generated XAML .g.cs declarations and SDK Compile effects: BaseIntermediateOutputPath=obj/ (inside project); Configuration=Debug (inside project); TargetFramework=net8.0-windows (inside project); IntermediateOutputPath=obj/Debug/net8.0-windows/ (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Desktop/Desktop.csproj a non-SDK project's transitive reference flow is not modeled
   unresolved_global_usings Mixed/Mixed.csproj TargetFrameworkIdentifier does not establish the System.Net.Http condition
-  unsupported_project_items MixedWeb/MixedWeb.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items MixedWeb/MixedWeb.csproj Microsoft.NET.Sdk.Web generated Razor/cshtml declarations and SDK Compile effects: TargetFramework=net8.0 AppDesignerFolder=Properties (inside project); TargetFramework=net8.0-browser AppDesignerFolder=Properties (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow MixedWeb/MixedWeb.csproj a non-SDK project's transitive reference flow is not modeled
   unresolved_global_usings MixedWeb/MixedWeb.csproj TargetFramework does not establish the Web SDK browser condition
-  unsupported_project_items Razor/Razor.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Razor/Razor.csproj Microsoft.NET.Sdk.Razor generated Razor/cshtml declarations and SDK Compile effects: BaseIntermediateOutputPath=obj/ (inside project); Configuration=Debug (inside project); TargetFramework=net8.0 (inside project); IntermediateOutputPath=obj/Debug/net8.0/ (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Razor/Razor.csproj a non-SDK project's transitive reference flow is not modeled
-  unsupported_project_items Razor10/Razor10.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Razor10/Razor10.csproj Microsoft.NET.Sdk.Razor generated Razor/cshtml declarations and SDK Compile effects: BaseIntermediateOutputPath=obj/ (inside project); Configuration=Debug (inside project); TargetFramework=NET10.0 (inside project); IntermediateOutputPath=obj/Debug/net10.0/ (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Razor10/Razor10.csproj a non-SDK project's transitive reference flow is not modeled
   unresolved_global_usings Razor10/Razor10.csproj .NET 10 Razor _AddEmbeddedValidationAttribute can add Microsoft.Extensions.Validation.Embedded based on unevaluated Razor inputs
-  unsupported_project_items Razor10Disabled/Razor10Disabled.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Razor10Disabled/Razor10Disabled.csproj Microsoft.NET.Sdk.Razor generated Razor/cshtml declarations and SDK Compile effects: BaseIntermediateOutputPath=obj/ (inside project); Configuration=Debug (inside project); TargetFramework=net10.0 (inside project); IntermediateOutputPath=obj/Debug/net10.0/ (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Razor10Disabled/Razor10Disabled.csproj a non-SDK project's transitive reference flow is not modeled
-  unsupported_project_items Unknown/Unknown.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Unknown/Unknown.csproj unmodeled SDK membership: ["Unknown.Sdk"]
   unproven_transitive_reference_flow Unknown/Unknown.csproj a non-SDK project's transitive reference flow is not modeled
   unknown_implicit_usings_sdk Unknown/Unknown.csproj unmodeled SDK Unknown.Sdk
-  unsupported_project_items Web/Web.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Web/Web.csproj Microsoft.NET.Sdk.Web generated Razor/cshtml declarations and SDK Compile effects: AppDesignerFolder=Properties (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Web/Web.csproj a non-SDK project's transitive reference flow is not modeled
-  unsupported_project_items Worker/Worker.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unsupported_project_items Worker/Worker.csproj Microsoft.NET.Sdk.Worker unmodeled worker declaration inventory and SDK Compile effects: AppDesignerFolder=Properties (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Worker/Worker.csproj a non-SDK project's transitive reference flow is not modeled

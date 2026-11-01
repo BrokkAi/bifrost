@@ -4,27 +4,15 @@
 //! as conversions when lowering cannot prove their source and target types are
 //! identical. This module owns the bounded positive proof that can recover
 //! identity later: one exact modeled result type, one explicit binding type,
-//! and one parser/import/shadow resolution. Any missing fact abstains.
+//! and native declaration resolution. Any missing fact abstains.
 
-use crate::analyzer::go::package_identity::GoOverlayPackages;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallableKey;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
-
-use crate::analyzer::usages::get_definition::go::parse_go_tree;
-
-use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
+use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
-
-use brokk_bifrost_core::analyzer::model::CodeUnitType;
 
 use crate::analyzer::GoAnalyzer;
 
@@ -38,25 +26,22 @@ use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
 use brokk_bifrost_core::analyzer::model::Range;
 
-use brokk_bifrost_core::analyzer::model::StructuredTypeIdentity;
-
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
-use brokk_bifrost_core::analyzer::model::{StructuredTypeNodeId, StructuredTypeNodeView};
+use brokk_bifrost_core::analyzer::model::StructuredTypeNodeView;
 use brokk_bifrost_core::analyzer::structural::native_obligation::{
     NativeResultObligation, NativeResultObligationBasis,
 };
-use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::path_utils::rel_path_string;
-use brokk_bifrost_go::declarations::{go_structured_type_identity, is_predeclared_go_type};
+use brokk_bifrost_go::declarations::is_predeclared_go_type;
 use brokk_bifrost_go::references::go_name_shadowed_at_with_scope;
 use tree_sitter::Node;
 
-/// Exact source larger than this is outside the bounded result-binding proof.
-pub const GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES: usize = 1024 * 1024;
+/// Source bound for the retained native error-result obligation.
+const GO_NATIVE_ERROR_OBLIGATION_MAX_SOURCE_BYTES: usize = 1024 * 1024;
 
-/// Maximum syntax work the lexical-shadow half of one proof may consume.
-pub const GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS: usize = 100_000;
+/// Syntax bound for the retained native error-result obligation.
+const GO_NATIVE_ERROR_OBLIGATION_MAX_STEPS: usize = 100_000;
 
 /// Prove the native Go B5 obligation for one resolved declaration and result
 /// port. The caller supplies a target that the structured resolver already
@@ -89,10 +74,11 @@ pub fn go_native_error_result_obligation(
 
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
     let source = analyzer.indexed_source(target.source())?;
-    if source.len() > GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES {
+    if source.len() > GO_NATIVE_ERROR_OBLIGATION_MAX_SOURCE_BYTES {
         return None;
     }
-    let tree = parse_go_tree(&source)?;
+    let tree =
+        crate::analyzer::usages::get_definition::go::parse_go_tree_for_proof(analyzer, &source)?;
     let root = tree.root_node();
     let declaration = go_target_declaration_node(root, analyzer.ranges_of(target))?;
     if declaration.has_error() {
@@ -105,18 +91,21 @@ pub fn go_native_error_result_obligation(
 
     let scope = AnalyzerQueryScope::new(analyzer);
     let (imports, _dot_imports) = go.definition_import_namespaces(scope.token(), target.source());
-    let packages = GoOverlayPackages::new(None);
-    let mut context = GoTypeIdentityContext {
-        go,
-        packages: &packages,
-        source: &source,
-        root,
-        type_byte: result_type.start_byte(),
-        imports,
-        package: go.go_package_of(target.source()),
-        remaining_shadow_steps: go_shadow_step_limit(&source),
-    };
-    if !context.predeclared_name_is_exact("error") {
+    let mut remaining_shadow_steps = go_shadow_step_limit(&source);
+    let shadowed =
+        go_name_shadowed_at_with_scope(root, &source, result_type.start_byte(), "error", || {
+            let admitted = remaining_shadow_steps > 0;
+            remaining_shadow_steps = remaining_shadow_steps.saturating_sub(1);
+            admitted
+        })
+        .unwrap_or(true);
+    if shadowed
+        || imports.contains_key("error")
+        || !go.workspace_declaration_identities_authoritative()
+        || !go
+            .go_package_of(target.source())
+            .is_some_and(|package| go.definitions(&format!("{package}.error")).next().is_none())
+    {
         return None;
     }
 
@@ -308,117 +297,142 @@ pub(crate) fn go_predeclared_type_name_is_exact(
     }
 }
 
-/// Conservative query work to charge before a proof-cache miss.
-///
-/// The charge includes the exact source bytes consumed by parsing plus the
-/// explicit capped allowance admitted by the lexical-shadow walk. `None`
-/// means the source is outside the proof's supported size boundary.
-pub fn go_modeled_result_binding_type_identity_proof_work(source: &str) -> Option<usize> {
-    (source.len() <= GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES)
-        .then(|| source.len().saturating_add(go_shadow_step_limit(source)))
+/// Native static type proof for an exact explicit binding. Prepared syntax is
+/// shared with the analyzer request; type text is never parsed or resolved here.
+pub fn go_explicit_binding_type_identity(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    binding: Range,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
+    Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
+> {
+    use super::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
+    use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+    let unknown = || BoundedResolution::Complete {
+        value: None,
+        work: Default::default(),
+    };
+    if cancellation.is_cancelled() {
+        return BoundedResolution::Cancelled {
+            work: Default::default(),
+        };
+    }
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return unknown();
+    };
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let Some(syntax) = go.inner.prepared_syntax(scope.token(), file) else {
+        return unknown();
+    };
+    if syntax.source() != source {
+        return unknown();
+    }
+    let Some(text) = source.get(binding.start_byte..binding.end_byte) else {
+        return unknown();
+    };
+    let site = brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+        path: rel_path_string(file),
+        text: text.into(),
+        range: binding,
+        focus_start_byte: binding.start_byte,
+        focus_end_byte: binding.end_byte,
+    };
+    let opened = match GoNativePointRequest::open_for_file(
+        go,
+        file,
+        analyzer.semantic_model_overlay(),
+        cancellation,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => {
+            analyzer.record_query_failure(error);
+            return unknown();
+        }
+    };
+    match opened {
+        GoNativePointRequestOpen::Ready(mut request) => request.explicit_binding_type(
+            brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+                analyzer,
+                file,
+                source,
+                tree: Some(syntax.tree()),
+                site: &site,
+                budget: Default::default(),
+                cancellation: Some(cancellation),
+            },
+            binding,
+        ),
+        GoNativePointRequestOpen::Cancelled => BoundedResolution::Cancelled {
+            work: Default::default(),
+        },
+        GoNativePointRequestOpen::Unavailable { .. } => {
+            analyzer.mark_execution_dependent();
+            unknown()
+        }
+    }
+}
+
+/// Lower one provider-pinned callable once and export only canonical scalars.
+#[allow(clippy::type_complexity)]
+pub fn go_selected_callable_result_type_identities(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    member: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::ModelSymbolRef,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Option<(
+    Vec<Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>>,
+    usize,
+)> {
+    use super::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let opened = GoNativePointRequest::open_for_file(
+        go,
+        file,
+        analyzer.semantic_model_overlay(),
+        cancellation,
+    );
+    let opened = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            analyzer.record_query_failure(error);
+            return None;
+        }
+    };
+    match opened {
+        GoNativePointRequestOpen::Ready(request) => {
+            request.selected_callable_result_type_identities(member, cancellation)
+        }
+        GoNativePointRequestOpen::Cancelled => None,
+        GoNativePointRequestOpen::Unavailable { .. } => {
+            analyzer.mark_execution_dependent();
+            None
+        }
+    }
 }
 
 fn go_shadow_step_limit(source: &str) -> usize {
     source
         .len()
         .saturating_mul(4)
-        .clamp(1, GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS)
+        .clamp(1, GO_NATIVE_ERROR_OBLIGATION_MAX_STEPS)
 }
 
-/// Whether one modeled Go result and one explicitly typed binding have the
-/// same exact type at the binding's source declaration.
-///
-/// `binding` is the source range of the binding identifier, not an assignment
-/// occurrence. The model target is already the oracle's typed callable key;
-/// this function never reconstructs it from a rendered signature. A partial
-/// declaration pack may prove a callable it positively publishes, but model
-/// conflicts, ambiguous facts, inferred bindings, unresolved imports,
-/// shadowed predeclared names, and unsupported type shapes all return `false`.
-#[allow(clippy::too_many_arguments)]
-pub fn go_modeled_result_binding_type_identity_is_exact(
-    analyzer: &dyn IAnalyzer,
-    overlay: &SemanticModelOverlay,
-    file: &ProjectFile,
-    source: &str,
+pub(super) fn explicit_binding_type_node(
+    root: Node<'_>,
     binding: Range,
-    target: SemanticModelCallableKey<'_>,
-    result_ordinal: usize,
-) -> bool {
-    if target.language != "go"
-        || go_modeled_result_binding_type_identity_proof_work(source).is_none()
-    {
-        return false;
-    }
-    let Some(parameter_count) = usize::try_from(target.parameter_count).ok() else {
-        return false;
-    };
-    let packages = GoOverlayPackages::new(Some(overlay));
-    let Some(result_type) = packages.callable_result_type_ref(
-        target.owner,
-        target.member,
-        target.has_receiver,
-        parameter_count,
-        result_ordinal,
-    ) else {
-        return false;
-    };
-    go_explicit_binding_matches_modeled_result(
-        analyzer,
-        &packages,
-        file,
-        source,
-        binding,
-        &result_type,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn go_explicit_binding_matches_modeled_result(
-    analyzer: &dyn IAnalyzer,
-    packages: &GoOverlayPackages<'_>,
-    file: &ProjectFile,
-    source: &str,
-    binding: Range,
-    result_type: &TypeRef,
-) -> bool {
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return false;
-    };
-    let Some(tree) = parse_go_tree(source) else {
-        return false;
-    };
-    let root = tree.root_node();
-    if root.has_error() {
-        return false;
-    }
-    let Some(type_node) = explicit_binding_type_node(root, binding) else {
-        return false;
-    };
-    let Some(target_type) = go_structured_type_identity(type_node, source) else {
-        return false;
-    };
-
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let (imports, _dot_imports) = go.definition_import_namespaces(scope.token(), file);
-    let package = go.go_package_of(file);
-    let mut context = GoTypeIdentityContext {
-        go,
-        packages,
-        source,
-        root,
-        type_byte: type_node.start_byte(),
-        imports,
-        package,
-        remaining_shadow_steps: go_shadow_step_limit(source),
-    };
-    modeled_result_matches_target(result_type, &target_type, &mut context)
-}
-
-fn explicit_binding_type_node(root: Node<'_>, binding: Range) -> Option<Node<'_>> {
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Node<'_>> {
     if binding.start_byte >= binding.end_byte {
         return None;
     }
-    let name = smallest_named_node_covering(root, binding.start_byte, binding.end_byte)?;
+    let name = smallest_named_node_covering_with_scope(
+        root,
+        binding.start_byte,
+        binding.end_byte,
+        &mut scope_step,
+    )?;
     if name.start_byte() != binding.start_byte
         || name.end_byte() != binding.end_byte
         || name.kind() != "identifier"
@@ -429,7 +443,7 @@ fn explicit_binding_type_node(root: Node<'_>, binding: Range) -> Option<Node<'_>
     if !matches!(declaration.kind(), "var_spec" | "parameter_declaration")
         || !node_has_field_child(declaration, "name", name)
         || (declaration.kind() == "parameter_declaration"
-            && parameter_has_generic_callable_context(declaration))
+            && parameter_has_generic_callable_context(declaration, &mut scope_step))
     {
         return None;
     }
@@ -437,9 +451,15 @@ fn explicit_binding_type_node(root: Node<'_>, binding: Range) -> Option<Node<'_>
     (name.end_byte() <= type_node.start_byte()).then_some(type_node)
 }
 
-fn parameter_has_generic_callable_context(parameter: Node<'_>) -> bool {
+fn parameter_has_generic_callable_context(
+    parameter: Node<'_>,
+    scope_step: &mut impl FnMut() -> bool,
+) -> bool {
     let mut owner = parameter.parent();
     while let Some(node) = owner {
+        if !scope_step() {
+            return true;
+        }
         if matches!(
             node.kind(),
             "func_literal" | "function_declaration" | "method_declaration"
@@ -452,6 +472,9 @@ fn parameter_has_generic_callable_context(parameter: Node<'_>) -> bool {
             };
             let mut stack = vec![receiver];
             while let Some(current) = stack.pop() {
+                if !scope_step() {
+                    return true;
+                }
                 if current.kind() == "type_arguments" {
                     return true;
                 }
@@ -467,211 +490,6 @@ fn parameter_has_generic_callable_context(parameter: Node<'_>) -> bool {
 
 fn node_has_field_child(parent: Node<'_>, field: &str, target: Node<'_>) -> bool {
     brokk_bifrost_core::analyzer::structural::adapter_helpers::is_field_of(parent, target, field)
-}
-
-struct GoTypeIdentityContext<'tree, 'source, 'context, 'overlay> {
-    go: &'context GoAnalyzer,
-    packages: &'context GoOverlayPackages<'overlay>,
-    source: &'source str,
-    root: Node<'tree>,
-    type_byte: usize,
-    imports: HashMap<String, Vec<String>>,
-    package: Option<String>,
-    remaining_shadow_steps: usize,
-}
-
-enum TypeMatchFrame<'a> {
-    Type(&'a TypeRef, StructuredTypeNodeId),
-    DeclaredName(&'a str, StructuredTypeNodeId),
-    PredeclaredName(&'a str, StructuredTypeNodeId),
-}
-
-fn modeled_result_matches_target(
-    modeled: &TypeRef,
-    target: &StructuredTypeIdentity,
-    context: &mut GoTypeIdentityContext<'_, '_, '_, '_>,
-) -> bool {
-    let mut frames = vec![TypeMatchFrame::Type(modeled, target.root_id())];
-    while let Some(frame) = frames.pop() {
-        match frame {
-            TypeMatchFrame::Type(modeled, target_id) => match modeled {
-                TypeRef::Named {
-                    name,
-                    arguments,
-                    nullable,
-                } => {
-                    if *nullable || !arguments.is_empty() {
-                        return false;
-                    }
-                    frames.push(TypeMatchFrame::PredeclaredName(name, target_id));
-                }
-                TypeRef::Declared {
-                    id,
-                    arguments,
-                    nullable,
-                } => {
-                    if *nullable {
-                        return false;
-                    }
-                    if arguments.is_empty() {
-                        frames.push(TypeMatchFrame::DeclaredName(id, target_id));
-                        continue;
-                    }
-                    let Some(StructuredTypeNodeView::Generic {
-                        base,
-                        arguments: target_arguments,
-                    }) = target.view(target_id)
-                    else {
-                        return false;
-                    };
-                    if arguments.len() != target_arguments.len() {
-                        return false;
-                    }
-                    frames.push(TypeMatchFrame::DeclaredName(id, base));
-                    frames.extend(
-                        arguments
-                            .iter()
-                            .zip(target_arguments)
-                            .rev()
-                            .map(|(argument, target)| TypeMatchFrame::Type(argument, *target)),
-                    );
-                }
-                TypeRef::Pointer { element } => {
-                    let Some(StructuredTypeNodeView::Pointer(target)) = target.view(target_id)
-                    else {
-                        return false;
-                    };
-                    frames.push(TypeMatchFrame::Type(element, target));
-                }
-                TypeRef::Slice { element } => {
-                    let Some(StructuredTypeNodeView::Slice(target)) = target.view(target_id) else {
-                        return false;
-                    };
-                    frames.push(TypeMatchFrame::Type(element, target));
-                }
-                TypeRef::Map { key, value } => {
-                    let Some(StructuredTypeNodeView::Map {
-                        key: target_key,
-                        value: target_value,
-                    }) = target.view(target_id)
-                    else {
-                        return false;
-                    };
-                    frames.push(TypeMatchFrame::Type(value, target_value));
-                    frames.push(TypeMatchFrame::Type(key, target_key));
-                }
-                // StructuredTypeIdentity deliberately does not retain array
-                // lengths, channel directions, function layouts, or language
-                // model substitutions. Those shapes cannot establish exact Go
-                // identity at this boundary.
-                TypeRef::TypeParameter { .. }
-                | TypeRef::Array { .. }
-                | TypeRef::ByRef { .. }
-                | TypeRef::FixedArray { .. }
-                | TypeRef::Channel { .. }
-                | TypeRef::Wildcard { .. }
-                | TypeRef::Tuple { .. }
-                | TypeRef::Function { .. }
-                | TypeRef::Projection { .. }
-                | TypeRef::Unknown => return false,
-            },
-            TypeMatchFrame::DeclaredName(declaration_id, target_id) => {
-                let Some(qualified_name) = context
-                    .packages
-                    .declared_type_qualified_name(declaration_id)
-                else {
-                    return false;
-                };
-                let Some(StructuredTypeNodeView::Named(target_name)) = target.view(target_id)
-                else {
-                    return false;
-                };
-                if target_name.is_absolute()
-                    || !target_name.lexical_scope().is_empty()
-                    || !context.declared_name_matches(target_name.path(), &qualified_name)
-                {
-                    return false;
-                }
-            }
-            TypeMatchFrame::PredeclaredName(name, target_id) => {
-                let Some(StructuredTypeNodeView::Named(target_name)) = target.view(target_id)
-                else {
-                    return false;
-                };
-                if target_name.is_absolute() || !target_name.lexical_scope().is_empty() {
-                    return false;
-                }
-                let [target_component] = target_name.path() else {
-                    return false;
-                };
-                if target_component != name || !context.predeclared_name_is_exact(name) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-impl GoTypeIdentityContext<'_, '_, '_, '_> {
-    fn declared_name_matches(&mut self, path: &[String], modeled_name: &str) -> bool {
-        match path {
-            [name] => {
-                !self.lexically_shadowed(name)
-                    && self.package.as_ref().is_some_and(|package| {
-                        let candidate = format!("{package}.{name}");
-                        candidate == modeled_name
-                            && self.same_package_declared_type_is_exact(&candidate)
-                    })
-            }
-            [qualifier, name] => {
-                if self.lexically_shadowed(qualifier) {
-                    return false;
-                }
-                let Some([import_path]) = self.imports.get(qualifier).map(Vec::as_slice) else {
-                    return false;
-                };
-                format!("{import_path}.{name}") == modeled_name
-            }
-            _ => false,
-        }
-    }
-
-    fn same_package_declared_type_is_exact(&self, candidate: &str) -> bool {
-        if !self.go.workspace_declaration_identities_authoritative() {
-            return false;
-        }
-        let mut definitions = self.go.definitions(candidate);
-        let Some(declaration) = definitions.next() else {
-            return false;
-        };
-        declaration.kind() == CodeUnitType::Class && definitions.next().is_none()
-    }
-
-    fn predeclared_name_is_exact(&mut self, name: &str) -> bool {
-        if !is_predeclared_go_type(name)
-            || self.lexically_shadowed(name)
-            || self.imports.contains_key(name)
-            || !self.go.workspace_declaration_identities_authoritative()
-        {
-            return false;
-        }
-        self.package.as_ref().is_some_and(|package| {
-            self.go
-                .definitions(&format!("{package}.{name}"))
-                .next()
-                .is_none()
-        })
-    }
-
-    fn lexically_shadowed(&mut self, name: &str) -> bool {
-        go_name_shadowed_at_with_scope(self.root, self.source, self.type_byte, name, || {
-            let admitted = self.remaining_shadow_steps > 0;
-            self.remaining_shadow_steps = self.remaining_shadow_steps.saturating_sub(1);
-            admitted
-        })
-        .unwrap_or(true)
-    }
 }
 
 use ValueTypeBarrierDecision::{ProvenMatch, ProvenNonMatch, Undecided};
@@ -877,322 +695,5 @@ pub(super) fn go_observed_value_type(answer: &SelectedNativeReferenceTypes) -> O
             })
         }
         _ => Type(ObservedValueType::Undecided(UnknownType)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use crate::analyzer::go::type_identity_proof::*;
-
-    use brokk_bifrost_core::analyzer::model::Language;
-
-    use brokk_bifrost_core::analyzer::model::ProjectFile;
-
-    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
-
-    fn binding_range(source: &str, name: &str) -> Range {
-        let start_byte = source.find(name).expect("binding name");
-        Range {
-            start_byte,
-            end_byte: start_byte + name.len(),
-            start_line: 0,
-            end_line: 0,
-        }
-    }
-
-    fn binding_matches(
-        fixture: &AnalyzerFixture,
-        source: &str,
-        binding: &str,
-        result: &TypeRef,
-    ) -> bool {
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let packages = GoOverlayPackages::new(None);
-        go_explicit_binding_matches_modeled_result(
-            fixture.analyzer.analyzer(),
-            &packages,
-            &file,
-            source,
-            binding_range(source, binding),
-            result,
-        )
-    }
-
-    #[test]
-    fn expression_case_type_shadow_ends_before_sibling_and_post_switch_bindings() {
-        let source = r#"package main
-func run(choice int) {
-    switch choice {
-    case 0:
-        type error struct{}
-        var shadowed error
-        _ = shadowed
-    case 1:
-        var sibling error
-        _ = sibling
-    }
-    var after error
-    _ = after
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-        );
-
-        assert!(
-            !binding_matches(&fixture, source, "shadowed", &TypeRef::named("error")),
-            "a case-local type must shadow the universe error type within its own clause"
-        );
-        assert!(
-            binding_matches(&fixture, source, "sibling", &TypeRef::named("error")),
-            "a case-local type must not poison a sibling clause's exact type proof"
-        );
-        assert!(
-            binding_matches(&fixture, source, "after", &TypeRef::named("error")),
-            "a case-local type must not poison the post-switch exact type proof"
-        );
-    }
-
-    #[test]
-    fn explicit_unshadowed_error_is_exact_but_inference_and_wrapper_changes_abstain() {
-        let source = r#"package main
-
-func run() {
-    var exact error
-    var inferred = exact
-    var boxed any
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-        );
-
-        assert!(binding_matches(
-            &fixture,
-            source,
-            "exact",
-            &TypeRef::named("error")
-        ));
-        assert!(!binding_matches(
-            &fixture,
-            source,
-            "inferred",
-            &TypeRef::named("error")
-        ));
-        assert!(!binding_matches(
-            &fixture,
-            source,
-            "boxed",
-            &TypeRef::named("error")
-        ));
-        assert!(!binding_matches(
-            &fixture,
-            source,
-            "boxed",
-            &TypeRef::Pointer {
-                element: Box::new(TypeRef::named("error")),
-            }
-        ));
-    }
-
-    #[test]
-    fn lexical_type_const_and_parameter_shadows_keep_predeclared_error_open() {
-        for (source, label) in [
-            (
-                r#"package main
-func run() {
-    type error struct{}
-    var typed error
-}
-"#,
-                "local type",
-            ),
-            (
-                r#"package main
-func run() {
-    const error = 1
-    var typed error
-}
-"#,
-                "local const",
-            ),
-            (
-                r#"package main
-func run(error int) {
-    var typed error
-}
-"#,
-                "parameter",
-            ),
-        ] {
-            let fixture = AnalyzerFixture::new_for_language(
-                Language::Go,
-                &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-            );
-            assert!(
-                !binding_matches(&fixture, source, "typed", &TypeRef::named("error")),
-                "{label} must shadow the universe type"
-            );
-        }
-    }
-
-    #[test]
-    fn package_declaration_in_another_file_and_import_binding_shadow_error() {
-        let package_source = r#"package main
-func run() {
-    var typed error
-}
-"#;
-        let package_fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[
-                ("go.mod", "module example.com/app\n"),
-                ("main.go", package_source),
-                ("shadow.go", "package main\ntype error struct{}\n"),
-            ],
-        );
-        assert!(!binding_matches(
-            &package_fixture,
-            package_source,
-            "typed",
-            &TypeRef::named("error")
-        ));
-
-        let import_source = r#"package main
-import error "net"
-func run() {
-    var typed error
-}
-"#;
-        let import_fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[
-                ("go.mod", "module example.com/app\n"),
-                ("main.go", import_source),
-            ],
-        );
-        assert!(!binding_matches(
-            &import_fixture,
-            import_source,
-            "typed",
-            &TypeRef::named("error")
-        ));
-    }
-
-    #[test]
-    fn variadic_and_generic_parameter_bindings_abstain() {
-        for (source, label) in [
-            (
-                r#"package main
-func run(typed ...error) {}
-"#,
-                "variadic parameter",
-            ),
-            (
-                r#"package main
-func run[error interface{ ~int }](typed error) {}
-"#,
-                "generic parameter",
-            ),
-        ] {
-            let fixture = AnalyzerFixture::new_for_language(
-                Language::Go,
-                &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-            );
-            assert!(
-                !binding_matches(&fixture, source, "typed", &TypeRef::named("error")),
-                "{label} must stay outside the exact binding proof"
-            );
-        }
-    }
-
-    #[test]
-    fn declared_name_resolution_uses_exact_import_alias_and_rejects_shadowing() {
-        fn resolved(source: &str, extra_file: Option<(&str, &str)>, modeled_name: &str) -> bool {
-            let mut files = vec![("go.mod", "module example.com/app\n"), ("main.go", source)];
-            files.extend(extra_file);
-            let fixture = AnalyzerFixture::new_for_language(Language::Go, &files);
-            let analyzer = fixture.analyzer.analyzer();
-            let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go analyzer");
-            let file = ProjectFile::new(fixture.project_root(), "main.go");
-            let binding = binding_range(source, "conn");
-            let tree = parse_go_tree(source).expect("Go tree");
-            let root = tree.root_node();
-            let type_node = explicit_binding_type_node(root, binding).expect("explicit type");
-            let identity = go_structured_type_identity(type_node, source).expect("type identity");
-            let StructuredTypeNodeView::Named(name) =
-                identity.view(identity.root_id()).expect("identity root")
-            else {
-                panic!("qualified type is named")
-            };
-            let scope = AnalyzerQueryScope::new(analyzer);
-            let (imports, _) = go.definition_import_namespaces(scope.token(), &file);
-            let packages = GoOverlayPackages::new(None);
-            GoTypeIdentityContext {
-                go,
-                packages: &packages,
-                source,
-                root,
-                type_byte: type_node.start_byte(),
-                imports,
-                package: go.go_package_of(&file),
-                remaining_shadow_steps: go_shadow_step_limit(source),
-            }
-            .declared_name_matches(name.path(), modeled_name)
-        }
-
-        assert!(resolved(
-            r#"package main
-import network "net"
-func run() {
-    var conn network.Listener
-}
-"#,
-            None,
-            "net.Listener",
-        ));
-        assert!(!resolved(
-            r#"package main
-import network "net"
-func run(network int) {
-    var conn network.Listener
-}
-"#,
-            None,
-            "net.Listener",
-        ));
-        assert!(resolved(
-            r#"package main
-type Name struct{}
-func run() {
-    var conn Name
-}
-"#,
-            None,
-            "example.com/app.Name",
-        ));
-        assert!(!resolved(
-            r#"package main
-func Name() {}
-func run() {
-    var conn Name
-}
-"#,
-            None,
-            "example.com/app.Name",
-        ));
-        assert!(!resolved(
-            r#"package main
-type Name struct{}
-func run() {
-    var conn Name
-}
-"#,
-            Some(("duplicate.go", "package main\ntype Name int\n")),
-            "example.com/app.Name",
-        ));
     }
 }

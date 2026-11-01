@@ -35,7 +35,7 @@ impl PolicyRegistry {
         path: PolicySelectorPath,
         reference: &DeclarationSelectionReference,
         loaded: &mut HashMap<WorkspaceRelativePath, LoadedDeclarationSelection>,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
         locators: LocatorResolution<'_>,
     ) -> Result<Option<ResolvedPolicySelector>, PolicyRegistryError> {
         let Some(root) = self.workspace_root.as_ref() else {
@@ -81,7 +81,7 @@ impl PolicyRegistry {
         root: &WorkspaceRoot,
         parsed: &ParsedRqlpDocument,
         reference: &DeclarationSelectionReference,
-        retained_bytes: &mut usize,
+        retained_bytes: &mut i128,
     ) -> Result<LoadedDeclarationSelection, PolicyRegistryError> {
         self.check_cancellation()?;
         let available = self

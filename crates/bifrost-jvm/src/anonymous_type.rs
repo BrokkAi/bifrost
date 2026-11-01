@@ -15,8 +15,26 @@ pub(crate) struct AnonymousTypeBody {
 
 impl AnonymousTypeBody {
     pub(crate) fn name(body: tree_sitter::Node<'_>) -> String {
-        let position = body.start_position();
-        format!("$anon${}:{}", position.row, position.column)
+        let node = body
+            .parent()
+            .expect("anonymous body has an expression owner");
+        if matches!(node.kind(), "object_creation_expression" | "enum_constant") {
+            return crate::java::declarations::java_synthetic_name(node);
+        }
+        brokk_bifrost_core::analyzer::tree_walk::synthetic_name(
+            node,
+            |candidate| (candidate.kind() == "object_literal").then_some("anon"),
+            |candidate| {
+                matches!(
+                    candidate.kind(),
+                    "function_declaration"
+                        | "secondary_constructor"
+                        | "class_declaration"
+                        | "object_declaration"
+                )
+            },
+        )
+        .to_string()
     }
 
     pub(crate) fn declare(self, facts: &mut FileResolutionFacts) {

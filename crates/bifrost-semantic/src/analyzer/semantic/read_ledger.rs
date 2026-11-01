@@ -12,8 +12,6 @@ use brokk_bifrost_core::analyzer::model::Language;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
-use brokk_bifrost_core::analyzer::model::Range;
-
 use brokk_bifrost_core::path_utils::rel_path_string;
 use git2::Oid;
 use serde::{Deserialize, Serialize};
@@ -95,6 +93,7 @@ pub enum WorkspaceFactFamily {
     CSharpCompilationConfiguration,
     CSharpExternalDeclarations,
     GoWorkspaceIndexes,
+    GoHierarchySeeks,
     GoWorkspacePaths,
     GoImportFacts,
     GoReverseImports,
@@ -274,6 +273,7 @@ impl WorkspaceFactFamily {
             "csharp_external_declarations",
         ),
         (Self::GoWorkspaceIndexes, "go_workspace_indexes"),
+        (Self::GoHierarchySeeks, "go_hierarchy_seeks"),
         (Self::GoWorkspacePaths, "go_workspace_paths"),
         (Self::GoImportFacts, "go_import_facts"),
         (Self::GoReverseImports, "go_reverse_imports"),
@@ -588,13 +588,9 @@ pub enum LookupKind {
     Descendants,
     /// The dispatch targets of one call site.
     Dispatch,
-    /// The dispatch targets of one call site addressed relative to its owning
-    /// procedure declaration.
-    ///
-    /// This is distinct from [`Self::Dispatch`], whose source-facing question
-    /// is pinned to one exact semantic artifact and absolute source range.
-    /// Procedure-local products use this funnel so an edit to a different
-    /// declaration in the same file does not change the question.
+    /// Handle-keyed dispatch through the same stable procedure/rank address
+    /// as source-selected dispatch. Source selection separately records its
+    /// whole-artifact input, including an empty or partial selection.
     ProcedureDispatch,
     /// One procedure summary, by its mount-free identity.
     ProcedureSummary,
@@ -637,6 +633,7 @@ pub enum ReadKey {
         language: Language,
         rel_path: Box<str>,
         blob: Oid,
+        parse_variant: brokk_bifrost_core::gitblob::ParseVariant,
     },
     /// A name-keyed lookup served by a per-file fact index.
     Index { family: IndexFamily, key: Box<[u8]> },
@@ -704,11 +701,17 @@ impl ReadKey {
     /// (`brokk_bifrost_core::path_utils::rel_path_string`); the caller owns
     /// that conversion because it holds the `ProjectFile` this type refuses to
     /// carry.
-    pub fn file(language: Language, rel_path: impl Into<Box<str>>, blob: Oid) -> Self {
+    pub fn file(
+        language: Language,
+        rel_path: impl Into<Box<str>>,
+        blob: Oid,
+        parse_variant: brokk_bifrost_core::gitblob::ParseVariant,
+    ) -> Self {
         Self::File {
             language,
             rel_path: rel_path.into(),
             blob,
+            parse_variant,
         }
     }
 
@@ -805,10 +808,14 @@ impl ReadKey {
                 language,
                 rel_path,
                 blob,
+                parse_variant,
             } => {
                 hasher.field("language", language.config_label().as_bytes());
                 hasher.field("rel_path", rel_path.as_bytes());
                 hasher.field("blob", blob.as_bytes());
+                if let Some(variant) = parse_variant.file_read_key_field() {
+                    hasher.field("parse_variant", variant);
+                }
             }
             Self::Index { family, key } => {
                 hasher.field("family", family.stable_label().as_bytes());
@@ -911,48 +918,20 @@ pub enum LookupQuestion {
     },
     /// One file.
     File { rel_path: Box<str> },
-    /// One call site: the file it sits in, the public fingerprint of the
-    /// semantic artifact it was resolved against, and its source range.
-    ///
-    /// The artifact fingerprint is part of the question rather than of the
-    /// answer: "dispatch at this range of this artifact" is a different
-    /// question from "dispatch at this range of the artifact that file has
-    /// now", and a head whose artifact moved has no answer to the first.
+    /// One call addressed by stable procedure lineage and source-order rank.
     CallSite {
         rel_path: Box<str>,
-        artifact: StableDigest,
-        site: CallSiteLocator,
-    },
-    /// One exact procedure-local call site.
-    ///
-    /// `procedure` is stable declaration lineage. The byte interval is
-    /// relative to the owning procedure's start, so a preceding sibling may
-    /// move the declaration without changing this question. The ordinal
-    /// selects one structured call row among those at that interval.
-    ProcedureCallSite {
-        rel_path: Box<str>,
         procedure: StableDigest,
-        site: ProcedureCallSiteLocator,
+        site: CallSiteLocator,
     },
     /// One procedure summary, by its mount-free identity.
     Summary { identity: StableDigest },
 }
 
-/// Where in its file one call site sits.
+/// A call's rank among its enclosing procedure's calls in source order.
+/// Equal source spans retain semantic call-row order as a tie breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CallSiteLocator {
-    pub start_byte: usize,
-    pub end_byte: usize,
-}
-
-/// Where one call site sits relative to its owning procedure's start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ProcedureCallSiteLocator {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    /// The call's position, in call-row order, among the procedure's calls at
-    /// exactly this interval. Lowering can give one source call several rows:
-    /// a Python `finally` body is lowered once per exit path (#6638).
     pub ordinal: usize,
 }
 
@@ -974,29 +953,13 @@ impl LookupQuestion {
         }
     }
 
-    /// The question "what does the workspace answer about this call site?".
-    ///
-    /// `rel_path` is the artifact's own workspace-relative path, which the
-    /// semantic artifact key already carries in normalized form; nothing here
-    /// re-derives it from a rooted `ProjectFile`.
-    pub fn call_site(rel_path: &str, artifact: StableDigest, range: Range) -> Self {
-        Self::CallSite {
-            rel_path: Box::from(rel_path),
-            artifact,
-            site: CallSiteLocator {
-                start_byte: range.start_byte,
-                end_byte: range.end_byte,
-            },
-        }
-    }
-
-    /// The question "what does this procedure-local call site dispatch to?".
+    /// One stable procedure-local call question.
     pub fn procedure_call_site(
         rel_path: &str,
         procedure: StableDigest,
-        site: ProcedureCallSiteLocator,
+        site: CallSiteLocator,
     ) -> Self {
-        Self::ProcedureCallSite {
+        Self::CallSite {
             rel_path: Box::from(rel_path),
             procedure,
             site,
@@ -1020,7 +983,6 @@ impl LookupQuestion {
             Self::Declaration { .. } => "declaration",
             Self::File { .. } => "file",
             Self::CallSite { .. } => "call_site",
-            Self::ProcedureCallSite { .. } => "procedure_call_site",
             Self::Summary { .. } => "summary",
             Self::WorkspaceFact { .. } => "workspace_fact",
         }
@@ -1032,8 +994,7 @@ impl LookupQuestion {
             Self::Name { .. } | Self::Summary { .. } | Self::WorkspaceFact { .. } => None,
             Self::Declaration { rel_path, .. }
             | Self::File { rel_path }
-            | Self::CallSite { rel_path, .. }
-            | Self::ProcedureCallSite { rel_path, .. } => Some(rel_path),
+            | Self::CallSite { rel_path, .. } => Some(rel_path),
         }
     }
 
@@ -1071,23 +1032,11 @@ impl LookupQuestion {
             Self::File { rel_path } => hasher.field("rel_path", rel_path.as_bytes()),
             Self::CallSite {
                 rel_path,
-                artifact,
-                site,
-            } => {
-                hasher.field("rel_path", rel_path.as_bytes());
-                hasher.field("artifact", artifact.as_bytes());
-                hasher.field("start_byte", &(site.start_byte as u64).to_be_bytes());
-                hasher.field("end_byte", &(site.end_byte as u64).to_be_bytes());
-            }
-            Self::ProcedureCallSite {
-                rel_path,
                 procedure,
                 site,
             } => {
                 hasher.field("rel_path", rel_path.as_bytes());
                 hasher.field("procedure", procedure.as_bytes());
-                hasher.field("start_byte", &(site.start_byte as u64).to_be_bytes());
-                hasher.field("end_byte", &(site.end_byte as u64).to_be_bytes());
                 hasher.field("ordinal", &(site.ordinal as u64).to_be_bytes());
             }
             Self::Summary { identity } => hasher.field("identity", identity.as_bytes()),

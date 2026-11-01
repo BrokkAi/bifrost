@@ -6277,3 +6277,129 @@ fn profiled_stderr_capture_bounds_tail_and_transport_evidence() {
             .all(|phase| state.observed_phase(phase))
     );
 }
+
+#[test]
+fn legacy_semantic_model_evidence_accepts_semver_and_reports_invalid_versions() {
+    let project = InlineTestProject::new()
+        .file("Main.java", PACK_ACTIVATION_JAVA)
+        .build();
+    install_pack_activation_fixture(project.root());
+    let catalog = project.root().join(".bifrost/packs-catalog");
+    let evidence = |version: &str| {
+        json!([{
+            "language": "java", "ecosystem": "jdk",
+            "package": {"name": "fixture.jdk", "version": version},
+            "module": {"name": "java.base", "version": version},
+            "toolchain": {"name": "jdk", "version": version}
+        }])
+        .to_string()
+    };
+    for (version, expected_error) in [("21.0.2", false), ("not-a-version", true)] {
+        let mut child = mcp_server_command(project.root(), "searchtools", &[])
+            .env("BIFROST_SEMANTIC_PACK_CATALOG", &catalog)
+            .env("BIFROST_SEMANTIC_PACK_EVIDENCE", evidence(version))
+            .spawn()
+            .expect("spawn configured server");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+        initialize_session(&mut stdin, &mut reader, &mut stderr);
+        // Semantic-pack activation runs in the background, so the configured
+        // evidence is judged only once the overlay leaves `pending`. Asserting
+        // on the first response would race it, and for the valid version the
+        // absence check would pass before activation had run at all.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut id = 1;
+        let response = loop {
+            let response = round_trip(
+                &mut stdin,
+                &mut reader,
+                &mut stderr,
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "get_active_workspace", "arguments": {}}
+                }),
+            );
+            let workspace: serde_json::Value = response["result"]["content"][0]["text"]
+                .as_str()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or_default();
+            if workspace["semantic_model_overlay"]["state"] != "pending" {
+                break response;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "semantic-pack activation stayed pending: {response}"
+            );
+            id += 1;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let body = response.to_string();
+        if expected_error {
+            assert!(
+                body.contains("invalid configured semantic-pack version"),
+                "{body}"
+            );
+        } else {
+            assert_eq!(response["result"]["isError"], false, "{body}");
+            assert!(
+                !body.contains("invalid configured semantic-pack version"),
+                "{body}"
+            );
+        }
+        drop(stdin);
+        assert!(child.wait().expect("wait bifrost").success());
+    }
+}
+
+#[test]
+fn symbol_sources_rejects_responses_over_source_budget() {
+    let root = TempDir::new().expect("workspace");
+    let mut symbols = Vec::new();
+    for index in 0..18 {
+        let name = format!("Budget{index}");
+        let source = format!(
+            "class {name} {{\n/*{}*/\n}}\n",
+            format!("{}\n", "x".repeat(70)).repeat(13_900)
+        );
+        fs::write(root.path().join(format!("{name}.java")), source).expect("write source");
+        symbols.push(format!("{name}.java#{name}"));
+    }
+    let mut child = spawn_server(root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let call = |id, names: Vec<String>, stdin: &mut _, reader: &mut _, stderr: &mut _| {
+        round_trip(
+            stdin,
+            reader,
+            stderr,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "get_symbol_sources", "arguments": {"symbols": names}}
+            }),
+        )
+    };
+    let small = call(
+        1,
+        vec![symbols[0].clone()],
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+    );
+    assert_eq!(small["result"]["isError"], false, "{small}");
+    assert!(
+        small["result"]["structuredContent"]["sources"]
+            .as_array()
+            .is_some_and(|sources| !sources.is_empty()),
+        "{small}"
+    );
+    let large = call(2, symbols, &mut stdin, &mut reader, &mut stderr);
+    assert_eq!(large["error"]["code"], -32602, "{large}");
+    let message = large.to_string();
+    assert!(message.contains("response budget"), "{message}");
+    assert!(message.contains("narrower symbols"), "{message}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}

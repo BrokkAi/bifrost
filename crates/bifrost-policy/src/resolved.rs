@@ -3787,3 +3787,7 @@ mod tests {
         assert!(paths.contains("/dependencies/catalogs/test.catalog@1/catalog-model/selector"));
     }
 }
+
+#[cfg(test)]
+#[path = "resolved/validation_tests.rs"]
+mod validation_tests;

@@ -122,7 +122,10 @@ pub(crate) fn select<'analyzer>(
     let scope = AnalyzerQueryScope::new(analyzer);
     let prepared = rust.prepared_syntax(scope.token(), file)?;
     if prepared.source() != source {
-        crate::analyzer::rust::std_types::incomplete_proof("source_mismatch");
+        crate::analyzer::rust::std_types::operational_proof_stop(
+            "source_mismatch",
+            brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+        );
         return None;
     }
     let tree = prepared.tree();
@@ -187,15 +190,21 @@ pub(crate) fn select<'analyzer>(
                     Ok(SelectedResolutionOperationOpenOutcome::Ready(operation)) => {
                         operation.rust_prelude_for_caller(file.rel_path(), &cancellation)
                     }
-                    Ok(_) => {
-                        crate::analyzer::rust::std_types::incomplete_proof(
-                            "selected_operation_unavailable",
+                    Ok(outcome) => {
+                        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+                        let cause = match outcome {
+                            SelectedResolutionOperationOpenOutcome::Cancelled => DerivationExecutionCause::Cancelled,
+                            SelectedResolutionOperationOpenOutcome::Unavailable(_) | SelectedResolutionOperationOpenOutcome::Stale(_) => DerivationExecutionCause::Provider,
+                            SelectedResolutionOperationOpenOutcome::Ready(_) => unreachable!(),
+                        };
+                        crate::analyzer::rust::std_types::operational_proof_stop(
+                            "selected_operation_unavailable", cause,
                         );
                         return None;
                     }
                     Err(error) => {
                         eprintln!("opening selected Rust trait scope: {error}");
-                        crate::analyzer::rust::std_types::incomplete_proof("store_error");
+                        crate::analyzer::rust::std_types::operational_proof_stop("store_error", brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider);
                         return None;
                     }
                 }
@@ -203,7 +212,7 @@ pub(crate) fn select<'analyzer>(
         }
         .unwrap_or_else(|error| {
             eprintln!("reading selected Rust trait prelude: {error}");
-            crate::analyzer::rust::std_types::incomplete_proof("store_error");
+            crate::analyzer::rust::std_types::operational_proof_stop("store_error", brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider);
             None
         })?;
         let imports = analyzer.import_analysis_provider_for_file(file)?;
@@ -378,8 +387,9 @@ pub(crate) fn select<'analyzer>(
                 Ok(is_trait) => is_trait,
                 Err(error) => {
                     eprintln!("reading source trait candidate {candidate:?}: {error:?}");
-                    crate::analyzer::rust::std_types::incomplete_proof(
+                    crate::analyzer::rust::std_types::operational_proof_stop(
                         "source_trait_scope_unknown",
+                        super::std_types::cargo_route_execution_cause(&error),
                     );
                     return None;
                 }

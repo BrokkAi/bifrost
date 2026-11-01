@@ -19,6 +19,8 @@ pub(in crate::analyzer::kotlin::semantic) struct ProcedureSpec<'tree> {
     pub(in crate::analyzer::kotlin::semantic) delegated: bool,
     pub(in crate::analyzer::kotlin::semantic) captures_receiver: bool,
     pub(in crate::analyzer::kotlin::semantic) captures: Box<[LexicalCaptureSpec<'tree>]>,
+    pub(in crate::analyzer::kotlin::semantic) shared_bindings: Box<[(&'tree str, usize)]>,
+    pub(in crate::analyzer::kotlin::semantic) ancestor_capture_gap: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -26,6 +28,8 @@ pub(in crate::analyzer::kotlin::semantic) struct LexicalCaptureSpec<'tree> {
     pub(in crate::analyzer::kotlin::semantic) name: &'tree str,
     pub(in crate::analyzer::kotlin::semantic) declaration_start: usize,
     pub(in crate::analyzer::kotlin::semantic) reference: Node<'tree>,
+    pub(in crate::analyzer::kotlin::semantic) mutable: bool,
+    pub(in crate::analyzer::kotlin::semantic) delegated: bool,
 }
 
 /// What a procedure executes, already classified by the inventory so control
@@ -88,6 +92,7 @@ pub(in crate::analyzer::kotlin::semantic) struct NestedProcedureTarget {
 pub(in crate::analyzer::kotlin::semantic) struct LexicalCaptureSource {
     pub(in crate::analyzer::kotlin::semantic) name: Box<str>,
     pub(in crate::analyzer::kotlin::semantic) declaration_start: usize,
+    pub(in crate::analyzer::kotlin::semantic) mutable: bool,
 }
 
 pub(in crate::analyzer::kotlin::semantic) type ProcedureEnumeration<'tree> =
@@ -168,6 +173,8 @@ pub(in crate::analyzer::kotlin::semantic) fn enumerate_procedures<'tree>(
                     delegated: shape.delegated,
                     captures_receiver,
                     captures: Box::new([]),
+                    shared_bindings: Box::new([]),
+                    ancestor_capture_gap: false,
                 });
                 child_parent = Some(identity.id);
                 child_path = identity.declaration_path;
@@ -199,11 +206,8 @@ pub(in crate::analyzer::kotlin::semantic) fn enumerate_procedures<'tree>(
     Ok(inventory.complete(specs))
 }
 
-/// Inventory the exact Kotlin capture subset represented by the shared IR:
-/// one immutable `val` declared in the direct lexical parent before the
-/// nested callable, read by that child without a child-local declaration of
-/// the same name. Kotlin forbids reassignment of a `val`, so the declaration
-/// node and its lexical scope are the stable storage identity.
+/// Inventory locals captured by a directly nested callable. A mutable local
+/// needs one shared cell in its owner and a capture location in the child.
 fn populate_lexical_capture_specs<'tree>(
     specs: &mut [ProcedureSpec<'tree>],
     source: &'tree str,
@@ -217,6 +221,8 @@ fn populate_lexical_capture_specs<'tree>(
         visible_from: usize,
         scope_start: usize,
         scope_end: usize,
+        mutable: bool,
+        delegated: bool,
     }
 
     let mut bindings = vec![Vec::<ParentBinding<'tree>>::new(); specs.len()];
@@ -228,23 +234,45 @@ fn populate_lexical_capture_specs<'tree>(
             {
                 return Ok(WalkControl::SkipChildren);
             }
-            if node.kind() == "property_declaration"
-                && child_of_kind(node, "binding_pattern_kind")
+            if node.kind() == "variable_declaration" {
+                let property = node
+                    .parent()
+                    .filter(|parent| parent.kind() == "property_declaration");
+                let visible_from = property.map_or(node.end_byte(), |parent| parent.end_byte());
+                let mutable = property
+                    .and_then(|parent| child_of_kind(parent, "binding_pattern_kind"))
                     .and_then(|kind| node_text(source, kind))
-                    == Some("val")
-                && let Some(binding) = binding_node(node)
-                && binding.kind() == "variable_declaration"
-                && let Some(name_node) = binding_names(binding).first().copied()
+                    == Some("var");
+                let delegated = property
+                    .is_some_and(|property| property_delegate_expression(property).is_some());
+                for name_node in binding_names(node) {
+                    if let Some(name) = node_text(source, name_node)
+                        && let Some((scope_start, scope_end)) = kotlin_local_scope(name_node)
+                    {
+                        found.push(ParentBinding {
+                            name,
+                            declaration_start: name_node.start_byte(),
+                            visible_from,
+                            scope_start,
+                            scope_end,
+                            mutable,
+                            delegated,
+                        });
+                    }
+                }
+            } else if node.kind() == "catch_block"
+                && let Some(name_node) = child_of_kind(node, "simple_identifier")
                 && let Some(name) = node_text(source, name_node)
-                && property_initializer(node).is_some()
                 && let Some((scope_start, scope_end)) = kotlin_local_scope(name_node)
             {
                 found.push(ParentBinding {
                     name,
                     declaration_start: name_node.start_byte(),
-                    visible_from: node.end_byte(),
+                    visible_from: name_node.end_byte(),
                     scope_start,
                     scope_end,
+                    mutable: false,
+                    delegated: false,
                 });
             }
             Ok(WalkControl::Continue)
@@ -253,6 +281,8 @@ fn populate_lexical_capture_specs<'tree>(
     }
 
     let mut captures = vec![Vec::<LexicalCaptureSpec<'tree>>::new(); specs.len()];
+    let mut ancestor_capture_gaps = vec![false; specs.len()];
+    let mut transitive_shared = vec![Vec::new(); specs.len()];
     for child in specs.iter() {
         let Some(parent) = child.lexical_parent else {
             continue;
@@ -309,28 +339,65 @@ fn populate_lexical_capture_specs<'tree>(
         })?;
 
         for (name, reference) in first_references {
-            let Some(binding) = bindings[parent.index()]
-                .iter()
-                .filter(|binding| {
-                    binding.name == name.as_ref()
-                        && binding.visible_from <= child.callable.start_byte()
-                        && binding.scope_start <= child.callable.start_byte()
-                        && child.callable.start_byte() < binding.scope_end
-                })
-                .min_by_key(|binding| binding.scope_end - binding.scope_start)
-            else {
+            let mut ancestor = Some(parent);
+            let mut resolved = None;
+            while let Some(owner) = ancestor {
+                if let Some(binding) = bindings[owner.index()]
+                    .iter()
+                    .filter(|binding| {
+                        binding.name == name.as_ref()
+                            && binding.visible_from <= child.callable.start_byte()
+                            && binding.scope_start <= child.callable.start_byte()
+                            && child.callable.start_byte() < binding.scope_end
+                    })
+                    .min_by_key(|binding| binding.scope_end - binding.scope_start)
+                {
+                    resolved = Some((owner, *binding));
+                    break;
+                }
+                ancestor = specs[owner.index()].lexical_parent;
+            }
+            let Some((owner, binding)) = resolved else {
                 continue;
             };
+            if owner != parent {
+                ancestor_capture_gaps[owner.index()] = true;
+                ancestor_capture_gaps[child.id.index()] = true;
+                if binding.mutable {
+                    transitive_shared[owner.index()]
+                        .push((binding.name, binding.declaration_start));
+                }
+                continue;
+            }
             captures[child.id.index()].push(LexicalCaptureSpec {
                 name: binding.name,
                 declaration_start: binding.declaration_start,
                 reference,
+                mutable: binding.mutable,
+                delegated: binding.delegated,
             });
         }
         captures[child.id.index()].sort_by_key(|capture| capture.declaration_start);
     }
-    for (spec, captures) in specs.iter_mut().zip(captures) {
+    let mut shared = transitive_shared;
+    for child in specs.iter() {
+        if let Some(parent) = child.lexical_parent {
+            for capture in &captures[child.id.index()] {
+                if capture.mutable {
+                    shared[parent.index()].push((capture.name, capture.declaration_start));
+                }
+            }
+        }
+    }
+    for (spec, ((captures, mut shared), gap)) in specs
+        .iter_mut()
+        .zip(captures.into_iter().zip(shared).zip(ancestor_capture_gaps))
+    {
+        shared.sort_unstable_by_key(|(_, declaration_start)| *declaration_start);
+        shared.dedup_by_key(|(_, declaration_start)| *declaration_start);
         spec.captures = captures.into_boxed_slice();
+        spec.shared_bindings = shared.into_boxed_slice();
+        spec.ancestor_capture_gap = gap;
     }
     Ok(())
 }

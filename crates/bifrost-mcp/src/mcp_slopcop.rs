@@ -1,9 +1,5 @@
-use crate::mcp_common::{
-    McpRenderOptions, WeightThreshold, run_named_stdio_server, tool_descriptor,
-    weight_knob_descriptor,
-};
+use crate::mcp_common::{WeightThreshold, tool_descriptor, weight_knob_descriptor};
 use serde_json::{Value, json};
-use std::path::PathBuf;
 
 pub const SLOPCOP_TOOL_NAMES: &[&str] = &[
     "compute_cyclomatic_complexity",
@@ -18,13 +14,6 @@ pub const SLOPCOP_TOOL_NAMES: &[&str] = &[
     "report_dead_code_and_unused_abstraction_smells",
     "report_secret_like_code",
 ];
-
-pub fn run_slopcop_stdio_server(
-    root: PathBuf,
-    render_options: McpRenderOptions,
-) -> Result<(), String> {
-    run_named_stdio_server(root, render_options, "slopcop")
-}
 
 pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
     vec![

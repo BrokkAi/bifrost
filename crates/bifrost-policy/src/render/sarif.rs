@@ -28,6 +28,9 @@ const SARIF_SCHEMA_URI: &str =
 const SARIF_VERSION: &str = "2.1.0";
 const SOURCE_ROOT_ID: &str = "SRCROOT";
 
+#[cfg(test)]
+mod exit_contract_tests;
+
 /// Stable producer metadata for one SARIF log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SarifToolIdentity {

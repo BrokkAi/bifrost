@@ -12,7 +12,7 @@ use super::{Result, StoreError};
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
 use crate::analyzer::read_ledger::{
-    CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, ProcedureCallSiteLocator, ReadKey,
+    CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, ReadKey,
 };
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::{CodeUnitType, Language};
@@ -72,10 +72,13 @@ impl ReadKeyColumns {
                 language,
                 rel_path,
                 blob,
+                parse_variant,
             } => {
                 columns.languages = Some(language.config_label().to_string());
                 columns.rel_path = Some(rel_path.to_string());
                 columns.blob_oid = Some(blob.to_string());
+                // For File keys, digest holds the parse variant; NULL means Empty.
+                columns.digest = parse_variant.file_read_key_field().map(<[u8]>::to_vec);
             }
             ReadKey::PathAbsent { language, rel_path } => {
                 columns.languages = Some(language.config_label().to_string());
@@ -118,24 +121,18 @@ impl ReadKeyColumns {
                     }
                     LookupQuestion::CallSite {
                         rel_path,
-                        artifact,
-                        site,
-                    } => {
-                        columns.rel_path = Some(rel_path.to_string());
-                        columns.subject = Some(artifact.as_bytes().to_vec());
-                        columns.start_byte = Some(site.start_byte as i64);
-                        columns.end_byte = Some(site.end_byte as i64);
-                    }
-                    LookupQuestion::ProcedureCallSite {
-                        rel_path,
                         procedure,
                         site,
                     } => {
                         columns.rel_path = Some(rel_path.to_string());
                         columns.subject = Some(procedure.as_bytes().to_vec());
-                        columns.start_byte = Some(site.start_byte as i64);
-                        columns.end_byte = Some(site.end_byte as i64);
-                        columns.site_ordinal = Some(site.ordinal as i64);
+                        // Legacy interval columns now hold a scalar source-order rank.
+                        // Keeping the SQL layout also preserves existing plan families.
+                        columns.start_byte = Some(site.ordinal as i64);
+                        columns.end_byte = Some(site.ordinal as i64);
+                        if *kind == LookupKind::ProcedureDispatch {
+                            columns.site_ordinal = Some(site.ordinal as i64);
+                        }
                     }
                     LookupQuestion::WorkspaceFact {
                         family,
@@ -256,6 +253,14 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
             language: decode_language(languages.as_deref().ok_or_else(|| missing("language"))?)?,
             rel_path: Box::from(rel_path.ok_or_else(|| missing("path"))?.as_str()),
             blob: decode_oid(&blob_oid.ok_or_else(|| missing("blob"))?)?,
+            parse_variant: match digest.as_deref() {
+                None => brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                Some(bytes) => brokk_bifrost_core::gitblob::ParseVariant::Digest(
+                    bytes
+                        .try_into()
+                        .map_err(|_| StoreError::corrupt("invalid File parse variant length"))?,
+                ),
+            },
         },
         "path_absent" => ReadKey::PathAbsent {
             language: decode_language(languages.as_deref().ok_or_else(|| missing("language"))?)?,
@@ -364,33 +369,23 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                     (Some(rel_path), None, None, None, None) => LookupQuestion::File {
                         rel_path: Box::from(rel_path.as_str()),
                     },
-                    (Some(rel_path), None, Some(subject), Some(start), Some(end)) => {
-                        match (lookup_kind, site_ordinal) {
-                            (LookupKind::Dispatch, None) => LookupQuestion::CallSite {
-                                rel_path: Box::from(rel_path.as_str()),
-                                artifact: decode_digest(&subject, "call site artifact")?,
-                                site: CallSiteLocator {
-                                    start_byte: start as usize,
-                                    end_byte: end as usize,
-                                },
+                    (Some(rel_path), None, Some(subject), Some(rank), Some(end))
+                        if rank == end
+                            && rank >= 0
+                            && matches!(
+                                lookup_kind,
+                                LookupKind::Dispatch | LookupKind::ProcedureDispatch
+                            ) =>
+                    {
+                        if site_ordinal.is_some_and(|ordinal| ordinal != rank) {
+                            return Err(StoreError::corrupt("call rank columns disagree"));
+                        }
+                        LookupQuestion::CallSite {
+                            rel_path: Box::from(rel_path.as_str()),
+                            procedure: decode_digest(&subject, "procedure lineage")?,
+                            site: CallSiteLocator {
+                                ordinal: rank as usize,
                             },
-                            (LookupKind::ProcedureDispatch, Some(ordinal)) => {
-                                LookupQuestion::ProcedureCallSite {
-                                    rel_path: Box::from(rel_path.as_str()),
-                                    procedure: decode_digest(&subject, "procedure lineage")?,
-                                    site: ProcedureCallSiteLocator {
-                                        start_byte: start as usize,
-                                        end_byte: end as usize,
-                                        ordinal: ordinal as usize,
-                                    },
-                                }
-                            }
-                            (other, ordinal) => {
-                                return Err(StoreError::new(format!(
-                                    "lookup kind `{}` cannot carry a call-site question with site ordinal {ordinal:?}",
-                                    other.stable_label()
-                                )));
-                            }
                         }
                     }
                     (None, None, Some(identity), None, None) => LookupQuestion::Summary {
@@ -513,7 +508,7 @@ fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> 
         ) | (LookupKind::Dispatch, LookupQuestion::CallSite { .. })
             | (
                 LookupKind::ProcedureDispatch,
-                LookupQuestion::ProcedureCallSite { .. }
+                LookupQuestion::CallSite { .. }
             )
     ) || (!matches!(
         kind,
@@ -525,9 +520,7 @@ fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> 
             | LookupKind::ProcedureDispatch
     ) && !matches!(
         question,
-        LookupQuestion::Name { .. }
-            | LookupQuestion::CallSite { .. }
-            | LookupQuestion::ProcedureCallSite { .. }
+        LookupQuestion::Name { .. } | LookupQuestion::CallSite { .. }
     ))
 }
 
@@ -679,6 +672,46 @@ mod tests {
     use rusqlite::{Connection, params};
 
     use super::*;
+
+    #[test]
+    fn file_receipts_preserve_legacy_encoding_and_round_trip_variants() {
+        use brokk_bifrost_core::gitblob::ParseVariant;
+        let oid = Oid::from_bytes(&[1; 20]).unwrap();
+        let legacy = ReadKey::file(Language::Rust, "lib.rs", oid, ParseVariant::Empty);
+        let columns = ReadKeyColumns::of(&legacy);
+        // Fixed base-branch canonical spelling; no optional field was present.
+        assert_eq!(
+            legacy.canonical_digest().to_string(),
+            "8ead77b582602a575e7474157927d7c1c3ff56e55427ef0824220a9283e253aa"
+        );
+        assert_eq!(columns.digest, None);
+        assert_eq!(columns.languages.as_deref(), Some("rust"));
+        assert_eq!(columns.rel_path.as_deref(), Some("lib.rs"));
+        assert_eq!(
+            columns.blob_oid.as_deref(),
+            Some("0101010101010101010101010101010101010101")
+        );
+        assert_eq!(decode_columns(&columns).unwrap(), legacy);
+        let selected = ReadKey::file(
+            Language::CSharp,
+            "Shared.cs",
+            oid,
+            ParseVariant::Digest([2; 32]),
+        );
+        let selected_columns = ReadKeyColumns::of(&selected);
+        assert_eq!(
+            selected_columns.digest.as_deref(),
+            Some([2_u8; 32].as_slice())
+        );
+        assert_eq!(decode_columns(&selected_columns).unwrap(), selected);
+        let changed = ReadKey::file(
+            Language::CSharp,
+            "Shared.cs",
+            oid,
+            ParseVariant::Digest([3; 32]),
+        );
+        assert_ne!(selected.canonical_digest(), changed.canonical_digest());
+    }
 
     fn decode_columns(columns: &ReadKeyColumns) -> Result<ReadKey> {
         let connection = Connection::open_in_memory()?;

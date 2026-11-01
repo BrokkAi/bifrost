@@ -719,6 +719,7 @@ fn main() {}
         let workspace_files = [&file_a, &file_b]
             .into_iter()
             .map(|file| WorkspaceFileRow {
+                decision: None,
                 rel_path: brokk_bifrost_core::path_utils::rel_path_string(file),
                 blob_oid: oid,
             })

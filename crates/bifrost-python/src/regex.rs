@@ -18,8 +18,9 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use brokk_bifrost_core::analyzer::structural::regex::{
-    CharacterSet, ClassAtom, EscapeValue, Fact, GroupPrefix, MAX_PATTERN_CHARS, MappedChar,
-    NfaError, RegexAnalysis, RegexFlags, RegexNfa, RegexParser, RegexSyntax, single_character,
+    CaptureGroups, CharacterSet, ClassAtom, EscapeValue, Fact, GroupPrefix, MAX_PATTERN_CHARS,
+    MappedChar, NfaError, RegexAnalysis, RegexFlags, RegexNfa, RegexParser, RegexSyntax,
+    single_character,
 };
 
 #[derive(Debug)]
@@ -886,8 +887,9 @@ impl RegexSyntax for PythonRegexSyntax {
         start: usize,
         in_class: bool,
         flags: RegexFlags,
+        groups: &CaptureGroups,
     ) -> Option<EscapeValue> {
-        parse_regex_escape(chars, start, in_class, flags.ascii)
+        parse_regex_escape(chars, start, in_class, flags.ascii, groups)
     }
     fn class_atom(&self, chars: &[char], start: usize, flags: RegexFlags) -> Option<ClassAtom> {
         parse_class_atom(chars, start, flags.ascii)
@@ -919,6 +921,9 @@ impl RegexSyntax for PythonRegexSyntax {
     }
     fn supports_possessive_quantifiers(&self) -> bool {
         true
+    }
+    fn final_line_terminators(&self, _: RegexFlags) -> &'static [&'static str] {
+        &["\n"]
     }
     fn analyze(&self, context: &mut RegexAnalysis<'_>) {
         if context.incomplete.is_some() || !context.flags.complete {
@@ -1136,6 +1141,7 @@ fn parse_regex_escape(
     start: usize,
     in_class: bool,
     ascii: bool,
+    groups: &CaptureGroups,
 ) -> Option<EscapeValue> {
     if chars.get(start) != Some(&'\\') {
         return None;
@@ -1211,7 +1217,11 @@ fn parse_regex_escape(
             }
             Some("unicode-name".to_owned())
         }
-        '0'..='7' => {
+        // CPython sre_parse: `\0` and, inside a class, `\1` to `\7` start an
+        // octal escape of at most three digits. Outside a class a nonzero digit
+        // is octal only when three octal digits follow the backslash;
+        // otherwise one or two decimal digits name a group.
+        '0' | '1'..='7' if escaped == '0' || in_class || three_octal_digits(chars, start) => {
             let mut codepoint = escaped as u32 - '0' as u32;
             let mut digits = 1usize;
             while digits < 3 {
@@ -1222,20 +1232,33 @@ fn parse_regex_escape(
                 digits += 1;
             }
             end = start + 1 + digits;
-            match char::from_u32(codepoint) {
-                Some(character) => {
-                    value = Some(character);
-                    Some(format!("U+{codepoint:04X}"))
-                }
-                None => {
-                    incomplete = Some("invalid-octal-escape");
-                    Some("invalid-octal".to_owned())
-                }
+            if codepoint <= 0o377 {
+                let character = char::from_u32(codepoint).expect("an octal byte is a scalar");
+                value = Some(character);
+                Some(format!("U+{codepoint:04X}"))
+            } else {
+                incomplete = Some("invalid-octal-escape");
+                Some("invalid-octal".to_owned())
             }
         }
         '1'..='9' if !in_class => {
-            incomplete = Some("backreference-not-supported");
-            Some(format!("backreference:{escaped}"))
+            let mut group = escaped as usize - '0' as usize;
+            if let Some(digit @ '0'..='9') = chars.get(start + 2).copied() {
+                group = group * 10 + (digit as usize - '0' as usize);
+                end += 1;
+            }
+            incomplete = Some(if group > groups.opened {
+                "invalid-group-reference"
+            } else if groups.open.contains(&group) {
+                "open-group-reference"
+            } else {
+                "backreference-not-supported"
+            });
+            Some(format!("backreference:{group}"))
+        }
+        '8' | '9' => {
+            incomplete = Some("invalid-class-escape");
+            Some(format!("unknown:{escaped}"))
         }
         'g' | 'k' if !in_class => {
             incomplete = Some("named-backreference-not-supported");
@@ -1266,6 +1289,12 @@ fn parse_regex_escape(
     })
 }
 
+fn three_octal_digits(chars: &[char], start: usize) -> bool {
+    chars
+        .get(start + 1..start + 4)
+        .is_some_and(|digits| digits.iter().all(|digit| matches!(digit, '0'..='7')))
+}
+
 fn parse_class_atom(chars: &[char], start: usize, ascii: bool) -> Option<ClassAtom> {
     let value = *chars.get(start)?;
     if value != '\\' {
@@ -1280,7 +1309,7 @@ fn parse_class_atom(chars: &[char], start: usize, ascii: bool) -> Option<ClassAt
             incomplete: None,
         });
     }
-    let escape = parse_regex_escape(chars, start, true, ascii)?;
+    let escape = parse_regex_escape(chars, start, true, ascii, &CaptureGroups::default())?;
     Some(ClassAtom {
         start,
         end: escape.end,

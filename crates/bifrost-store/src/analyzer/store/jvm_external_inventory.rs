@@ -49,6 +49,13 @@ impl AnalyzerStore {
         members: impl IntoIterator<Item = &'a MemberFact>,
         complete: bool,
     ) -> Result<()> {
+        // This provider is synthesized by the JVM intrinsic inventory and
+        // must never acquire durable rows: operation-local owner-index reads
+        // rely on its absence throughout the operation.
+        assert_ne!(
+            provider_id, "jvm-intrinsic",
+            "intrinsic JVM provider cannot publish external inventory rows"
+        );
         let enumerated_types = types.into_iter().collect::<Vec<_>>();
         if enumerated_types.is_empty() {
             return Ok(());
@@ -228,5 +235,24 @@ impl AnalyzerStore {
                 })
                 .transpose()
         })
+    }
+}
+
+#[cfg(test)]
+mod reserved_provider_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "intrinsic JVM provider cannot publish external inventory rows")]
+    fn intrinsic_provider_publication_is_rejected_before_empty_return() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .publish_jvm_external_inventory_facts(
+                "jvm-intrinsic".to_owned(),
+                std::iter::empty::<&crate::analyzer::semantic_model::TypeFact>(),
+                std::iter::empty::<&MemberFact>(),
+                true,
+            )
+            .unwrap();
     }
 }

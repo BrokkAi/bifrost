@@ -189,8 +189,7 @@ controller.
 hours when `master` has moved, on every push to a `candidate/v*-rc` (or legacy `dave/v*-rc`) branch, and on
 demand through `workflow_dispatch`. It runs the whole workspace with
 `--cfg scheduled_tests` on Windows/x86, Linux/ARM64 and macOS/ARM64, the
-hourly detector's subset on native Windows/ARM64, the cadenced Python,
-extension and plugin legs, the
+cadenced Python, extension and plugin legs, the
 licenses-and-crates assurance job (which also packages the exact crate
 archives), the open-core `classification` check, and the `release preflight`
 job, which rehearses the release harness on Linux/x86 against a locally built

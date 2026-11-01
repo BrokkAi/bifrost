@@ -428,6 +428,12 @@ pub mod pinned_plans {
     /// does not even prepare, so the dump would report a preparation error
     /// instead of a plan.
     pub fn prepare_pin_context(conn: &Connection) {
+        conn.execute_batch(
+            super::super::resolution_selection::SELECTED_RESOLUTION_INPUT_SCHEMA_SQL,
+        )
+        .expect("selection input schema for C# extent plans");
+        conn.execute_batch(super::super::csharp_compilation::extent::OVERLAY_SCHEMA)
+            .expect("C# extent overlay schema");
         conn.execute_batch(super::super::python_unit_summaries::STAGING)
             .expect("Python environment staging tables");
         super::super::ensure_revisioned_workspace_views(conn)
@@ -2166,6 +2172,18 @@ pub mod pinned_plans {
                             brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedCallApplicability,
                         ),
                     )),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::ValueReference,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::UnsupportedExpression,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::UnsupportedRoute,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::SyntheticReference,
+                    )),
                 ],
             ),
             pin(
@@ -2336,7 +2354,19 @@ pub mod pinned_plans {
                             brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedCallApplicability,
                         ),
                     )),
+                    integer(super::super::resolution_prepare::resolution_rows::code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_ENGINE_RULE_KINDS,
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionEngineRuleKind::ArgumentCoercionFilter,
+                    )),
+                    integer(i64::from(super::super::source_facts::provenance_code(
+                        brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode,
+                    ))),
                 ],
+            ),
+            pin(
+                "rust_unenumerable_member_dispatch",
+                super::super::resolution_lexical::RUST_UNENUMERABLE_MEMBER_DISPATCH_SQL,
+                vec![integer(1), integer(1)],
             ),
         ]);
         queries.extend([
@@ -2452,6 +2482,76 @@ pub mod pinned_plans {
         for (name, sql) in TYPED_FACT_PINS {
             queries.push(pin(*name, *sql, vec![integer(1), text("[0]")]));
         }
+        queries.push(pin(
+            "go_hierarchy_selection_coverage",
+            crate::analyzer::store::resolution_operation::go_context::GO_HIERARCHY_SELECTION_COVERAGE_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "go_type_support",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_TYPE_SUPPORT_SQL
+                .as_str(),
+            vec![integer(1), integer(1), integer(1), text("go")],
+        ));
+        queries.push(pin(
+            "go_alias_without_bridge",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_ALIAS_WITHOUT_BRIDGE_SQL
+                .as_str(),
+            vec![integer(1), integer(1), integer(1), text("go")],
+        ));
+        queries.push(pin(
+            "go_direct_embeddings",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_DIRECT_EMBEDDINGS_SQL
+                .as_str(),
+            vec![integer(1), integer(1), integer(1), text("go")],
+        ));
+        queries.push(pin(
+            "go_embedded_reference",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_EMBEDDED_REFERENCE_SQL
+                .as_str(),
+            vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "go_alias_target_type",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_ALIAS_TARGET_TYPE_SQL
+                .as_str(),
+            vec![integer(1), integer(1), integer(1), text("go")],
+        ));
+        queries.push(pin(
+            "go_inverse_embedding_owners",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_INVERSE_EMBEDDING_OWNERS_SQL.as_str(),
+            vec![integer(1), text("Base")],
+        ));
+        queries.push(pin(
+            "go_inverse_alias_nominees",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_INVERSE_ALIAS_NOMINEES_SQL.as_str(),
+            vec![integer(1), text("Base")],
+        ));
+        queries.push(pin(
+            "go_method_lookup_count",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_METHOD_LOOKUP_COUNT_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "go_unbound_alias_interface",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_UNBOUND_ALIAS_INTERFACE_SQL.as_str(),
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "go_method_interface_owners",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_METHOD_INTERFACE_OWNERS_SQL.as_str(),
+            vec![integer(1), integer(1), text("M"), integer(1), text("go")],
+        ));
+        queries.push(pin(
+            "go_interface_owner_for_method",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_INTERFACE_OWNER_FOR_METHOD_SQL.as_str(),
+            vec![integer(1), integer(1), integer(1), text("go")],
+        ));
+        queries.push(pin(
+            "go_hierarchy_method_identity",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_HIERARCHY_METHOD_IDENTITY_SQL.as_str(),
+            vec![integer(1), integer(1), integer(1), text("go")],
+        ));
         for (name, sql, keys) in TYPED_OWNER_PINS {
             queries.push(pin(
                 *name,
@@ -2760,12 +2860,299 @@ pub mod pinned_plans {
             ],
         ));
         queries.push(pin(
+            "open_file_version_decision",
+            super::super::OPEN_FILE_VERSION_DECISION_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                text("csharp"),
+                integer(1),
+                text("App.cs"),
+            ],
+        ));
+        queries.push(pin(
+            "open_partition_decisions",
+            super::super::workspace_inputs::OPEN_PARTITION_DECISIONS_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                text("csharp"),
+                integer(1),
+                text("source"),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_membership_cap",
+            super::super::csharp_compilation::MEMBERSHIP_CAP_SQL,
+            vec![
+                integer(1),
+                text(
+                    &serde_json::to_string(&super::super::csharp_compilation::MEMBERSHIP_CAP_CODES)
+                        .unwrap(),
+                ),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_membership_coverage",
+            super::super::csharp_compilation::MEMBERSHIP_COVERAGE_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "csharp_inventory",
+            super::super::csharp_compilation::INVENTORY_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "csharp_open_inventories",
+            super::super::csharp_compilation::OPEN_INVENTORIES_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "csharp_extent_overlay_affected",
+            super::super::csharp_compilation::extent::OVERLAY_AFFECTED_SQL,
+            vec![
+                integer(1),
+                integer(0),
+                text(&"a".repeat(64)),
+                integer(1),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_extent_overlay_counts",
+            super::super::csharp_compilation::extent::OVERLAY_COUNTS_SQL,
+            vec![integer(1)],
+        ));
+        for (name, sql, values) in [
+            (
+                "csharp_using_mark",
+                super::super::csharp_compilation::extent::MARK_SQL,
+                vec![integer(1), text("native")],
+            ),
+            (
+                "csharp_using_unmark",
+                super::super::csharp_compilation::extent::UNMARK_SQL,
+                vec![integer(1)],
+            ),
+            (
+                "csharp_using_retire_mark",
+                super::super::csharp_compilation::extent::RETIRE_MARK_SQL,
+                vec![integer(1), text("native")],
+            ),
+        ] {
+            queries.push(pin(name, sql, values));
+        }
+        queries.push(pin(
+            "csharp_using_certificate_counts",
+            super::super::csharp_compilation::extent::CERTIFICATE_COUNTS_SQL,
+            vec![text(&"a".repeat(64)), integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "csharp_using_update_installed",
+            super::super::csharp_compilation::extent::UPDATE_INSTALLED_SQL,
+            vec![
+                text(&"a".repeat(64)),
+                integer(1),
+                integer(1),
+                integer(0),
+                text("[]"),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_extent_affected_certificates",
+            super::super::csharp_compilation::extent::affected_certificates_sql(),
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "csharp_extent_files",
+            super::super::csharp_compilation::extent::FILES_SQL,
+            vec![text(&"a".repeat(64)), integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "csharp_extent_publication",
+            super::super::csharp_compilation::extent::PUBLICATION_SQL,
+            vec![
+                text(&"a".repeat(40)),
+                integer(1),
+                text("native"),
+                Value::Blob(Vec::new()),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_extent_counts",
+            super::super::csharp_compilation::extent::COUNTS_SQL,
+            vec![
+                text(&"a".repeat(64)),
+                integer(1),
+                integer(1),
+                integer(1),
+                text("native"),
+                integer(0),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_extent_publication_members",
+            super::super::csharp_compilation::extent::PUBLICATION_MEMBERS_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
             "csharp_compilation_metadata",
             super::super::csharp_compilation::COMPILATION_METADATA_SQL,
             vec![integer(1), text("Proj2/Proj2.csproj")],
         ));
         queries.push(pin(
-            "csharp_selected_set",
+            "csharp_owner_environment",
+            super::super::csharp_compilation::OWNER_ENVIRONMENT_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "csharp_selected_file_decision",
+            super::super::csharp_compilation::SELECTED_FILE_DECISION_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                text("csharp"),
+                integer(1),
+                text("App/Sub/Thing.cs"),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_selected_refusal_paths",
+            super::super::csharp_compilation::SELECTED_REFUSAL_PATHS_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                text("csharp"),
+                integer(1),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_selected_configurations",
+            super::super::csharp_compilation::SELECTED_CONFIGURATIONS_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "csharp_file_version_decision",
+            super::super::csharp_compilation::FILE_DECISION_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                text("csharp"),
+                integer(1),
+                text("App/Sub/Thing.cs"),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_unseen_branch_files",
+            super::super::csharp_compilation::UNSEEN_BRANCH_FILES_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(1),
+            ],
+        ));
+        for (name, sql, params) in [
+            (
+                "csharp_insert_undecided_chain",
+                super::super::csharp_compilation::INSERT_UNDECIDED_CHAIN_SQL,
+                vec![
+                    integer(1),
+                    integer(0),
+                    integer(4),
+                    integer(12),
+                    integer(1),
+                    integer(0),
+                    text("[]"),
+                    text("[]"),
+                    text("[]"),
+                ],
+            ),
+            (
+                "csharp_delete_stale_epoch_chains",
+                super::super::csharp_compilation::DELETE_STALE_EPOCH_CHAINS_SQL,
+                vec![
+                    text("1111111111111111111111111111111111111111"),
+                    text("csharp"),
+                    integer(1),
+                    digest(1),
+                ],
+            ),
+            (
+                "csharp_delete_unrooted_chains",
+                super::super::csharp_compilation::DELETE_UNROOTED_CHAINS_SQL,
+                vec![
+                    text("1111111111111111111111111111111111111111"),
+                    text("csharp"),
+                    digest(1),
+                ],
+            ),
+            (
+                "csharp_delete_replaced_chains",
+                super::super::csharp_compilation::DELETE_REPLACED_CHAINS_SQL,
+                vec![
+                    text("1111111111111111111111111111111111111111"),
+                    text("csharp"),
+                    digest(1),
+                ],
+            ),
+            (
+                "csharp_delete_reclaimed_chains",
+                super::super::csharp_compilation::DELETE_RECLAIMED_CHAINS_SQL,
+                vec![
+                    text("1111111111111111111111111111111111111111"),
+                    text("csharp"),
+                    digest(1),
+                ],
+            ),
+        ] {
+            queries.push(pin(name, sql, params));
+        }
+        queries.push(pin(
+            "csharp_referenced_symbols",
+            super::super::csharp_compilation::REFERENCED_SYMBOLS_SQL,
+            vec![
+                text("1111111111111111111111111111111111111111"),
+                text("csharp"),
+                digest(0),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_set_membership",
+            super::super::csharp_compilation::SET_MEMBERSHIP_SQL,
+            vec![
+                integer(1),
+                integer(super::super::csharp_compilation::DERIVATION_VERSION),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_missing_decisions",
+            super::super::csharp_compilation::MISSING_DECISIONS_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "workspace_path_parse_variants",
+            super::super::query::SELECTED_PARSE_VARIANTS_SQL,
+            // Preserve NULL for a requested path without a selected version.
+            vec![
+                text("csharp"),
+                integer(1),
+                text("[\"App/Sub/Thing.cs\",\"Absent.cs\"]"),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_existing_set_content",
+            super::super::csharp_compilation::EXISTING_SET_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                text("csharp"),
+                integer(1),
+                integer(super::super::csharp_compilation::DERIVATION_VERSION),
+                digest(0),
+            ],
+        ));
+        queries.push(pin(
+            "csharp_selected_set_content",
             super::super::csharp_compilation::SELECTED_SET_SQL,
             vec![
                 text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -6279,6 +6666,19 @@ pub mod tests {
             }
             for query in pinned_queries() {
                 let plan = explain_pin(&conn, &query);
+                if query.name == "rust_unenumerable_member_dispatch" {
+                    assert!(
+                        plan.iter().any(|detail| detail.contains(
+                            "SEARCH resolution_contract_references USING PRIMARY KEY (blob_id=? AND definition=?)"
+                        )),
+                        "{state}: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|detail| !detail.contains("AUTOMATIC")
+                            && !detail.starts_with("SCAN resolution_contract_references")),
+                        "{state}: {plan:?}"
+                    );
+                }
                 if query.name == "rust_unit_summary_package_members" {
                     assert!(
                         plan.iter()
@@ -7223,6 +7623,7 @@ pub mod tests {
         prepare_pin_context(&conn);
         let mut opened_any = false;
         let mut opened_compilation_symbols = false;
+        let mut opened_variant_tables = std::collections::BTreeSet::new();
         for query in pinned_queries() {
             let mut statement = conn
                 .prepare(&format!("EXPLAIN {}", query.sql))
@@ -7257,6 +7658,15 @@ pub mod tests {
                     )
                     .ok();
                 let Some(table) = table else { continue };
+                if matches!(
+                    table.as_str(),
+                    "csharp_file_version_decisions"
+                        | "csharp_source_condition_symbols"
+                        | "csharp_undecided_chains"
+                ) {
+                    opened_variant_tables.insert(table.clone());
+                    continue;
+                }
                 if table == "csharp_compilation_symbols" {
                     opened_compilation_symbols = true;
                     let columns = conn.prepare("SELECT name FROM pragma_table_info('csharp_compilation_symbols') ORDER BY cid").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
@@ -7281,8 +7691,17 @@ pub mod tests {
             }
         }
         assert!(
-            opened_compilation_symbols,
-            "the pinned configuration projection must actually read symbol rows"
+            opened_variant_tables
+                == [
+                    "csharp_file_version_decisions",
+                    "csharp_source_condition_symbols",
+                    "csharp_undecided_chains"
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+                && opened_compilation_symbols,
+            "the pinned configuration projection must actually read all C# variant rows: {opened_variant_tables:?}"
         );
         assert!(
             opened_any,

@@ -140,6 +140,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct ImportBinder {
     pub(super) identity: CandidatePathIdentity,
     pub(super) scope: BindingNodeId,
@@ -161,18 +162,23 @@ pub(super) struct ImportBinderClass {
     pub(super) route: Option<SelectedImportRoute>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct ImportBinding<P> {
     pub(super) reference: SemanticId,
     pub(super) token: SemanticId,
     pub(super) precedence: P,
+    pub(super) endpoint: BindingNodeId,
+    pub(super) coordinate: Option<crate::analyzer::resolution::precedence::BindingScopeCoordinate>,
 }
 
-/// Supplies import metadata and each language's total precedence order, for
-/// example origin rank before depth, or a level-first language's depth first.
-/// The shared join never imposes an order of its own.
+/// Supplies import metadata and language-specific precedence values. C# uses
+/// its own total order; the shared join sorts only by stable source identity.
 pub(super) trait ImportBindingRules {
-    type Precedence: Copy + Ord;
+    type Precedence: Copy;
+
+    fn competes_with_local_definition(&self, _language: Language) -> bool {
+        false
+    }
 
     fn token_metadata(
         &self,
@@ -187,9 +193,9 @@ pub(super) trait ImportBindingRules {
     fn precedence(&self, depth: u32, rank: u32) -> Self::Precedence;
 }
 
-pub(super) fn sort_import_bindings<P: Copy + Ord>(bindings: &mut Vec<ImportBinding<P>>) {
-    bindings.sort_unstable_by_key(|binding| (binding.reference, binding.precedence, binding.token));
-    bindings.dedup_by_key(|binding| (binding.reference, binding.precedence, binding.token));
+pub(super) fn sort_import_bindings<P>(bindings: &mut Vec<ImportBinding<P>>) {
+    bindings.sort_unstable_by_key(|binding| (binding.reference, binding.token, binding.endpoint));
+    bindings.dedup_by_key(|binding| (binding.reference, binding.token, binding.endpoint));
 }
 
 pub(super) fn authored_reference_local_path_evidence(
@@ -241,6 +247,7 @@ pub(super) fn import_bindings_for_lookup<R: ImportBindingRules>(
                     token,
                     demand,
                     source_scope_head,
+                    source_start,
                     activation,
                     ..
                 } = half
@@ -260,7 +267,7 @@ pub(super) fn import_bindings_for_lookup<R: ImportBindingRules>(
                     return Ok(false);
                 };
                 if let Some(rank) = rules.binder_rank(record.semantic_language(), &metadata) {
-                    binders.push((*token, *source_scope_head, *activation, rank));
+                    binders.push((*token, *source_scope_head, *source_start, *activation, rank));
                 }
             }
             Ok(true)
@@ -331,11 +338,12 @@ pub(super) fn import_bindings_for_lookup<R: ImportBindingRules>(
         };
         if !evidence.metadata().unqualified()
             || !evidence.local_bindings_certified()
-            || !evidence.local_definitions().is_empty()
+            || (!rules.competes_with_local_definition(record.semantic_language())
+                && !evidence.local_definitions().is_empty())
         {
             continue;
         }
-        for &(token, scope, activation, rank) in &binders {
+        for &(token, scope, endpoint, activation, rank) in &binders {
             if activation.is_some_and(|start| evidence.metadata().start_byte() < start as usize) {
                 continue;
             }
@@ -350,6 +358,14 @@ pub(super) fn import_bindings_for_lookup<R: ImportBindingRules>(
                     reference,
                     token,
                     precedence: rules.precedence(depth, rank),
+                    endpoint,
+                    coordinate: evidence.binding_scope_coordinate(
+                        if record.semantic_language() == Language::Scala {
+                            scope
+                        } else {
+                            endpoint
+                        },
+                    ),
                 });
             }
         }
@@ -709,6 +725,36 @@ pub const AT_SITE: &str = concat!(
     route_columns!(),
     "WHERE route.blob_id=?1 AND route.import_site=?2"
 );
+// Select named binders at one authored declaration, retaining their full route.
+// The scope seek and selector PK join do not enumerate another declaration.
+pub const SCOPE_NAMED: &str = concat!(
+    route_columns!(),
+    "INDEXED BY resolution_root_imports_binding
+ JOIN resolution_import_selectors selector ON selector.blob_id=route.blob_id AND selector.site=route.import_site
+ WHERE route.blob_id=?1 AND route.root_scope=?2 AND selector.kind='named' AND selector.local_name=?3
+ ORDER BY route.import_site"
+);
+
+pub(super) fn scope_named_routes(
+    connection: &Connection,
+    blob: i64,
+    scope: u32,
+    name: &str,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<ImportRoute>>> {
+    let mut routes = Vec::new();
+    for row in connection
+        .prepare_cached(SCOPE_NAMED)?
+        .query_map(params![blob, scope, name], read_route)?
+    {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        routes.push(row?);
+    }
+    Ok(Some(routes))
+}
+
 /// A token is a semantic catalog key, never a source import ordinal.
 #[doc(hidden)]
 pub const TOKEN_SITE: &str = "SELECT import_source_site FROM resolution_semantic_catalog

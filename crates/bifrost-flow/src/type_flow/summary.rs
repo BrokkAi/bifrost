@@ -17,11 +17,11 @@ use std::{
 use crate::analyzer::read_ledger::read_set_digest;
 use crate::analyzer::read_ledger::{FactSubject, WorkspaceFactFamily};
 use crate::analyzer::semantic::{
-    CancellationToken, ClassAtom, ClassIdentity, DispatchBoundaryKind, IcfgProvider,
-    IcfgProviderBehaviorIdentity, LengthDelimitedDigest, OracleCallContext, ProcedureHandle,
-    ProcedureId, ProgramPointId, ReturnTransferKind, SemanticArtifactKey,
-    SemanticArtifactMaterializationId, SemanticBudget, SemanticRequest, SemanticWork, StableDigest,
-    ValueFlowSnapshot, one_call_dispatch_answer_digest,
+    CancellationToken, ClassAtom, ClassIdentity, IcfgProvider, IcfgProviderBehaviorIdentity,
+    LengthDelimitedDigest, OracleCallContext, ProcedureHandle, ProcedureId, ProgramPointId,
+    ReturnTransferKind, SemanticArtifactKey, SemanticArtifactMaterializationId, SemanticBudget,
+    SemanticRequest, SemanticWork, StableDigest, ValueFlowSnapshot,
+    one_call_dispatch_answer_digest,
 };
 #[cfg(test)]
 use crate::analyzer::semantic::{MemberAccessKind, MemberReceiverQuery};
@@ -1707,24 +1707,7 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
                 bindings: Vec::new(),
             };
             if let Some(dispatch) = outcome.available_value() {
-                live.has_uncovered_boundary = dispatch.boundaries().iter().any(|boundary| {
-                    !matches!(
-                        (&boundary.kind, &boundary.completeness),
-                        (
-                            DispatchBoundaryKind::External(Some(_)),
-                            crate::analyzer::semantic::EvidenceCompleteness::Complete
-                        )
-                    )
-                });
-                live.truncated = dispatch
-                    .boundaries()
-                    .iter()
-                    .any(|boundary| matches!(boundary.kind, DispatchBoundaryKind::Truncated));
-                live.complete_receiver_hint_refinable = dispatch.complete_receiver_hint_refinable();
-                live.dispatch = DispatchStatus::Resolved {
-                    status: dispatch_status,
-                    coverage: dispatch.coverage(),
-                };
+                live = CallSiteCoverage::from_dispatch(dispatch_status, dispatch);
                 boundaries.extend(dispatch.boundaries().iter().cloned());
                 let mut seen_targets = HashSet::default();
                 for dispatch_candidate in dispatch.candidates() {
@@ -2410,6 +2393,11 @@ fn class_set_procedure_surface(
                 behavior_read_digest: *identity.behavior().read_bytes(),
             },
             owner_blob_oid,
+            owner_parse_variant: attachment
+                .as_ref()
+                .map_or(brokk_bifrost_core::gitblob::ParseVariant::Empty, |row| {
+                    row.parse_variant
+                }),
             artifact_public_identity: owner.artifact_public_identity,
             artifact_content_identity: owner.artifact_content_identity,
             exact_behavior_digest: *identity.behavior().as_bytes(),

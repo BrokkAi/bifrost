@@ -136,6 +136,10 @@ impl Serialize for TaintDisplayPathCache {
     }
 }
 
+#[cfg(test)]
+#[path = "display_path/wire_contract_tests.rs"]
+mod wire_contract_tests;
+
 impl PartialEq for TaintDisplayPathCache {
     fn eq(&self, _other: &Self) -> bool {
         // Presentation data does not participate in canonical finding equality.
@@ -498,10 +502,13 @@ struct TaintDisplayGroup {
     witness_ids: Vec<WitnessId>,
 }
 
+/// Display quality order, best first: complete anchors, a complete canonical
+/// path, more informative stages, less projection noise, fewer display
+/// omissions, and finally the lexicographically smaller canonical witness
+/// identity. A fully anchored witness is therefore shown before one missing its
+/// sink excerpt, and a path with informative steps before a bare source-to-sink
+/// path.
 fn compare_candidates(left: &TaintDisplayCandidate, right: &TaintDisplayCandidate) -> Ordering {
-    // Display quality order: complete anchors, complete canonical path, more
-    // informative stages, less projection noise, fewer display omissions, and
-    // finally the lexicographically smaller canonical witness identity.
     left.complete_anchors
         .cmp(&right.complete_anchors)
         .then_with(|| (!left.path.canonical_incomplete).cmp(&!right.path.canonical_incomplete))

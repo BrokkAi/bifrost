@@ -16,6 +16,28 @@ pub use brokk_bifrost_semantic::analyzer::semantic::*;
 macro_rules! impl_program_semantics_provider {
     ($analyzer:ty, |$context:ident| $lowerer:expr) => {
         impl $crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
+            #[cfg(any(test, feature = "test-support"))]
+            fn lower_with_budget_for_test(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                budget: &$crate::analyzer::semantic::SemanticBudget,
+                cancellation: &$crate::analyzer::semantic::CancellationToken,
+            ) -> Result<
+                $crate::analyzer::semantic::SemanticOutcome<
+                    Vec<$crate::analyzer::semantic::ProcedureSemanticsParts>,
+                >,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                let $context = self;
+                let lowerer = $lowerer;
+                let scope = $crate::analyzer::AnalyzerQueryScope::new(self);
+                let prepared = self.inner.prepared_syntax(
+                    brokk_bifrost_core::analyzer::query_token::QueryScope::token(&scope), file,
+                ).expect("test source is prepared");
+                $crate::analyzer::semantic::service::ProgramSemanticsLowerer::lower(
+                    &lowerer, file, &prepared, budget, cancellation,
+                )
+            }
             fn capabilities(&self) -> $crate::analyzer::semantic::SemanticCapabilities {
                 let $context = self;
                 let lowerer = $lowerer;
@@ -120,6 +142,27 @@ macro_rules! impl_program_semantics_provider {
     };
     ($analyzer:ty, $lowerer:expr) => {
         impl $crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
+            #[cfg(any(test, feature = "test-support"))]
+            fn lower_with_budget_for_test(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                budget: &$crate::analyzer::semantic::SemanticBudget,
+                cancellation: &$crate::analyzer::semantic::CancellationToken,
+            ) -> Result<
+                $crate::analyzer::semantic::SemanticOutcome<
+                    Vec<$crate::analyzer::semantic::ProcedureSemanticsParts>,
+                >,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                let lowerer = $lowerer;
+                let scope = $crate::analyzer::AnalyzerQueryScope::new(self);
+                let prepared = self.inner.prepared_syntax(
+                    brokk_bifrost_core::analyzer::query_token::QueryScope::token(&scope), file,
+                ).expect("test source is prepared");
+                $crate::analyzer::semantic::service::ProgramSemanticsLowerer::lower(
+                    &lowerer, file, &prepared, budget, cancellation,
+                )
+            }
             fn capabilities(&self) -> $crate::analyzer::semantic::SemanticCapabilities {
                 let lowerer = $lowerer;
                 $crate::analyzer::semantic::service::ProgramSemanticsLowerer::capabilities(&lowerer)

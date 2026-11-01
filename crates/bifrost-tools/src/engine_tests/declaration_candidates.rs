@@ -8,6 +8,7 @@ use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
 use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 use brokk_bifrost_python_analysis::analyzer::python::adapter::PythonAdapter;
 use brokk_bifrost_rust_analysis::analyzer::rust::adapter::RustAdapter;
+use brokk_bifrost_test_macros::hardwon;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -236,6 +237,35 @@ fn hierarchy_query_on_rekeyed_go_overlay_is_an_explicit_empty_result() {
         request.hierarchy_declaration_facts_by_kind(CodeUnitType::Class),
         Some(rows) if rows.is_empty()
     ));
+}
+
+#[test]
+#[hardwon(
+    "#8429: the non-authoritative parent lookup recorded no read, so a unit could be reused across a Cargo.toml save"
+)]
+fn definition_parent_under_a_rekeyed_cargo_overlay_records_an_unattributed_read() {
+    let (_temp, analyzer) = rust_analyzer(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"original\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "pub trait Worker { fn run(&self); }\n"),
+    ]);
+    let member = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.identifier() == "run")
+        .expect("trait member must be indexed");
+    let overlay = Arc::new(OverlayProject::new(Arc::clone(&analyzer.project)));
+    assert!(overlay.set(
+        analyzer.project.root().join("Cargo.toml"),
+        "[package]\nname = \"rekeyed\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string()
+    ));
+    let request = analyzer.clone_with_project(Arc::new(overlay.snapshot()));
+    assert!(!request.workspace_declaration_identities_authoritative());
+    let (parent, reads) = capture_query_reads(&request, || request.definition_parent_unit(&member));
+    assert_eq!(parent, None);
+    assert!(reads.unattributed_reads() > 0, "{reads:?}");
 }
 
 #[test]

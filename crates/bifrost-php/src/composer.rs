@@ -41,20 +41,47 @@ impl PhpComposerAutoload {
             return false;
         }
         if target.is_class() {
-            return self.class_is_autoloaded(target);
+            return self.class_is_autoloaded(index.project(), target);
         }
         index
             .parent_of(target)
             .as_ref()
-            .is_some_and(|owner| self.class_is_autoloaded(owner))
+            .is_some_and(|owner| self.class_is_autoloaded(index.project(), owner))
     }
 
-    pub fn class_is_autoloaded(&self, class_unit: &CodeUnit) -> bool {
-        class_unit.is_class()
-            && self
-                .psr4_roots
+    /// Whether Composer's PSR-4 loader loads `class_unit` from the file that
+    /// declares it. `ClassLoader::findFileWithExtension` tries the longest
+    /// registered prefix first and each prefix's directories in order, then
+    /// the empty-prefix fallback directories, and loads the first candidate
+    /// file that exists. A class whose own file comes after an existing
+    /// candidate is never loaded from it.
+    pub fn class_is_autoloaded(&self, project: &dyn Project, class_unit: &CodeUnit) -> bool {
+        if !class_unit.is_class() {
+            return false;
+        }
+        let declared = normalize_rel_path(class_unit.source().rel_path());
+        let fq_name = class_unit.fq_name();
+        let segments = fq_name.as_str().split('.').collect::<Vec<_>>();
+        let prefixed = (1..segments.len()).rev().flat_map(|length| {
+            let namespace = segments[..length].join(".");
+            let class_path = segments_to_path(&segments[length..]);
+            self.psr4_roots
                 .iter()
-                .any(|root| root.matches_class(class_unit.fq_name().as_str(), class_unit.source()))
+                .filter(move |root| root.namespace == namespace)
+                .flat_map(|root| root.paths.iter())
+                .map(move |path| path.join(&class_path))
+        });
+        let fallback = self
+            .psr4_roots
+            .iter()
+            .filter(|root| root.namespace.is_empty())
+            .flat_map(|root| root.paths.iter())
+            .map(|path| path.join(segments_to_path(&segments)));
+        prefixed
+            .chain(fallback)
+            .map(normalize_rel_path)
+            .find(|candidate| *candidate == declared || project_file_exists(project, candidate))
+            .is_some_and(|loaded| loaded == declared)
     }
 }
 
@@ -66,23 +93,15 @@ fn composer_manifest_file(project: &dyn Project) -> Option<ProjectFile> {
     })
 }
 
+fn project_file_exists(project: &dyn Project, rel_path: &Path) -> bool {
+    project.file_by_rel_path(rel_path).is_some()
+        || project.has_overlay(&ProjectFile::new(project.root().to_path_buf(), rel_path))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Psr4Root {
     namespace: String,
     paths: Vec<PathBuf>,
-}
-
-impl Psr4Root {
-    fn matches_class(&self, fq_name: &str, file: &ProjectFile) -> bool {
-        let Some(remainder) = namespace_remainder(fq_name, &self.namespace) else {
-            return false;
-        };
-        let class_path = dotted_fqn_to_path(remainder);
-        self.paths
-            .iter()
-            .map(|path| normalize_rel_path(path.join(&class_path)))
-            .any(|expected| expected == normalize_rel_path(file.rel_path()))
-    }
 }
 
 fn collect_psr4_roots(section: Option<&Value>, roots: &mut Vec<Psr4Root>) {
@@ -93,6 +112,12 @@ fn collect_psr4_roots(section: Option<&Value>, roots: &mut Vec<Psr4Root>) {
         return;
     };
     for (namespace, paths) in entries {
+        // Composer refuses a non-empty PSR-4 prefix without a trailing
+        // namespace separator ("psr-4 namespaces must end with a namespace
+        // separator"), and its class loader never matches one.
+        if !namespace.is_empty() && !namespace.ends_with('\\') {
+            continue;
+        }
         let paths = composer_paths(paths);
         if paths.is_empty() {
             continue;
@@ -128,23 +153,8 @@ fn normalized_composer_path(path: &str) -> Option<PathBuf> {
     normalize_project_relative_path(Path::new(&normalized))
 }
 
-fn namespace_remainder<'a>(fq_name: &'a str, namespace: &str) -> Option<&'a str> {
-    if namespace.is_empty() {
-        return Some(fq_name);
-    }
-    if fq_name == namespace {
-        return Some("");
-    }
-    fq_name
-        .strip_prefix(namespace)
-        .and_then(|rest| rest.strip_prefix('.'))
-}
-
-fn dotted_fqn_to_path(fq_name: &str) -> PathBuf {
-    let mut path = PathBuf::new();
-    for part in fq_name.split('.').filter(|part| !part.is_empty()) {
-        path.push(part);
-    }
+fn segments_to_path(segments: &[&str]) -> PathBuf {
+    let mut path = segments.iter().collect::<PathBuf>();
     path.set_extension("php");
     path
 }
@@ -162,6 +172,7 @@ mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::model::{CodeUnitType, Language, Range};
     use brokk_bifrost_core::analyzer::project::{FileSetProject, OverlayProject};
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -186,7 +197,7 @@ mod tests {
             self.project.analyzable_files(language)
         }
         fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
-            self.listed
+            (self.listed || path != Path::new("composer.json"))
                 .then(|| self.project.file_by_rel_path(path))
                 .flatten()
         }
@@ -249,12 +260,19 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#7233: review of #7228: PSR-4 membership ignored Composer's longest-prefix lookup and accepted prefixes without a trailing separator"
+    )]
     fn composer_manifest_format_boundary() {
         // Composer's PSR-4 schema maps namespaces to a string or an array;
         // PSR-4 maps remaining namespace components and the basename to .php.
+        // Its class loader tries the longest prefix first and loads the first
+        // candidate file that exists, and rejects a non-empty prefix that
+        // does not end with a namespace separator.
         let manifest = serde_json::json!({
             "autoload": {"psr-4": {
-                "App\\": "src/", "Multi\\": ["modern/", "legacy/"], "": "fallback/"
+                "App\\": "src/", "App\\Sub\\": "sub/", "NoSep": "nosep/",
+                "Multi\\": ["modern/", "legacy/"], "": "fallback/"
             }},
             "autoload-dev": {"psr-4": {"Tests\\": "tests/"}}
         })
@@ -263,14 +281,11 @@ mod tests {
         // Exercise a listed manifest and an overlay-only manifest, with a
         // conflicting lock file present in both project views.
         for listed in [true, false] {
-            let files = if listed {
-                vec![
-                    PathBuf::from("composer.json"),
-                    PathBuf::from("composer.lock"),
-                ]
-            } else {
-                vec![PathBuf::from("composer.lock")]
-            };
+            let files = vec![
+                PathBuf::from("composer.json"),
+                PathBuf::from("composer.lock"),
+                PathBuf::from("sub/Widget.php"),
+            ];
             let project = OverlayProject::new(Arc::new(FileSetProject::new(root.clone(), files)));
             assert!(project.set(root.join("composer.json"), manifest.clone()));
             assert!(project.set(root.join("composer.lock"), "{}".into()));
@@ -302,6 +317,10 @@ mod tests {
                 ("App", "Service", "src/Service.phtml", false),
                 ("Vendor", "OffPath", "misc/OffPath.php", false),
                 ("Application", "Service", "src/Service.php", false),
+                ("App.Sub", "Widget", "src/Sub/Widget.php", false),
+                ("App.Sub", "Widget", "sub/Widget.php", true),
+                ("App.Sub", "Other", "src/Sub/Other.php", true),
+                ("NoSep", "Thing", "nosep/Thing.php", false),
             ];
             for (namespace, class, path, expected) in rows {
                 let file = ProjectFile::new(&root, path);
@@ -314,7 +333,7 @@ mod tests {
                 );
                 index.owner = owner.clone();
                 assert_eq!(
-                    autoload.class_is_autoloaded(&owner),
+                    autoload.class_is_autoloaded(&index, &owner),
                     expected,
                     "listed={listed}: {owner:?}"
                 );
@@ -328,7 +347,7 @@ mod tests {
                     expected,
                     "member {member:?}"
                 );
-                assert!(!autoload.class_is_autoloaded(&member));
+                assert!(!autoload.class_is_autoloaded(&index, &member));
             }
         }
     }

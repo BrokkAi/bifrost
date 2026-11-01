@@ -264,7 +264,7 @@ impl<A: LanguageAdapter> CanonicalPythonSourceFacts for TreeSitterAnalyzer<A> {
         }
         let generation = self.language_generation("python")?;
         let oid = self.resolve_live_oid_for_file(file)?;
-        let keys = self.file_read_key(file, oid);
+        let keys = self.file_read_key(file, oid, brokk_bifrost_core::gitblob::ParseVariant::Empty);
         debug_assert!(matches!(
             keys,
             brokk_bifrost_analysis::analyzer::read_ledger::ReadKey::File { .. }
@@ -309,7 +309,13 @@ impl<A: LanguageAdapter> CanonicalPythonSourceFacts for TreeSitterAnalyzer<A> {
             return Some(facts);
         }
         let facts = self.store_query_or_record(
-            |sink| sink.push(self.file_read_key(file, oid)),
+            |sink| {
+                sink.push(self.file_read_key(
+                    file,
+                    oid,
+                    brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                ))
+            },
             self.store_context
                 .store
                 .python_source_facts(oid, generation, file, keep_going),

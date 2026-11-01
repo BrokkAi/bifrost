@@ -434,7 +434,10 @@ fn negative_source_memo_replays_transient_failure_into_later_builder() {
                 .any(|reason| matches!(reason, QueryReadIncomplete::StoreFailure(_))),
             "memo must replay I/O provenance: {reasons:?}"
         );
-        assert!(!analyzer.macro_composed_fields_by_file.contains_key(&owner));
+        assert!(
+            analyzer.macro_composed_fields_by_file.contains_key(&owner),
+            "a fresh fill domain rereads the restored donor despite the caller's failed request memo"
+        );
     }
     let fresh = AnalyzerQueryScope::new(&analyzer);
     let fields = analyzer.macro_composed_fields(&owner);
@@ -448,7 +451,7 @@ fn negative_source_memo_replays_transient_failure_into_later_builder() {
             .iter()
             .any(|field| field.unit.fq_name() == "Owner.value")
     );
-    assert_eq!(analyzer.macro_composed_fields_build_count_for_test(), 2);
+    assert_eq!(analyzer.macro_composed_fields_build_count_for_test(), 1);
 }
 
 #[test]
@@ -548,8 +551,8 @@ fn nested_cancelled_macro_composed_field_read_marks_outer_scope_incomplete() {
             .is_empty()
     );
     assert!(
-        analyzer.direct_ancestors.get(&owner_unit).is_none(),
-        "an incomplete dependency must neither panic nor publish an ancestor cache entry"
+        analyzer.direct_ancestors.get(&owner_unit).is_some(),
+        "a fresh fill after cancellation ends may retain its own complete ancestor read"
     );
 }
 

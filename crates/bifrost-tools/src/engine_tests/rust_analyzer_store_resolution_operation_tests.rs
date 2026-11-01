@@ -2064,6 +2064,7 @@ pub mod rust_departing_root_tests {
             self.selected_sources
                 .iter()
                 .map(|source| WorkspaceFileRow {
+                    decision: None,
                     rel_path: brokk_bifrost_core::path_utils::rel_path_string(&ProjectFile::new(
                         self._project_root.path(),
                         &source.relative_path,
@@ -2165,6 +2166,7 @@ pub mod rust_departing_root_tests {
                     existing.blob_oid = oid;
                 } else {
                     sources.push(WorkspaceFileRow {
+                        decision: None,
                         rel_path: source_row.clone(),
                         blob_oid: oid,
                     });
@@ -2427,6 +2429,7 @@ pub mod rust_departing_root_tests {
                     .expect("prepare parsed Rust root blob with resolution bundle"),
                 );
                 versions.push(WorkspaceFileRow {
+                    decision: None,
                     rel_path: path.clone(),
                     blob_oid: oid,
                 });
@@ -3705,11 +3708,14 @@ pub mod rust_departing_root_tests {
             // (resolution_selection.rs) and, per search, four reads that verify
             // reason-owner memo hits against the publication (resolution_typed.rs,
             // cfg(debug_assertions)). Release-code builds such as the measure
-            // profile compile them out: 270/238 open, 330 search.
+            // profile compile them out: 270/238 open, 328 search.
+            // #8166: the batch candidate-path memo serves repeated
+            // RESOLUTION_PATHS_BY_KEY_SQL hydration within one point operation;
+            // only that statement moves: -2 executions/-3 rows per search.
             if cfg!(debug_assertions) {
-                (273, 241, 334, 207)
+                (273, 241, 332, 204)
             } else {
-                (270, 238, 330, 207)
+                (270, 238, 328, 204)
             },
             "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
         );
@@ -3760,10 +3766,11 @@ pub mod rust_departing_root_tests {
             // #6594 removes the same four request-buffer writes per search.
             // #6594: independently measured warm/repeated searches also skip 31 empty reads.
             // The same three cached recipe reads as the cold search: -3/-3.
+            // #8166: the same candidate-path hydration as the cold search: -2/-3.
             if cfg!(debug_assertions) {
-                (5, 4, 334, 207)
+                (5, 4, 332, 204)
             } else {
-                (5, 4, 330, 207)
+                (5, 4, 328, 204)
             },
             "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
         );
@@ -3786,10 +3793,11 @@ pub mod rust_departing_root_tests {
             // #6594 removes the same four request-buffer writes per search.
             // #6594: independently measured warm/repeated searches also skip 31 empty reads.
             // The same three cached recipe reads as the cold search: -3/-3.
+            // #8166: the same candidate-path hydration as the cold search: -2/-3.
             if cfg!(debug_assertions) {
-                (5, 4, 334, 207)
+                (5, 4, 332, 204)
             } else {
-                (5, 4, 330, 207)
+                (5, 4, 328, 204)
             },
             "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
         );
@@ -5810,10 +5818,12 @@ pub mod rust_departing_root_tests {
         );
         let mut source_rows = fixture.source_rows();
         source_rows.push(WorkspaceFileRow {
+            decision: None,
             rel_path: ALT_PROVIDER_ROOT_PATH.to_owned(),
             blob_oid: alt_root_oid,
         });
         source_rows.push(WorkspaceFileRow {
+            decision: None,
             rel_path: ALT_PROVIDER_PATH.to_owned(),
             blob_oid: alt_oid,
         });

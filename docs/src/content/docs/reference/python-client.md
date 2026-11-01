@@ -24,7 +24,7 @@ python -c "import bifrost_searchtools, inspect; print(inspect.signature(bifrost_
 | Wheel platforms | Linux x86_64 and aarch64 (manylinux2014), macOS x86_64 and arm64, Windows x86_64 (amd64). |
 | Other platforms | Install from the sdist. The build needs a Rust toolchain (Rust 1.99 or later) and maturin 1.7 or later. |
 | Python dependencies | None. |
-| Native module | `bifrost_searchtools._native`, a compiled extension built with PyO3. |
+| Native module | `bifrost_searchtools._native`, a compiled extension built with PyO3. A published wheel ships it xz-compressed to stay under PyPI's upload limit. The first import unpacks and verifies it, which takes a few seconds, into a `bin-*` directory in the package directory, or into the user cache directory when the installation is read-only. Uninstalling leaves the unpacked copy behind. |
 
 ## Module Contents
 
@@ -131,6 +131,12 @@ strings.
 | `get_summaries(targets: list[str])` | `FileSummariesResult` | Directory and package targets return entries in `listings`. A glob that matches too many files is reported in `too_broad`, and an ambiguous path in `ambiguous_paths`. |
 | `list_symbols(file_patterns: list[str])` | `SkimFilesResult` | Not exposed to MCP agents. |
 | `classify_test_files(file_paths: list[str])` | `dict[str, dict[str, Any]]` | Maps each resolved path to `{"kind": ..., "contains_test_code": bool}`. `kind` is `test`, `test_support`, `production`, or `ambiguous`. Inputs that do not resolve to exactly one file are left out. Not exposed to MCP agents. |
+
+Partial hierarchy answers retain definite ancestors and add `complete: false`,
+`incomplete_reasons` with stable reason labels and endpoint names when known,
+and `alternatives` with one
+list per ambiguous edge. Complete answers omit these fields.
+
 
 ### Navigation
 

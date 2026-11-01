@@ -58,6 +58,9 @@ impl brokk_bifrost_jvm::kotlin::hierarchy::KotlinHierarchyFact for JvmHierarchyF
 // Each generation-lived ancestor entry owns its build receipt, including fills
 // performed before any policy unit starts capturing reads.
 use brokk_bifrost_analysis::analyzer::IAnalyzer;
+use brokk_bifrost_analysis::analyzer::common::{
+    ReplayableQueryCacheValue, replayable_query_cache_value,
+};
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
 use brokk_bifrost_analysis::analyzer::workspace_authority::{
@@ -98,18 +101,37 @@ pub(crate) fn memoized_ancestors(
     (*ancestors).clone()
 }
 
+type WeightedDerivedMemo<K, V> = ReplayingMemo<Cache<K, Arc<ReplayingMemoEntry<V, ReadKey>>>>;
+
+pub(crate) type RawDerivedMemo<K, V> = WeightedDerivedMemo<K, Arc<V>>;
+
+pub(crate) fn raw_derived_memo<K, V>(budget: u64) -> RawDerivedMemo<K, V>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    weighted_derived_memo(budget)
+}
+
 /// A bounded derived projection carries the reads of the entry it returns.
-pub(crate) type DerivedMemo<K, V> =
-    ReplayingMemo<Cache<K, Arc<ReplayingMemoEntry<Arc<V>, ReadKey>>>>;
+pub(crate) type DerivedMemo<K, V> = WeightedDerivedMemo<K, ReplayableQueryCacheValue<Arc<V>>>;
 
 pub(crate) fn derived_memo<K, V>(budget: u64) -> DerivedMemo<K, V>
 where
     K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     V: Send + Sync + 'static,
 {
+    weighted_derived_memo(budget)
+}
+
+fn weighted_derived_memo<K, V>(budget: u64) -> WeightedDerivedMemo<K, V>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
     ReplayingMemo::new(build_weighted_cache(
         budget,
-        |_, entry: &Arc<ReplayingMemoEntry<Arc<V>, ReadKey>>| {
+        |_, entry: &Arc<ReplayingMemoEntry<V, ReadKey>>| {
             u32::try_from(entry.retained_bytes(|key| {
                 let mut heap = RetainedHeap::default();
                 retained_read_key(&mut heap, key);
@@ -133,10 +155,25 @@ where
     let result = memo
         .read(&memo_attribution(analyzer), |cache, capture| {
             Ok::<_, std::convert::Infallible>(cache.get(key).unwrap_or_else(|| {
-                let attempt = brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                let mut publish = false;
+                // The outer replay entry retains ledger channels too. Isolate
+                // before its capture so caller store failures cannot mark it.
+                let _fill = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::for_retained_fill(
                     analyzer,
-                    || Arc::new(capture.build_weighted(build)),
                 );
+                let entry = Arc::new(capture.build_weighted(|| {
+                    let mut bytes = 0;
+                    let attempt = replayable_query_cache_value(analyzer, || {
+                        let built = build();
+                        bytes = built.1;
+                        built.0
+                    });
+                    publish = attempt.is_ok();
+                    let value = attempt.unwrap_or_else(|value| value);
+                    bytes += value.retained_receipt_bytes();
+                    (value, bytes)
+                }));
+                let attempt: Result<_, Arc<_>> = if publish { Ok(entry) } else { Err(entry) };
                 match attempt {
                     Ok(entry) => {
                         cache.insert(key.clone(), Arc::clone(&entry));
@@ -147,13 +184,42 @@ where
             }))
         })
         .expect("derived memo build is infallible");
-    Arc::clone(&result)
+    Arc::clone(result.replay())
 }
 
 #[cfg(test)]
 mod memo_tests {
     use super::*;
     use brokk_bifrost_analysis::analyzer::{capture_query_reads, store::StoreError};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8184: the outer JVM replay entry retained an unrelated caller store failure"
+    )]
+    fn retained_derived_entry_excludes_enclosing_execution_failure() {
+        let project = crate::inline_project::InlineTestProject::with_language(
+            brokk_bifrost_core::analyzer::model::Language::Java,
+        )
+        .file("Example.java", "class Example {}\n")
+        .build();
+        let analyzer = crate::analyzer::java::JavaAnalyzer::new(project.project_arc());
+        let memo = derived_memo(64 * 1024);
+        {
+            let _outer = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.record_query_failure(StoreError::new("unrelated"));
+            assert_eq!(
+                *derived_read(&memo, &analyzer, &"complete", || (Arc::new(17), 4)),
+                17
+            );
+        }
+        let (_, warm) = capture_query_reads(&analyzer, || {
+            assert_eq!(
+                *derived_read(&memo, &analyzer, &"complete", || panic!("must hit")),
+                17
+            );
+        });
+        assert_eq!(warm.execution_dependences(), 0, "{warm:?}");
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(

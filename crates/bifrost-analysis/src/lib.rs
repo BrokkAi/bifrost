@@ -149,6 +149,10 @@ pub use navigation::NavigationOperation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod native_resolution_test_support {
     pub use crate::analyzer::resolution::test_support::fixture_fragment;
+    pub use crate::analyzer::store::resolution_operation::native_units::{
+        NativeCompletionReasonOwnership, start_native_completion_reason_probe_for_test,
+        take_native_completion_reason_probe_for_test,
+    };
 
     #[test]
     #[ignore = "one-file native smoke run with an external per-file timeout"]
@@ -396,6 +400,7 @@ pub mod native_resolution_test_support {
                 SelectedResolutionContentMountRequest::new(
                     content.into_parts().0,
                     crate::analyzer::store::WorkspaceFileRow {
+                        decision: None,
                         rel_path,
                         blob_oid: oid,
                     },

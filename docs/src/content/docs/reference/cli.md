@@ -33,7 +33,7 @@ applies:
    `--policy-file`, `--policy-pack`, `--policy-category`, `--policy-id`,
    `--exclude-policy-id`, `--list-policies`, `--list-row-schemas`, `--format`, `--fail-on`,
    `--suppressions-file`, `--scope-file`, `--baseline-file`, `--accept-current`,
-   `--evaluation-date`, `--diff-base`, `--no-incremental`, `--policy-timings`, `--policy-cost-hints`,
+   `--evaluation-date`, `--diff-base`, `--no-incremental`, `--policy-timings`, `--policy-cost-hints`, `--policy-deadlines-ms`,
    `--output`, `--color`, `--verbose`, `--require-explicit-schema-versions`,
    `--explain-finding`, `--explain-candidate`, `--explain-near-misses`, and
    `--explain-generation`.
@@ -81,7 +81,7 @@ sha256=<digest>` line, and one activation summary line to stderr. The
 including opt-in policies that the scan does not run.
 
 A scan reads the default suppression, scope, and baseline files under `PATH`.
-It does not accept `--sources`, `--policy-timings`, `--policy-cost-hints`, policy selectors, or
+It does not accept `--sources`, `--policy-timings`, `--policy-cost-hints`, `--policy-deadlines-ms`, policy selectors, or
 custom document paths. Use the flag surface for those.
 
 ## Flags
@@ -179,6 +179,7 @@ The field tables of these files are on [Policies Reference](/reference/policies/
 | `--no-incremental` | None | Off | Once | Evaluate every policy in full without reading or writing policy units in the analyzer cache. |
 | `--accept-current` | None | Off | Once | Run the selected policies and write every current strong finding identity to the baseline file. Writes only when the run is reliable and complete and no suppression record is orphaned. |
 | `--policy-cost-hints <path>` | JSON file path | Empty | Once | Object from non-empty policy IDs to non-negative integer milliseconds, at most 256 entries. Parallel batches start unknown policies first, then hinted policies from longest to shortest; hints never change the report. |
+| `--policy-deadlines-ms <path>` | JSON file path | Empty | Once | Object from non-empty policy IDs to integer milliseconds of at least 1, at most 256 entries. Each listed policy stops at its own deadline, counted from when its evaluation starts; it ends `inconclusive` with reason `rule_deadline_exceeded`, the exit status is 2, and `execution.timed_out_policy_ids` lists it. The other policies keep running. |
 | `--policy-timings` | None | Off | Once | Add each policy's elapsed time to the report's work metrics (`evaluation.elapsed_ms`, plus `units.prefetch_ms`, `units.verify_ms`, `units.lookup_replay_ms` and `units.recompute_ms` for a policy that ran unit by unit). Also write one `bifrost: policy stage timings {...}` line to stderr whose JSON has `kind` `bifrost.policy-stage-timings` and `schema_version` `1`. |
 
 ### Policy Explanation
@@ -221,7 +222,7 @@ Bifrost rejects these combinations before it does any work:
 | `--list-policies` with `--list-row-schemas` | Error, exit 2 |
 | A listing flag with any other policy flag or `--sources` | Error, exit 2 |
 | Two of `--explain-finding`, `--explain-candidate`, `--explain-near-misses` | Error, exit 2 |
-| An explanation flag with `--format`, `--fail-on`, `--suppressions-file`, `--scope-file`, `--baseline-file`, `--accept-current`, `--evaluation-date`, `--diff-base`, `--policy-timings`, `--policy-cost-hints`, `--verbose`, `--color`, or `--sources` | Error, exit 2 |
+| An explanation flag with `--format`, `--fail-on`, `--suppressions-file`, `--scope-file`, `--baseline-file`, `--accept-current`, `--evaluation-date`, `--diff-base`, `--policy-timings`, `--policy-cost-hints`, `--policy-deadlines-ms`, `--verbose`, `--color`, or `--sources` | Error, exit 2 |
 | An explanation flag with no `--policy-file` and no built-in selector | Error, exit 2 |
 | `--explain-generation` without an explanation flag | Error, exit 2 |
 | `--no-builtin-policies` with a built-in selector, or without `--policy-file` | Error, exit 2 |

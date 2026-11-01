@@ -2715,13 +2715,12 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             if !statuses.is_empty() {
                 for status in statuses {
                     boundaries.push(workspace_hierarchy_unenumerated_boundary(status));
-                    if status == ExternalMemberFamilyStatus::Cancelled {
-                        materialization_quality = DispatchQuality::Cancelled;
-                    }
+                    materialization_quality = merge_dispatch_quality(
+                        materialization_quality,
+                        workspace_hierarchy_unenumerated_quality(status),
+                    );
                 }
                 workspace_hierarchy_unenumerated = true;
-                materialization_quality =
-                    merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
             }
         }
 
@@ -2791,7 +2790,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             && boundaries.is_empty();
         let coverage = if dispatch_truncated {
             CandidateCoverage::Truncated
-        } else if cancelled {
+        } else if cancelled || workspace_hierarchy_unenumerated {
             CandidateCoverage::Open
         } else if resolver_proved_no_callee
             || anonymous_receiver_refined
@@ -3934,10 +3933,24 @@ pub(crate) fn external_member_workspace_override_proven_absent(
                 .is_empty())
 }
 
+fn workspace_hierarchy_unenumerated_quality(status: ExternalMemberFamilyStatus) -> DispatchQuality {
+    match status {
+        ExternalMemberFamilyStatus::Complete => {
+            unreachable!("a complete external member family needs no refusing boundary")
+        }
+        ExternalMemberFamilyStatus::Unsupported | ExternalMemberFamilyStatus::Incomplete(_) => {
+            DispatchQuality::Unproven
+        }
+        ExternalMemberFamilyStatus::Cancelled => DispatchQuality::Cancelled,
+        ExternalMemberFamilyStatus::BudgetExhausted => DispatchQuality::Truncated,
+    }
+}
+
 /// #2371: the arm a call keeps when the workspace half of its residual
-/// dynamic-dispatch gap is not proven enumerated. Distinct from the generic
-/// [`truncated_dispatch_boundary`] reason so a corpus trace can tell the two
-/// causes apart; both are `Truncated`, so both refuse discharge identically.
+/// dynamic-dispatch gap is not proven enumerated. Stable incompleteness and
+/// cancellation retain a typed hierarchy boundary; budget exhaustion stays
+/// truncated. Both kinds refuse complete dispatch and mark possible omitted
+/// workspace procedures without depending on diagnostic reason text.
 pub(crate) fn workspace_hierarchy_unenumerated_boundary(
     status: ExternalMemberFamilyStatus,
 ) -> DispatchBoundary {
@@ -3959,7 +3972,10 @@ pub(crate) fn workspace_hierarchy_unenumerated_boundary(
         }
     };
     DispatchBoundary {
-        kind: DispatchBoundaryKind::Truncated,
+        kind: match status {
+            ExternalMemberFamilyStatus::BudgetExhausted => DispatchBoundaryKind::Truncated,
+            _ => DispatchBoundaryKind::HierarchyUnenumerated,
+        },
         external_callee_identity: None,
         exact_external_target: None,
         unmaterialized_external_target: None,
@@ -4502,7 +4518,9 @@ pub(crate) fn dispatch_boundary_evidence_count(
     procedure_call_gap: Option<&SemanticGap>,
 ) -> usize {
     let expected_exceeded = match &boundary.kind {
-        DispatchBoundaryKind::Unresolved => Some(false),
+        DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::HierarchyUnenumerated => {
+            Some(false)
+        }
         DispatchBoundaryKind::Truncated => Some(true),
         DispatchBoundaryKind::External(_)
         | DispatchBoundaryKind::Unmaterialized(_)
@@ -4595,7 +4613,8 @@ pub fn attach_dispatch_provenance(
                     vec![target_evidence.clone()]
                 } else {
                     let expected_gap_kind = match &boundary.kind {
-                        DispatchBoundaryKind::Unresolved => Some(false),
+                        DispatchBoundaryKind::Unresolved
+                        | DispatchBoundaryKind::HierarchyUnenumerated => Some(false),
                         DispatchBoundaryKind::Truncated => Some(true),
                         DispatchBoundaryKind::External(None) => None,
                         DispatchBoundaryKind::External(Some(_))
@@ -6685,8 +6704,10 @@ pub fn dispatch_coverage(
     {
         CandidateCoverage::Truncated
     } else if boundaries.iter().any(|boundary| {
-        boundary.kind == DispatchBoundaryKind::Unresolved
-            || matches!(boundary.proof, ProofStatus::Unproven(_))
+        matches!(
+            boundary.kind,
+            DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::HierarchyUnenumerated
+        ) || matches!(boundary.proof, ProofStatus::Unproven(_))
     }) {
         CandidateCoverage::Open
     } else {
@@ -7017,8 +7038,15 @@ pub fn procedures_for_definition_with_limits(
             status: ProcedureRangeLookupStatus::SourceChanged,
         };
     };
+    let Some(variant) = analyzer.selected_parse_variant(definition.source()) else {
+        return progress.failed(ProcedureRangeLookupStatus::SourceChanged);
+    };
     let indexed_identity = match content_identity_with_progress(&indexed_source, &mut progress) {
-        Ok(identity) => identity,
+        Ok(identity) => crate::analyzer::semantic::ContentIdentity::from_source_digest(
+            identity.digest(),
+            definition.source().language(),
+            variant,
+        ),
         Err(status) => return progress.failed(status),
     };
     if indexed_identity != artifact.key().revision().content() {
@@ -7225,7 +7253,11 @@ pub fn compare_dispatch_boundaries(left: &DispatchBoundary, right: &DispatchBoun
                 .label()
                 .cmp(right_kind.label())
                 .then_with(|| compare_locator_fields(left_target, right_target)),
-            (DispatchBoundaryKind::Unresolved, DispatchBoundaryKind::Unresolved)
+            (
+                DispatchBoundaryKind::HierarchyUnenumerated,
+                DispatchBoundaryKind::HierarchyUnenumerated,
+            )
+            | (DispatchBoundaryKind::Unresolved, DispatchBoundaryKind::Unresolved)
             | (DispatchBoundaryKind::Truncated, DispatchBoundaryKind::Truncated) => Ordering::Equal,
             _ => unreachable!("matching boundary ranks must identify the same variant"),
         })
@@ -7264,6 +7296,24 @@ pub mod js_ts_tests_support;
 #[doc(hidden)]
 #[cfg(test)]
 pub mod tests {
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#2445: an unsupported external member family was reported as budget truncation")]
+    fn unsupported_external_member_family_stays_open_without_budget_truncation() {
+        use super::*;
+        let status = ExternalMemberFamilyStatus::Unsupported;
+        let boundary = workspace_hierarchy_unenumerated_boundary(status);
+        assert_eq!(boundary.kind, DispatchBoundaryKind::HierarchyUnenumerated);
+        assert_eq!(
+            workspace_hierarchy_unenumerated_quality(status),
+            DispatchQuality::Unproven
+        );
+        assert_eq!(
+            dispatch_coverage(Some(DefinitionLookupStatus::Resolved), &[boundary]),
+            CandidateCoverage::Open
+        );
+    }
 
     use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::agreed_external_formal_contract;
 

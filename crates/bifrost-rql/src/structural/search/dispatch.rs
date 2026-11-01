@@ -21,6 +21,53 @@ use crate::analyzer::semantic::{
     SemanticLocator, UnmaterializedExternalTarget,
 };
 
+/// Typed boundary vocabulary retained until the public row rendering boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DispatchBoundaryClass {
+    External,
+    Unmaterialized,
+    Deferred,
+    Unresolved,
+    HierarchyUnenumerated,
+    Truncated,
+}
+
+impl DispatchBoundaryClass {
+    pub(super) fn from_kind(kind: &crate::analyzer::semantic::DispatchBoundaryKind) -> Self {
+        use crate::analyzer::semantic::DispatchBoundaryKind;
+        let class = match kind {
+            DispatchBoundaryKind::External(_) => Self::External,
+            DispatchBoundaryKind::Unmaterialized(_) => Self::Unmaterialized,
+            DispatchBoundaryKind::Deferred { .. } => Self::Deferred,
+            DispatchBoundaryKind::Unresolved => Self::Unresolved,
+            DispatchBoundaryKind::HierarchyUnenumerated => Self::HierarchyUnenumerated,
+            DispatchBoundaryKind::Truncated => Self::Truncated,
+        };
+        // Rows render `label()`; it must stay the oracle's public label.
+        debug_assert_eq!(class.label(), kind.label());
+        class
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Unmaterialized => "unmaterialized",
+            Self::Deferred => "deferred",
+            Self::Unresolved => "unresolved",
+            Self::HierarchyUnenumerated => "hierarchy_unenumerated",
+            Self::Truncated => "truncated",
+        }
+    }
+
+    /// Exact builtin literal receivers cannot dispatch to subclass overrides.
+    pub(super) fn closes_for_exact_builtin_receiver(self) -> bool {
+        match self {
+            Self::Unresolved | Self::HierarchyUnenumerated | Self::Truncated => true,
+            Self::External | Self::Unmaterialized | Self::Deferred => false,
+        }
+    }
+}
+
 /// Domain separator for one dispatch site's stable id.
 const DISPATCH_SITE_ID_DOMAIN: &[u8] = b"bifrost.code_query.dispatch_site.v1";
 /// Domain separator for one dispatch target arm's stable id.
@@ -117,7 +164,7 @@ pub(super) struct DispatchSiteAnswer {
     /// interchangeable: one `unresolved` residual is what an authored contract
     /// claim can discharge (#2371), while `truncated` and `external` without a
     /// locator name nothing any content can address.
-    pub(super) unnamed_boundaries: Vec<&'static str>,
+    pub(super) unnamed_boundaries: Vec<DispatchBoundaryClass>,
 }
 
 impl DispatchSiteAnswer {
@@ -189,7 +236,7 @@ pub(super) struct DispatchArm {
     pub(super) unmaterialized_target: Option<UnmaterializedExternalTarget>,
     pub(super) proof: &'static str,
     pub(super) completeness: &'static str,
-    pub(super) boundary_kind: Option<&'static str>,
+    pub(super) boundary_kind: Option<DispatchBoundaryClass>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +256,7 @@ pub(super) struct DispatchCallContext {
     /// Whether the semantic procedure's own anchor equals a range of `caller`.
     pub(super) caller_is_exact: bool,
     /// Residuals belonging to this exact observation, including cleanup copies.
-    pub(super) unnamed_boundaries: Vec<&'static str>,
+    pub(super) unnamed_boundaries: Vec<DispatchBoundaryClass>,
 }
 
 /// Derive the dispatch answer for one pipeline input position and project the
@@ -230,7 +277,11 @@ pub(super) fn dispatch_expansions_for_input(
     targets: bool,
 ) -> Vec<PipelineExpansion> {
     let facts = coherent_trace_facts_for_file(traces, file);
-    let (site_id, derived_ast_id) = dispatch_site_identity(analyzer, file, range, facts);
+    let Some((site_id, derived_ast_id)) = dispatch_site_identity(analyzer, file, range, facts)
+    else {
+        semantic.push_source_generation_changed(file);
+        return Vec::new();
+    };
     let (answer, incompleteness) = semantic.dispatch_at_source_with_cause(file, range);
     if incompleteness.execution_cause().is_some() {
         analyzer.mark_execution_dependent();
@@ -270,12 +321,13 @@ fn dispatch_site_identity(
     file: &ProjectFile,
     range: Range,
     facts: Option<&Arc<FileFacts>>,
-) -> (String, Option<String>) {
+) -> Option<(String, Option<String>)> {
+    let variant = analyzer.selected_parse_variant(file)?;
     let content_identity = facts.map_or_else(
         || {
-            analyzer
-                .indexed_source(file)
-                .map(|source| ContentIdentity::hash_bytes(source.as_bytes()))
+            analyzer.indexed_source(file).map(|source| {
+                ContentIdentity::from_source_bytes(source.as_bytes(), file.language(), variant)
+            })
         },
         |facts| Some(facts.source_identity()),
     );
@@ -293,7 +345,7 @@ fn dispatch_site_identity(
     let site_ast_id = facts
         .zip(content_identity)
         .and_then(|(facts, identity)| receiver::site_ast_id_for_range(facts, identity, range));
-    (site_id, site_ast_id)
+    Some((site_id, site_ast_id))
 }
 
 /// The workspace declaration a dispatch target's semantic locator names, or

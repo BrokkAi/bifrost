@@ -552,6 +552,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::RecoveredSyntaxIncomplete, Impact::Incomplete),
         (Code::UnsupportedImportAnalysis, Impact::Incomplete),
         (Code::DynamicImportTarget, Impact::Incomplete),
+        (Code::HierarchyIncomplete, Impact::Incomplete),
         (Code::SemanticResultsOmitted, Impact::Incomplete),
         (Code::SemanticWorkspaceRequired, Impact::Incomplete),
         (Code::NoEnclosingProcedure, Impact::Advisory),
@@ -772,6 +773,7 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
                         code: CallRelationDiagnosticCode::ParseFailed,
                         message: "parse failed".to_string(),
                         context: "caller".to_string(),
+                        semantic_count: None,
                         reason_kind: None,
                     }],
                     ..CallRelationResult::default()
@@ -812,6 +814,7 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
             code: CallRelationDiagnosticCode::TargetsAmbiguous,
             message: "ambiguous".to_string(),
             context: "caller".to_string(),
+            semantic_count: None,
             reason_kind: None,
         }],
         ..CallRelationResult::default()
@@ -940,6 +943,7 @@ fn call_declaration_projection_reports_retained_file_scope_target_as_omitted() {
                         code: CallRelationDiagnosticCode::TargetsAmbiguous,
                         message: "ambiguous".to_string(),
                         context: "caller".to_string(),
+                        semantic_count: None,
                         reason_kind: None,
                     }],
                     ..CallRelationResult::default()

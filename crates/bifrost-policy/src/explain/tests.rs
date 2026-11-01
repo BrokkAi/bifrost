@@ -44,6 +44,9 @@ use super::why_not::{
 
 use crate::inline_project::InlineTestProject;
 
+#[cfg(test)]
+mod typestate_contract_tests;
+
 /// One class with one member plus a free function, so a candidate can sit
 /// inside a class but outside every member.
 const MEMBERS_POLICY: &str = r#"(policy
@@ -3760,3 +3763,12 @@ fn a_near_miss_ranking_honours_the_same_workspace_generation_pin() {
         }
     );
 }
+
+#[path = "why_projection_contract_tests.rs"]
+mod why_projection_contract_tests;
+
+#[path = "why_not_identity_contract_tests.rs"]
+mod why_not_identity_contract_tests;
+
+#[path = "why_not_completion_contract_tests.rs"]
+mod why_not_completion_contract_tests;

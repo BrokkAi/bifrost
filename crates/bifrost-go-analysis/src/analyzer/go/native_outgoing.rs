@@ -619,6 +619,7 @@ fn resolve_outgoing(
                                 code: CallRelationDiagnosticCode::TargetsAmbiguous,
                                 message: format!("Go call at {}..{} has ambiguous canonical targets: {:?}", metadata.start_byte(), metadata.end_byte(), callees),
                                 context: caller.fq_name().to_string(),
+                                semantic_count: Some(binding.targets().len()),
                                 reason_kind: Some("native_call_targets_ambiguous".to_owned()),
                             });
                         }
@@ -638,6 +639,7 @@ fn resolve_outgoing(
                                 code: CallRelationDiagnosticCode::CandidateLimit,
                                 message: format!("Go call at {}..{} exceeds its candidate bound", metadata.start_byte(), metadata.end_byte()),
                                 context: caller.fq_name().to_string(),
+                                semantic_count: Some(callees.len().saturating_sub(limits.max_candidates)),
                                 reason_kind: Some("native_call_candidates_omitted".to_owned()),
                             });
                         }

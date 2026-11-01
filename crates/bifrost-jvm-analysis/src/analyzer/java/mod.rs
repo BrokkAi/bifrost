@@ -273,7 +273,7 @@ pub struct JavaAnalyzer {
             >,
         >,
     >,
-    external_inputs: crate::analyzer::jvm::hierarchy::DerivedMemo<(), ()>,
+    external_inputs: crate::analyzer::jvm::hierarchy::RawDerivedMemo<(), ()>,
 }
 
 impl_forward_query_provider!(JavaAnalyzer);
@@ -294,7 +294,7 @@ impl JavaAnalyzer {
             external_index: Arc::new(
                 brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
             ),
-            external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(
+            external_inputs: crate::analyzer::jvm::hierarchy::raw_derived_memo(
                 self.memo_caches.budget_bytes() / 8,
             ),
         })
@@ -350,11 +350,19 @@ impl JavaAnalyzer {
         clone.external_index =
             Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new());
         clone.external_inputs =
-            crate::analyzer::jvm::hierarchy::derived_memo(self.memo_caches.budget_bytes() / 8);
+            crate::analyzer::jvm::hierarchy::raw_derived_memo(self.memo_caches.budget_bytes() / 8);
         clone
     }
 
     pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        // Unlike an overlay clone, this keeps the import inventory, which
+        // depends on the discovered JDK environment. That is valid only for a
+        // project of the same source generation.
+        debug_assert_eq!(
+            self.project().analysis_generation(),
+            project.analysis_generation(),
+            "an index-warm clone shares its generation's import inventory"
+        );
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
         clone
@@ -377,7 +385,7 @@ impl JavaAnalyzer {
             external_index: Arc::new(
                 brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
             ),
-            external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
+            external_inputs: crate::analyzer::jvm::hierarchy::raw_derived_memo(memo_budget / 8),
         }
     }
 
@@ -684,8 +692,13 @@ impl JavaFileClassIndex {
 
 #[derive(Default)]
 struct JavaFileClassIndexMemo {
-    by_file: Mutex<HashMap<ProjectFile, Arc<JavaFileClassIndex>>>,
+    by_file: Mutex<HashMap<ProjectFile, Arc<JavaFileClassIndexEntry>>>,
 }
+
+type JavaFileClassIndexEntry = (
+    JavaFileClassIndex,
+    Box<[brokk_bifrost_analysis::analyzer::QueryReadIncomplete]>,
+);
 
 impl JavaSource for JavaAnalyzer {
     fn resolve_imported_type_name(
@@ -771,8 +784,8 @@ impl JavaSource for JavaAnalyzer {
         fqn: &str,
         file: &ProjectFile,
     ) -> brokk_bifrost_jvm::java::graph_support::UniqueClassInFile {
-        // This hot file-only index is cheaper to certify directly than to
-        // allocate and replay one receipt for every same-file class question.
+        // The source key is recorded directly on each hit. Only typed gaps
+        // from the cold build need replay; no per-hit read receipt is needed.
         if let Some(reader) = self.inner.canonical_source_read(file, "java") {
             reader.record_read_key();
         }
@@ -788,10 +801,24 @@ impl JavaSource for JavaAnalyzer {
                     .get(file)
                     .cloned();
                 match cached {
-                    Some(index) => index,
+                    Some(index) => {
+                        brokk_bifrost_analysis::analyzer::common::replay_query_cache_stable_reasons(
+                            &index.1,
+                        );
+                        return index.0.unique_class(fqn);
+                    }
                     None => {
+                        let (built, receipt) =
+                            brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(
+                                self,
+                                || JavaFileClassIndex::build(self.inner.declarations(file)),
+                            );
+                        // Unattributed reads cannot be replayed by this lightweight memo.
+                        if receipt.has_execution_dependences() || receipt.unattributed_reads() > 0 {
+                            return built.unique_class(fqn);
+                        }
                         let index =
-                            Arc::new(JavaFileClassIndex::build(self.inner.declarations(file)));
+                            Arc::new((built, receipt.stable_reasons().to_vec().into_boxed_slice()));
                         memo.by_file
                             .lock()
                             .expect("Java file class index memo poisoned")
@@ -801,9 +828,11 @@ impl JavaSource for JavaAnalyzer {
                     }
                 }
             }
-            None => Arc::new(JavaFileClassIndex::build(self.inner.declarations(file))),
+            None => {
+                return JavaFileClassIndex::build(self.inner.declarations(file)).unique_class(fqn);
+            }
         };
-        index.unique_class(fqn)
+        index.0.unique_class(fqn)
     }
 
     fn source_types_in_packages(
@@ -1131,7 +1160,8 @@ impl IAnalyzer for JavaAnalyzer {
                 let entry = Arc::new(capture.try_build_weighted(|| {
             let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
             self.inner
-                .record_read_key(self.inner.file_read_key(file, oid));
+                .record_read_key(self.inner.file_read_key(file, oid, brokk_bifrost_core::gitblob::ParseVariant::Empty
+));
             let tree = parse_tree(&source).ok_or(())?;
             let root = tree.root_node();
             let mut rows = capture_statement_facts(&JAVA_STRUCTURAL_SPEC, root, &source, &Default::default());
@@ -1213,7 +1243,8 @@ impl IAnalyzer for JavaAnalyzer {
                             )
                             .expect("source blob hash");
                             self.inner
-                                .record_read_key(self.inner.file_read_key(unit.source(), other_oid));
+                                .record_read_key(self.inner.file_read_key(unit.source(), other_oid, brokk_bifrost_core::gitblob::ParseVariant::Empty
+));
                             other_tree = Some(parse_tree(&text)?);
                             other_source = Some(text);
                         }
@@ -1381,7 +1412,7 @@ impl IAnalyzer for JavaAnalyzer {
                 import_inventory: fresh_import_inventory(),
                 java_config: self.java_config.clone(),
                 external_index,
-                external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(
+                external_inputs: crate::analyzer::jvm::hierarchy::raw_derived_memo(
                     self.memo_caches.budget_bytes() / 8,
                 ),
             }

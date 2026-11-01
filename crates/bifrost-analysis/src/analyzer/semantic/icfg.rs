@@ -105,6 +105,7 @@ pub fn record_dispatch_read(
 }
 
 #[doc(hidden)]
+#[track_caller]
 pub fn record_dispatch_read_attribution(
     workspace: &WorkspaceAnalyzer,
     attribution: &DispatchReadAttribution,
@@ -115,7 +116,18 @@ pub fn record_dispatch_read_attribution(
     }
     match attribution {
         DispatchReadAttribution::Attributed(key) => analyzer.record_read(key.clone()),
-        DispatchReadAttribution::Unattributed(_) => analyzer.record_unattributed_read(),
+        DispatchReadAttribution::Unattributed(reason) => {
+            let _refusal = brokk_bifrost_core::profiling::read_refusal_scope(
+                brokk_bifrost_core::profiling::enabled().then(|| {
+                    brokk_bifrost_core::profiling::ReadRefusal {
+                        kind: "unattributed",
+                        reason: format!("Unattributed({reason:?})"),
+                        origin: std::panic::Location::caller(),
+                    }
+                }),
+            );
+            analyzer.record_unattributed_read();
+        }
     }
 }
 
@@ -125,8 +137,8 @@ pub fn dispatch_read_attribution_with_range(
     outcome: &SemanticOutcome<DispatchResult>,
     range: Result<crate::analyzer::Range, SemanticProviderError>,
 ) -> DispatchReadAttribution {
-    let Some(question) = range.ok().and_then(|range| {
-        crate::analyzer::semantic::workspace_oracle::procedure_dispatch_question(call, range)
+    let Some(question) = range.ok().and_then(|_| {
+        crate::analyzer::semantic::workspace_oracle::procedure_dispatch_question(call)
     }) else {
         return DispatchReadAttribution::Unattributed(
             DispatchReadUnattributedReason::SourceRangeUnavailable,

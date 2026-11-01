@@ -312,6 +312,7 @@ pub(crate) fn outgoing(
                             code: CallRelationDiagnosticCode::TargetsAmbiguous,
                             message: format!("native call at {callee_range:?} has ambiguous canonical targets: {:?}", answer.resolution.binding().targets()),
                             context: caller.fq_name(),
+                            semantic_count: Some(cardinality),
                             reason_kind: None,
                         });
                     }

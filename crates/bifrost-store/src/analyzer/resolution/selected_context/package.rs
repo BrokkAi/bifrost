@@ -673,7 +673,7 @@ impl SelectedPackageBridgeDescriptor {
 }
 
 impl SelectedPackageBridgeDescriptor {
-    pub(super) fn charge_retained(
+    pub(crate) fn charge_retained(
         &self,
         heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
     ) {

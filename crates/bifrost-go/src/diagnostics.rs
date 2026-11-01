@@ -22,15 +22,34 @@ use brokk_bifrost_core::analyzer::semantic_diagnostics::{
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, ProjectFile, Range};
+use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::Node;
 
 use crate::declarations::{declared_go_package_name, is_predeclared_go_type};
-use crate::graph::resolver::GoImportBindings;
 use crate::packages::{GO_MODULE_SCOPE_SEGMENT, canonical_go_package_name};
 use crate::syntax::{
     for_each_parameter_declaration, range_clause_binding_names, range_clause_is_short_declaration,
 };
+
+/// Every name a Go file's import block binds, split by whether a workspace
+/// package answers the import path.
+///
+/// Semantic diagnostics need both halves: the workspace half decides whether a
+/// package member is indexed here, and the external half is the only way to
+/// name the package identity an exact API pack publishes. Resolving them in
+/// one pass keeps a path from appearing in both halves.
+#[derive(Debug, Default)]
+pub struct GoImportBindings {
+    /// Local name -> canonical, module-qualified workspace package prefixes.
+    pub workspace: HashMap<String, Vec<String>>,
+    /// Dot-imported canonical workspace package prefixes.
+    pub dot_workspace: Vec<String>,
+    /// Local name -> import paths that no workspace package answers.
+    pub external: HashMap<String, Vec<String>>,
+    /// Dot-imported import paths that no workspace package answers.
+    pub dot_external: Vec<String>,
+}
 
 pub const GO_UNRECOGNIZED_SYMBOL: &str = "go_unrecognized_symbol";
 pub const GO_UNRECOGNIZED_PACKAGE_MEMBER: &str = "go_unrecognized_package_member";

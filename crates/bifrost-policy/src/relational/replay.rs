@@ -40,8 +40,8 @@ pub(crate) fn replay_candidate_ir(
     load: &mut impl FnMut(&RowBindingName, &ReplayConstraints) -> EvalResult<ReplayInput>,
     cancellation: Option<&CancellationToken>,
 ) -> EvalResult<CandidateReplay> {
-    // This boundary accepts the lowered source/join/group form, including the
-    // IR-only left join. Fail at construction if a caller bypasses lowering.
+    // This boundary accepts the lowered source/join/group form, including
+    // left joins. Fail at construction if a caller bypasses lowering.
     let mut chain = IrRelationId(0);
     for relation in &plan.relations {
         match &relation.op {

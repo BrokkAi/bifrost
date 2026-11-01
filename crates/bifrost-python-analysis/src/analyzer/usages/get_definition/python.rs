@@ -339,6 +339,7 @@ struct PythonDefinitionContextKey {
 struct Replayable<T> {
     value: T,
     reads: Arc<brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger>,
+    receipt: brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt,
 }
 
 #[derive(Default)]
@@ -394,25 +395,28 @@ pub(crate) fn request_definition_context(
         memo.build_counters
             .context_builds
             .fetch_add(1, Ordering::Relaxed);
-        let (context, reads) =
-            brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(analyzer, || {
-                PythonDefinitionContext::build(
-                    py,
-                    analyzer,
-                    token,
-                    file,
-                    *key.source.as_bytes(),
-                    #[cfg(test)]
-                    Arc::clone(&memo.build_counters),
-                )
+        let ((context, reads), receipt) =
+            brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(analyzer, || {
+                brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(analyzer, || {
+                    PythonDefinitionContext::build(
+                        py,
+                        analyzer,
+                        token,
+                        file,
+                        *key.source.as_bytes(),
+                        #[cfg(test)]
+                        Arc::clone(&memo.build_counters),
+                    )
+                })
             });
         Replayable {
             value: Arc::new(context),
             reads,
+            receipt,
         }
     });
     if !built_here.get() {
-        brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(analyzer, &entry.reads);
+        entry.receipt.replay();
         debug_assert!(entry.reads.keys_satisfy(|key| {
             brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers(
                 analyzer, key,
@@ -5507,10 +5511,7 @@ impl PythonDefinitionContext {
                     &cached.reads.keys()
                 )
             );
-            brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(
-                analyzer,
-                &cached.reads,
-            );
+            cached.receipt.replay();
             return cached.value.clone();
         }
 
@@ -5519,12 +5520,20 @@ impl PythonDefinitionContext {
             .receiver_type_cache_misses
             .fetch_add(1, Ordering::Relaxed);
 
-        let (resolved, reads) =
-            brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(analyzer, || {
-                self.receiver_type_for_object(py, support, raw_type)
-                    .or_else(|| {
-                        self.generic_receiver_type(analyzer, py, file, raw_type, target_self_file)
-                    })
+        let ((resolved, reads), receipt) =
+            brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(analyzer, || {
+                brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(analyzer, || {
+                    self.receiver_type_for_object(py, support, raw_type)
+                        .or_else(|| {
+                            self.generic_receiver_type(
+                                analyzer,
+                                py,
+                                file,
+                                raw_type,
+                                target_self_file,
+                            )
+                        })
+                })
             });
 
         let mut cache = self
@@ -5537,6 +5546,7 @@ impl PythonDefinitionContext {
                 Replayable {
                     value: resolved.clone(),
                     reads,
+                    receipt,
                 },
             );
         }
@@ -5592,10 +5602,7 @@ impl PythonDefinitionContext {
                 entry.reads.digest(),
                 brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest(&entry.reads.keys())
             );
-            brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(
-                analyzer,
-                &entry.reads,
-            );
+            entry.receipt.replay();
             return Some(Arc::clone(&entry.value));
         }
         let _scope = brokk_bifrost_core::profiling::scope("get_definition::python::scope_facts");
@@ -5603,10 +5610,12 @@ impl PythonDefinitionContext {
         self.build_counters
             .scope_fact_builds
             .fetch_add(1, Ordering::Relaxed);
-        let (facts, reads) =
-            brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(analyzer, || {
-                with_python_graph_source(analyzer, |graph| {
-                    collect_scope_facts_from_parsed_source(&graph, py, file, source, root)
+        let ((facts, reads), receipt) =
+            brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(analyzer, || {
+                brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(analyzer, || {
+                    with_python_graph_source(analyzer, |graph| {
+                        collect_scope_facts_from_parsed_source(&graph, py, file, source, root)
+                    })
                 })
             });
         let Some(facts) = facts else {
@@ -5620,8 +5629,9 @@ impl PythonDefinitionContext {
         let entry = self.scope_facts.get_or_init(|| Replayable {
             value: Arc::new(facts),
             reads,
+            receipt,
         });
-        brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(analyzer, &entry.reads);
+        entry.receipt.replay();
         Some(Arc::clone(&entry.value))
     }
 

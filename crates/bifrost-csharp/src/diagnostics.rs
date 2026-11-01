@@ -72,7 +72,7 @@ pub const CSHARP_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-csharp";
 /// Past this size the pass reports one `Truncated` outcome instead of walking
 /// the file. A generated or vendored C# file that large is not what a
 /// diagnostic request is for.
-const MAX_CSHARP_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
+pub const MAX_CSHARP_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
 
 /// The most diagnostics one file may publish before the rest is `Truncated`.
 pub const MAX_CSHARP_SEMANTIC_DIAGNOSTICS: usize = 200;
@@ -184,6 +184,26 @@ pub fn collect_csharp_semantic_diagnostics(
         );
         return report;
     };
+    collect_csharp_semantic_diagnostics_with_scan(
+        csharp, token, external, file, source, &tree, &scan,
+    )
+}
+
+/// Diagnose the same source reading used by the indexed parser and fact producers.
+pub fn collect_csharp_semantic_diagnostics_with_scan(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    external: &dyn CSharpExternalEvidence,
+    file: &ProjectFile,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    scan: &crate::preprocessor::PreprocessorScan,
+) -> SemanticDiagnosticReport {
+    let mut report = SemanticDiagnosticReport::new();
+    if source.len() > MAX_CSHARP_SEMANTIC_DIAGNOSTIC_BYTES {
+        report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
+        return report;
+    }
     if scan
         .conditional_regions(source)
         .has_uncertain_omission(0..source.len())
@@ -232,8 +252,8 @@ pub fn collect_csharp_semantic_diagnostics(
     // The `using` directives are checked first and in one pass: whether the
     // namespaces a file opens are all visible decides whether an unqualified
     // reference that misses everywhere was checked against a complete surface.
-    collector.check_using_directives(token, &tree);
-    collector.collect_partial_declarations(&tree);
+    collector.check_using_directives(token, tree);
+    collector.collect_partial_declarations(tree);
     collector.scan_tree(token, tree.root_node());
     collector.report
 }

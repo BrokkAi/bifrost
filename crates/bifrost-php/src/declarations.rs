@@ -366,12 +366,14 @@ impl<'a> PhpVisitor<'a> {
                 let expression = (node.named_child_count() == 1)
                     .then(|| node.named_child(0))
                     .flatten();
+                let context = self.properties.context();
                 self.properties
                     .imports
                     .push(crate::imports::project_include_source_fact(
                         node,
                         expression,
                         self.source,
+                        &context,
                         &mut self.source_facts,
                     ));
             }

@@ -12,6 +12,8 @@ pub struct CapturedMemoReads<K> {
     pub keys: Arc<[K]>,
     pub unattributed_reads: usize,
     pub execution_dependences: usize,
+    pub first_refusal: Option<crate::profiling::ReadRefusal>,
+    pub first_execution_refusal: Option<crate::profiling::ReadRefusal>,
 }
 
 /// Supplied by the analysis layer; core does not know the key vocabulary.
@@ -19,6 +21,7 @@ pub trait MemoAttribution {
     type Key;
     fn is_capturing(&self) -> bool;
     fn capture_identity(&self) -> Option<CaptureIdentity>;
+    #[track_caller]
     fn record_unattributed(&self);
     fn capture<T>(
         &self,
@@ -43,6 +46,7 @@ impl<A: MemoAttribution> MemoCapability<A> {
     pub fn capture_identity(&self) -> Option<CaptureIdentity> {
         self.attribution.capture_identity()
     }
+    #[track_caller]
     pub fn record_unattributed(&self) {
         self.attribution.record_unattributed();
     }
@@ -299,6 +303,8 @@ impl<A: MemoAttribution> MemoReadCapture<'_, A> {
                     keys: Arc::clone(&reads.keys),
                     unattributed_reads: reads.unattributed_reads,
                     execution_dependences: reads.execution_dependences,
+                    first_refusal: reads.first_refusal.clone(),
+                    first_execution_refusal: reads.first_execution_refusal.clone(),
                 },
                 forwarded_to,
             });

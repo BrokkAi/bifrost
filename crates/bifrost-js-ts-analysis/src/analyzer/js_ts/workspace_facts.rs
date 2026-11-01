@@ -1,5 +1,9 @@
 //! Position-free answers for the complete JS/TS workspace authorities.
 use super::providers::{JsTsMemoSource, imported_code_units_of, resolve_js_ts_source};
+use brokk_bifrost_analysis::analyzer::common::{
+    ReplayableQueryCache, ReplayableQueryCacheValue, build_replayable_query_cache,
+    read_replayable_query_cache,
+};
 use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
 use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
 use brokk_bifrost_analysis::analyzer::{
@@ -8,7 +12,7 @@ use brokk_bifrost_analysis::analyzer::{
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::capabilities::{
     DescendantIndexScope, DescendantIndexVariant, DirectDescendantIndex, ReverseFileIndex,
-    build_reverse_import_index,
+    memoized_reverse_import_index,
 };
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::query_token::{QueryScope, QueryToken};
@@ -24,19 +28,27 @@ pub(crate) struct Descendants {
 }
 
 pub(crate) struct DescendantMemos {
-    whole: WorkspaceAuthorityMemo<PoolSafeMemo<Descendants>>,
-    production: WorkspaceAuthorityMemo<PoolSafeMemo<Descendants>>,
+    whole: WorkspaceAuthorityMemo<ReplayableQueryCache<(), Option<Arc<Descendants>>>>,
+    production: WorkspaceAuthorityMemo<ReplayableQueryCache<(), Option<Arc<Descendants>>>>,
 }
 impl DescendantMemos {
     pub fn new() -> Self {
         Self {
             whole: WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::JsTsDescendants,
-                PoolSafeMemo::new(),
+                build_replayable_query_cache(|value: &Option<Arc<Descendants>>| {
+                    value.as_ref().map_or(0, |value| {
+                        std::mem::size_of::<Descendants>() + value.index.estimated_retained_bytes()
+                    })
+                }),
             ),
             production: WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::JsTsProductionDescendants,
-                PoolSafeMemo::new(),
+                build_replayable_query_cache(|value: &Option<Arc<Descendants>>| {
+                    value.as_ref().map_or(0, |value| {
+                        std::mem::size_of::<Descendants>() + value.index.estimated_retained_bytes()
+                    })
+                }),
             ),
         }
     }
@@ -45,6 +57,37 @@ impl DescendantMemos {
 pub(crate) struct ReverseImports {
     pub index: ReverseFileIndex,
     answer: StableDigest,
+}
+
+pub(crate) fn reverse_import_memo() -> ReplayableQueryCache<(), Arc<ReverseImports>> {
+    build_replayable_query_cache(|value: &Arc<ReverseImports>| {
+        let file_bytes = |file: &brokk_bifrost_core::analyzer::ProjectFile| {
+            std::mem::size_of_val(file)
+                + file.root().as_os_str().len()
+                + file.rel_path().as_os_str().len()
+        };
+        std::mem::size_of::<ReverseImports>()
+            + value.index.capacity()
+                * (std::mem::size_of::<brokk_bifrost_core::analyzer::ProjectFile>()
+                    + std::mem::size_of::<
+                        Arc<
+                            brokk_bifrost_core::hash::HashSet<
+                                brokk_bifrost_core::analyzer::ProjectFile,
+                            >,
+                        >,
+                    >()
+                    + 1)
+            + value
+                .index
+                .iter()
+                .map(|(file, sources)| {
+                    file_bytes(file)
+                        + sources.capacity()
+                            * (std::mem::size_of::<brokk_bifrost_core::analyzer::ProjectFile>() + 1)
+                        + sources.iter().map(file_bytes).sum::<usize>()
+                })
+                .sum::<usize>()
+    })
 }
 
 pub(super) fn unit_identity(unit: &CodeUnit) -> StableDigest {
@@ -62,7 +105,7 @@ pub(super) fn descendants(
         }
     };
     let build = || {
-        complete_descendant_build(host.analyzer(), || {
+        (|| {
             let index = build_direct_descendant_index_by_unit(host, host, scope)?;
             // Enumerate the complete row domain, including imported ancestors.
             // The temporary vectors die with this one build; only the digest stays.
@@ -105,11 +148,24 @@ pub(super) fn descendants(
                 index,
                 answer: StableDigest::from_array(hash.finish()),
             })
-        })
+        })()
     };
     family.read(
         &memo_attribution(host.analyzer()),
-        |memo| memo.get_or_build_while(&scope.keep_going(), build, build),
+        |memo| {
+            let fill = || {
+                brokk_bifrost_analysis::analyzer::common::replayable_descendant_fill(
+                    host.analyzer(),
+                    scope,
+                    || build().map(Arc::new),
+                )
+            };
+            if memo.get(&()).is_none() && !(scope.keep_going())() {
+                return None;
+            }
+            let entry = read_replayable_query_cache(memo, &(), fill);
+            entry.replay().clone()
+        },
         |value| match value {
             Some(value) => AuthorityInputs::Fact {
                 language: host.language(),
@@ -119,15 +175,6 @@ pub(super) fn descendants(
             None => AuthorityInputs::Unnamed,
         },
     )
-}
-
-fn complete_descendant_build<T>(
-    analyzer: &dyn IAnalyzer,
-    build: impl FnOnce() -> Option<T>,
-) -> Option<T> {
-    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, build)
-        .ok()
-        .flatten()
 }
 
 fn reverse_value(index: ReverseFileIndex) -> ReverseImports {
@@ -157,46 +204,42 @@ pub(super) fn reverse_imports(
     host: &dyn JsTsMemoSource,
     token: QueryToken<'_>,
 ) -> Arc<ReverseImports> {
-    host.memo_caches().reverse_import_index.read(
+    let value = host.memo_caches().reverse_import_index.read(
         &memo_attribution(host.analyzer()),
         |memo| {
-            memo.get_or_try_build(
-                || {
-                    complete_reverse_import_build(host.analyzer(), || {
-                        let files = host.all_files();
-                        reverse_value(build_reverse_import_index(
-                            &files,
+            read_replayable_query_cache(memo, &(), || {
+                complete_reverse_import_build(host.analyzer(), || {
+                    let index = {
+                        let build_memo = PoolSafeMemo::new();
+                        memoized_reverse_import_index(
+                            &build_memo,
+                            || host.all_files(),
                             |file| imported_code_units_of(host, token, file),
-                            true,
-                        ))
-                    })
-                },
-                || {
-                    complete_reverse_import_build(host.analyzer(), || {
-                        let files = host.all_files();
-                        reverse_value(build_reverse_import_index(
-                            &files,
-                            |file| imported_code_units_of(host, token, file),
-                            false,
-                        ))
-                    })
-                },
-            )
-            .unwrap_or_else(Arc::new)
+                        )
+                    };
+                    reverse_value(
+                        Arc::try_unwrap(index)
+                            .expect("the query-local build memo has dropped its index"),
+                    )
+                })
+            })
         },
         |value| AuthorityInputs::Fact {
             language: host.language(),
             subject: FactSubject::Whole,
             answer: value.answer,
         },
-    )
+    );
+    Arc::clone(value.replay())
 }
 
 fn complete_reverse_import_build<T>(
     analyzer: &dyn IAnalyzer,
     build: impl FnOnce() -> T,
-) -> Result<T, T> {
-    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, build)
+) -> Result<ReplayableQueryCacheValue<Arc<T>>, ReplayableQueryCacheValue<Arc<T>>> {
+    brokk_bifrost_analysis::analyzer::common::replayable_query_cache_value(analyzer, || {
+        Arc::new(build())
+    })
 }
 
 fn module_paths_answer(host: &dyn JsTsMemoSource, subject: &FactSubject) -> Option<StableDigest> {
@@ -279,6 +322,7 @@ mod tests {
         capture_query_reads,
     };
     use brokk_bifrost_analysis::inline_project::{BuiltInlineTestProject, InlineTestProject};
+    #[cfg(test)]
     use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
     use brokk_bifrost_test_macros::hardwon;
 
@@ -1112,18 +1156,21 @@ mod tests {
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
         let memo = PoolSafeMemo::new();
         let incomplete = || {
-            complete_descendant_build(workspace.analyzer(), || {
-                workspace
-                    .analyzer()
-                    .record_query_incomplete(QueryReadIncomplete::Cancelled);
-                Some(7_u8)
-            })
+            brokk_bifrost_analysis::analyzer::common::replayable_optional_query_cache_value(
+                workspace.analyzer(),
+                || {
+                    workspace
+                        .analyzer()
+                        .record_query_incomplete(QueryReadIncomplete::Cancelled);
+                    Some(7_u8)
+                },
+            )
         };
 
-        assert!(
-            memo.get_or_build_while(&|| true, incomplete, incomplete)
-                .is_none()
-        );
+        let failed = memo
+            .get_or_try_build_wave_while(&|| true, incomplete, incomplete)
+            .unwrap_err();
+        assert!(failed.replay().is_none());
         assert!(!memo.is_ready(), "an incomplete answer was published");
     }
 

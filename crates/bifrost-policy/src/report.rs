@@ -44,6 +44,9 @@ use super::source::{PolicySourceIdentity, PolicySourceRelatedDiagnostic};
 use super::suppression::{PolicyReportEvaluationContext, PolicySuppressionReview};
 pub use super::units::{PolicyIncrementalReview, PolicyIncrementalRun};
 use crate::is_false;
+#[cfg(test)]
+#[path = "report_wire_contract_tests.rs"]
+mod report_wire_contract_tests;
 
 const MAX_REPORT_TEXT_BYTES: usize = 4_096;
 const MAX_REPORT_RELATED_DIAGNOSTICS: usize = 64;
@@ -56,6 +59,10 @@ pub struct SelectorSchemaVersionResolution {
     path: PolicySelectorPath,
     resolution: SchemaVersionResolution,
 }
+
+#[cfg(test)]
+#[path = "report/retention_tests.rs"]
+mod retention_tests;
 
 impl SelectorSchemaVersionResolution {
     pub fn new(path: PolicySelectorPath, resolution: SchemaVersionResolution) -> Self {
@@ -2351,6 +2358,9 @@ pub struct PolicyReportDocument {
     worst_omitted_diagnostic_severity: Option<PolicyDiagnosticSeverity>,
 }
 
+#[cfg(test)]
+mod render_contract_tests;
+
 impl PolicyReportDocument {
     pub const SCHEMA_VERSION: u32 = 6;
 
@@ -2781,6 +2791,10 @@ pub struct PolicyReportBuilder {
     omitted_diagnostics_lower_bound: u64,
     worst_omitted_diagnostic_severity: Option<PolicyDiagnosticSeverity>,
 }
+
+#[cfg(test)]
+#[path = "report/baseline_budget_contract_tests.rs"]
+mod baseline_budget_contract_tests;
 
 impl PolicyReportBuilder {
     #[cfg(any(test, feature = "test-support"))]
@@ -4089,7 +4103,12 @@ fn report_storage_size(
 
 #[cfg(test)]
 mod tests {
+    #[path = "limit_contract_tests.rs"]
+    mod limit_contract_tests;
     use super::*;
+
+    #[path = "baseline_finding_budget.rs"]
+    mod baseline_finding_budget;
     use crate::coordinator::PolicyEvaluationOptions;
     use crate::finding::{
         FindingCertainty, FindingCompleteness, FindingIncompleteReason, MatchFindingEvidence,
@@ -5279,4 +5298,7 @@ mod tests {
         let review = PolicyBaselineReview::new(&"x".repeat(10_000), &document, Vec::new());
         assert_review_over_budget(review, |builder, review| builder.set_baseline(review));
     }
+
+    #[path = "retained_size_contract_tests.rs"]
+    mod retained_size_contract_tests;
 }

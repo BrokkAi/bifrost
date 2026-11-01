@@ -8,14 +8,14 @@ use crate::graph::resolver::{
     PhpHierarchyIndex, TargetKind, TargetSpec, enclosing_owner_fq_name_at,
     is_const_declaration_name, is_function_call_name, is_member_or_scoped_access_name,
     is_object_creation_type_name, node_text, qualified_candidate_text, receiver_type_matches,
-    static_receiver_matches,
+    static_receiver_matches, static_scope_member_matches,
 };
 use crate::graph::syntax::{
     assignment_parts, assignment_value_type_fq_name, captured_local_scope_bindings,
     declared_instance_callable, declared_instance_field, direct_receiver_union_member,
-    instance_receiver_type_fq_name, is_local_scope, literal_member_identifier,
-    seed_assignment_binding, seed_parameter_types, static_member_parts, static_property_identifier,
-    static_scope_type_fq_name,
+    instance_receiver_type_fq_name, is_local_scope, is_relative_scope_keyword,
+    literal_member_identifier, seed_assignment_binding, seed_parameter_types, static_member_parts,
+    static_property_identifier, static_scope_type_fq_name,
 };
 use crate::graph_support::PhpSource;
 use brokk_bifrost_core::analyzer::ProjectFile;
@@ -282,12 +282,13 @@ fn candidate_resolves_to_type(
         return false;
     }
     let raw = qualified_candidate_text(node, source);
-    if matches!(raw.as_str(), "self" | "static" | "parent") && node_is_within_trait(node) {
+    let relative = is_relative_scope_keyword(&raw);
+    if relative && node_is_within_trait(node) {
         // Trait-relative scopes resolve in each consuming class. The trait
         // declaration itself is never the type denoted by these keywords.
         return false;
     }
-    let enclosing_owner = matches!(raw.as_str(), "self" | "static" | "parent")
+    let enclosing_owner = relative
         .then(|| {
             enclosing_owner_fq_name_at(
                 analyzer,
@@ -298,8 +299,10 @@ fn candidate_resolves_to_type(
             )
         })
         .flatten();
+    // PHP class names are ASCII case-insensitive: `new service()` constructs
+    // `Service`.
     static_scope_type_fq_name(php, analyzer, &raw, ctx, enclosing_owner.as_deref())
-        .is_some_and(|fq| fq == target_fq_name)
+        .is_some_and(|fq| fq.eq_ignore_ascii_case(target_fq_name))
 }
 
 fn node_is_within_trait(mut node: Node<'_>) -> bool {
@@ -335,7 +338,7 @@ fn is_constructor_reference(
         return false;
     }
     let raw = qualified_candidate_text(node, source);
-    resolve_php_type(&raw, ctx).is_some_and(|fq| fq == owner)
+    resolve_php_type(&raw, ctx).is_some_and(|fq| fq.eq_ignore_ascii_case(owner))
 }
 
 fn is_constant_reference(
@@ -593,10 +596,7 @@ fn seed_parameter_receivers(
 ) {
     let ctx = contexts.context_at(node.start_byte());
     seed_parameter_types(node, source, engine, |_name, raw| {
-        if ["self", "static", "parent"]
-            .iter()
-            .any(|keyword| raw.eq_ignore_ascii_case(keyword))
-        {
+        if is_relative_scope_keyword(raw) {
             let owner = enclosing_owner_fq_name_at(
                 analyzer,
                 file,
@@ -707,18 +707,40 @@ fn record_member_hit(
                 return;
             }
             let receiver_text = node_text(receiver_node, source);
-            if !static_receiver_matches(
-                php,
-                analyzer,
-                file,
-                member_node.start_byte(),
-                member_node.end_byte(),
-                line_starts,
-                receiver_text,
-                owner,
-                ctx,
-                hierarchy,
+            let reaches_target = if matches!(
+                receiver_node.kind(),
+                "name" | "qualified_name" | "relative_scope"
             ) {
+                static_receiver_matches(
+                    php,
+                    analyzer,
+                    file,
+                    member_node.start_byte(),
+                    member_node.end_byte(),
+                    line_starts,
+                    receiver_text,
+                    spec,
+                    ctx,
+                    hierarchy,
+                )
+            } else {
+                // `$obj::m()`, `$obj::$count` and `$obj::C` reach the class of
+                // the object the scope expression evaluates to.
+                receiver_expression_type(
+                    receiver_node,
+                    php,
+                    analyzer,
+                    file,
+                    source,
+                    line_starts,
+                    contexts,
+                    engine,
+                )
+                .is_some_and(|scope| {
+                    static_scope_member_matches(php, analyzer, &scope, spec, hierarchy)
+                })
+            };
+            if !reaches_target {
                 return;
             }
             // `self::m()` / `static::m()` are same-owner own-type static calls;

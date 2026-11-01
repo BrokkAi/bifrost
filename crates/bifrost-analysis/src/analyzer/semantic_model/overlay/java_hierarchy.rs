@@ -58,13 +58,21 @@ impl SemanticModelOverlay {
             max_visits,
             cancellation,
             |current| {
-                let owner = owner_declaration(active, current)
-                    .ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
-                let inventory = owner
-                    .jvm_inventory
+                let owner = owner_declaration(active, current);
+                if let Some(inventory) = owner
                     .as_ref()
+                    .and_then(|owner| owner.jvm_inventory.as_ref())
+                {
+                    return Ok((inventory.supertypes.clone(), inventory.supertypes_complete));
+                }
+                // Authored edges establish positive paths without certifying
+                // an exhaustive supertype inventory. A missing witness must
+                // therefore stay open even when all authored edges were read.
+                let (_, edges) = self
+                    .java_hierarchy
+                    .get(&current.id)
                     .ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
-                Ok((inventory.supertypes.clone(), inventory.supertypes_complete))
+                Ok((edges.clone(), false))
             },
             |ty| match ty {
                 TypeRef::Named { name, .. } => Some(name),

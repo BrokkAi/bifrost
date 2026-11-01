@@ -245,7 +245,10 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 // pointer signatures for unchanged assemblies.
 // #7338: C# assembly packs record their own assembly identity and the type-forward
 // records of facades for unchanged assemblies.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 73;
+// #8523: brokk-tree-sitter-kotlin 0.4.7 parses empty collection literals, so
+// Kotlin source-jar productions change for unchanged artifacts.
+// #8591: re-produce Kotlin source jars with context-parameter function types.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 76;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

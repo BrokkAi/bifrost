@@ -444,6 +444,11 @@ fn vulnerability_identity(projection: CvssFindingProjection<'_>) -> Vulnerabilit
     VulnerabilityIdentity::from_bytes(digest)
 }
 
+/// One reduction step is charged for each predicate node visited, authored
+/// assertion emitted, evidence record scanned for a scenario, scope pair
+/// compared, highest-basis record considered, outcome grouped, and variant
+/// sealed. For one matching assertion with one evidence record and no source
+/// scenarios, these seven operations consume exactly seven steps.
 #[derive(Debug)]
 struct ReductionMeter {
     remaining: usize,
@@ -2060,3 +2065,7 @@ mod tests {
         assert_eq!(retained_refs.len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "reduction_contract_tests.rs"]
+mod reduction_contract_tests;

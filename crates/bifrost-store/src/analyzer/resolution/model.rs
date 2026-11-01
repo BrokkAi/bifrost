@@ -245,6 +245,9 @@ macro_rules! numeric_id {
                 matches!(self.kind(), ResolutionIdentityKind::Operation).then(|| self.payload())
             }
 
+            #[cfg(any(test, feature = "test-support"))]
+            pub(crate) fn from_raw_for_test(raw: u64) -> Self { Self(raw) }
+
             #[doc(hidden)]
             pub const fn get(self) -> u64 {
                 self.0

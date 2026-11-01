@@ -1233,6 +1233,7 @@ mod tests {
         ) -> Option<brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity> {
             None
         }
+        #[track_caller]
         fn record_unattributed(&self) {
             panic!("fixture has no captures")
         }
@@ -1250,6 +1251,8 @@ mod tests {
                     keys: Arc::from([]),
                     unattributed_reads: 0,
                     execution_dependences: 0,
+                    first_refusal: None,
+                    first_execution_refusal: None,
                 },
                 None,
             )

@@ -53,6 +53,8 @@ use crate::searchtools::scan_usages::UsageGraphEdge;
 
 use crate::searchtools::scan_usages::UsageGraphIncompleteReason;
 
+use crate::searchtools::scan_usages::UsageGraphNode;
+
 use crate::searchtools::scan_usages::UsageGraphParams;
 
 use crate::searchtools::scan_usages::UsageGraphResult;
@@ -3416,9 +3418,12 @@ where
 {
     let mut exported =
         export_snapshot_symbol_files_from_tree_with(repo, tree, root, paths, &mut export_file)?;
+    // Compared as paths, not strings: the changed paths keep Git's `/` while
+    // resolved imports are joined with the native separator, and on Windows
+    // the two spellings of one file must not both be exported.
     let already_exported = exported
         .iter()
-        .map(|(path, _)| path.to_string_lossy().into_owned())
+        .map(|(path, _)| path.as_path())
         .collect::<BTreeSet<_>>();
 
     // Import expansion resolves against a manifest that just landed on disk
@@ -3431,16 +3436,21 @@ where
     for target in snapshot_import_expansion_targets(root, tree, &changed, cache)? {
         match target {
             ImportExpansionTarget::Directory(dir) => {
-                expansion.extend(tree_dir_file_paths(repo, tree, &dir));
+                expansion.extend(
+                    tree_dir_file_paths(repo, tree, &dir)
+                        .into_iter()
+                        .map(PathBuf::from),
+                );
             }
             ImportExpansionTarget::File(file) => {
-                expansion.insert(file.to_string_lossy().into_owned());
+                expansion.insert(file);
             }
         }
     }
     let expansion: Vec<String> = expansion
         .into_iter()
-        .filter(|path| !already_exported.contains(path))
+        .filter(|path| !already_exported.contains(path.as_path()))
+        .map(|path| path.to_string_lossy().into_owned())
         .collect();
     exported.extend(export_tree_paths_with(
         tree,
@@ -5123,9 +5133,9 @@ fn diff_call_edges(
         .iter()
         .map(|edge| (edge_key(edge), edge))
         .collect::<BTreeMap<_, _>>();
-    let definitions = symbols_by_edge_key(postimage);
+    let definitions = symbols_by_edge_key(postimage, &after.nodes);
     let mut deltas: HashMap<CallerKey, CalleeDelta> = HashMap::new();
-    let mut deps: BTreeMap<String, CommitSymbol> = BTreeMap::new();
+    let mut deps: BTreeMap<SymbolKey, CommitSymbol> = BTreeMap::new();
     for (key, edge) in &new {
         // An added relation requires an absence proof on the before side;
         // a proven positive after edge alone cannot establish that delta.
@@ -5137,8 +5147,15 @@ fn diff_call_edges(
             .or_default()
             .added
             .push(callee_change(edge));
-        if let Some(symbol) = definitions.get(&(edge.to.clone(), edge.language.clone())) {
-            deps.insert(symbol.fqn.clone(), (*symbol).clone());
+        if let Some(symbol) = definitions.get(&edge.to_id) {
+            deps.insert(
+                SymbolKey {
+                    fqn: symbol.fqn.clone(),
+                    kind: symbol.kind.clone(),
+                    language: symbol.language.clone(),
+                },
+                (*symbol).clone(),
+            );
         }
     }
     for (key, edge) in &old {
@@ -5221,21 +5238,33 @@ fn callee_change(edge: &UsageGraphEdge) -> CalleeChange {
     }
 }
 
-/// Index the postimage symbols the way an edge endpoint names them.
-///
-/// The snapshot map is keyed by fqn, kind and language, but an edge carries no
-/// kind, so the two fqns a class and a function share collapse onto one entry.
-/// The first in snapshot-key order wins, which is the symbol a scan of the map
-/// would have found.
-fn symbols_by_edge_key(
-    symbols: &BTreeMap<SymbolKey, SymbolSnapshot>,
-) -> HashMap<CallerKey, &CommitSymbol> {
-    let mut out: HashMap<CallerKey, &CommitSymbol> = HashMap::new();
+/// Join postimage graph declarations to the symbols published by the patch.
+/// The graph node carries the exact target identity and kind; names alone can
+/// select a field when the edge calls a method with that same name.
+fn symbols_by_edge_key<'s>(
+    symbols: &'s BTreeMap<SymbolKey, SymbolSnapshot>,
+    nodes: &[UsageGraphNode],
+) -> HashMap<DeclarationId, &'s CommitSymbol> {
+    let mut by_name_kind = HashMap::new();
     for snapshot in symbols.values() {
-        out.entry(symbol_edge_key(&snapshot.symbol))
-            .or_insert(&snapshot.symbol);
+        by_name_kind.insert(
+            (
+                snapshot.symbol.fqn.as_str(),
+                snapshot.symbol.language.as_str(),
+                snapshot.symbol.kind.as_str(),
+            ),
+            &snapshot.symbol,
+        );
     }
-    out
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let language = language_for_path(Path::new(&node.path));
+            by_name_kind
+                .get(&(node.fqn.as_str(), language.as_str(), node.kind.as_str()))
+                .map(|symbol| (node.id.clone(), *symbol))
+        })
+        .collect()
 }
 
 fn large_callsite_symbols(
@@ -5358,6 +5387,10 @@ fn commit_endpoint(commit_id: &str) -> Result<RevisionEndpoint, String> {
         .map(RevisionEndpoint::Commit)
         .map_err(|error| format!("commit `{commit_id}` is not a usable object name: {error}"))
 }
+
+#[cfg(test)]
+#[path = "diff_analysis/revision_project_contract.rs"]
+mod revision_project_contract;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -6825,6 +6858,27 @@ mod tests {
         assert!(csharp_files.contains(Path::new("fixture.dll")));
         assert!(!csharp_files.contains(Path::new("src/main.ts")));
 
+        // A mixed-language image retains an identity input owned by just one
+        // selected ecosystem.
+        fs::write(dir.path().join("go.mod"), "module example.com/fixture\n").unwrap();
+        fs::write(dir.path().join("src/main.go"), "package main\n").unwrap();
+        fs::write(dir.path().join("src/helper.py"), "def helper(): pass\n").unwrap();
+        let mixed_commit = test_repo::commit_all(&repo, "mixed ecosystem");
+        let mixed_image = RevisionImage::materialize_file_dependencies(
+            &repo,
+            Snapshot::Commit(mixed_commit),
+            &BTreeSet::from([Language::Go, Language::Python]),
+            &[],
+        )
+        .unwrap();
+        assert!(mixed_image.files().contains(&PathBuf::from("src/main.go")));
+        assert!(
+            mixed_image
+                .files()
+                .contains(&PathBuf::from("src/helper.py"))
+        );
+        assert!(mixed_image.files().contains(&PathBuf::from("go.mod")));
+
         // The complete exporter remains an independent contract for callers
         // that need every regular tree file.
         let complete =
@@ -7437,6 +7491,62 @@ mod entry_point_tests {
                 .collect::<Vec<_>>(),
             vec!["Existing"],
             "the analyzer's project root is the repository that gets diffed"
+        );
+    }
+
+    #[test]
+    fn analyze_diff_entry_respects_explicit_test_symbols() {
+        let temp = RevisionTempDir::new("analyzer-test-entry").unwrap();
+        let root = temp.path();
+        let repo = Repository::init(root).unwrap();
+        let signature = git2::Signature::now("Tester", "tester@example.com").unwrap();
+        let mut parent = None;
+        for value in [1, 2] {
+            fs::write(
+                root.join("sample_test.go"),
+                format!("package sample\nfunc TestChanged() int {{ return {value} }}\n"),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("sample_test.go")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents = parent
+                .into_iter()
+                .map(|oid| repo.find_commit(oid).unwrap())
+                .collect::<Vec<_>>();
+            parent = Some(
+                repo.commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "commit",
+                    &tree,
+                    &parents.iter().collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            );
+        }
+        let analyzer = build_analyzer(root, &[PathBuf::from("sample_test.go")]).unwrap();
+        let result = analyze_diff(
+            analyzer.analyzer(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".into()),
+                target: Some("HEAD".into()),
+                include_tests: true,
+                ..Default::default()
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(
+            result
+                .patch_symbols
+                .edited
+                .iter()
+                .any(|pair| pair.after.name == "TestChanged"),
+            "{result:?}"
         );
     }
 

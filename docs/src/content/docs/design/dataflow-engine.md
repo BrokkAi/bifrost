@@ -718,10 +718,13 @@ blob whose rows are missing or carry an older epoch counts as a missing complete
 analysis, and the startup reconcile reparses and republishes it. Resolution
 bundles follow the same rule.
 
-Only parse-time persistence writes rows. An overlay, or a blob without a
-current publication, is lowered on demand in memory, and that lowering writes
-no IR or partial-flow rows. A query reads such a procedure's partial flows by
-running the same file-local fixpoint.
+Only parse-time persistence writes rows. Native languages with file-local
+lowerers publish at parse time. Python and Scala lowerers read models, overlays,
+or dependencies outside the file, so they cannot publish until the producer
+epoch keys those inputs. Legacy engines do not publish. An overlay, or a blob
+without a current publication, is lowered on demand in memory. That lowering
+writes no IR or partial-flow rows. A query reads such a procedure's partial
+flows by running the same file-local fixpoint.
 
 ### The search
 

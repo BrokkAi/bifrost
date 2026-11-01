@@ -56,6 +56,7 @@ mod python_extraction_tests {
                 "caller.py",
                 git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
                     .expect("fixture blob identity"),
+                brokk_bifrost_core::gitblob::ParseVariant::Empty
             )
         );
         let ReadKey::Lookup { kind, question, .. } = &first_keys[1] else {

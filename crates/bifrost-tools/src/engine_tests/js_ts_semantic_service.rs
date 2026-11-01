@@ -906,7 +906,7 @@ mod js_ts_extraction_tests {
             budget.resident().nested_entries,
             artifact.work().nested_entries
         );
-        assert!(budget.used().owned_text_bytes > work.owned_text_bytes);
+        assert_eq!(budget.used().owned_text_bytes, work.owned_text_bytes);
         let second_cache = CompleteSemanticArtifactCache::default();
         let mut warming_budget = SemanticBudget::default();
         let SemanticOutcome::Complete { value: second, .. } = materialize(
@@ -1474,10 +1474,10 @@ mod js_ts_extraction_tests {
                 ..SemanticWork::default()
             }
         );
-        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.len(), 1);
         assert!(
             collector.take_all_complete().is_empty(),
-            "a complete lowerer result whose budget commit failed is not observable"
+            "a complete producer result refused by the request is not observable"
         );
     }
     #[test]
@@ -1842,7 +1842,7 @@ mod js_ts_extraction_tests {
         assert_eq!(cache.len(), 0);
     }
     #[test]
-    fn source_limit_is_enforced_before_parsing_or_lowering() {
+    fn request_source_limit_does_not_change_producer_lowering() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("root");
         let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
@@ -1861,13 +1861,12 @@ mod js_ts_extraction_tests {
             &mut budget,
             &brokk_bifrost_core::cancellation::CancellationToken::default(),
         );
-        assert!(matches!(
-            outcome,
-            SemanticOutcome::ExceededBudget { partial: None, work, .. }
-                if work.source_bytes > 8
-        ));
-        assert_eq!(lowerer.calls(), 0);
-        assert_eq!(budget.used(), SemanticWork::default());
+        assert!(matches!(outcome, SemanticOutcome::Complete { .. }));
+        assert_eq!(lowerer.calls(), 1);
+        assert_eq!(
+            budget.used().source_bytes,
+            "export const value = 1;\n".len()
+        );
     }
     #[test]
     fn empty_source_is_a_valid_exact_snapshot() {

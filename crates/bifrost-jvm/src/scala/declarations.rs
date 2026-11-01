@@ -13,7 +13,7 @@ use brokk_bifrost_core::analyzer::model::{
     ParameterMetadata, ProjectFile, Range, SignatureMetadata, StructuredTypeIdentity,
     StructuredTypeName, child_fq_base,
 };
-use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
+use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts};
 use brokk_bifrost_core::analyzer::scala_facts::{
     ScalaDeclarationKind, ScalaDeclarationSourceFact, ScalaDeclarationVisibility,
 };
@@ -44,12 +44,35 @@ fn scala_package_fq(package_name: &str) -> FqName {
     fq
 }
 
-fn scala_root_anonymous_name(source: &str, line: usize, column: usize) -> String {
-    let source_id = lower_hex_string(&hash_domain_bytes(
-        b"scala-root-anonymous-owner-v1",
-        source.as_bytes(),
+fn scala_synthetic_name(node: Node<'_>, parsed: &ParsedFile) -> String {
+    // Use precisely the named owners this producer retained. Local values and
+    // local declarations captured only as source facts do not own CodeUnits.
+    let owners: brokk_bifrost_core::hash::HashSet<_> = parsed
+        .declarations()
+        .iter()
+        .filter(|unit| !unit.is_synthetic())
+        .flat_map(|unit| parsed.declaration_ranges(unit))
+        .map(|range| (range.start_byte, range.end_byte))
+        .collect();
+    brokk_bifrost_core::analyzer::tree_walk::synthetic_name(
+        node,
+        |candidate| {
+            (candidate.kind() == "instance_expression"
+                && scala_anonymous_template_body(candidate).is_some())
+            .then_some("anon")
+        },
+        |candidate| owners.contains(&(candidate.start_byte(), candidate.end_byte())),
+    )
+    .to_string()
+}
+
+fn scala_root_anonymous_name(file: &ProjectFile, name: &str) -> String {
+    let path = file.rel_path().to_string_lossy().replace('\\', "/");
+    let file_id = lower_hex_string(&hash_domain_bytes(
+        b"scala-root-anonymous-file-v1",
+        path.as_bytes(),
     ));
-    format!("$anon${source_id}${line}:{column}")
+    format!("$file${file_id}{name}")
 }
 
 /// The structured segment for a Scala type declaration's own name. A Scala
@@ -577,13 +600,19 @@ impl ScalaVisitor<'_, '_> {
             .as_ref()
             .map(|parent| parent.package_name().to_string())
             .unwrap_or_else(|| self.parsed.package_name.clone());
-        let line = instance.start_position().row;
-        let column = instance.start_position().column;
-        let anonymous_name = format!("anon${line}:{column}");
+        let name = scala_synthetic_name(instance, self.parsed);
+        let name = parent
+            .as_ref()
+            .filter(|parent| parent.is_function())
+            .map_or_else(
+                || name.clone(),
+                |parent| format!("$owner${}{name}", parent.declaration_id()),
+            );
+        let anonymous_name = name[1..].to_owned();
         let mut fq = child_fq_base(parent.as_ref(), || scala_package_fq(&package_name));
         let (fq_name, segment_kind) = match parent.as_ref() {
             None => (
-                scala_root_anonymous_name(self.source, line, column),
+                scala_root_anonymous_name(self.file, &name),
                 SegmentKind::Type,
             ),
             Some(_) => (anonymous_name, SegmentKind::Nested),
@@ -591,7 +620,7 @@ impl ScalaVisitor<'_, '_> {
         fq.push(segment_interner().intern(&fq_name, segment_kind));
         let short_name = parent.as_ref().map_or_else(
             || fq_name.clone(),
-            |parent| format!("{}$anon${line}:{column}", parent.short_name()),
+            |parent| format!("{}{name}", parent.short_name()),
         );
         let anonymous = CodeUnit::with_signature_and_fq(
             self.file.clone(),
@@ -2442,6 +2471,46 @@ mod same_package_and_extension_tests {
             .expect("Scala parser")
             .expect("Scala syntax tree");
         parse_scala_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn synthetic_declaration_ids_follow_rank_across_edits() {
+        fn ids(source: &str) -> std::collections::BTreeSet<String> {
+            let parsed = parse(source);
+            parsed
+                .declarations()
+                .iter()
+                .filter(|unit| unit.identifier() == "Target")
+                .map(|unit| unit.declaration_id().to_string())
+                .collect()
+        }
+        let source = "package demo\ntrait T\nobject Factory { def f = { new T { class Target } } }";
+        let original = ids(source);
+        assert!(!original.is_empty(), "target declarations were produced");
+        assert_eq!(original, ids(&format!("// byte shift\n{source}")));
+        let inserted = ids(
+            "package demo\ntrait T\nobject Factory { def f = { new T {}; new T { class Target } } }",
+        );
+        assert_eq!(original.len(), inserted.len());
+        assert!(
+            original.is_disjoint(&inserted),
+            "earlier siblings change ranks"
+        );
+    }
+
+    #[test]
+    fn overload_anonymous_declarations_keep_distinct_ids() {
+        let parsed = parse(
+            "package demo\ntrait Base\nobject Owner { def f(x: Int) = new Base { class Marker }; def f(x: String) = new Base { class Marker } }",
+        );
+        let ids: Vec<_> = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.identifier() == "Marker")
+            .map(|unit| unit.declaration_id())
+            .collect();
+        assert_eq!(ids.len(), 2, "both overloads keep their anonymous member");
+        assert_ne!(ids[0], ids[1], "anonymous members have distinct identities");
     }
 
     #[test]

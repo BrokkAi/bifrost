@@ -4,7 +4,7 @@ use brokk_bifrost_analysis::analyzer::store::csharp_compilation::CSharpSymbolEnv
 
 type Properties = HashMap<String, Result<String, &'static str>>;
 
-fn expand(value: &str, properties: &Properties) -> Result<String, &'static str> {
+pub(super) fn expand(value: &str, properties: &Properties) -> Result<String, &'static str> {
     // MSBuild property values, never C# syntax. Functions and item transforms
     // require MSBuild evaluation and cannot be inferred from their spelling.
     if value.contains("$([") || value.contains("@(") || value.contains("%(") {
@@ -31,6 +31,177 @@ fn expand(value: &str, properties: &Properties) -> Result<String, &'static str> 
     Ok(result)
 }
 
+// The caller already expanded the supported import chain and retained any
+// unresolved imports as membership obligations. Reuse the symbol evaluator's
+// scalar operations and expansion; these values describe the declared workspace.
+pub(super) fn membership_properties<'a>(
+    sources: impl Iterator<Item = &'a str>,
+) -> Result<Properties, &'static str> {
+    membership_properties_with_globals(sources, &[])
+}
+
+// Preserve the structurally selected raw assignment for diagnostics when its
+// value cannot be expanded. It never contributes to a project-scope proof.
+pub(super) fn raw_target_frameworks<'a>(sources: impl Iterator<Item = &'a str>) -> Option<String> {
+    sources
+        .filter_map(|source| operations(source).ok())
+        .flatten()
+        .filter_map(|operation| match operation {
+            Operation::Property(name, Ok(value))
+                if name.eq_ignore_ascii_case("targetframeworks") =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .last()
+}
+
+pub(super) fn membership_properties_with_globals<'a>(
+    sources: impl Iterator<Item = &'a str>,
+    globals: &[(&str, &str)],
+) -> Result<Properties, &'static str> {
+    let mut properties = initial_properties();
+    for &(name, value) in globals {
+        properties.insert(name.to_ascii_lowercase(), Ok(value.to_owned()));
+    }
+    // Fill this SDK fallback after workspace assignments; a self-reference
+    // without a declared prior value must not invent an inside-project path.
+    for source in sources {
+        for operation in operations(source)? {
+            match operation {
+                Operation::Property(name, value) => {
+                    let name = name.to_ascii_lowercase();
+                    if globals
+                        .iter()
+                        .any(|(global, _)| name.eq_ignore_ascii_case(global))
+                    {
+                        continue;
+                    }
+                    if !matches!(properties.get(&name), Some(Err("target_assignment"))) {
+                        let value = value.and_then(|value| expand(&value, &properties));
+                        properties.insert(name, value);
+                    }
+                }
+                Operation::TargetProperty(name) => {
+                    if globals
+                        .iter()
+                        .any(|(global, _)| name.eq_ignore_ascii_case(global))
+                    {
+                        continue;
+                    }
+                    properties.insert(name, Err("target_assignment"));
+                }
+                Operation::TreatAsLocalProperty if !globals.is_empty() => {
+                    return Err("treat_as_local_property");
+                }
+                Operation::TreatAsLocalProperty => {}
+                Operation::Import(_) => {}
+            }
+        }
+    }
+    // These optional SDK suffixes cannot make an in-project default escape.
+    // Unmodeled artifacts defaults can choose a different base entirely.
+    for (name, label) in [
+        ("platform", "Platform"),
+        ("platformname", "PlatformName"),
+        (
+            "_platformtoappendtooutputpath",
+            "_PlatformToAppendToOutputPath",
+        ),
+        ("runtimeidentifier", "RuntimeIdentifier"),
+    ] {
+        if let Some(value) = properties.get(name) {
+            let value = value.as_ref().map_err(|_| label)?;
+            if !value.is_empty()
+                && (!static_item_path(value)
+                    || value.contains(':')
+                    || resolve_item_path(Path::new(""), value).is_none())
+            {
+                return Err(label);
+            }
+        }
+    }
+    for name in ["useartifactsoutput", "useartifactsintermediateoutput"] {
+        if properties.get(name).is_some_and(|value| {
+            !value
+                .as_ref()
+                .is_ok_and(|value| value.is_empty() || value.eq_ignore_ascii_case("false"))
+        }) {
+            return Err("BaseIntermediateOutputPath (SDK artifacts layout)");
+        }
+    }
+    if properties
+        .get("artifactspath")
+        .is_some_and(|value| !value.as_ref().is_ok_and(String::is_empty))
+    {
+        return Err("BaseIntermediateOutputPath (ArtifactsPath layout)");
+    }
+    for (name, value) in [
+        ("appdesignerfolder", "Properties"),
+        ("baseintermediateoutputpath", "obj/"),
+        ("configuration", "Debug"),
+    ] {
+        if properties
+            .get(name)
+            .is_none_or(|value| value.as_ref().is_ok_and(|value| value.trim().is_empty()))
+        {
+            properties.insert(name.into(), Ok(value.into()));
+        }
+    }
+    if let Some(Ok(base)) = properties.get_mut("baseintermediateoutputpath")
+        && !base.ends_with(['/', '\\'])
+    {
+        base.push('/');
+    }
+    if properties
+        .get("intermediateoutputpath")
+        .is_none_or(|value| value.as_ref().is_ok_and(|value| value.trim().is_empty()))
+    {
+        let platform = properties
+            .get("platformname")
+            .or_else(|| properties.get("platform"))
+            .and_then(|value| value.as_ref().ok())
+            .map(String::as_str)
+            .unwrap_or("AnyCPU");
+        let append = properties
+            .get("appendplatformtooutputpath")
+            .map(|value| {
+                value
+                    .as_ref()
+                    .map(|value| value.eq_ignore_ascii_case("true"))
+                    .map_err(|_| "AppendPlatformToOutputPath")
+            })
+            .transpose()?
+            .unwrap_or(!platform.eq_ignore_ascii_case("AnyCPU"));
+        let prefix = if append {
+            format!("{platform}/")
+        } else {
+            properties
+                .get("_platformtoappendtooutputpath")
+                .and_then(|value| value.as_ref().ok())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let value = expand(
+            &format!("$(BaseIntermediateOutputPath){prefix}$(Configuration)/"),
+            &properties,
+        )
+        .and_then(|mut value| {
+            let framework = properties
+                .get("targetframework")
+                .ok_or("dynamic_property")?
+                .as_ref()
+                .map_err(|_| "dynamic_property")?;
+            value.push_str(&framework.to_ascii_lowercase());
+            value.push('/');
+            Ok(value)
+        });
+        properties.insert("intermediateoutputpath".into(), value);
+    }
+    Ok(properties)
+}
+
 fn initial_properties() -> Properties {
     [
         ("configuration", "Debug"),
@@ -50,6 +221,8 @@ fn initial_properties() -> Properties {
 #[derive(Debug)]
 enum Operation {
     Property(String, Result<String, &'static str>),
+    TargetProperty(String),
+    TreatAsLocalProperty,
     Import(Result<String, &'static str>),
 }
 fn operations(source: &str) -> Result<Vec<Operation>, &'static str> {
@@ -65,12 +238,18 @@ fn operations(source: &str) -> Result<Vec<Operation>, &'static str> {
         }
         match event {
             Event::Start(ref element) | Event::Empty(ref element) => {
-                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                let name = msbuild_name(element.name().as_ref()).ok_or("dynamic_property")?;
+                if stack.len() >= 2 && stack[stack.len() - 2].0 == "propertygroup" {
+                    return Err("dynamic_property");
+                }
+                let in_target = stack.iter().any(|frame| frame.0 == "target");
                 let mut condition = stack
                     .last()
-                    .is_some_and(|frame| frame.1 || frame.0 == "Target" || frame.0 == "Choose");
+                    .is_some_and(|frame| frame.1 || frame.0 == "choose");
                 let mut import = None;
+                let mut output_property = None;
                 let mut qualified_import = false;
+                let mut treat_as_local = false;
                 for attr in element.attributes() {
                     let attr = attr.map_err(|_| "dynamic_property")?;
                     let value = attr
@@ -80,19 +259,41 @@ fn operations(source: &str) -> Result<Vec<Operation>, &'static str> {
                         )
                         .map_err(|_| "dynamic_property")?
                         .into_owned();
-                    match attr.key.as_ref() {
-                        b"Condition" => condition = true,
-                        b"Project" if name == "Import" => import = Some(value),
-                        b"Sdk" | b"Version" | b"MinimumVersion" if name == "Import" => {
+                    let key = msbuild_name(attr.key.as_ref()).ok_or("dynamic_property")?;
+                    match key.as_str() {
+                        "treataslocalproperty" if name == "project" => {
+                            treat_as_local = true;
+                        }
+                        "condition" => condition = true,
+                        "project" if name == "import" => import = Some(value),
+                        "propertyname" if name == "output" => output_property = Some(value),
+                        "sdk" | "version" | "minimumversion" if name == "import" => {
                             qualified_import = true
                         }
                         _ => {}
                     }
                 }
-                if name == "Target" {
-                    return Err("unevaluated_import");
+                if treat_as_local {
+                    result.push(Operation::TreatAsLocalProperty);
                 }
-                if name == "Import" {
+                if in_target
+                    && name == "output"
+                    && let Some(property) = output_property
+                {
+                    // MSBuild expands this destination at target execution time.
+                    // Another target can change an expansion input after evaluation.
+                    if property.is_empty()
+                        || !property.chars().enumerate().all(|(index, ch)| {
+                            ch == '_'
+                                || ch.is_ascii_alphabetic()
+                                || (index > 0 && ch.is_ascii_digit())
+                        })
+                    {
+                        return Err("dynamic_target_property");
+                    }
+                    result.push(Operation::TargetProperty(property.to_ascii_lowercase()));
+                }
+                if name == "import" && !in_target {
                     result.push(Operation::Import(if qualified_import {
                         Err("unevaluated_import")
                     } else if condition {
@@ -103,15 +304,19 @@ fn operations(source: &str) -> Result<Vec<Operation>, &'static str> {
                 }
                 if matches!(event, Event::Start(_)) {
                     stack.push((name, condition, String::new()));
-                } else if stack.last().is_some_and(|frame| frame.0 == "PropertyGroup") {
-                    result.push(Operation::Property(
-                        name.to_ascii_lowercase(),
-                        if condition {
-                            Err("condition")
-                        } else {
-                            Ok(String::new())
-                        },
-                    ));
+                } else if stack.last().is_some_and(|frame| frame.0 == "propertygroup") {
+                    if in_target {
+                        result.push(Operation::TargetProperty(name.to_ascii_lowercase()));
+                    } else {
+                        result.push(Operation::Property(
+                            name.to_ascii_lowercase(),
+                            if condition {
+                                Err("condition")
+                            } else {
+                                Ok(String::new())
+                            },
+                        ));
+                    }
                 }
             }
             Event::Text(text) => {
@@ -131,15 +336,19 @@ fn operations(source: &str) -> Result<Vec<Operation>, &'static str> {
             }
             Event::End(_) => {
                 let (name, condition, value) = stack.pop().ok_or("dynamic_property")?;
-                if stack.last().is_some_and(|frame| frame.0 == "PropertyGroup") {
-                    result.push(Operation::Property(
-                        name.to_ascii_lowercase(),
-                        if condition {
-                            Err("condition")
-                        } else {
-                            Ok(value)
-                        },
-                    ));
+                if stack.last().is_some_and(|frame| frame.0 == "propertygroup") {
+                    if stack.iter().any(|frame| frame.0 == "target") {
+                        result.push(Operation::TargetProperty(name.to_ascii_lowercase()));
+                    } else {
+                        result.push(Operation::Property(
+                            name.to_ascii_lowercase(),
+                            if condition {
+                                Err("condition")
+                            } else {
+                                Ok(value)
+                            },
+                        ));
+                    }
                 }
             }
             Event::Eof => break,
@@ -198,6 +407,9 @@ fn evaluate(
                     if name == "configuration" {
                         continue;
                     } // Selected global property.
+                    if matches!(properties.get(&name), Some(Err("target_assignment"))) {
+                        continue;
+                    }
                     let value = value.and_then(|value| expand(&value, properties));
                     // Conditions remain unknown even if a later assignment
                     // happens to overwrite the same property.
@@ -206,6 +418,10 @@ fn evaluate(
                     }
                     properties.insert(name, value);
                 }
+                Operation::TargetProperty(name) => {
+                    properties.insert(name, Err("target_assignment"));
+                }
+                Operation::TreatAsLocalProperty => {}
                 Operation::Import(value) => {
                     let value = expand(&value?, properties).map_err(|_| "unevaluated_import")?;
                     // A drive-qualified or rooted import is external even on

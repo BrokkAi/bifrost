@@ -30,7 +30,9 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
          AND (name LIKE 'resolution_%' OR name LIKE 'source_%'
               OR name LIKE 'python_binding_%' OR name LIKE 'python_member_%'
               OR name LIKE 'go_context_%' OR name LIKE 'go_package_%'
-              OR name = 'semantic_ir_call_sites' OR name = 'csharp_compilation_symbols') AND ?1 = ''",
+              OR name = 'semantic_ir_call_sites' OR name IN ('csharp_compilation_symbols','csharp_undecided_chains')
+              OR name IN ('csharp_using_publications','csharp_compilation_members','csharp_global_using_extent',
+                          'csharp_compilation_using_coverage')) AND ?1 = ''",
         "",
     );
     assert_eq!(
@@ -60,6 +62,14 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
             "csharp_compilation_symbols"
         ),
         ["compilation_id:csharp_compilations.compilation_id:CASCADE"]
+    );
+    assert_eq!(
+        string_column(
+            &conn,
+            r#"SELECT "from" || ':' || "table" || '.' || "to" || ':' || on_delete FROM pragma_foreign_key_list(?1)"#,
+            "csharp_undecided_chains"
+        ),
+        ["blob_id:blobs.id:CASCADE"]
     );
     let compilation_columns = string_column(
         &conn,
@@ -130,6 +140,50 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
                 foreign_keys.entry(id).or_default().push(column);
             }
             for (id, columns) in &foreign_keys {
+                if matches!(
+                    table.as_str(),
+                    "csharp_using_publications"
+                        | "csharp_compilation_members"
+                        | "csharp_global_using_extent"
+                        | "csharp_compilation_using_coverage"
+                ) {
+                    // Revision probes use the workspace prefix; a source content
+                    // parent uses the full blob/site prefix. All must seek a
+                    // declared child index rather than scan the child table.
+                    let predicates = columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, column)| format!("\"{column}\"=?{}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    let values = columns.iter().map(|column| match column.as_str() {
+                        "workspace_id" => rusqlite::types::Value::Text("0".repeat(64)),
+                        "lang" => rusqlite::types::Value::Text("csharp".into()),
+                        _ => rusqlite::types::Value::Integer(1),
+                    });
+                    let plan = conn
+                        .prepare(&format!(
+                            "EXPLAIN QUERY PLAN SELECT 1 FROM \"{table}\" WHERE {predicates}"
+                        ))
+                        .unwrap()
+                        .query_map(rusqlite::params_from_iter(values), |r| {
+                            r.get::<_, String>(3)
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    assert!(
+                        plan.iter().any(|line| line.starts_with("SEARCH ")),
+                        "{table} {columns:?} {state}: {plan:?}"
+                    );
+                    assert!(
+                        !plan
+                            .iter()
+                            .any(|line| line.starts_with("SCAN ") || line.contains("AUTOMATIC")),
+                        "{table} {columns:?} {state}: {plan:?}"
+                    );
+                    continue;
+                }
                 if table != "csharp_compilation_symbols"
                     && (columns.len() < 2 || !columns.iter().any(|column| column == "blob_id"))
                 {

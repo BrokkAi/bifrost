@@ -422,6 +422,7 @@ fn publication_receipt_tx(
         }
         membership.push(row?);
     }
+    super::csharp_compilation::extent::content_available(tx, &owner.lang, blob_id)?;
     Ok(Some(PublishedResolutionContent {
         witness,
         membership,
@@ -1185,6 +1186,8 @@ impl AnalyzerStore {
     }
 }
 
+// Capsules and their host catalogs currently come only from the Rust producer.
+// Their synthetic content keys and Rust host keys use the empty parse variant.
 /// Publish one capsule on `conn`, in its own immediate transaction. The
 /// store's writer runs this, and so does a selected operation on the
 /// in-memory fallback, whose reader is that writer connection (#6018).
@@ -1310,6 +1313,10 @@ pub(super) fn publish_resolution_capsule_on(
     else {
         return Ok(ResolutionContentPublicationOutcome::Cancelled);
     };
+    super::csharp_compilation::extent::before_blob_delete(
+        &tx,
+        &super::BlobKey::unvaried(oid, &owner.lang),
+    )?;
     tx.execute(
         "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
         params![oid_text, owner.lang, super::ParseVariant::Empty],

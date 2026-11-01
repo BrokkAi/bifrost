@@ -442,6 +442,7 @@ pub trait MemberFamilyProvider: CapabilityProvider + Send + Sync {
 struct FamilyWalk<'a> {
     analyzer: &'a dyn IAnalyzer,
     hierarchy: &'a dyn TypeHierarchyProvider,
+    query: &'a mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery,
     rules: &'a dyn NominalFamilyRules,
     cancellation: Option<&'a CancellationToken>,
     remaining: usize,
@@ -451,12 +452,14 @@ impl<'a> FamilyWalk<'a> {
     fn new(
         analyzer: &'a dyn IAnalyzer,
         hierarchy: &'a dyn TypeHierarchyProvider,
+        query: &'a mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery,
         rules: &'a dyn NominalFamilyRules,
         cancellation: Option<&'a CancellationToken>,
     ) -> Self {
         Self {
             analyzer,
             hierarchy,
+            query,
             rules,
             cancellation,
             remaining: MAX_FAMILY_VISITS,
@@ -548,14 +551,13 @@ fn forward_edges(walk: &mut FamilyWalk<'_>, member: &CodeUnit) -> ForwardStep {
     let mut edges: Vec<MemberFamilyEdge> = Vec::new();
     let mut unread_ancestors = Vec::new();
     let mut hierarchy_incomplete = false;
+    let mut hierarchy_ambiguous = false;
     let mut seen = vec![owner.clone()];
     let mut frontier = VecDeque::from([(owner.clone(), 0_usize)]);
     while let Some((type_unit, depth)) = frontier.pop_front() {
-        hierarchy_incomplete |= !walk
-            .hierarchy
-            .get_direct_ancestors(&type_unit)
-            .is_complete();
-        let ancestors = walk.hierarchy.member_family_ancestors(&type_unit);
+        hierarchy_incomplete |= !walk.query.direct_ancestors(&type_unit).is_complete();
+        let ancestors = walk.query.member_family_ancestors(&type_unit);
+        hierarchy_ambiguous |= !ancestors.ambiguous.is_empty();
         for ancestor in ancestors.unread {
             if ancestor.inventory.is_none_or(|inventory| {
                 walk.hierarchy
@@ -603,14 +605,19 @@ fn forward_edges(walk: &mut FamilyWalk<'_>, member: &CodeUnit) -> ForwardStep {
     }
     unread_ancestors.sort();
     unread_ancestors.dedup();
-    if hierarchy_incomplete
+    if hierarchy_ambiguous
+        || hierarchy_incomplete
         || !unread_ancestors.is_empty()
         || (edges.is_empty()
             && facts.override_modifier() == Some(CallableOverrideModifier::Override))
     {
         let mut answer = MemberFamilyAnswer::incomplete_with_edges(
             capability,
-            MemberFamilyReason::AncestorExternalUnindexed,
+            if hierarchy_ambiguous {
+                MemberFamilyReason::HierarchyAmbiguous
+            } else {
+                MemberFamilyReason::AncestorExternalUnindexed
+            },
             edges,
             Vec::new(),
         );
@@ -649,8 +656,31 @@ pub fn nominal_member_family(
     member: &CodeUnit,
     cancellation: Option<&CancellationToken>,
 ) -> MemberFamilyAnswer {
+    let mut result = None;
+    hierarchy.with_hierarchy_query_for(member, &mut |query| {
+        result = Some(nominal_member_family_in_query(
+            analyzer,
+            hierarchy,
+            query,
+            rules,
+            member,
+            cancellation,
+        ));
+    });
+    result.expect("hierarchy query callback runs once")
+}
+
+/// Run every family direction inside an existing hierarchy query.
+pub fn nominal_member_family_in_query(
+    analyzer: &dyn IAnalyzer,
+    hierarchy: &dyn TypeHierarchyProvider,
+    query: &mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery,
+    rules: &dyn NominalFamilyRules,
+    member: &CodeUnit,
+    cancellation: Option<&CancellationToken>,
+) -> MemberFamilyAnswer {
     let capability = nominal_member_family_capability(analyzer, rules, member);
-    let mut walk = FamilyWalk::new(analyzer, hierarchy, rules, cancellation);
+    let mut walk = FamilyWalk::new(analyzer, hierarchy, query, rules, cancellation);
     let (owner, mut edges, mut reason, mut unread_ancestors) =
         match forward_edges(&mut walk, member) {
             ForwardStep::Answer(answer) if answer.outcome == MemberFamilyOutcome::Incomplete => {
@@ -725,9 +755,19 @@ fn inverse_edges(
     let mut seen = vec![owner.clone()];
     let mut frontier = VecDeque::from([owner]);
     while let Some(type_unit) = frontier.pop_front() {
-        let descendants = walk.hierarchy.get_direct_descendants(&type_unit);
+        let descendants = walk.query.direct_descendants(&type_unit);
         if !descendants.is_complete() {
-            return Err(MemberFamilyReason::HierarchyTruncated);
+            // Ambiguous alternatives are an open hierarchy cause; other
+            // incomplete descendant boundaries retain the truncation reason.
+            return Err(if !descendants.ambiguous.is_empty()
+                || descendants.open.iter().any(|reason| {
+                    matches!(reason, brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::MemberFamily(MemberFamilyReason::HierarchyAmbiguous))
+                })
+            {
+                MemberFamilyReason::HierarchyAmbiguous
+            } else {
+                MemberFamilyReason::HierarchyTruncated
+            });
         }
         for descendant in descendants.edges {
             if seen.contains(&descendant) {

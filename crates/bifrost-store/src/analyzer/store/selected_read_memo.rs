@@ -7,8 +7,16 @@ use std::hash::Hash;
 
 use crate::hash::HashMap;
 
+/// Bounded admission stops at this many entries or at this many estimated
+/// bytes, whichever comes first. Past either bound, reads continue uncached.
+const EXACT_READ_MEMO_ENTRY_CAP: usize = 8192;
+const EXACT_READ_MEMO_BYTE_CAP: usize = 16 * 1024 * 1024;
+
 pub(crate) struct ExactReadMemo<K: Eq + Hash, V> {
     entries: HashMap<K, V>,
+    /// Estimated heap bytes of the entries admitted through
+    /// `insert_bounded_weighed`.
+    weighed_bytes: usize,
     #[cfg(any(test, feature = "test-support"))]
     bounded_fills: usize,
     #[cfg(any(test, feature = "test-support"))]
@@ -19,6 +27,7 @@ impl<K: Eq + Hash, V> Default for ExactReadMemo<K, V> {
     fn default() -> Self {
         Self {
             entries: HashMap::default(),
+            weighed_bytes: 0,
             #[cfg(any(test, feature = "test-support"))]
             bounded_fills: 0,
             #[cfg(any(test, feature = "test-support"))]
@@ -29,19 +38,33 @@ impl<K: Eq + Hash, V> Default for ExactReadMemo<K, V> {
 
 impl<K: Eq + Hash, V> ExactReadMemo<K, V> {
     pub(crate) fn insert_bounded(&mut self, key: K, value: V) -> bool {
+        self.insert_bounded_weighed(key, value, 0)
+    }
+
+    /// `insert_bounded` for values whose size varies widely: `bytes` is the
+    /// caller's estimate of the value's heap size, charged against the byte cap.
+    pub(crate) fn insert_bounded_weighed(&mut self, key: K, value: V, bytes: usize) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         {
             self.bounded_fills += 1;
         }
-        if self.entries.len() >= 8192 {
+        if self.entries.len() >= EXACT_READ_MEMO_ENTRY_CAP
+            || self.weighed_bytes.saturating_add(bytes) > EXACT_READ_MEMO_BYTE_CAP
+        {
             #[cfg(any(test, feature = "test-support"))]
             {
                 self.refused_admissions += 1;
             }
             return false;
         }
+        self.weighed_bytes += bytes;
         self.entries.insert(key, value);
         true
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn weighed_bytes(&self) -> usize {
+        self.weighed_bytes
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -59,6 +82,14 @@ impl<K: Eq + Hash, V> ExactReadMemo<K, V> {
 
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.entries.insert(key, value)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

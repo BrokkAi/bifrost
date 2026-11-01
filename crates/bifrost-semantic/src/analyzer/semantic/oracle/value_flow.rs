@@ -5,6 +5,8 @@ use crate::analyzer::semantic::ids::MemoryLocationId;
 
 use crate::analyzer::semantic::ids::SemanticDigestHasher;
 
+use crate::analyzer::semantic::ir::AsyncResumeKind;
+
 use crate::analyzer::semantic::ir::BackingStoreOffset;
 
 use crate::analyzer::semantic::ir::CaptureSource;
@@ -727,6 +729,18 @@ fn relation_matches_event(
             }
             _ => false,
         },
+        SemanticEffect::AsyncResume {
+            suspend,
+            kind: AsyncResumeKind::Normal,
+            result: Some(result),
+        } => {
+            relation.kind == ValueFlowRelationKind::LanguageDefined
+                && procedure
+                    .semantics()
+                    .awaited_value(*suspend)
+                    .is_some_and(|awaited| value_endpoint(&relation.source, awaited))
+                && value_endpoint(&relation.target, *result)
+        }
         _ => false,
     }
 }

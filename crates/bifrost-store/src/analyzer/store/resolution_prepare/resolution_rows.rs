@@ -1183,6 +1183,33 @@ fn optional_integer(value: &Element, what: &str) -> Option<i64> {
 /// One stored path body, parsed once.
 pub(crate) struct ParsedPathBody(Vec<Element>);
 
+impl ParsedPathBody {
+    // Iterative walk: nested arrays may be arbitrarily deep. Include allocated
+    // capacities, and conservatively charge object entries for tree overhead.
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let mut bytes = self.0.capacity() * std::mem::size_of::<Element>();
+        let mut pending: Vec<_> = self.0.iter().collect();
+        while let Some(value) = pending.pop() {
+            match value {
+                Element::Array(values) => {
+                    bytes += values.capacity() * std::mem::size_of::<Element>();
+                    pending.extend(values);
+                }
+                Element::String(value) => bytes += value.capacity(),
+                Element::Object(values) => {
+                    bytes += values.len() * (std::mem::size_of::<Element>() + 128);
+                    for (key, value) in values {
+                        bytes += key.capacity();
+                        pending.push(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        bytes
+    }
+}
+
 pub(crate) fn parse_path_body(body: &str) -> ParsedPathBody {
     let document: Element =
         serde_json::from_str(body).expect("a stored path body is the JSON this module wrote");

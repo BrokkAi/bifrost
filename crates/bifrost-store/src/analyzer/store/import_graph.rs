@@ -9,10 +9,38 @@ pub(crate) const IMPORT_GRAPH_PATH_BATCH: usize = 256;
 pub(crate) const IMPORT_GRAPH_ORDINAL_BATCH: usize = 256;
 pub(crate) const IMPORT_GRAPH_ROW_BATCH: usize = 64;
 
+// The second arm is PHP's conditional static include: a path folded through
+// an unqualified `dirname` call records the call's namespace as the include's
+// lexical prefix, and a declared `<namespace>.dirname` function is called
+// instead of the global one. The PHP include resolver drops those edges by the
+// same test. Only those PHP includes carry import prefixes.
 pub(crate) const DYNAMIC_IMPORT_SOURCES_SQL: &str = "SELECT files.lang, files.rel_path
 FROM source_imports AS imports INDEXED BY idx_source_imports_dynamic_include_blob
 JOIN live_workspace_files AS files ON files.blob_id = imports.blob_id
 WHERE imports.path_kind = 'dynamic_include'
+  AND (?1 IS NULL OR EXISTS (
+    SELECT 1 FROM json_each(?1) AS seed
+    WHERE json_extract(seed.value, '$[0]') = files.lang
+      AND json_extract(seed.value, '$[1]') = files.rel_path
+  ))
+UNION ALL
+SELECT files.lang, files.rel_path
+FROM source_import_prefixes AS prefix
+JOIN source_imports AS imports
+  ON imports.blob_id = prefix.blob_id AND imports.import_id = prefix.import_id
+JOIN live_workspace_files AS files ON files.blob_id = imports.blob_id
+WHERE imports.path_kind = 'file_include'
+  AND files.lang = 'php'
+  AND EXISTS (
+    SELECT 1 FROM main.code_units AS unit INDEXED BY idx_code_units_stable_exact_tail
+    JOIN live_workspace_files AS declaring ON declaring.blob_id = unit.blob_id
+    WHERE unit.lang = 'php'
+      AND COALESCE(unit.exact_fqn_tail, '') = prefix.prefix || '.dirname'
+      AND unit.fq_anchor_kind IS NULL
+      AND unit.exact_fqn_tail IS NOT NULL
+      AND (unit.in_declarations = 1 OR unit.in_definition_lookup = 1)
+      AND unit.kind = 1
+  )
   AND (?1 IS NULL OR EXISTS (
     SELECT 1 FROM json_each(?1) AS seed
     WHERE json_extract(seed.value, '$[0]') = files.lang

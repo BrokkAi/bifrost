@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,12 +12,55 @@ use crate::analyzer::store::{
     StoreError,
 };
 use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::gitblob::ParseVariant;
 use crate::hash::{HashMap, HashSet};
+
+pub(super) const SELECTED_PARSE_VARIANTS_SQL: &str = "SELECT requested.key,
+    (SELECT files.parse_variant FROM workspace_files AS files
+              WHERE files.lang = ?1 AND files.generation = ?2
+                AND files.rel_path = requested.value)
+    FROM json_each(?3) AS requested";
+
+impl super::AnalyzerStore {
+    /// Select only this request's paths from the revisioned source view.
+    #[doc(hidden)]
+    pub fn selected_parse_variants_for_paths(
+        &self,
+        snapshot: &super::WorkspaceSnapshotId,
+        paths: &[String],
+    ) -> Result<Vec<Option<ParseVariant>>> {
+        let conn = self.read_conn_for_workspace(
+            &[(snapshot.lang.clone(), snapshot.clone())]
+                .into_iter()
+                .collect(),
+        )?;
+        let encoded = serde_json::to_string(paths).expect("path strings serialize");
+        let mut statement = conn.prepare_cached(SELECTED_PARSE_VARIANTS_SQL)?;
+        let rows = statement.query_map(
+            rusqlite::params![snapshot.lang, snapshot.generation.0, encoded],
+            |row| {
+                Ok((
+                    row.get::<_, usize>(0)?,
+                    row.get::<_, Option<ParseVariant>>(1)?,
+                ))
+            },
+        )?;
+        let mut variants = vec![None; paths.len()];
+        for row in rows {
+            let (ordinal, variant) = row?;
+            variants[ordinal] = variant;
+        }
+        Ok(variants)
+    }
+}
 
 pub struct QueryResolver<'a, A: StoreLanguageAdapter> {
     adapter: &'a A,
     project_root: &'a Path,
     snapshot: Arc<LiveSnapshot>,
+    variant_for_file: &'a dyn Fn(&ProjectFile) -> Option<ParseVariant>,
+    // One resolver's lookup scope only; discarded with the resolver, including unreadable paths.
+    variants: RefCell<HashMap<ProjectFile, Option<ParseVariant>>>,
 }
 
 impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
@@ -24,11 +68,14 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
         adapter: &'a A,
         project_root: &'a Path,
         snapshot: Arc<LiveSnapshot>,
+        variant_for_file: &'a dyn Fn(&ProjectFile) -> Option<ParseVariant>,
     ) -> Self {
         Self {
             adapter,
             project_root,
             snapshot,
+            variant_for_file,
+            variants: RefCell::new(HashMap::default()),
         }
     }
 
@@ -36,9 +83,15 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
         adapter: &'a A,
         project_root: &'a Path,
         liveness: &'a Liveness,
+        variant_for_file: &'a dyn Fn(&ProjectFile) -> Option<ParseVariant>,
     ) -> Result<Self> {
         let snapshot = liveness.snapshot().map_err(StoreError::new)?;
-        Ok(Self::from_snapshot(adapter, project_root, snapshot))
+        Ok(Self::from_snapshot(
+            adapter,
+            project_root,
+            snapshot,
+            variant_for_file,
+        ))
     }
 
     pub fn resolve_rows(
@@ -89,8 +142,8 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
         let rows: Vec<_> = rows.into_iter().collect();
         let mut inspected = 0usize;
         let mut files = HashSet::default();
-        // The live paths a row resolves to depend on nothing but its blob and
-        // its storage language, and a workspace holds tens of declarations per
+        // The live paths a row resolves to depend on its full blob key and
+        // the selected variant of each mount, and a workspace holds tens of declarations per
         // blob -- so this is memoized for the same reason the name-projection
         // pass memoizes its own (issue #1199). Deriving it per row instead cost
         // a `Vec`, a rebase, and an allocated storage-language key per path per
@@ -144,7 +197,7 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
     /// A unit's fully-qualified name is `package_name` plus its short name, and
     /// `package_name` is hydrated from the persisted content qualifier together
     /// with the live path the blob is mounted at. Both inputs are constant per
-    /// `(blob, language)` and per `(blob, language, qualifier)` respectively, so
+    /// `(blob, variant, language)` and per `(blob, variant, language, qualifier)` respectively, so
     /// they are memoized: a workspace with tens of thousands of declarations
     /// spread over a few hundred files hydrates a few hundred package prefixes
     /// instead of one per declaration (issue #1199).
@@ -161,8 +214,9 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
         mut keep: impl FnMut(&str, &str) -> bool,
         cancellation: Option<&CancellationToken>,
     ) -> Result<LimitedQueryRows<SearchCandidateKey>> {
-        let mut paths: HashMap<(Oid, usize), Vec<ProjectFile>> = HashMap::default();
-        let mut packages: HashMap<(Oid, usize, &str), Vec<String>> = HashMap::default();
+        let mut paths: HashMap<(Oid, ParseVariant, usize), Vec<ProjectFile>> = HashMap::default();
+        let mut packages: HashMap<(Oid, ParseVariant, usize, &str), Vec<String>> =
+            HashMap::default();
         let mut out = Vec::new();
         let mut inspected = 0usize;
         for row in rows {
@@ -174,16 +228,17 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
                 continue;
             };
             let files = paths
-                .entry((row.blob_oid, row.lang_index))
+                .entry((row.blob_oid, row.variant, row.lang_index))
                 .or_insert_with(|| {
                     self.paths_for_oid(row.blob_oid)
                         .into_iter()
                         .filter(|file| {
-                            self.snapshot.is_mounted_under(
-                                file,
-                                self.adapter.storage_language_key_for_file(file),
-                                lang,
-                            )
+                            self.variant_for_path(file) == Some(row.variant)
+                                && self.snapshot.is_mounted_under(
+                                    file,
+                                    self.adapter.storage_language_key_for_file(file),
+                                    lang,
+                                )
                         })
                         .collect()
                 });
@@ -192,6 +247,7 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
             }
             let package_names = match packages.entry((
                 row.blob_oid,
+                row.variant,
                 row.lang_index,
                 row.content_qualifier.as_str(),
             )) {
@@ -230,20 +286,32 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
             .collect()
     }
 
+    // A resolver belongs to one lookup. The memo dies with that request,
+    // including paths whose rows have several candidate variants.
+    fn variant_for_path(&self, file: &ProjectFile) -> Option<ParseVariant> {
+        if let Some(variant) = self.variants.borrow().get(file).copied() {
+            return variant;
+        }
+        let variant = (self.variant_for_file)(file);
+        self.variants.borrow_mut().insert(file.clone(), variant);
+        variant
+    }
+
     fn paths_for_row(&self, row: &HydratedCandidateRow) -> Vec<ProjectFile> {
         self.paths_for_oid(row.blob_oid)
             .into_iter()
             .filter(|file| {
-                self.snapshot.is_mounted_under(
-                    file,
-                    self.adapter.storage_language_key_for_file(file),
-                    &row.lang,
-                )
+                self.variant_for_path(file) == Some(row.variant)
+                    && self.snapshot.is_mounted_under(
+                        file,
+                        self.adapter.storage_language_key_for_file(file),
+                        &row.lang,
+                    )
             })
             .collect()
     }
 
-    /// [`Self::paths_for_row`] answered once per `(blob, storage language)`.
+    /// [`Self::paths_for_row`] answered once per full blob key.
     fn paths_for_row_memoized<'m>(
         &self,
         row: &HydratedCandidateRow,

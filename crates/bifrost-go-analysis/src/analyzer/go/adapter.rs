@@ -26,6 +26,8 @@ use tree_sitter::Tree;
 #[doc(hidden)]
 pub struct GoAdapter;
 
+static GO_SEMANTIC_LOWERER: super::semantic::GoSemanticLowerer = super::semantic::GoSemanticLowerer;
+
 impl LanguageAdapter for GoAdapter {
     fn record_file_identity_inputs(
         &self,
@@ -63,6 +65,7 @@ impl LanguageAdapter for GoAdapter {
                         Language::Go,
                         rel_path.as_str(),
                         git2::Oid::from_bytes(blob).expect("Go module blob width"),
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty,
                     ));
                 }
                 GoModuleInput::PathAbsent { rel_path } => {
@@ -194,6 +197,19 @@ impl LanguageAdapter for GoAdapter {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for GoAdapter {
+    // Parse-time publication runs the same lowerer and row derivation that
+    // on-demand materialization already uses, so the adapter fingerprint and
+    // SEMANTIC_IR_ROWS_VERSION are unchanged (#8388).
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<brokk_bifrost_semantic::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        Some(
+            brokk_bifrost_semantic::analyzer::semantic::service::ParseTimeSemanticLowerer::new(
+                &GO_SEMANTIC_LOWERER,
+            ),
+        )
+    }
+
     fn source_fact_storage(
         &self,
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>

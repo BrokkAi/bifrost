@@ -107,49 +107,37 @@ pub const fn projected_source_coverage(
     }
 }
 
-/// The replayable question "dispatch at this range of this artifact".
-///
-/// The file is named by its workspace-relative path and the artifact by its
-/// public fingerprint, never by the mount-bearing `SemanticArtifactKey`, so
-/// the same question over the same content at two roots is the same question.
+/// Call rows in source order, with semantic row order breaking equal-span ties.
+/// This is shared by recording and replay; no source position enters the key.
 #[doc(hidden)]
-pub fn dispatch_question(
-    artifact: &SemanticArtifact,
-    range: Range,
-) -> crate::analyzer::semantic::read_ledger::LookupQuestion {
-    crate::analyzer::semantic::read_ledger::LookupQuestion::call_site(
-        artifact.key().path().as_str(),
-        artifact.key().public_fingerprint(),
-        range,
-    )
-}
-
-/// The replayable question for one handle-keyed procedure-local dispatch.
-///
-/// Unlike [`dispatch_question`], this address excludes the artifact source
-/// revision and measures the call range from the owning procedure's start.
-/// That is the exact scope a procedure summary needs: another declaration in
-/// the same file may move both absolute ranges without changing this call.
-/// Calls that share the range are told apart by their position among the
-/// procedure's call rows at it, which replay counts the same way.
-#[doc(hidden)]
-pub fn procedure_dispatch_question(
-    call: &CallSiteHandle,
-    range: Range,
-) -> Option<crate::analyzer::semantic::read_ledger::LookupQuestion> {
-    let procedure = call.procedure();
-    let procedure_start = procedure.semantics().locator().anchor().span().start_byte() as usize;
-    let start_byte = range.start_byte.checked_sub(procedure_start)?;
-    let end_byte = range.end_byte.checked_sub(procedure_start)?;
-    let ordinal = procedure
+pub fn source_ordered_calls(procedure: &ProcedureHandle) -> Vec<&SemanticCallSite> {
+    let mut calls = procedure
         .semantics()
         .call_sites()
         .iter()
-        .take_while(|candidate| candidate.id != call.id())
-        .filter(|candidate| {
-            call_row_has_exact_bytes(procedure, candidate, range.start_byte, range.end_byte)
-        })
-        .count();
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|call| {
+        let span = procedure
+            .semantics()
+            .source_mapping(call.source)
+            .map(|mapping| mapping.locator.anchor().span());
+        (
+            span.map(|span| (span.start_byte(), span.end_byte())),
+            call.id.index(),
+        )
+    });
+    calls
+}
+
+/// Address a call by stable procedure lineage and its source-order rank.
+#[doc(hidden)]
+pub fn procedure_dispatch_question(
+    call: &CallSiteHandle,
+) -> Option<crate::analyzer::semantic::read_ledger::LookupQuestion> {
+    let procedure = call.procedure();
+    let ordinal = source_ordered_calls(procedure)
+        .iter()
+        .position(|candidate| candidate.id == call.id())?;
     Some(
         crate::analyzer::semantic::read_ledger::LookupQuestion::procedure_call_site(
             procedure.artifact().key().path().as_str(),
@@ -157,11 +145,7 @@ pub fn procedure_dispatch_question(
                 .artifact()
                 .key()
                 .procedure_lineage_fingerprint(procedure.semantics().locator().declaration()),
-            crate::analyzer::semantic::read_ledger::ProcedureCallSiteLocator {
-                start_byte,
-                end_byte,
-                ordinal,
-            },
+            crate::analyzer::semantic::read_ledger::CallSiteLocator { ordinal },
         ),
     )
 }
@@ -368,7 +352,7 @@ fn source_points_have_globally_incomplete_proven_candidates(
         })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum SourceOutcomeQuality {
     Complete,

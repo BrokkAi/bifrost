@@ -303,6 +303,7 @@ impl<'a> SubjectQueryBatch<'a> {
 
 #[cfg(test)]
 mod tests {
+    mod contract_tests;
     use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
     use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, AnalyzerQueryScope, Language};
     use brokk_bifrost_test_macros::hardwon;

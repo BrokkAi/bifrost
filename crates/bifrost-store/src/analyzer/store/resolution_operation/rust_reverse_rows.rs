@@ -1,3 +1,4 @@
+// Rust-only reverse rows use the empty parse variant.
 //! Query-local reverse discovery from persisted crate and reference rows.
 
 use super::super::resolution_prepare::resolution_rows::{
@@ -425,7 +426,10 @@ FROM effective_gaps AS gap"#,
     })
 }
 
-/// Only qualified gaps owning an authored reference nominate point requests.
+/// Qualified routes and exact callee applicability gaps nominate point requests.
+/// Require primary source and exact argument eligibility for callee placeholders:
+/// transcribers and incomplete argument lists are not exact authored calls.
+/// Declaration, argument-inventory and broad source gaps remain obligations.
 /// Keep the certificate's exclusions, but neither decode its reasons nor run
 /// macro reason filtering: the full helper appends locators before that filter.
 pub(crate) fn initial_reference_inventory_gap_locators_sql() -> &'static str {
@@ -436,11 +440,43 @@ pub(crate) fn initial_reference_inventory_gap_locators_sql() -> &'static str {
                 "{projection}",
                 "SELECT DISTINCT gap.host,gap.source_site
                  FROM effective_gaps AS gap
-                 WHERE gap.origin=?3 AND EXISTS (
+                 WHERE EXISTS (
                    SELECT 1 FROM main.resolution_sites AS reference_site
                    WHERE reference_site.blob_id=gap.blob_id
                      AND reference_site.site=gap.source_site
                      AND reference_site.role=0
+                     AND (
+                       gap.origin=?3 OR (
+                         gap.origin=?11
+                         AND reference_site.site_kind IN (?5,?8)
+                         AND EXISTS (
+                           SELECT 1 FROM main.resolution_semantic_sites AS reference
+                           JOIN main.resolution_call_obligations AS obligation
+                             ON obligation.blob_id=reference.blob_id
+                            AND obligation.callee_reference=reference.semantic_key
+                           JOIN main.resolution_rust_reference_contexts AS context
+                             ON context.blob_id=reference.blob_id
+                            AND context.semantic_key=reference.semantic_key
+                           JOIN main.source_occurrence_arenas AS arena
+                             ON arena.blob_id=reference.blob_id
+                           WHERE reference.blob_id=gap.blob_id
+                             AND reference.source_site=gap.source_site
+                             AND reference.semantic_role='reference'
+                             AND json_extract(arena.spans,'$[' || context.source_occurrence || '][4]')=?13
+                             AND EXISTS (
+                               SELECT 1 FROM json_each(obligation.eligible_rules) AS rule
+                               WHERE rule.value=?12
+                             )
+                         )
+                         AND EXISTS (
+                           SELECT 1 FROM main.resolution_gaps AS applicability
+                             INDEXED BY resolution_gaps_reason_covers
+                           WHERE applicability.blob_id=gap.blob_id
+                             AND applicability.reason=gap.reason_key-(?4+(gap.host<<32))
+                             AND applicability.covers=4
+                         )
+                       )
+                     )
                  )",
             )
             .replace("?6", "'[]'")
@@ -1224,6 +1260,13 @@ fn initial_reference_inventory_gap_locators(
                 gap_origin_code(crate::analyzer::resolution::LoweringGapOrigin::Extracted(
                     ResolutionGapKind::UnsupportedCallApplicability,
                 )),
+                super::super::resolution_prepare::resolution_rows::code(
+                    brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_ENGINE_RULE_KINDS,
+                    brokk_bifrost_core::analyzer::resolution_facts::ResolutionEngineRuleKind::ArgumentCoercionFilter,
+                ),
+                super::super::source_facts::provenance_code(
+                    brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode,
+                ),
             ])?;
             while let Some(row) = rows.next()? {
                 let host = row.get::<_, u32>(0)?;
@@ -4459,6 +4502,10 @@ impl RustReverseQueries<'_, '_, '_> {
                         gap_origin_code(crate::analyzer::resolution::LoweringGapOrigin::Extracted(
                             ResolutionGapKind::UnsupportedCallApplicability,
                         )),
+                        site_kind_code(ResolutionSiteKind::ValueReference),
+                        site_kind_code(ResolutionSiteKind::UnsupportedExpression),
+                        site_kind_code(ResolutionSiteKind::UnsupportedRoute),
+                        site_kind_code(ResolutionSiteKind::SyntheticReference),
                     ], |row| row.get::<_, bool>(0)).optional()? == Some(false)
                 {
                     // This structural rejection closes only the exact site's
@@ -4999,6 +5046,33 @@ impl RustReverseQueries<'_, '_, '_> {
 /// sources and structural facts. So the operation lends that connection to
 /// the callback, and takes it back only while it answers (#6018).
 impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
+    fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>> {
+        self.on_own_connection(None, |queries| {
+            let definition = match queries
+                .selected
+                .locate_rust_definition(target, queries.cancellation)?
+            {
+                SelectedRustDefinitionSemanticOutcome::Found(definition) => definition,
+                SelectedRustDefinitionSemanticOutcome::Cancelled => return Ok(None),
+                // Without the definition nothing proves the target is outside
+                // every trait impl, so the inventory stays open.
+                SelectedRustDefinitionSemanticOutcome::Missing => return Ok(Some(true)),
+            };
+            let Some(ordinal) = definition.ordinal() else {
+                return Ok(Some(true));
+            };
+            queries
+                .selected
+                .ready
+                .lexical_source()
+                .rust_unenumerable_member_dispatch(
+                    SelectedResolutionMountOrdinal::new(ordinal),
+                    definition,
+                    queries.cancellation,
+                )
+        })
+    }
+
     fn analysis_generation(&self) -> u64 {
         self.selected.ready.analysis_generation
     }

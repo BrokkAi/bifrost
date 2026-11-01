@@ -324,9 +324,11 @@ pub(super) fn failure_handler_state_expansions(
         .as_ref()
     {
         StructuralSyntaxLimitedOutcome::Available(syntax) => {
-            let actual = ContentIdentity::from_digest(StableDigest::from_array(
-                syntax.prepared().source_sha256(),
-            ));
+            let actual = ContentIdentity::from_source_digest(
+                StableDigest::from_array(syntax.prepared().source_sha256()),
+                syntax.prepared().dialect().language(),
+                syntax.prepared().parse_variant(),
+            );
             if actual != seed.facts.source_identity() {
                 return expansion(
                     analyzer,

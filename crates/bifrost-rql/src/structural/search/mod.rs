@@ -181,6 +181,7 @@ use edges::{EdgeKey, EdgeTraversalCache, EdgeValue};
 pub use edges::{SelectedEdgesOfTelemetry, SelectedEdgesOfTelemetrySnapshot};
 mod paths;
 mod pipeline;
+mod procedure_return_profile;
 mod provenance;
 mod python_comparisons;
 mod python_import_cycles;
@@ -519,7 +520,9 @@ impl CodeQueryRowFamilySession {
 // `apply_pipeline_step` below (this engine's own per-step dispatch) reaches
 // into `expansions` for its three graph-traversal entry points.
 #[cfg(any(test, feature = "test-support"))]
-pub use effects::cancelled_modeled_call_coverages_for_test;
+pub use effects::{
+    cancelled_modeled_call_coverages_for_test, with_effect_dispatch_provider_failure_for_test,
+};
 
 use execution::*;
 use expansions::{
@@ -547,8 +550,8 @@ pub use units::{
     UnitRowItemProvenanceStep, UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal,
     UnitRowKey, UnitRowProvenance, UnitRowProvenanceRef, UnitRowProvenanceStep, UnitRowScalar,
     UnitRowUnknownField, execute_code_query_selector_unit, execute_code_query_unit,
-    merge_unit_rows, plan_seed_files, seed_file_order, structural_seed_file_order,
-    unit_plan_node_count,
+    merge_unit_rows, plan_seed_files, push_skipped_unit_diagnostic, remaining_unit_limits,
+    seed_file_order, structural_seed_file_order, unit_plan_node_count,
 };
 pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
@@ -1308,15 +1311,22 @@ fn record_render_source_read(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     blob: Option<git2::Oid>,
-) {
+) -> bool {
     match blob {
-        Some(blob) => analyzer.record_read(crate::analyzer::ReadKey::file(
-            crate::analyzer::common::language_for_file(file),
-            rel_path_string(file),
-            blob,
-        )),
+        Some(blob) => {
+            let Some(variant) = analyzer.selected_parse_variant(file) else {
+                return false;
+            };
+            analyzer.record_read(crate::analyzer::ReadKey::file(
+                crate::analyzer::common::language_for_file(file),
+                rel_path_string(file),
+                blob,
+                variant,
+            ));
+        }
         None => analyzer.record_unattributed_read(),
     }
+    true
 }
 
 fn primary_range_key(range: &Range) -> (usize, usize, usize, usize) {
@@ -1637,9 +1647,18 @@ impl PipelineValue {
     /// evidence. A union or deduplicating render keeps the first row, so merge
     /// the evidence here to keep whole and sliced queries consistent.
     fn merge_evidence(&mut self, other: Self) {
-        if let (Self::AbsentMemberFinding(value), Self::AbsentMemberFinding(other)) = (self, other)
-        {
-            value.merge_evidence(*other);
+        match (self, other) {
+            (Self::AbsentMemberFinding(value), Self::AbsentMemberFinding(other)) => {
+                value.merge_evidence(*other);
+            }
+            // One branch that selects the match structurally makes it a fact,
+            // whichever branch came first.
+            (Self::StructuralMatch(value), Self::StructuralMatch(other))
+                if value.fact_match.heuristic.is_some() && other.fact_match.heuristic.is_none() =>
+            {
+                Arc::make_mut(value).fact_match.heuristic = None;
+            }
+            _ => {}
         }
     }
 
@@ -1653,6 +1672,14 @@ impl PipelineValue {
         let other = match (&mut *self, other) {
             (Self::Declaration(value), Self::Declaration(other)) => {
                 value.merge_structural_kind(other);
+                return;
+            }
+            // Every branch must hold, so a heuristic branch leaves the
+            // survivor a guess.
+            (Self::StructuralMatch(value), Self::StructuralMatch(other)) => {
+                if value.fact_match.heuristic.is_none() && other.fact_match.heuristic.is_some() {
+                    Arc::make_mut(value).fact_match.heuristic = other.fact_match.heuristic;
+                }
                 return;
             }
             (Self::ReferenceSite(value), Self::ReferenceSite(other)) => {
@@ -2462,11 +2489,13 @@ impl PipelineRenderCache {
         file: &ProjectFile,
     ) -> Option<&CachedSourceCoordinates> {
         let coordinates = self.sources.get(file).and_then(Option::as_ref);
-        record_render_source_read(
+        if !record_render_source_read(
             analyzer,
             file,
             coordinates.map(|coordinates| coordinates.blob),
-        );
+        ) {
+            return None;
+        }
         coordinates
     }
 
@@ -2482,7 +2511,9 @@ impl PipelineRenderCache {
     ) -> Option<CodeQueryRange> {
         let file = declaration.unit.source();
         if let Some((range, blob)) = self.declaration_ranges.get(declaration) {
-            record_render_source_read(analyzer, file, *blob);
+            if !record_render_source_read(analyzer, file, *blob) {
+                return None;
+            }
             return *range;
         }
         let coordinates = self.coordinates_for(analyzer, file, || analyzer.indexed_source(file));
@@ -2511,6 +2542,9 @@ impl PipelineRenderCache {
         start_line: usize,
         end_line: usize,
     ) -> Option<CodeUnit> {
+        if !record_render_source_read(analyzer, file, analyzer.indexed_blob_oid(file)) {
+            return None;
+        }
         let cache_key = (file.clone(), start_line, end_line);
         // An enclosing-unit hit consumes the declaration list's receipt too.
         let (declarations, _) = traversal_memo::derive(

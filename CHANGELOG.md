@@ -5,7 +5,77 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## Unreleased
+## [0.15.0] - 2026-11-01
+
+### Added
+
+- RQL return profiles now cover non-Python procedures through shared semantic
+  analysis, reporting constant returns and explicit uncertainty (#8551).
+- C# RQL can query `typeof` operands, local and parameter reference bindings,
+  and call program points; flow analysis also recognizes supported string
+  equality guards (#8567, #8568, #8570).
+- MCP `run_policy` supports per-policy deadlines and optional streaming of
+  individual runs as they finish. A policy timeout leaves the rest running;
+  streamed runs are best-effort, unreviewed results, and the final report
+  remains authoritative (#8284, #8292).
+- `bifrost --policy` takes `--policy-deadlines-ms <path>`, a JSON object from
+  policy id to milliseconds, the CLI form of MCP `run_policy`'s
+  `policy_deadlines_ms`. A listed policy that reaches its deadline ends
+  `inconclusive` with reason `rule_deadline_exceeded` while the other policies
+  keep running (#7557).
+- C# RQL queries expose NuGet dependency evidence from project, central-version,
+  lock and restore files, including version-range checks against complete
+  locked or installed versions (#8358).
+- C# RQL supports parameter selection and attribute-type identity queries.
+  Plain parameters can serve as taint sources; attribute-filtered taint sources
+  remain incomplete pending semantic binding support (#8359).
+- Semantic-pack authoring supports rule-only and runtime-value-only models.
+  New release bundles use index schema 4, while the engine continues to accept
+  schema-3 bundles (#8336).
+- The engine advertises the `configuration-absence`, `configuration-code`,
+  `field-write-value` and `resolved-value` policy capabilities, so packs can
+  require these RQL operators by name. `configuration-facts` covers every
+  supported configuration format, including XML and `.properties` (#8117).
+
+### Fixed
+
+- Taint analysis preserves values across `await` in C#, JavaScript/TypeScript,
+  Python and Rust, while retaining uncertainty for unsupported await behavior
+  (#8556).
+- Policies matching writes to source-declared fields no longer fail validation
+  with an internal-invariant error (#8569).
+- C# analysis selects preprocessor branches using owning project configurations;
+  definition lookup and policy evaluation report incompleteness when undecided
+  branches leave relevant text unparsed (#8444, #8684).
+- C# flow analysis records `foreach` iteration assignments and handles array and
+  string iteration without spurious enumerator gaps. Collection expressions
+  retain element flow and uncertainty for user-defined construction (#8671, #8683).
+- PHP import analysis follows Composer PSR-4 lookup order and handles include
+  paths and shadowed `dirname` calls without inventing import edges (#8595).
+- PHP usage analysis respects static-scope overrides, supported case-insensitive
+  member lookup and rebound closures, reducing incorrect targets and member
+  diagnostics (#8597).
+- Java guarded and default-only switches retain their semantic analysis, and
+  method references model receiver null checks without opening every relation
+  in the procedure (#8589, #8682, #8650).
+- Kotlin flow analysis treats captured mutable locals as shared closure cells,
+  preventing false overwritten-unread findings (#8724).
+- Query sessions warn when workspace semantic models exist but were not loaded
+  by default; explicitly disabling those models remains quiet (#8552).
+- Summary tools report cancellation and unavailable source as incomplete, and
+  symbol search finds C# nested types written with `+` (#8706).
+- Dead-code, maintainability and missing-tests reports point to the correct
+  declaration lines instead of the following line (#8660).
+- Hierarchy queries report unavailable descendant reads as incomplete instead
+  of panicking or treating them as empty. RQL semantic-model hierarchy queries
+  also retain incompleteness when a relation reaches an unmodeled type
+  (#8150, #8327).
+- RQL configuration queries report unread HOCON files as incomplete instead of
+  treating them as absent configuration; HOCON ingestion remains unsupported
+  (#8354).
+- C# analysis respects file-local preprocessor assignments and literal
+  conditions when selecting `#if` branches, avoiding analysis of code that
+  those directives exclude (#8322).
 
 ## [0.14.4] - 2026-10-30
 
@@ -44,6 +114,15 @@ projection and its commit history does not contain every source commit.
   verifies it in a few seconds; the `bifrost` and `brokk-bifrost` commands are
   unchanged.
 
+### Changed
+
+- The `brokk-bifrost-searchtools` PyPI wheels ship the native extension module
+  xz-compressed, at about 57 MB instead of up to 94 MB, to stay well under
+  PyPI's upload limit. The first import unpacks and verifies it, which takes a
+  few seconds; the unpacked copy sits beside the package, or in the user cache
+  directory when the installation is read-only. Builds from the sdist and the
+  `library_path` argument are unchanged (#8288).
+
 ### Fixed
 
 - Bounded declaration lookups, symbol search and hierarchy queries honor
@@ -71,6 +150,11 @@ projection and its commit history does not contain every source commit.
   `monkeypatch.setitem`/`delitem` or `unittest.mock.patch.dict`. These calls
   are now read as edits of the module table, so storing `None` or an unrelated
   module no longer makes every summarized call inconclusive (#8107).
+  The receiver of `with pytest.MonkeyPatch.context() as mp` counts as a
+  `MonkeyPatch` too (#8114). `mock.patch.dict("sys.modules", ...)` and the
+  `in_dict=` form are read the same way, so a string-named table update that
+  may store the queried module now refuses the summary instead of passing
+  unchecked (#8115).
 - External-command handling avoids spurious pipe-closure failures after a
   process tree has exited, improving Go environment and JVM build-tool
   discovery under load (#7983).

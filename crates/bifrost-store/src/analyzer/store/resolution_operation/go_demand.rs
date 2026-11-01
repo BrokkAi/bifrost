@@ -499,7 +499,7 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
             context,
             self.cancellation,
             self.session,
-            None,
+            Some(&self.operation.jvm_context_blueprints),
             |blueprint| self.register_blueprint(blueprint, mount, source_role),
         )
     }

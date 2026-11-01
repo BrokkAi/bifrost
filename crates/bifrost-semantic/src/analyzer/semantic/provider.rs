@@ -755,6 +755,14 @@ impl SemanticBudget {
         self.observe_root_work();
     }
 
+    /// Record performed work that is not part of a solver root, such as
+    /// preparing source before an artifact cache lookup.
+    #[doc(hidden)]
+    pub fn record_performed_work(&mut self, work: SemanticWork) {
+        self.cumulative = self.cumulative.saturating_add(work);
+        self.performed = self.performed.saturating_add(work);
+    }
+
     pub const fn root_work_peak(&self) -> SemanticWork {
         self.root_work_peak
     }
@@ -1324,6 +1332,15 @@ impl Default for SemanticBudget {
     }
 }
 
+impl SemanticBudget {
+    /// Every semantic artifact is lowered under this budget, so its contents
+    /// depend only on source content and producer identity. Parse-time and
+    /// on-demand publication must use the same producer budget.
+    pub fn producer() -> Self {
+        Self::default()
+    }
+}
+
 /// Cross-provider accounting for distinct workspace files entered and traversal
 /// steps performed while resolving them. Ordinary execution ledgers record
 /// traversal as non-refusing telemetry; a dedicated fixpoint ledger also bounds it.
@@ -1690,32 +1707,46 @@ impl SemanticExecutionBudget {
 pub enum SemanticOutcome<T> {
     Complete {
         value: T,
+        /// The work represented by the answer (recorded work for cached rows),
+        /// not the charge to the caller's budget.
         work: SemanticWork,
     },
     Ambiguous {
         candidates: T,
+        /// The work represented by the answer (recorded work for cached rows),
+        /// not the charge to the caller's budget.
         work: SemanticWork,
     },
     Unknown {
         partial: Option<T>,
+        /// The work represented by the answer (recorded work for cached rows),
+        /// not the charge to the caller's budget.
         work: SemanticWork,
     },
     Unsupported {
         capability: SemanticCapability,
         partial: Option<T>,
+        /// The work represented by the answer (recorded work for cached rows),
+        /// not the charge to the caller's budget.
         work: SemanticWork,
     },
     Unproven {
         partial: T,
+        /// The work represented by the answer (recorded work for cached rows),
+        /// not the charge to the caller's budget.
         work: SemanticWork,
     },
     ExceededBudget {
         partial: Option<T>,
         exceeded: SemanticBudgetExceeded,
+        /// The work represented by the answer (recorded work for cached rows),
+        /// not the charge to the caller's budget.
         work: SemanticWork,
     },
     Cancelled {
         partial: Option<T>,
+        /// The work represented by the answer (recorded work for cached rows),
+        /// not the charge to the caller's budget.
         work: SemanticWork,
     },
 }
@@ -2140,6 +2171,20 @@ impl SemanticArtifactSourceSnapshot {
 
 /// A standalone per-language adapter boundary for immutable semantic artifacts.
 pub trait ProgramSemanticsProvider: Send + Sync {
+    /// Exercise the language lowerer before publication in cross-language tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    fn lower_with_budget_for_test(
+        &self,
+        _file: &ProjectFile,
+        _budget: &SemanticBudget,
+        _cancellation: &CancellationToken,
+    ) -> Result<
+        SemanticOutcome<Vec<crate::analyzer::semantic::ProcedureSemanticsParts>>,
+        SemanticProviderError,
+    > {
+        unimplemented!("this provider has no direct language lowerer")
+    }
     /// Stable procedure addresses, when the adapter supports inventory without IR.
     fn procedure_inventory(
         &self,

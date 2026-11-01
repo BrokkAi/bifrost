@@ -761,6 +761,7 @@ mod js_ts_extraction_tests {
             .expect("workspace dispatch");
         let result = SourceDispatchResult {
             observations: Box::new([SourceDispatchObservation {
+                quality: SourceOutcomeQuality::from_outcome(&outcome),
                 call,
                 dispatch: outcome
                     .available_value()

@@ -702,6 +702,15 @@ CROSS JOIN main.resolution_gaps AS h
   ON h.blob_id = ?1 AND h.covers = ?2 AND h.subject = requested.value
 "#;
 
+// Whether a selected member implements a trait contract, on its own blob.
+//
+// The producer writes one contract reference for every member of a declared
+// trait implementation with a lowered trait reference. Lowering withholds the
+// trait half of an impl from an embedded macro fragment, so such a member has
+// no row here; today it also has no selected definition, so the selected
+// inverse already reports its inventory incomplete before this read runs.
+pub(super) const RUST_UNENUMERABLE_MEMBER_DISPATCH_SQL: &str = "SELECT EXISTS(SELECT 1 FROM resolution_contract_references WHERE blob_id=?1 AND definition=?2)";
+
 // The lowest selected mount ordinal one blob is mounted at.
 //
 // `selected_resolution_mounts_blob_ordinal` is `(blob_id, mount_ordinal)`, so
@@ -1075,6 +1084,10 @@ pub struct SelectedResolutionLexicalSource<'selection, 'store> {
     /// Immutable SQL payloads demanded by this lexical source. Classification
     /// against mutable staged endpoints is recomputed after every lookup.
     reference_local_path_read_memo: std::rc::Rc<RefCell<ReferenceLocalPathReadMemo>>,
+    /// Parsed candidate-path rows by content OID and path key, shared by the
+    /// point operations of one native point batch (#8166). Fragment decoding,
+    /// completion decisions and suppression stay per call.
+    candidate_path_read_memo: std::rc::Rc<RefCell<CandidatePathReadMemo>>,
     #[doc(hidden)]
     pub ordinary_completion_suppression: RefCell<Option<OrdinaryCompletionSuppression>>,
     /// One candidate direction's unconditional completion box, forward then
@@ -2068,6 +2081,25 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         )
     }
 
+    /// A Rust member may be reached through dispatch absent from named reverse rows.
+    #[doc(hidden)]
+    pub fn rust_unenumerable_member_dispatch(
+        &self,
+        mount: SelectedResolutionMountOrdinal,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<bool>> {
+        let mount = self.mount_record(mount)?;
+        self.authority.read_authority(&mount, cancellation, |conn| {
+            let key = definition
+                .local_key()
+                .expect("selected definition is local");
+            Ok(conn
+                .prepare_cached(RUST_UNENUMERABLE_MEMBER_DISPATCH_SQL)?
+                .query_row(rusqlite::params![mount.blob_id(), key], |row| row.get(0))?)
+        })
+    }
+
     /// The references in one blob whose structured qualified route looks one
     /// name up.
     pub(crate) fn qualified_route_reference_sites(
@@ -2080,6 +2112,18 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             self.authority
                 .qualified_route_reference_sites(mount, lookup, cancellation)
         })
+    }
+
+    /// Producer reasons attached to this exact declaration/reference site.
+    /// This does not import unrelated scope-wide publisher gaps.
+    pub fn site_gap_reasons(
+        &self,
+        mount: SelectedResolutionMountOrdinal,
+        site: ResolutionSiteId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        self.authority
+            .site_gap_reasons(&*self.mount_record(mount)?, site, cancellation)
     }
 
     /// The reason semantics one unsupported scope, binder or expression at a
@@ -2228,6 +2272,14 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         self
     }
 
+    pub(crate) fn with_candidate_path_read_memo(
+        mut self,
+        memo: std::rc::Rc<RefCell<CandidatePathReadMemo>>,
+    ) -> Self {
+        self.candidate_path_read_memo = memo;
+        self
+    }
+
     pub(crate) fn with_reference_read_memo(
         mut self,
         memo: std::rc::Rc<RefCell<ReferenceLocalPathReadMemo>>,
@@ -2257,6 +2309,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             ),
             forward_reference_fragments: None,
             selected_interiors_validated: OnceCell::new(),
+            candidate_path_read_memo: std::rc::Rc::default(),
             reference_local_path_read_memo: std::rc::Rc::default(),
             ordinary_completion_suppression: RefCell::new(None),
             unconditional_candidate_reasons: [OnceCell::new(), OnceCell::new()],
@@ -5811,6 +5864,7 @@ fn read_reference_local_path_evidence(
     prefix_scope_spellings.dedup();
     scope_endpoints.sort_unstable();
     scope_endpoints.dedup();
+    let ordered_checkpoint_ancestry = raw_ordered_checkpoint_ancestry(&lexical_scopes, ordinal);
     lexical_scopes.sort_unstable();
     lexical_scopes.dedup();
     let mut enclosing_scope_depths = lexical_scopes
@@ -5844,8 +5898,25 @@ fn read_reference_local_path_evidence(
                     )
                 })
                 .collect(),
-        ),
+        )
+        .with_ordered_checkpoint_ancestry(ordered_checkpoint_ancestry),
     ))
+}
+
+/// Read the unnormalized reference walk in source-outward order. The depth
+/// comes from the recursive path walk; normalizing it to lexical levels would
+/// collapse distinct checkpoints in one Scala scope.
+fn raw_ordered_checkpoint_ancestry(
+    scopes: &[(u32, u32, bool)],
+    ordinal: SelectedResolutionMountOrdinal,
+) -> Vec<(BindingNodeId, u32)> {
+    let mut ancestry = scopes
+        .iter()
+        .map(|(node, depth, _)| (BindingNodeId::local(ordinal.get(), *node), *depth))
+        .collect::<Vec<_>>();
+    ancestry.sort_unstable_by_key(|(node, depth)| (*depth, *node));
+    ancestry.dedup();
+    ancestry
 }
 
 impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
@@ -6629,42 +6700,83 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         for (fragment, keys) in &groups {
             let mount = &*self.mount_record_of_fragment(*fragment)?;
             let blob_id = mount.blob_id();
-            let key_array = json_array(keys.iter().map(|(_, key)| *key));
-            let Some(bodies) = self.read_statement(cancellation, |conn| {
-                let mut statement = conn.prepare_cached(RESOLUTION_PATHS_BY_KEY_SQL)?;
-                let mut rows = statement.query(params![blob_id, &key_array])?;
-                let mut bodies: HashMap<i64, (i64, i64, ParsedPathBody, Option<u32>)> =
-                    HashMap::default();
-                while let Some(row) = rows.next()? {
-                    let key: i64 = row.get(0)?;
-                    let start_node: i64 = row.get(1)?;
-                    let end_node: i64 = row.get(2)?;
-                    let body: String = row.get(3)?;
-                    let activation: Option<i64> = row.get(4)?;
-                    bodies.insert(
-                        key,
-                        (
-                            start_node,
-                            end_node,
-                            parse_path_body(&body),
-                            activation.map(|ordinal| {
-                                u32::try_from(ordinal)
-                                    .expect("a stored root import activation fits a source offset")
-                            }),
-                        ),
-                    );
-                }
-                Ok(Some(bodies))
-            })?
-            else {
+            if cancellation.is_cancelled() {
                 return Ok(Vec::new());
-            };
+            }
+            let oid = mount.blob_oid();
+            let mut bodies = HashMap::default();
+            let mut missing = Vec::new();
+            for (_, key) in keys {
+                if let Some(body) = self
+                    .candidate_path_read_memo
+                    .borrow()
+                    .rows
+                    .get(&(blob_id, oid, *key))
+                {
+                    bodies.insert(*key, std::rc::Rc::clone(body));
+                } else {
+                    missing.push(*key);
+                }
+            }
+            if !missing.is_empty() {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    self.candidate_path_read_memo.borrow_mut().statements += 1;
+                }
+                let key_array = json_array(missing);
+                let Some(fetched) = self.read_statement(cancellation, |conn| {
+                    let mut statement = conn.prepare_cached(RESOLUTION_PATHS_BY_KEY_SQL)?;
+                    let mut rows = statement.query(params![blob_id, &key_array])?;
+                    let mut bodies: HashMap<i64, (i64, i64, ParsedPathBody, Option<u32>)> =
+                        HashMap::default();
+                    while let Some(row) = rows.next()? {
+                        let key: i64 = row.get(0)?;
+                        let start_node: i64 = row.get(1)?;
+                        let end_node: i64 = row.get(2)?;
+                        let body: String = row.get(3)?;
+                        let activation: Option<i64> = row.get(4)?;
+                        bodies.insert(
+                            key,
+                            (
+                                start_node,
+                                end_node,
+                                parse_path_body(&body),
+                                activation.map(|ordinal| {
+                                    u32::try_from(ordinal).expect(
+                                        "a stored root import activation fits a source offset",
+                                    )
+                                }),
+                            ),
+                        );
+                    }
+                    Ok(Some(bodies))
+                })?
+                else {
+                    return Ok(Vec::new());
+                };
+                for (key, row) in fetched {
+                    let row = std::rc::Rc::new(row);
+                    let bytes = row.2.estimated_heap_bytes() + CANDIDATE_PATH_ROW_OVERHEAD_BYTES;
+                    self.candidate_path_read_memo
+                        .borrow_mut()
+                        .rows
+                        .insert_bounded_weighed(
+                            (blob_id, oid, key),
+                            std::rc::Rc::clone(&row),
+                            bytes,
+                        );
+                    bodies.insert(key, row);
+                }
+            }
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
             let context = PathBodyContext {
                 fragment: *fragment,
             };
             for (position, key) in keys {
                 let (start_node, end_node, body, activation) =
-                    bodies.get(key).unwrap_or_else(|| {
+                    bodies.get(key).map(|row| row.as_ref()).unwrap_or_else(|| {
                         panic!("blob {blob_id} has no path row for candidate key {key}")
                     });
                 hydrated[*position] = Some(decode_path_row(
@@ -6697,7 +6809,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         } else {
             Vec::new()
         };
-        Ok(candidates
+        let result: Vec<_> = candidates
             .iter()
             .zip(hydrated)
             .map(|(candidate, path)| {
@@ -6712,7 +6824,12 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                     },
                 )
             })
-            .collect())
+            .collect();
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(observed) = self.candidate_path_read_memo.borrow_mut().observed.as_mut() {
+            observed.push(result.clone());
+        }
+        Ok(result)
     }
 
     fn visit_type_transfer_rules(
@@ -10099,5 +10216,29 @@ impl SelectedResolutionLexicalSource<'_, '_> {
                 .transpose()?
         };
         Ok(language)
+    }
+}
+
+// Parsed rows only: fragment decoding and completion decisions remain per call.
+type CandidatePathRow = (i64, i64, ParsedPathBody, Option<u32>);
+// The key, the row tuple, the Rc and the hash-table slot, beyond the body.
+const CANDIDATE_PATH_ROW_OVERHEAD_BYTES: usize = 128;
+// A path key is a position in one blob row's catalog. One OID can own several
+// blob rows (lang, parse_variant) whose path rows differ, so the key names the
+// blob row as well; the OID still guards a blob id reused across selections.
+#[derive(Default)]
+pub(crate) struct CandidatePathReadMemo {
+    rows: ExactReadMemo<(i64, git2::Oid, i64), std::rc::Rc<CandidatePathRow>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) observed: Option<Vec<Vec<(CandidatePathIdentity, PartialPath)>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) statements: usize,
+}
+impl CandidatePathReadMemo {
+    /// Statements run, fills, refused admissions and admitted bytes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn counts_for_test(&self) -> (usize, usize, usize, usize) {
+        let (fills, refusals) = self.rows.bounded_counts();
+        (self.statements, fills, refusals, self.rows.weighed_bytes())
     }
 }

@@ -2,7 +2,6 @@
 
 use super::language_rules::{LanguageRuleMatches, UndecidedSite};
 use crate::analyzer::ProjectFile;
-use crate::analyzer::usages::get_definition::parse_tree_for_language_preprocessed;
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::body_relations::{
     BodyOwner, BodyState, BodyStateAnswer, body_relation_for_block, body_state,
@@ -15,19 +14,21 @@ use tree_sitter::Node;
 /// seed still verifies its ordinary normalized kind/name fields; this helper
 /// only supplies the source-backed relation ranges.
 pub(super) fn matches_for_file(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     file: &ProjectFile,
     source: &str,
     language: Language,
     state: BodyState,
     owner: Option<BodyOwner>,
 ) -> LanguageRuleMatches {
-    let Some((tree, preprocessor)) = parse_tree_for_language_preprocessed(file, language, source)
-    else {
-        return LanguageRuleMatches::default();
+    let syntax = match super::language_rules::selected_syntax(analyzer, file, source) {
+        Ok(syntax) => syntax,
+        Err(result) => return result,
     };
-    let regions = preprocessor
-        .as_ref()
-        .map(|p| p.conditional_regions(source))
+    let tree = syntax.tree();
+    let regions = syntax
+        .preprocessor()
+        .map(|scan| scan.conditional_regions(source))
         .unwrap_or_default();
     let mut undecided = Vec::new();
     let mut pending = vec![tree.root_node()];

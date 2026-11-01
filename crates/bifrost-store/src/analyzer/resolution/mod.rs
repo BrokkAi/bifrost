@@ -657,6 +657,11 @@ pub(crate) use fact_resolution::PolledCompletionAccumulator;
 pub(crate) use fact_resolution::SelectedFactOperationBlueprint;
 #[doc(hidden)]
 pub use fact_resolution::SelectedFactOperationBlueprintConstruction;
+#[doc(hidden)]
+pub use fact_resolution::{
+    CanonicalTypeIdentity, CanonicalTypeNode, canonical_projected_type_identity,
+    canonical_type_identity,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use fact_resolution::reset_reverse_fact_evaluation_count_for_test;
@@ -673,10 +678,12 @@ pub(crate) use fact_resolution::{
     HierarchyTailMembership, ProviderObservationStore, RootClosure,
 };
 
-#[cfg(test)]
-pub(crate) use fact_resolution::reset_selected_fact_operation_construction_count_for_test;
-#[cfg(test)]
-pub(crate) use fact_resolution::selected_fact_operation_construction_count_for_test;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use fact_resolution::reset_selected_fact_operation_construction_count_for_test;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use fact_resolution::selected_fact_operation_construction_count_for_test;
 
 pub(crate) use fact_source::CompanionTypeRelation;
 pub(crate) use fact_source::DeclarationAccessDecision;

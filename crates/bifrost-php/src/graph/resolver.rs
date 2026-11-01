@@ -1,6 +1,9 @@
-use crate::aliases::{PhpFileContext, resolve_php_type};
+use crate::aliases::PhpFileContext;
 use crate::graph::PhpGraphSource;
-use crate::graph::syntax::static_member_parts;
+use crate::graph::syntax::{
+    declared_member_family, is_relative_scope_keyword, static_member_parts,
+    static_scope_type_fq_name,
+};
 use crate::graph_support::PhpSource;
 use crate::graph_support::{php_is_constructor, php_is_interface};
 use crate::structural::php_namespace_name_declares;
@@ -186,6 +189,12 @@ pub fn receiver_type_matches(
     hierarchy.is_subtype(php, receiver_fq_name, owner)
 }
 
+/// Whether a static member access through a class-name or relative scope can
+/// reach the target. `self::`, `parent::` and an explicit class reach the one
+/// member that scope class effectively has, declared or inherited, so an
+/// intermediate override hides the ancestor's member. `static::` names the
+/// called class under late static binding: the enclosing class's member, or an
+/// override in any subclass of it.
 #[allow(clippy::too_many_arguments)]
 pub fn static_receiver_matches(
     php: &dyn PhpSource,
@@ -195,47 +204,51 @@ pub fn static_receiver_matches(
     end: usize,
     line_starts: &[usize],
     receiver: &str,
-    owner: &str,
+    spec: &TargetSpec,
     ctx: &PhpFileContext,
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
-    match receiver {
-        receiver
-            if receiver.eq_ignore_ascii_case("self") || receiver.eq_ignore_ascii_case("static") =>
-        {
-            receiver_is_enclosing_subtype(
-                php,
-                analyzer,
-                file,
-                start,
-                end,
-                line_starts,
-                owner,
-                hierarchy,
-            )
-        }
-        receiver if receiver.eq_ignore_ascii_case("parent") => {
-            enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
-                .is_some_and(|enclosing_owner| hierarchy.is_subtype(php, &enclosing_owner, owner))
-        }
-        _ => resolve_php_type(receiver, ctx)
-            .is_some_and(|fq| receiver_type_matches(php, &fq, owner, hierarchy)),
+    let enclosing_owner = is_relative_scope_keyword(receiver)
+        .then(|| enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts))
+        .flatten();
+    if receiver.eq_ignore_ascii_case("static") {
+        let Some(enclosing_owner) = enclosing_owner else {
+            return false;
+        };
+        return static_scope_member_matches(php, analyzer, &enclosing_owner, spec, hierarchy)
+            || spec
+                .owner
+                .as_ref()
+                .is_some_and(|owner| class_is_subtype_of_owner(php, owner, &enclosing_owner));
     }
+    static_scope_type_fq_name(php, analyzer, receiver, ctx, enclosing_owner.as_deref())
+        .is_some_and(|scope| static_scope_member_matches(php, analyzer, &scope, spec, hierarchy))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn receiver_is_enclosing_subtype(
+/// Whether the member `scope_fq_name` effectively has under the target's name
+/// is the target. When that member is unknown or ambiguous, a scope that is
+/// the target owner or one of its subtypes may still reach it.
+pub fn static_scope_member_matches(
     php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
-    file: &ProjectFile,
-    start: usize,
-    end: usize,
-    line_starts: &[usize],
-    owner: &str,
+    scope_fq_name: &str,
+    spec: &TargetSpec,
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
-    enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
-        .is_some_and(|receiver| receiver_type_matches(php, &receiver, owner, hierarchy))
+    let Some(owner) = spec.owner_fq_name.as_deref() else {
+        return false;
+    };
+    let wanted: fn(&CodeUnit) -> bool = match spec.kind {
+        TargetKind::Method | TargetKind::Constructor => CodeUnit::is_function,
+        TargetKind::Field => CodeUnit::is_field,
+        TargetKind::Type | TargetKind::Constant | TargetKind::Function => return false,
+    };
+    match declared_member_family(php, analyzer, scope_fq_name, &spec.member_name, wanted) {
+        Some(family) => family
+            .iter()
+            .any(|member| member.fq_name() == spec.target_fq_name),
+        None => receiver_type_matches(php, scope_fq_name, owner, hierarchy),
+    }
 }
 
 pub fn enclosing_owner_fq_name_at(

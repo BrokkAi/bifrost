@@ -45,6 +45,10 @@ use super::model::{
     build_explanation,
 };
 
+#[cfg(test)]
+#[path = "why_not_collision_contract_tests.rs"]
+mod collision_contract_tests;
+
 /// The selector path a match policy's one selector always occupies.
 pub(super) const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 

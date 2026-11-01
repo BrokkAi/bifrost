@@ -746,7 +746,19 @@ pub(super) fn receiver_analysis_expansions(
                 Some(DerivationExecutionCause::Budget),
             ));
         }
-        let (site_id, site_ast_id) = receiver_site_identity(analyzer, &report, structural_facts);
+        let Some((site_id, site_ast_id)) =
+            receiver_site_identity(analyzer, &report, structural_facts)
+        else {
+            analyzer.mark_execution_dependent();
+            receiver_diagnostics.push((
+                CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
+                language,
+                operation.as_str(),
+                "selected parse variant unreadable".to_owned(),
+                None,
+            ));
+            break;
+        };
         let value = ReceiverAnalysisValue {
             report,
             capture: capture.clone(),
@@ -779,12 +791,25 @@ pub(super) fn receiver_site_identity(
     analyzer: &dyn IAnalyzer,
     report: &ReceiverQueryReport,
     facts: Option<&Arc<FileFacts>>,
-) -> (String, Option<String>) {
+) -> Option<(String, Option<String>)> {
+    let variant = analyzer.selected_parse_variant(&report.site.file)?;
     let content_identity = facts.map_or_else(
         || {
             analyzer.indexed_source(&report.site.file).map_or_else(
-                || ContentIdentity::hash_bytes(report.site.text.as_bytes()),
-                |source| ContentIdentity::hash_bytes(source.as_bytes()),
+                || {
+                    ContentIdentity::from_source_bytes(
+                        report.site.text.as_bytes(),
+                        report.site.file.language(),
+                        variant,
+                    )
+                },
+                |source| {
+                    ContentIdentity::from_source_bytes(
+                        source.as_bytes(),
+                        report.site.file.language(),
+                        variant,
+                    )
+                },
             )
         },
         |facts| facts.source_identity(),
@@ -798,7 +823,7 @@ pub(super) fn receiver_site_identity(
 
     let site_ast_id =
         facts.and_then(|facts| site_ast_id_for_range(facts, content_identity, report.site.range));
-    (site_id, site_ast_id)
+    Some((site_id, site_ast_id))
 }
 
 /// The AST identity of the one facts-arena node whose span is exactly `range`.

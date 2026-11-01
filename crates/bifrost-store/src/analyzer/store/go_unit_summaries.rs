@@ -1,3 +1,4 @@
+// Go-only summary rows use the empty parse variant.
 //! The Go unit definition for the shared per-unit resolution summary
 //! (`unit_summaries.rs`).
 //!

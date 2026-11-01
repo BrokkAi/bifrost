@@ -1062,6 +1062,17 @@ impl ProcedureSemantics {
         self.call_sites.get(id.index())
     }
 
+    /// The value an async suspend point awaits, when it names one.
+    pub fn awaited_value(&self, suspend: ProgramPointId) -> Option<ValueId> {
+        self.point(suspend)?
+            .events
+            .iter()
+            .find_map(|event| match event.effect {
+                SemanticEffect::AsyncSuspend { awaited, .. } => awaited,
+                _ => None,
+            })
+    }
+
     fn same_source_occurrence(&self, left: SourceMappingId, right: SourceMappingId) -> bool {
         self.source_mapping(left)
             .zip(self.source_mapping(right))

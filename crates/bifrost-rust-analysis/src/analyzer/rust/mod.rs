@@ -538,6 +538,9 @@ pub use crate::analyzer::rust::std_types::RustNativeObligationProof;
 pub use crate::analyzer::rust::std_types::rust_call_is_standard_drop;
 
 pub use crate::analyzer::rust::std_types::rust_native_result_obligation;
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::analyzer::rust::std_types::with_rust_native_result_obligation_limits_for_test;
+
 #[cfg(test)]
 mod module_export_resolution_tests;
 mod structural;
@@ -694,8 +697,13 @@ fn rust_source_fact_cache_budget(memo_budget: u64) -> u64 {
 /// field holds them.
 #[derive(Default)]
 struct RustRouteRequestMemo {
-    routes: brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo<RustCargoRouteIndex>,
+    routes: brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo<RustRouteMemoEntry>,
     package_files: brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo<RustPackageFileIndex>,
+}
+
+struct RustRouteMemoEntry {
+    routes: Arc<RustCargoRouteIndex>,
+    stable_reasons: Box<[brokk_bifrost_analysis::analyzer::QueryReadIncomplete]>,
 }
 
 /// Query occurrences and their immutable fact product share one selected blob.
@@ -1367,16 +1375,57 @@ impl RustAnalyzer {
             .inner
             .active_query_request_memo::<RustRouteRequestMemo>()
         {
-            Some(memo) => memo
-                .routes
-                .get_or_try_build_pool_independent_while(&|| keep_going(), || {
-                    match self.build_cargo_routes_while(keep_going) {
-                        Ok(routes) => Ok(Some(routes)),
-                        Err(RustCargoRouteError::Cancelled) => Ok(None),
-                        Err(error) => Err(error),
+            Some(memo) => {
+                let uncached = std::sync::Mutex::new(None);
+                let built_here = std::sync::atomic::AtomicBool::new(false);
+                let entry = memo.routes.get_or_try_build_pool_independent_while(
+                    &|| keep_going(),
+                    || {
+                        built_here.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let (built, receipt) =
+                            brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(
+                                self,
+                                || self.build_cargo_routes_while(keep_going),
+                            );
+                        match built {
+                            Ok(routes) => {
+                                let routes = Arc::new(routes);
+                                // Unattributed reads cannot be replayed by this lightweight memo.
+                                if receipt.has_execution_dependences()
+                                    || receipt.unattributed_reads() > 0
+                                {
+                                    *uncached.lock().expect("Rust route result mutex poisoned") =
+                                        Some(Arc::clone(&routes));
+                                    return Ok(None);
+                                }
+                                Ok(Some(RustRouteMemoEntry {
+                                    routes,
+                                    stable_reasons: receipt
+                                        .stable_reasons()
+                                        .to_vec()
+                                        .into_boxed_slice(),
+                                }))
+                            }
+                            Err(RustCargoRouteError::Cancelled) => Ok(None),
+                            Err(error) => Err(error),
+                        }
+                    },
+                )?;
+                match entry {
+                    Some(entry) => {
+                        if !built_here.load(std::sync::atomic::Ordering::Relaxed) {
+                            brokk_bifrost_analysis::analyzer::common::replay_query_cache_stable_reasons(
+                                &entry.stable_reasons,
+                            );
+                        }
+                        Arc::clone(&entry.routes)
                     }
-                })?
-                .ok_or(RustCargoRouteError::Cancelled)?,
+                    None => uncached
+                        .into_inner()
+                        .expect("Rust route result mutex poisoned")
+                        .ok_or(RustCargoRouteError::Cancelled)?,
+                }
+            }
             None => Arc::new(self.build_cargo_routes_while(keep_going)?),
         };
         self.note_rust_publication_verified();
@@ -3028,6 +3077,72 @@ fn rust_import_binder_visible_at_byte(path: &StructuredImportPath, call_start_by
 }
 
 impl LanguageSupport for RustSupport {
+    fn intrinsic_call(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        call: &brokk_bifrost_analysis::analyzer::semantic::ir::CallSiteHandle,
+    ) -> Result<
+        Option<brokk_bifrost_analysis::analyzer::semantic::IntrinsicCall>,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        use self::std_types::RustStdBuiltinTransfer;
+        use brokk_bifrost_analysis::analyzer::semantic::{IntrinsicCall, IntrinsicTransfer};
+        Ok(
+            crate::analyzer::semantic::workspace_oracle::rust::rust_std_builtin_call(
+                workspace, call,
+            )?
+            .map(|builtin| IntrinsicCall {
+                operation: builtin.operation,
+                transfer: match builtin.transfer {
+                    RustStdBuiltinTransfer::ReceiverToResult => IntrinsicTransfer::ReceiverToResult,
+                    RustStdBuiltinTransfer::ArgumentToResult => IntrinsicTransfer::ArgumentToResult,
+                    RustStdBuiltinTransfer::FreshResult => IntrinsicTransfer::FreshResult,
+                },
+                model_namespace: "bifrost.rust-std",
+                content_domain: b"bifrost-rust-std-builtin/v1\0",
+            }),
+        )
+    }
+
+    fn intrinsic_format_result(
+        &self,
+        identity: &brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity,
+    ) -> bool {
+        matches!(
+            (identity.owner_fqn(), identity.member()),
+            ("std" | "core" | "alloc", "format" | "format_args") | ("alloc.fmt", "format")
+        )
+    }
+
+    fn intrinsic_complete_target(
+        &self,
+        identity: &brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity,
+    ) -> bool {
+        matches!(
+            (identity.owner_fqn(), identity.member()),
+            (
+                "std" | "core" | "alloc",
+                "format"
+                    | "format_args"
+                    | "print"
+                    | "println"
+                    | "eprint"
+                    | "eprintln"
+                    | "write"
+                    | "writeln"
+                    | "panic"
+            ) | ("alloc.fmt", "format")
+                | ("core.panicking", "panic_fmt" | "assert_failed")
+                | ("std.io.stdio", "_print" | "_eprint")
+                | ("core", "matches")
+                | ("alloc", "vec")
+        )
+    }
+
+    fn taint_uses_call_site_evidence(&self) -> bool {
+        true
+    }
+
     fn lexical_definitions_are_authoritative(&self) -> bool {
         false
     }

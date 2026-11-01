@@ -179,7 +179,7 @@ mod js_ts_extraction_tests {
             &read,
             ReadKey::Lookup {
                 kind: LookupKind::ProcedureDispatch,
-                question: LookupQuestion::ProcedureCallSite { .. },
+                question: LookupQuestion::CallSite { .. },
                 ..
             }
         ));
@@ -754,11 +754,9 @@ mod js_ts_extraction_tests {
             changed.path_changed(Language::TypeScript, "src/alpha.ts"),
             "the blob moved, so the path is changed"
         );
-        // Every key the edited blob publishes it published before: the two
-        // sides contribute the same names, so the changed-key set holds them
-        // -- but no key of the *other* file enters, and the names are the same
-        // ones on both sides rather than a new spelling.
-        assert!(changed.contains(IndexFamily::DefinitionExact, b"alpha"));
+        // A comment shifts source positions without changing the published
+        // declaration answer, so neither file contributes an index change.
+        assert!(!changed.contains(IndexFamily::DefinitionExact, b"alpha"));
         assert!(
             !changed.contains(IndexFamily::DefinitionExact, b"beta"),
             "an untouched file's names must stay out of the changed set"
@@ -798,5 +796,448 @@ mod js_ts_extraction_tests {
             !changed.contains(IndexFamily::DefinitionIdentifier, b"beta"),
             "an untouched file's names must stay out of the changed set"
         );
+    }
+
+    #[test]
+    fn native_read_digests_preserve_shifts_order_and_signature_changes() {
+        use brokk_bifrost_analysis::analyzer::read_ledger::signature_metadata_digest;
+        for (language, path, header, first, second, identifier) in [
+            (
+                Language::Rust,
+                "lib.rs",
+                "// padding\n",
+                "pub mod first { pub fn target(x: i32) {} }\n",
+                "pub mod second { pub fn target(y: i64) {} }\n",
+                "target",
+            ),
+            (
+                Language::Go,
+                "a.go",
+                "package sample\n// padding\n",
+                "type First struct {}\nfunc (First) Target(x int) {}\n",
+                "type Second struct {}\nfunc (Second) Target(y string) {}\n",
+                "Target",
+            ),
+        ] {
+            let build = |source: String| {
+                let project = InlineTestProject::with_language(language).file(path, source);
+                let project = if language == Language::Go {
+                    project.file("go.mod", "module example.com/sample\n\ngo 1.23\n")
+                } else {
+                    project.file("Cargo.toml", "[package]\nname=\"sample\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\npath=\"lib.rs\"\n")
+                };
+                project.build()
+            };
+            let base = build(format!("{header}{first}{second}"));
+            let shifted = build(format!(
+                "{header}// longer padding before declarations\n{first}{second}"
+            ));
+            let swapped = build(format!("{header}{second}{first}"));
+            let changed = build(format!("{header}{}{second}", first.replace("x", "renamed")));
+            let base_analyzer = base.workspace_analyzer(AnalyzerConfig::default());
+            let base_unit = base_analyzer
+                .analyzer()
+                .declarations(&base.file(path))
+                .into_iter()
+                .find(|unit| unit.identifier() == identifier)
+                .expect("first callable");
+            let before = signature_metadata_digest(
+                &base_unit,
+                &base_analyzer.analyzer().signature_metadata(&base_unit),
+            );
+            for (project, expect_change) in [(&shifted, false), (&swapped, true), (&changed, true)]
+            {
+                let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+                let changed_facts = ChangedFacts::between(&base_analyzer, &analyzer);
+                assert!(
+                    changed_facts.is_complete(),
+                    "{:?}",
+                    changed_facts.incompleteness()
+                );
+                assert_eq!(
+                    changed_facts
+                        .contains(IndexFamily::DefinitionIdentifier, identifier.as_bytes()),
+                    expect_change,
+                    "{language:?}"
+                );
+                let reads = [
+                    ReadKey::index(IndexFamily::DefinitionIdentifier, identifier),
+                    ReadKey::lookup(
+                        LookupKind::SignatureMetadata,
+                        LookupQuestion::declaration(&base_unit),
+                        before,
+                    ),
+                ];
+                let verdict = verify_read_set(
+                    &analyzer,
+                    &changed_facts,
+                    &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                    &reads,
+                    LookupReplayLimits::default(),
+                    &NoSummaryAnswers,
+                    &mut LookupMemo::new(),
+                );
+                assert_eq!(
+                    matches!(verdict, ReadVerdict::Unchanged),
+                    !expect_change,
+                    "{language:?}: {verdict:?}"
+                );
+                let unit = analyzer
+                    .analyzer()
+                    .declarations(&project.file(path))
+                    .into_iter()
+                    .find(|unit| unit.fq_name() == base_unit.fq_name())
+                    .expect("same first declaration identity");
+                let after = signature_metadata_digest(
+                    &unit,
+                    &analyzer.analyzer().signature_metadata(&unit),
+                );
+                if !expect_change {
+                    assert_eq!(before, after, "{language:?}");
+                }
+                if std::ptr::eq(project, &changed) {
+                    assert_ne!(before, after, "{language:?}");
+                }
+            }
+        }
+    }
+    fn assert_semantic_read_replay(
+        base: &WorkspaceAnalyzer,
+        head: &WorkspaceAnalyzer,
+        read: &ReadKey,
+        summaries: &dyn brokk_bifrost_analysis::analyzer::read_verification::SummaryAnswers,
+        unchanged: bool,
+    ) {
+        let changed = ChangedFacts::between(base, head);
+        assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+        let verdict = verify_read_set(
+            head,
+            &changed,
+            &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+            std::slice::from_ref(read),
+            LookupReplayLimits::default(),
+            summaries,
+            &mut LookupMemo::new(),
+        );
+        assert_eq!(
+            matches!(verdict, ReadVerdict::Unchanged),
+            unchanged,
+            "{read:?}: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn position_free_site_answers_replay_shifts_and_reject_changed_calls() {
+        use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
+        use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationService;
+        use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, QueryScope};
+        use std::sync::Arc;
+        let source = concat!(
+            "function leaf(value: number) { return value; }\n",
+            "function other(value: number) { return value + 1; }\n",
+            "export function wrapper(value: number) { return leaf(value) + other(value); }\n",
+        );
+        let build = |source: String| {
+            InlineTestProject::with_language(Language::TypeScript)
+                .file("src/main.ts", source)
+                .build()
+        };
+        let base = build(source.to_owned());
+        let shifted = build(format!("// length-changing padding\n{source}"));
+        let changed = build(source.replace("return leaf(value)", "return other(value)"));
+        let base_analyzer = base.workspace_analyzer(AnalyzerConfig::default());
+        let ledger = Arc::new(ReadLedger::new());
+        {
+            let analyzer = base_analyzer.analyzer();
+            let scope = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            let declarations = analyzer.declarations(&base.file("src/main.ts"));
+            let leaf = declarations
+                .iter()
+                .find(|unit| unit.identifier() == "leaf")
+                .unwrap();
+            let wrapper = declarations
+                .iter()
+                .find(|unit| unit.identifier() == "wrapper")
+                .unwrap();
+            let limits = LookupReplayLimits::default();
+            let incoming = CallRelationService::incoming_bounded(
+                analyzer,
+                scope.token(),
+                leaf,
+                limits.call_relations,
+                None,
+            );
+            assert!(!incoming.sites.is_empty(), "{incoming:?}");
+            let outgoing = CallRelationService::outgoing_bounded(
+                analyzer,
+                scope.token(),
+                wrapper,
+                limits.call_relations,
+                None,
+            );
+            assert_eq!(outgoing.sites.len(), 2, "{outgoing:?}");
+            let usages = brokk_bifrost_analysis::analyzer::usages::find_usages(
+                analyzer,
+                std::slice::from_ref(leaf),
+            );
+            assert!(
+                !usages.all_hits_including_imports().is_empty(),
+                "{usages:?}"
+            );
+            let edges = brokk_bifrost_analysis::analyzer::structural::reference_edges::inverse_edges_for_declaration(analyzer, leaf, None);
+            assert!(!edges.edges.is_empty(), "{edges:?}");
+        }
+        let keys = ledger.keys();
+        for kind in [
+            LookupKind::Callers,
+            LookupKind::Callees,
+            LookupKind::Usages,
+            LookupKind::ReferenceCandidates,
+        ] {
+            let subject = if kind == LookupKind::Callees {
+                "wrapper"
+            } else {
+                "leaf"
+            };
+            let read = keys
+                .iter()
+                .find(|key| matches!(key, ReadKey::Lookup { kind: actual, question: LookupQuestion::Declaration { fq_name, .. }, .. } if *actual == kind && fq_name.as_ref() == subject))
+                .unwrap_or_else(|| panic!("funnel did not record {kind:?}: {keys:?}"));
+            for (project, unchanged) in [(&shifted, true), (&changed, false)] {
+                assert_semantic_read_replay(
+                    &base_analyzer,
+                    &project.workspace_analyzer(AnalyzerConfig::default()),
+                    read,
+                    &NoSummaryAnswers,
+                    unchanged,
+                );
+            }
+        }
+        let (procedure_read, _) = dispatch_read(&base, &base_analyzer);
+        for kind in [LookupKind::Dispatch, LookupKind::ProcedureDispatch] {
+            let ReadKey::Lookup {
+                question, digest, ..
+            } = &procedure_read
+            else {
+                unreachable!()
+            };
+            let read = ReadKey::lookup(kind, question.clone(), *digest);
+            for (project, unchanged) in [(&shifted, true), (&changed, false)] {
+                assert_semantic_read_replay(
+                    &base_analyzer,
+                    &project.workspace_analyzer(AnalyzerConfig::default()),
+                    &read,
+                    &NoSummaryAnswers,
+                    unchanged,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#8385: cross-file module selection changed after padding")]
+    fn cross_file_module_selection_ignores_padding() {
+        let build = |padding: &str| {
+            InlineTestProject::with_language(Language::Ruby)
+                .file(
+                    "a.rb",
+                    format!("{padding}module Shared\n  def first; end\nend\n"),
+                )
+                .file("z.rb", "module Shared\n  def second; end\nend\n")
+                .build()
+        };
+        let base = build("");
+        let shifted = build("# padding before the first module\n");
+        let base_analyzer = base.workspace_analyzer(AnalyzerConfig::default());
+        let head_analyzer = shifted.workspace_analyzer(AnalyzerConfig::default());
+        let before = base_analyzer
+            .analyzer()
+            .definitions("Shared")
+            .collect::<Vec<_>>();
+        let after = head_analyzer
+            .analyzer()
+            .definitions("Shared")
+            .collect::<Vec<_>>();
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(
+            before.first().unwrap().source().rel_path(),
+            std::path::Path::new("a.rb")
+        );
+        assert_eq!(
+            after.first().unwrap().source().rel_path(),
+            std::path::Path::new("a.rb")
+        );
+        assert_semantic_read_replay(
+            &base_analyzer,
+            &head_analyzer,
+            &ReadKey::index(IndexFamily::DefinitionIdentifier, "Shared"),
+            &NoSummaryAnswers,
+            true,
+        );
+    }
+
+    #[test]
+    #[hardwon("#8385: range dispatch recorded aggregate quality and coverage for individual calls")]
+    fn two_call_range_records_replayable_dispatches_and_refuses_partial_outcomes() {
+        use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticOutcome;
+        use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::source::SourceOutcomeQuality;
+        use std::sync::Arc;
+        let source = concat!(
+            "def cleanup():\n    return 1\n",
+            "def stream(source):\n",
+            "    try:\n        gen = iter(source)\n",
+            "    except TypeError:\n        try:\n            yield from gen\n",
+            "        finally:\n            cleanup()\n",
+        );
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("stream.py", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("stream.py");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .unwrap()
+            .clone();
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("stream")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        let mut calls = procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .filter_map(|call| procedure.call_site_handle(call.id))
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|call| brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_call_range(call).unwrap().start_byte);
+        let duplicate = calls.windows(2).find(|pair| {
+            brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_call_range(&pair[0]).unwrap() == brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_call_range(&pair[1]).unwrap()
+        }).expect("finally has two calls mapped to the same range");
+        let range = brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_call_range(&duplicate[0]).unwrap();
+        let ledger = Arc::new(ReadLedger::new());
+        let mut complete_budget = SemanticBudget::default();
+        let complete_observations = {
+            let _scope = AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), ledger.clone());
+            let outcome = workspace
+                .semantic_oracle_provider()
+                .dispatch_at_source_in_artifact(
+                    SemanticOutcome::Complete {
+                        value: artifact.clone(),
+                        work: SemanticWork::default(),
+                    },
+                    range,
+                    &mut SemanticRequest::new(&mut complete_budget, &cancellation),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    SourceOutcomeQuality::from_outcome(&outcome),
+                    SourceOutcomeQuality::Complete
+                ),
+                "{outcome:?}"
+            );
+            let count = outcome.available_value().unwrap().observations().len();
+            assert!(count >= 2);
+            count
+        };
+        assert_eq!(ledger.unattributed_reads(), 0);
+        let reads = ledger
+            .keys()
+            .into_iter()
+            .filter(|read| {
+                matches!(
+                    read,
+                    ReadKey::Lookup {
+                        kind: LookupKind::Dispatch,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(reads.len() >= 2, "{reads:?}");
+        for read in reads {
+            assert_semantic_read_replay(&workspace, &workspace, &read, &NoSummaryAnswers, true);
+        }
+        // Find the first retained partial answer with deterministic
+        // cancellation injection, rather than pinning a parser/check count.
+        let attempt = |checks| {
+            let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+            let ledger = Arc::new(ReadLedger::new());
+            let outcome = {
+                let _scope =
+                    AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), ledger.clone());
+                workspace
+                    .semantic_oracle_provider()
+                    .dispatch_at_source_in_artifact(
+                        SemanticOutcome::Complete {
+                            value: artifact.clone(),
+                            work: SemanticWork::default(),
+                        },
+                        range,
+                        &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+                    )
+                    .unwrap()
+            };
+            (outcome, cancellation, ledger)
+        };
+        let mut lower = 0;
+        let mut upper = 1;
+        while attempt(upper).0.available_value().is_none() {
+            lower = upper;
+            upper *= 2;
+            assert!(
+                upper <= 1 << 20,
+                "the finite range must retain an observation"
+            );
+        }
+        while lower + 1 < upper {
+            let middle = lower + (upper - lower) / 2;
+            if attempt(middle).0.available_value().is_some() {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        let (outcome, cancellation, partial) = attempt(upper);
+        assert!(cancellation.is_cancelled(), "the stop must be operational");
+        let observations = outcome
+            .available_value()
+            .expect("retained partial dispatch")
+            .observations();
+        assert!(
+            !observations.is_empty(),
+            "a mapped call ran before cancellation"
+        );
+        assert!(
+            observations.len() < complete_observations,
+            "cancellation stopped the range before all calls: {outcome:?}"
+        );
+        assert!(partial.unattributed_reads() > 0);
+        assert!(!partial.keys().iter().any(|read| matches!(
+            read,
+            ReadKey::Lookup {
+                kind: LookupKind::Dispatch,
+                ..
+            }
+        )));
     }
 }

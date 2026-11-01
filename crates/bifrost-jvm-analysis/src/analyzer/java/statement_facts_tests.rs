@@ -40,7 +40,12 @@ fn enum_switch_cache_replays_reads_and_tracks_overlay_changes() {
     );
     assert_eq!(cold_reads, warm_reads);
     assert!(
-        warm_reads.contains(&ReadKey::file(Language::Java, "Mode.java", enum_oid)),
+        warm_reads.contains(&ReadKey::file(
+            Language::Java,
+            "Mode.java",
+            enum_oid,
+            brokk_bifrost_core::gitblob::ParseVariant::Empty
+        )),
         "enum declaration must be a replayed input: {warm_reads:?}"
     );
 

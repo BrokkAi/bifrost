@@ -20,7 +20,7 @@ You can print some of these lists from a binary:
 ## Schema versions
 
 Every authored pack declares `schema_version`. This build reads versions `2`
-through `20`, inclusive. Its newest version is `20`. Version `1` and
+through `21`, inclusive. Its newest version is `21`. Version `1` and
 any other value fail with `schema.unsupported_version`. The field is
 required; there is no default.
 
@@ -31,7 +31,9 @@ no field newer than version 8 is written as version 8, so a reader that predates
 later fields still accepts it. A pack loaded from an `authored_semantic_model`
 spec keeps the version its author declared. Current artifact producers supply
 schema-19 extraction authority, so their output requires at least version 19.
-C# assembly packs also carry assembly identities, requiring version 20.
+C# assembly packs also carry assembly identities, requiring version 20. JVM
+packs that record enclosing type parameters on owner inventories require
+version 21.
 
 A field is accepted only in a pack whose `schema_version` is at least the
 version that introduced it. A pack that declares an earlier version and uses
@@ -58,6 +60,7 @@ of an older version parse every pack that it accepts by number.
 | 18 | Rust generic defaults, implemented-trait facts and associated bindings, generic forwarding impls, self forms, and associated-type projections. | `declaration.rust_contract_schema_version` |
 | 19 | Rust implementation-inventory coverage, negative impls and conditional bounds; producer-only extraction authority in compiled manifests and shards. | `declaration.impl_inventory_schema_version`, `declaration.impl_conditions_schema_version`, `declaration.impl_self_schema_version`, `extraction.schema_version` |
 | 20 | `assembly_identity` and non-empty `type_forwards` on declaration payloads. | `schema.assembly_identity_version`, `schema.type_forwards_version` |
+| 21 | Non-empty `enclosing_type_parameters` on JVM owner inventories. | `jvm_inventory.schema_version` |
 
 A declaration payload can record its provider's `assembly_identity` and a
 `type_forwards` vector. Forward names retain CLR spelling, including generic
@@ -75,12 +78,12 @@ forward rows.
 ### JSON schema files
 
 The generated JSON schema is
-[`schemas/semantic-model-pack-v20.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v20.schema.json).
+[`schemas/semantic-model-pack-v21.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v21.schema.json).
 `cargo run --profile measure --example generate_semantic_model_schema` writes it from the Rust
 type `AuthoredSemanticModelPack`, and a repository test requires the
 checked-in file to match the generated schema exactly. The file describes
 every field of every supported version, and it accepts `schema_version` from
-`2` through `20`. It requires `compatibility.bifrost` for versions `2` through
+`2` through `21`. It requires `compatibility.bifrost` for versions `2` through
 `7` and forbids it for versions `8` and newer. It does not express the other
 per-field version gates in the table above; the validator enforces them.
 
@@ -95,7 +98,7 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | integer, 2 to 20 | yes | The pack format version. See [Schema versions](#schema-versions). |
+| `schema_version` | integer, 2 to 21 | yes | The pack format version. See [Schema versions](#schema-versions). |
 | `pack_id` | stable ID | yes | The pack identity. |
 | `version` | SemVer version | yes | The pack version. |
 | `producer` | `{name, version}` | yes | The tool that produced the pack. `name` is non-empty text; `version` is a SemVer version. |
@@ -117,7 +120,7 @@ Compiled schema-19 manifests and shard envelopes may contain `extraction`:
 paths supply this claim in memory; authored documents reject the field. Every
 shard must agree with its manifest. Both semantic digests include the claim,
 and older or curated packs without it have no extraction authority. The
-[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v20.schema.json)
+[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v21.schema.json)
 describes this envelope separately from the authoring format.
 
 A **stable ID** is 1 to 256 bytes of lowercase ASCII letters, digits, `.`,

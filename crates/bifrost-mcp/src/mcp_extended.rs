@@ -1,4 +1,4 @@
-use crate::mcp_common::{McpRenderOptions, run_named_stdio_server, tool_descriptor};
+use crate::mcp_common::tool_descriptor;
 use crate::rql::{
     ALL_KINDS, ALL_OWNER_RELATIONS, ALL_SITE_CLASSES, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH,
     MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS,
@@ -15,7 +15,6 @@ use brokk_bifrost_rql::schema::{
     reference_kind_label, rewrite_path_filter_labels, supported_query_schema_versions,
 };
 use serde_json::{Value, json};
-use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "query_code",
@@ -77,13 +76,6 @@ fn explain_policy_candidate_schema(description: &str) -> Value {
 pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
 pub(crate) const MAX_RUN_POLICY_SELECTOR_BYTES: usize = 256;
 pub(crate) const MAX_RUN_POLICY_DIFF_BASE_BYTES: usize = 256;
-
-pub fn run_extended_stdio_server(
-    root: PathBuf,
-    render_options: McpRenderOptions,
-) -> Result<(), String> {
-    run_named_stdio_server(root, render_options, "extended")
-}
 
 fn query_step_input_variants() -> Vec<Value> {
     let (parameter_name_minimum, parameter_name_maximum) = QueryStepField::ParameterName
@@ -1493,7 +1485,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_symbol_ancestors",
-            "Get nearest-parent-first ancestor class symbols for known classes after search_symbols; use when class inheritance context matters.",
+            "Get nearest-parent-first ancestor class symbols for known classes after search_symbols; use when class inheritance context matters. Partial answers retain definite ancestors and add complete=false, incomplete_reasons and grouped alternatives.",
             crate::mcp_common::symbol_names_schema(),
         ),
         tool_descriptor(

@@ -3962,6 +3962,7 @@ fn compare_dispatch_boundary_kind(
         DispatchBoundaryKind::Deferred { .. } => 2,
         DispatchBoundaryKind::Unresolved => 3,
         DispatchBoundaryKind::Truncated => 4,
+        DispatchBoundaryKind::HierarchyUnenumerated => 5,
     };
     rank(left)
         .cmp(&rank(right))

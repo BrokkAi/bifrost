@@ -13,6 +13,7 @@ use crate::searchtools::summaries::ContainerListingEntry;
 use crate::searchtools::summaries::MostRelevantFilesIncompleteReason;
 
 use crate::searchtools::summaries::MostRelevantFilesResult;
+use crate::searchtools::summaries::SummaryIncompleteReason;
 
 use crate::searchtools::selectors::NotFoundInput;
 
@@ -271,6 +272,34 @@ impl RenderText for SummaryResult {
             blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
         }
         blocks.extend(self.too_broad.iter().map(render_too_broad_scope));
+        if !self.complete {
+            let notice = match self.incomplete_reason {
+                Some(SummaryIncompleteReason::Cancelled) => {
+                    "summary lookup was cancelled before all selectors reached a verdict"
+                }
+                Some(SummaryIncompleteReason::TimeBudget) => {
+                    "summary lookup exceeded its time budget"
+                }
+                Some(SummaryIncompleteReason::StructureUnavailable) => {
+                    "indexed syntax was unavailable"
+                }
+                Some(SummaryIncompleteReason::SemanticEvidenceUnavailable) => {
+                    "structured semantic evidence was unavailable"
+                }
+                Some(SummaryIncompleteReason::ArtifactUnavailable) => {
+                    "a required artifact was unavailable"
+                }
+                Some(SummaryIncompleteReason::SemanticEvidenceGap) => {
+                    "structured semantic evidence was incomplete"
+                }
+                Some(SummaryIncompleteReason::StoreFailure) => "indexed reads failed",
+                Some(SummaryIncompleteReason::SourceUnavailable) => {
+                    "source content was unavailable"
+                }
+                None => "summary lookup was incomplete",
+            };
+            blocks.push(format!("Incomplete: {notice}."));
+        }
         if blocks.is_empty() {
             "No matching summaries found.".to_string()
         } else {
@@ -1068,7 +1097,7 @@ impl SymbolAncestors {
             format!("## {}", escape_markdown_heading(&self.symbol)),
             String::new(),
         ];
-        if self.ancestors.is_empty() {
+        if self.ancestors.is_empty() && self.complete {
             lines.push("No ancestors.".to_string());
         } else {
             lines.extend(
@@ -1076,6 +1105,17 @@ impl SymbolAncestors {
                     .iter()
                     .map(|ancestor| format!("- {}", escape_markdown_inline_code(ancestor))),
             );
+        }
+        if !self.complete {
+            if !self.incomplete_reasons.is_empty() {
+                lines.push(format!(
+                    "Incomplete: {}",
+                    self.incomplete_reasons.join(", ")
+                ));
+            }
+            for group in &self.alternatives {
+                lines.push(format!("One of: {}", group.join(" | ")));
+            }
         }
         lines.join("\n")
     }
@@ -1256,6 +1296,10 @@ fn escape_markdown_table_cell(text: &str) -> String {
         .replace('\n', "<br>")
         .replace('\r', "")
 }
+
+#[cfg(test)]
+#[path = "searchtools_render/rendered_reasons.rs"]
+mod rendered_reasons;
 
 #[cfg(test)]
 mod tests {

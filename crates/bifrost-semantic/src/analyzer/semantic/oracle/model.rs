@@ -2160,6 +2160,8 @@ pub enum DispatchBoundaryKind {
         kind: DeferredInvocationKind,
     },
     Unresolved,
+    /// Workspace implementors of an external member were not fully enumerated.
+    HierarchyUnenumerated,
     Truncated,
 }
 
@@ -2171,6 +2173,7 @@ impl DispatchBoundaryKind {
         "unmaterialized",
         "deferred",
         "unresolved",
+        "hierarchy_unenumerated",
         "truncated",
     ];
 
@@ -2181,6 +2184,7 @@ impl DispatchBoundaryKind {
             Self::Unmaterialized(_) => "unmaterialized",
             Self::Deferred { .. } => "deferred",
             Self::Unresolved => "unresolved",
+            Self::HierarchyUnenumerated => "hierarchy_unenumerated",
             Self::Truncated => "truncated",
         }
     }
@@ -2192,7 +2196,10 @@ impl DispatchBoundaryKind {
             Self::External(Some(target))
             | Self::Unmaterialized(target)
             | Self::Deferred { target, .. } => Some(target),
-            Self::External(None) | Self::Unresolved | Self::Truncated => None,
+            Self::External(None)
+            | Self::Unresolved
+            | Self::HierarchyUnenumerated
+            | Self::Truncated => None,
         }
     }
 }

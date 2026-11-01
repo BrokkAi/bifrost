@@ -779,3 +779,112 @@ fn external_callee_import_forms_retain_provider_obligations() {
         );
     }
 }
+
+#[test]
+fn missing_python_native_binding_rows_remain_incomplete() {
+    let source = "from pkg import value\nvalue\n";
+    for (name, mutation, reason) in [
+        (
+            "missing-rows",
+            "DELETE FROM python_binding_source",
+            "python_binding_rows_missing",
+        ),
+        (
+            "stale-format",
+            "UPDATE python_binding_source SET format=999",
+            "python_binding_format_stale",
+        ),
+    ] {
+        let fixture = InlineTestProject::with_language(Language::Python)
+            .file("src/probe.py", source)
+            .file("src/pkg.py", "value = 1\n")
+            .build();
+        let directory = tempfile::tempdir().unwrap();
+        let environment = PythonNativeEnvironment::open(
+            &directory.path().join("native.db"),
+            fixture.root(),
+            profile(),
+        )
+        .unwrap();
+        let revision = environment.publish_project(fixture.project_dyn()).unwrap();
+        let receipt = environment
+            .reconcile(revision, &CancellationToken::default())
+            .unwrap();
+        assert!(receipt.failed.is_empty(), "{name}: {receipt:?}");
+        environment
+            .publication
+            .store
+            .conn
+            .execute(|conn| conn.execute_batch(mutation))
+            .unwrap();
+        let output = environment
+            .route_probe(fixture.project_dyn().as_ref(), revision)
+            .unwrap();
+        assert!(output.contains(reason), "{name}: {output}");
+        assert!(!output.contains("Cancelled"), "{name}: {output}");
+    }
+}
+
+#[test]
+fn stopped_python_native_half_remains_cancelled() {
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+    use brokk_bifrost_core::analyzer::usages::resolution_session::{
+        BoundedResolution, ResolutionSession,
+    };
+
+    let fixture = InlineTestProject::with_language(Language::Python)
+        .file("src/probe.py", "from pkg import value\nvalue\n")
+        .file("src/pkg.py", "value = 1\n")
+        .build();
+    let directory = tempfile::tempdir().unwrap();
+    let environment = PythonNativeEnvironment::open(
+        &directory.path().join("native.db"),
+        fixture.root(),
+        profile(),
+    )
+    .unwrap();
+    let revision = environment.publish_project(fixture.project_dyn()).unwrap();
+    let receipt = environment
+        .reconcile(revision, &CancellationToken::default())
+        .unwrap();
+    assert!(receipt.failed.is_empty(), "{receipt:?}");
+    let budget = ReceiverAnalysisBudget {
+        max_scope_nodes: usize::MAX,
+        max_summary_expansions: usize::MAX,
+        max_resolution_rounds: usize::MAX,
+        ..ReceiverAnalysisBudget::default()
+    };
+    let baseline = ResolutionSession::bounded(budget, None);
+    environment
+        .route_probe_in_session(fixture.project_dyn().as_ref(), revision, &baseline)
+        .unwrap();
+    let work = baseline.finish(()).work();
+    let mut stopped_demand = false;
+    for cutoff in 0..work.scope_nodes {
+        let session = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_scope_nodes: cutoff,
+                ..budget
+            },
+            None,
+        );
+        let result =
+            environment.route_probe_in_session(fixture.project_dyn().as_ref(), revision, &session);
+        if result.as_ref().err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("Python reference probe cancelled")
+        }) {
+            assert!(matches!(
+                session.finish(result),
+                BoundedResolution::Exceeded { .. }
+            ));
+            stopped_demand = true;
+            break;
+        }
+    }
+    assert!(
+        stopped_demand,
+        "budget cutoff must stop a demand half; baseline={work:?}"
+    );
+}

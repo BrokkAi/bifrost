@@ -145,6 +145,65 @@ mod boundary_evidence_tests {
         }
     }
 
+    #[test]
+    #[hardwon("#8201: a stable capped external index read was refused and rebuilt on every lookup")]
+    fn external_index_retains_malformed_metadata_but_refuses_entry_read_errors() {
+        use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+        // Test-only synthetic class bytes: intentionally malformed, without
+        // any third-party artifact content.
+        for read_error in [false, true] {
+            let fixture =
+                BoundaryFixture::with_config(Language::Java, "App.java", "class App {}", |root| {
+                    let jar = root.join("malformed.jar");
+                    write_source_jar(&jar, "Probe.class", b"malformed-class");
+                    if read_error {
+                        // Corrupt the stored payload without changing its CRC.
+                        // The archive opens but reading the entry fails.
+                        let mut bytes = std::fs::read(&jar).unwrap();
+                        let offset = bytes
+                            .windows(b"malformed-class".len())
+                            .position(|value| value == b"malformed-class")
+                            .unwrap();
+                        bytes[offset] ^= 1;
+                        std::fs::write(&jar, bytes).unwrap();
+                    }
+                    jvm_config_with_artifact_jar(Some(jar))
+                });
+            let analyzer = fixture.workspace.analyzer();
+            let read = || {
+                let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+                analyzer.warm_query_indexes();
+                scope.captured_read_incompleteness()
+            };
+            let builds = brokk_bifrost_jvm_analysis::analyzer::jvm::external::external_index_build_count_for_test;
+            let before = builds();
+            let first = read();
+            assert_eq!(builds(), before + 1);
+            // A published cell guarantees the second warm is a hit; a refused
+            // fill leaves the cell empty and the next call builds again.
+            assert_eq!(analyzer.query_indexes_warm(), !read_error, "{first:?}");
+            let second = read();
+            assert_eq!(builds(), before + if read_error { 2 } else { 1 });
+            assert_eq!(first, second);
+            assert!(!first.is_empty(), "prove the artifact was inspected");
+            if read_error {
+                assert!(
+                    first.iter().any(|reason| matches!(reason,
+                    QueryReadIncomplete::SemanticEvidenceUnavailable(detail)
+                        if detail.contains("kotlin.classification_incomplete"))),
+                    "{first:?}"
+                );
+            } else {
+                assert!(
+                    first.iter().any(|reason| matches!(reason,
+                    QueryReadIncomplete::ArtifactUnavailable(detail)
+                        if detail.contains("kotlin.classification_malformed"))),
+                    "{first:?}"
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Scala: end-to-end through the resolver's own boundary outcome.
     // -----------------------------------------------------------------------

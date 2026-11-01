@@ -420,6 +420,13 @@ pub(super) fn poll_residual_route<T: Clone + Eq + std::hash::Hash>(
         let mut rank = 0;
         while let Some(tier) = rules.route_tier(&cursor, segment, rank)? {
             *completion = completion.combine(&tier.coverage).combine(&tier.blockers);
+            // `completion` is the demand's accumulated ledger, so a Cancelled
+            // reason from this tier, or one an earlier read already recorded,
+            // stops the walk: a cancelled demand never reads on and never turns
+            // a cancelled read into a missing segment.
+            if completion.contains_reason(ResolutionIncompleteReason::Cancelled) {
+                return Ok(Read::Cancelled(completion.clone()));
+            }
             let binding = !tier.edges.is_empty();
             for location in tier.edges {
                 state.retain_next(WalkCursor {
@@ -436,6 +443,9 @@ pub(super) fn poll_residual_route<T: Clone + Eq + std::hash::Hash>(
         }
         if !bound {
             *completion = completion.combine(&rules.dead_end(&cursor, segment)?);
+            if completion.contains_reason(ResolutionIncompleteReason::Cancelled) {
+                return Ok(Read::Cancelled(completion.clone()));
+            }
         }
     }
 }
@@ -457,7 +467,9 @@ pub(super) fn walk_residual_route<T: Clone + Eq + std::hash::Hash>(
             value: ResidualRouteProgress::Members { .. },
             ..
         } => panic!("a member-capable route requires the source scheduler"),
-        // Legacy synchronous callers retain their existing cancellation ledger.
+        // Synchronous callers keep failing closed: either their token is
+        // cancelled, or poll_residual_route has already written the Cancelled
+        // reason into their completion ledger before returning.
         Read::Cancelled(_) => Ok(Vec::new()),
         Read::Unavailable { .. } => panic!("a suspending route requires the source scheduler"),
     }
@@ -995,6 +1007,30 @@ impl PlacementObservationSink for CollectedPlacementObservations {
 
 #[doc(hidden)]
 pub struct EmptyHalf;
+/// A source half with no available rows and a named, incomplete obligation.
+#[doc(hidden)]
+pub struct OpenHalf {
+    completion: ResolutionCompletion,
+}
+impl OpenHalf {
+    pub fn new(completion: ResolutionCompletion) -> Self {
+        assert!(
+            completion != ResolutionCompletion::Complete,
+            "an open half is incomplete"
+        );
+        Self { completion }
+    }
+
+    pub fn completion(&self) -> &ResolutionCompletion {
+        &self.completion
+    }
+}
+
+#[doc(hidden)]
+pub enum HalfRowsOutcome<H> {
+    Rows(H),
+    Stopped,
+}
 impl RouteRules<ClosureTag> for EmptyHalf {
     fn root_starts(
         &self,
@@ -1321,6 +1357,23 @@ impl HalfRules for EmptyHalf {
     type Placement = ();
     type Target = ();
     type Member = ();
+}
+impl HalfRules for OpenHalf {
+    type MemberRow = ();
+    type Rank = ();
+    type Provider = ();
+    type LexicalTiers = std::iter::Empty<LexicalStartTier<(), ()>>;
+    type Placement = ();
+    type Target = ();
+    type Member = ();
+
+    fn initial_completion(&self) -> ResolutionCompletion {
+        self.completion.clone()
+    }
+
+    fn placements(&mut self) -> Vec<Self::Placement> {
+        Vec::new()
+    }
 }
 
 #[doc(hidden)]
@@ -1777,7 +1830,7 @@ pub trait DemandRules {
         _scopes: &'a crate::analyzer::store::resolution_lexical::NodeSourceScopes,
         _lexical: &'a dyn HalfSource,
         _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-    ) -> Result<Option<Self::Half<'a>>> {
+    ) -> Result<HalfRowsOutcome<Self::Half<'a>>> {
         unreachable!("source rows require language rules")
     }
 
@@ -3005,6 +3058,60 @@ mod tests {
                 "the first witness must use canonical location order"
             );
         }
+        struct CancelledCoverage;
+        impl RouteRules<()> for CancelledCoverage {
+            fn root_starts(
+                &self,
+                start: &WalkCursor<()>,
+                _: &mut ResolutionCompletion,
+            ) -> Result<RouteStarts> {
+                Ok(RouteStarts {
+                    locations: vec![start.location.clone()],
+                    consumed: 0,
+                })
+            }
+            fn route_tier(
+                &self,
+                _: &WalkCursor<()>,
+                _: &ResolutionLookupSemanticRecipe,
+                _: usize,
+            ) -> Result<Option<RouteEdgeTier>> {
+                Ok(Some(RouteEdgeTier {
+                    coverage: cancelled_completion(),
+                    blocks_fallback: true,
+                    ..Default::default()
+                }))
+            }
+            fn dead_end(
+                &self,
+                _: &WalkCursor<()>,
+                _: &ResolutionLookupSemanticRecipe,
+            ) -> Result<ResolutionCompletion> {
+                panic!("cancelled coverage cannot become a missing member")
+            }
+        }
+        // A reader can cancel before its shared token is changed (for example,
+        // session budget exhaustion). Its explicit coverage is still cancellation.
+        let cancellation = CancellationToken::new();
+        let mut completion = ResolutionCompletion::Complete;
+        let mut state = ResidualRouteState::new(
+            &CancelledCoverage,
+            WalkCursor::container((), 1, "root".into(), 0),
+            &mut completion,
+        )
+        .unwrap();
+        assert!(matches!(
+            poll_residual_route(
+                &CancelledCoverage,
+                &mut state,
+                &route,
+                &mut completion,
+                &cancellation
+            )
+            .unwrap(),
+            Read::Cancelled(_)
+        ));
+        assert!(!cancellation.is_cancelled());
     }
 
     struct PrefixRules;
@@ -5226,7 +5333,7 @@ fn poll_source_rows<R: DemandRules>(
                 },
             }
         };
-        let Some(mut rules) = shared.rules.half_rows(
+        let mut rules = match shared.rules.half_rows(
             &current.source,
             plan,
             state
@@ -5235,11 +5342,13 @@ fn poll_source_rows<R: DemandRules>(
                 .expect("source scopes are initialized"),
             &lexical,
             inputs,
-        )?
-        else {
-            return Ok(Read::Cancelled(
-                state.accum.hook_completion.combine(&cancelled_completion()),
-            ));
+        )? {
+            HalfRowsOutcome::Rows(rules) => rules,
+            HalfRowsOutcome::Stopped => {
+                return Ok(Read::Cancelled(
+                    state.accum.hook_completion.combine(&cancelled_completion()),
+                ));
+            }
         };
         if !current.initialized {
             let completion = rules.initial_completion();
@@ -6367,6 +6476,25 @@ pub(super) fn publish_closure<R: DemandRules>(
                 .rules
                 .publication_context(plan, shared.ready, &inventory_completion)?;
         for reason in owned_reasons {
+            // #8534: a route or descriptor can publish context inventory
+            // reasons only. Request-local support reads stay in the closure's
+            // operation evidence, where they cannot enter this registry.
+            let key = crate::analyzer::resolution::ResolutionIdentityDigestKey::from(reason);
+            #[cfg(any(test, feature = "test-support"))]
+            let fixture_owned =
+                crate::analyzer::resolution::fact_lowering::fixture_names::identity_content_digest(
+                    key,
+                )
+                .is_some();
+            #[cfg(not(any(test, feature = "test-support")))]
+            let fixture_owned = false;
+            debug_assert!(
+                key.context_number()
+                    .and_then(|number| shared.ready.context_identities.content_digest(number))
+                    .is_some()
+                    || fixture_owned,
+                "published inventory reason must have context-owned canonical content: {reason:?}"
+            );
             if !closer_step(
                 shared.session,
                 shared.cancellation,

@@ -145,6 +145,32 @@ typed_digests! {
     WorkspaceMountId,
 }
 
+impl ContentIdentity {
+    /// Scope C# source identity by its selected parse decision. Other languages
+    /// retain their raw source digest, including its exact historical spelling.
+    pub fn from_source_digest(
+        digest: StableDigest,
+        language: brokk_bifrost_core::analyzer::model::Language,
+        variant: brokk_bifrost_core::gitblob::ParseVariant,
+    ) -> Self {
+        if language != brokk_bifrost_core::analyzer::model::Language::CSharp {
+            return Self::from_digest(digest);
+        }
+        let mut hash = LengthDelimitedDigest::new(b"bifrost-csharp-content-identity-v1");
+        hash.push(digest.as_bytes());
+        hash.push(variant.as_bytes());
+        Self::from_digest(hash.finish())
+    }
+
+    pub fn from_source_bytes(
+        bytes: impl AsRef<[u8]>,
+        language: brokk_bifrost_core::analyzer::model::Language,
+        variant: brokk_bifrost_core::gitblob::ParseVariant,
+    ) -> Self {
+        Self::from_source_digest(StableDigest::sha256(bytes), language, variant)
+    }
+}
+
 /// The exact content-scoped identity of one normalized structural fact node.
 ///
 /// The normalized node id is meaningful only for the exact source content it
@@ -1382,5 +1408,28 @@ pub fn push_evidence_completeness(
     digest.push(completeness.label().as_bytes());
     if let EvidenceCompleteness::Partial(reason) = completeness {
         digest.push(reason.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod parse_identity_tests {
+    use super::*;
+    use brokk_bifrost_core::{analyzer::Language, gitblob::ParseVariant};
+
+    #[test]
+    fn source_identity_scopes_csharp_decisions_and_preserves_other_languages() {
+        let raw = StableDigest::sha256(b"class Shared {}");
+        let first = ParseVariant::Digest([1; 32]);
+        let second = ParseVariant::Digest([2; 32]);
+        assert_ne!(
+            ContentIdentity::from_source_digest(raw, Language::CSharp, first),
+            ContentIdentity::from_source_digest(raw, Language::CSharp, second)
+        );
+        for language in [Language::Rust, Language::Python, Language::Java] {
+            assert_eq!(
+                ContentIdentity::from_source_digest(raw, language, ParseVariant::Empty),
+                ContentIdentity::from_digest(raw)
+            );
+        }
     }
 }

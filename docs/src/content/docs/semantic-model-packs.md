@@ -417,7 +417,11 @@ These hosts run the reviewed workspace route:
 | A `SearchToolsService` session: the MCP server, one-shot `--tool` and `--query-file` runs, a policy run with `--sources`, and the Rust and Python libraries | when the session activates packs, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` (also `1` or `enabled`) | the session records a failed activation; a policy run in that session reports `pack-activation-failed` and exits 2 |
 
 `BIFROST_WORKSPACE_SEMANTIC_MODELS` is off by default. It also accepts `off`,
-`0`, and `disabled`; any other value is an error.
+`0`, and `disabled`; any other value is an error. When the variable is unset
+and the directory exists, every `query_code` answer that can depend on semantic
+models carries an advisory `workspace_semantic_models_not_loaded` diagnostic,
+because those answers can be missing rows or read `unknown` for modeled
+members. Set the variable to `off` to keep the default without the diagnostic.
 
 A pack that declares `safety.review_required` stays inert on every host until
 an `enable` control names its pack id. Both routes read that list from
@@ -512,13 +516,13 @@ rules failed closed, so production emitted neither rule.
 ## Version and extension rules
 
 Every source pack must contain a `schema_version` this build supports, from
-`2` through `20`. The field is mandatory: omitted, zero, and unsupported versions
+`2` through `21`. The field is mandatory: omitted, zero, and unsupported versions
 fail instead of falling back. Every object rejects unknown fields, and every
 variant is explicitly tagged. A schema addition takes a new version number and
 a new checked-in schema rather than silently widening a number that already
 shipped.
 
-The newest schema is `20`. Packs generated from pinned artifacts declare the
+The newest schema is `21`. Packs generated from pinned artifacts declare the
 lowest schema their content needs, never below `8`, so a reader that predates a
 field still accepts a pack that does not use it.
 
@@ -576,7 +580,7 @@ incomplete signature or body; none of those absences supplies an unknown type
 for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v20.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v20.schema.json).
+[`schemas/semantic-model-pack-v21.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v21.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 The version-two through version-eight schemas stay checked in as frozen

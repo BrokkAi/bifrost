@@ -11,6 +11,7 @@ use super::super::lexical_environment::{
 };
 use super::super::occurrence_rows::ast_id;
 use super::super::occurrences::Namespace;
+use super::call_binding::CallBindingValue;
 use super::results::{CodeQueryDecoratedParameter, DetailedCodeQueryDecoratedParameterEvidence};
 use super::*;
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
@@ -211,6 +212,118 @@ pub(super) fn expansions_for_seed(
             }))
         })
         .collect()
+}
+
+/// Whether the formal one call-binding row binds carries an annotation type.
+#[derive(Debug, Clone)]
+pub(super) enum FormalAnnotationMatch {
+    Carries,
+    Lacks,
+    /// The callee's declaration, its formal, or one of the formal's
+    /// decorators could not be read or resolved, so the formal may carry it.
+    Undecided(String),
+}
+
+/// Decide `:formal-annotation-type` for one exactly bound actual.
+///
+/// The formal is read from the callee's own declaration, so a call through an
+/// interface or abstract member binds to that member's annotated formal even
+/// when no implementation body is in the workspace (a source-generated Refit
+/// client, for example). The decorators are the formal's structural
+/// `Decorator` role edges, bound by the same resolution as `decorator_bindings`.
+pub(super) fn formal_annotation_match(
+    analyzer: &dyn IAnalyzer,
+    value: &CallBindingValue,
+    annotation_type: &str,
+    cancellation: Option<&CancellationToken>,
+) -> FormalAnnotationMatch {
+    use FormalAnnotationMatch::Undecided;
+    let formal_index = value
+        .row()
+        .formal_index
+        .expect("an exactly bound actual has a formal index");
+    let Some(target) = value.site.target.as_ref() else {
+        return Undecided("the callee has no workspace declaration to read formals from".into());
+    };
+    if value.site.formal_layout_id.is_none() {
+        return Undecided("the callee's formal layout has no identity".into());
+    }
+    let file = target.unit.source();
+    let language = crate::analyzer::common::language_for_file(file);
+    let Some(facts) = analyzer
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)
+        .and_then(|provider| provider.structural_facts(file))
+    else {
+        return Undecided("the callee's file has no structural facts".into());
+    };
+    let Some(tree) = parse_tree_for_language(file, language, facts.source()) else {
+        return Undecided("the callee's file does not parse".into());
+    };
+    let Some(layout) =
+        formal_parameter_slots(language, tree.root_node(), facts.source(), &target.range)
+    else {
+        return Undecided("the callee declaration has no formal parameter layout".into());
+    };
+    let Some(slot) = layout
+        .slots
+        .iter()
+        .filter(|slot| !slot.receiver)
+        .nth(formal_index)
+    else {
+        return Undecided(format!(
+            "the callee declaration has no formal at index {formal_index}"
+        ));
+    };
+    let Some(node) = facts.nodes().iter().position(|node| {
+        node.kind == NormalizedKind::Parameter
+            && node.span().start_byte == slot.declaration_range.start_byte
+            && node.span().end_byte == slot.declaration_range.end_byte
+    }) else {
+        return Undecided("the bound formal has no structural parameter fact".into());
+    };
+    let seed = SeedMatch {
+        language,
+        file: file.clone(),
+        facts,
+        fact_match: FactMatch {
+            node: u32::try_from(node).expect("structural node ids fit u32"),
+            captures: Vec::new(),
+            reported_range: None,
+            heuristic: None,
+        },
+        python_import: None,
+    };
+    let mut undecided = Vec::new();
+    for expansion in
+        expansions_for_seed(analyzer, &seed, &mut HashMap::default(), None, cancellation)
+    {
+        let PipelineValue::DecoratedParameter(decorated) = expansion.value else {
+            continue;
+        };
+        let row = decorated.row;
+        match row.annotation_status {
+            Some(JavaAnnotationTypeStatus::Resolved) => {
+                if row.annotation_fq_name.as_deref() == Some(annotation_type) {
+                    return FormalAnnotationMatch::Carries;
+                }
+            }
+            _ => undecided.push(format!(
+                "decorator {} is {}{}",
+                row.decorator_name,
+                row.binding_status,
+                row.reason
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default()
+            )),
+        }
+    }
+    if undecided.is_empty() {
+        FormalAnnotationMatch::Lacks
+    } else {
+        Undecided(format!("its decorator types are unproven: {undecided:?}"))
+    }
 }
 
 #[derive(Debug, Default)]

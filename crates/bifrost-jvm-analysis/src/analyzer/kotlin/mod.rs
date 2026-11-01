@@ -63,6 +63,7 @@ mod structural;
 pub(crate) mod types;
 
 pub use crate::analyzer::kotlin::scalar::kotlin_declared_scalar_types;
+pub use brokk_bifrost_jvm::kotlin::resolution::kotlin_declaration_has_annotation;
 
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
@@ -128,8 +129,6 @@ use brokk_bifrost_analysis::analyzer::languages::StructuralReceiverResolver;
 use brokk_bifrost_analysis::analyzer::languages::fqn_has_multiple_function_definitions;
 
 use brokk_bifrost_analysis::analyzer::languages::ready_preflight;
-
-use brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo;
 
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 
@@ -224,7 +223,7 @@ pub struct KotlinAnalyzer {
             >,
         >,
     >,
-    external_inputs: crate::analyzer::jvm::hierarchy::DerivedMemo<(), ()>,
+    external_inputs: crate::analyzer::jvm::hierarchy::RawDerivedMemo<(), ()>,
     memo_budget: u64,
     imported_code_units:
         crate::analyzer::jvm::hierarchy::DerivedMemo<ProjectFile, HashSet<CodeUnit>>,
@@ -259,18 +258,10 @@ pub struct KotlinAnalyzer {
     /// gets an index that was never built over them (issue #1748). Two cells at
     /// most, because the exclusion verdict is a pure function of the analyzer
     /// and the file.
-    direct_descendant_index: Arc<
-        KeyedPoolSafeMemo<
-            brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant,
-            brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex,
-        >,
-    >,
-    realm_direct_descendant_index: Arc<
-        KeyedPoolSafeMemo<
-            brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant,
-            brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex,
-        >,
-    >,
+    direct_descendant_index:
+        Arc<brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo>,
+    realm_direct_descendant_index:
+        Arc<brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo>,
     dead_code_usage_edges: UsageEdgesCache,
 }
 
@@ -387,7 +378,7 @@ impl KotlinAnalyzer {
             inner,
             jvm_config,
             external_index: Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new()),
-            external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
+            external_inputs: crate::analyzer::jvm::hierarchy::raw_derived_memo(memo_budget / 8),
             memo_budget,
             imported_code_units: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
             realm_imported_code_units: crate::analyzer::jvm::hierarchy::derived_memo(
@@ -403,8 +394,8 @@ impl KotlinAnalyzer {
             realm_direct_ancestors: crate::analyzer::jvm::hierarchy::ancestor_memo(
                 memo_budget / 16,
             ),
-            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
-            realm_direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(brokk_bifrost_analysis::analyzer::common::new_replayable_descendant_memo()),
+            realm_direct_descendant_index: Arc::new(brokk_bifrost_analysis::analyzer::common::new_replayable_descendant_memo()),
             dead_code_usage_edges: build_weighted_cache(memo_budget / 8, weight_usage_edges),
         }
     }

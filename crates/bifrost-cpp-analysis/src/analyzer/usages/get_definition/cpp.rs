@@ -5359,9 +5359,8 @@ fn cpp_direct_type_member_candidates(
     owner: &CodeUnit,
     member: &str,
 ) -> Vec<CodeUnit> {
-    let owner_name = owner.fq_name();
     let mut candidates = support
-        .members_for_owner_name(&owner_name, &owner_name, member)
+        .members_for_owner(owner, member)
         .into_iter()
         .filter(|candidate| {
             candidate.identifier() == member

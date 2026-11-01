@@ -1,8 +1,8 @@
 //! Java Pattern value grammar. Unrepresented languages explicitly abstain.
 use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
 use brokk_bifrost_core::analyzer::structural::regex::{
-    CharacterSet, ClassAtom, EscapeValue, GroupPrefix, RegexAnalysis, RegexFlags, RegexSyntax,
-    single_character,
+    CaptureGroups, CharacterSet, ClassAtom, EscapeValue, GroupPrefix, RegexAnalysis, RegexFlags,
+    RegexSyntax, single_character,
 };
 
 #[derive(Default)]
@@ -168,6 +168,7 @@ impl RegexSyntax for JavaRegexSyntax {
         start: usize,
         in_class: bool,
         flags: RegexFlags,
+        _groups: &CaptureGroups,
     ) -> Option<EscapeValue> {
         let result = self.parse_escape(chars, start, in_class, flags);
         if let Some(reason) = result.as_ref().and_then(|value| value.incomplete) {
@@ -194,7 +195,7 @@ impl RegexSyntax for JavaRegexSyntax {
             });
         }
         if value == '\\' {
-            let escape = self.escape(chars, start, true, flags)?;
+            let escape = self.escape(chars, start, true, flags, &CaptureGroups::default())?;
             return Some(ClassAtom {
                 start,
                 end: escape.end,
@@ -259,17 +260,17 @@ impl RegexSyntax for JavaRegexSyntax {
         matches!(character, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}')
     }
     fn supports_possessive_quantifiers(&self) -> bool {
-        false
+        true
+    }
+    fn final_line_terminators(&self, flags: RegexFlags) -> &'static [&'static str] {
+        if flags.dialect_flags & UNIX_LINES != 0 {
+            &["\n"]
+        } else {
+            &["\n", "\r\n", "\r", "\u{85}", "\u{2028}", "\u{2029}"]
+        }
     }
     fn analyze(&self, context: &mut RegexAnalysis<'_>) {
         for fact in context.facts {
-            if fact
-                .quantifier
-                .is_some_and(|quantifier| quantifier.possessive)
-            {
-                self.refusal
-                    .set(Some("java-possessive-quantifier-not-modeled"));
-            }
             if fact.quantifier.is_some_and(|quantifier| {
                 quantifier.minimum > i32::MAX as u32
                     || quantifier

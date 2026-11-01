@@ -1501,7 +1501,8 @@ pub(crate) fn lower_common_resolution_facts(
                 language,
                 match fact.kind {
                     ResolutionNameLookupKind::EmbeddedType
-                    | ResolutionNameLookupKind::SupertypeName => ResolutionNamespace::Type,
+                    | ResolutionNameLookupKind::SupertypeName
+                    | ResolutionNameLookupKind::AliasTarget => ResolutionNamespace::Type,
                     ResolutionNameLookupKind::InterfaceMethod => {
                         member_lookup_namespace(ResolutionMemberKind::Method)
                     }

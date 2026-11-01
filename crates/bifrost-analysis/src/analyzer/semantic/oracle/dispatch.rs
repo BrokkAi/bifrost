@@ -317,10 +317,12 @@ impl DispatchResult {
             member_field_anchor: None,
             member_receiver_preparation: None,
         };
-        let has_unresolved = result
-            .boundaries
-            .iter()
-            .any(|boundary| matches!(boundary.kind, DispatchBoundaryKind::Unresolved));
+        let has_unresolved = result.boundaries.iter().any(|boundary| {
+            matches!(
+                boundary.kind,
+                DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::HierarchyUnenumerated
+            )
+        });
         let has_truncated = result
             .boundaries
             .iter()
@@ -386,9 +388,9 @@ impl DispatchResult {
         self.coverage
     }
 
-    /// Whether this answer's only truncation is the workspace-override guard
-    /// on a syntax-derived external receiver arm. A complete, uncertainty-free
-    /// receiver hint may replace that arm; every other truncated answer stays
+    /// Whether this answer's open workspace-override guard is on a
+    /// syntax-derived external receiver arm. A complete, uncertainty-free
+    /// receiver hint may replace that arm; independent truncation stays
     /// ineligible for feedback.
     pub const fn complete_receiver_hint_refinable(&self) -> bool {
         self.complete_receiver_hint_refinable
@@ -425,7 +427,7 @@ impl DispatchResult {
     }
 
     pub(crate) fn mark_complete_receiver_hint_refinable(&mut self) {
-        debug_assert_eq!(self.coverage, CandidateCoverage::Truncated);
+        debug_assert!(!self.coverage.is_exhaustive());
         self.complete_receiver_hint_refinable = true;
     }
 

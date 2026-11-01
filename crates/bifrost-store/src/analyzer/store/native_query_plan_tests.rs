@@ -221,12 +221,28 @@ pub mod shared_support {
                 crate::analyzer::store::REQUIRED_EXISTING_ANALYSIS_PROJECTIONS_SQL,
             ),
             (
+                "csharp_compilation::SELECTED_CONFIGURATION_MASK_SQL",
+                crate::analyzer::store::csharp_compilation::SELECTED_CONFIGURATION_MASK_SQL,
+            ),
+            (
+                "csharp_units::GLOBAL_USING_CANDIDATES",
+                super::super::csharp_units::GLOBAL_USING_CANDIDATES,
+            ),
+            (
+                "csharp_units::GLOBAL_USING_SITES",
+                super::super::csharp_units::GLOBAL_USING_SITES,
+            ),
+            (
+                "csharp_units::GLOBAL_USING_COVERAGE",
+                super::super::csharp_units::GLOBAL_USING_COVERAGE,
+            ),
+            (
                 "csharp_demand::NAMESPACE_ROUTE",
                 super::super::csharp_demand::NAMESPACE_ROUTE,
             ),
             (
-                "csharp_demand::HAS_USING_DIRECTIVES",
-                super::super::csharp_demand::HAS_USING_DIRECTIVES,
+                "csharp_namespaces::NAMESPACE_CANDIDATES",
+                super::super::csharp_namespaces::NAMESPACE_CANDIDATES,
             ),
             (
                 "csharp_demand::TYPE_WITH_EXPLICIT_BASES",
@@ -246,6 +262,7 @@ pub mod shared_support {
             ),
             ("imports::POINT", imports::POINT),
             ("imports::ENUMERATE", imports::ENUMERATE),
+            ("imports::SCOPE_NAMED", imports::SCOPE_NAMED),
             ("imports::AT_SITE", imports::AT_SITE),
             (
                 "unit_summaries::LIVE_SUMMARY_SQL",
@@ -296,6 +313,10 @@ pub mod shared_support {
                 go_reverse_rows::GO_TARGET_DEFINITION_SEMANTICS_SQL.as_str(),
             ),
             (
+                "rust_reverse_rows::initial_reference_inventory_gap_locators_sql",
+                rust_reverse_rows::initial_reference_inventory_gap_locators_sql(),
+            ),
+            (
                 "rust_reverse_rows::target_scoped_reference_inventory_gaps_sql",
                 rust_reverse_rows::target_scoped_reference_inventory_gaps_sql(),
             ),
@@ -311,6 +332,10 @@ pub mod shared_support {
                 "resolution_lexical::SELECTED_MOUNT_OF_BLOB_SQL",
                 crate::analyzer::store::resolution_lexical::SELECTED_MOUNT_OF_BLOB_SQL,
             ),
+            (
+                "resolution_lexical::RUST_UNENUMERABLE_MEMBER_DISPATCH_SQL",
+                crate::analyzer::store::resolution_lexical::RUST_UNENUMERABLE_MEMBER_DISPATCH_SQL,
+            ),
         ] {
             registry.statements.push((name.to_owned(), sql.to_owned()));
         }
@@ -323,6 +348,7 @@ pub mod shared_support {
                         | "qualified_route_mounts"
                         | "selected_typed_shared_membership"
                         | "selected_typed_shared_membership_64"
+                        | "go_hierarchy_selection_coverage"
                 )
             })
         {

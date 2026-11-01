@@ -237,6 +237,13 @@ pub(in crate::analyzer) trait NominalLanguageRules: Sync + 'static {
     fn language(&self) -> Language;
     fn family(&self) -> &'static dyn NominalPackageRules;
 
+    /// Package-owned members in an active external inventory.
+    fn admits_external_package_member(
+        &self,
+        kind: &str,
+        namespace: super::ResolutionNamespace,
+    ) -> bool;
+
     /// Required: origin of a named or wildcard root import.
     fn root_import_origin(&self, kind: ResolutionRootImportKind) -> BindingOrigin;
     /// Required: origin of a common-assembly member from a route and selector.
@@ -650,22 +657,9 @@ impl NominalLanguageRules for JvmLanguageRules {
         &self,
         provider: crate::analyzer::resolution::JvmImplicitRootProvider,
     ) -> Option<u32> {
-        use crate::analyzer::resolution::JvmImplicitRootProvider;
-        match self.language {
-            Language::Scala => self
-                .implicit_root_providers()
-                .iter()
-                .rev()
-                .position(|root| *root == provider)
-                .map(|index| index as u32),
-            // The specification lists platform defaults without relative priority:
-            // https://kotlinlang.org/spec/packages-and-imports.html#importing
-            // Conservatively keep Kotlin roots above the Java platform root.
-            Language::Kotlin => Some(u32::from(
-                provider == JvmImplicitRootProvider::Package("java.lang"),
-            )),
-            _ => None,
-        }
+        brokk_bifrost_jvm::intrinsics::language_implicit_roots(self.language)
+            .iter()
+            .find_map(|(root, rank)| (*root == provider).then_some(*rank))
     }
     fn package_peer_languages(&self) -> &'static [Language] {
         self.package_peers
@@ -700,6 +694,18 @@ impl NominalLanguageRules for JvmLanguageRules {
 
     fn language(&self) -> Language {
         self.language
+    }
+    fn admits_external_package_member(
+        &self,
+        kind: &str,
+        namespace: super::ResolutionNamespace,
+    ) -> bool {
+        self.language == Language::Kotlin
+            && matches!(
+                (kind, namespace),
+                ("function", super::ResolutionNamespace::Callable)
+                    | ("property", super::ResolutionNamespace::Value)
+            )
     }
     fn family(&self) -> &'static dyn NominalPackageRules {
         &JVM_PACKAGE_RULES

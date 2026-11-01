@@ -295,6 +295,7 @@ pub struct ReferenceLocalPathEvidence {
     prefix_scope_spellings: Box<[(u32, String)]>,
     scope_endpoints: Box<[u32]>,
     lexical_scopes: Box<[(BindingNodeId, u32)]>,
+    ordered_checkpoint_ancestry: Box<[(BindingNodeId, u32)]>,
     reaches_root: bool,
     reaches_package_root_scope: bool,
     local_bindings_certified: bool,
@@ -317,6 +318,7 @@ impl ReferenceLocalPathEvidence {
             prefix_scope_spellings: prefix_scope_spellings.into_boxed_slice(),
             scope_endpoints: scope_endpoints.into_boxed_slice(),
             lexical_scopes: Box::new([]),
+            ordered_checkpoint_ancestry: Box::new([]),
             reaches_root,
             reaches_package_root_scope,
             local_bindings_certified: true,
@@ -335,6 +337,41 @@ impl ReferenceLocalPathEvidence {
 
     pub(crate) fn lexical_scopes(&self) -> &[(BindingNodeId, u32)] {
         &self.lexical_scopes
+    }
+
+    pub(crate) fn with_ordered_checkpoint_ancestry(
+        mut self,
+        ancestry: Vec<(BindingNodeId, u32)>,
+    ) -> Self {
+        self.ordered_checkpoint_ancestry = ancestry.into_boxed_slice();
+        self
+    }
+
+    pub(crate) fn ordered_checkpoint_ancestry(&self) -> &[(BindingNodeId, u32)] {
+        &self.ordered_checkpoint_ancestry
+    }
+
+    /// The binding endpoint and its outward source chain. A missing endpoint
+    /// or branching walk cannot prove lexical shadowing.
+    pub(crate) fn binding_scope_coordinate(
+        &self,
+        endpoint: BindingNodeId,
+    ) -> Option<super::precedence::BindingScopeCoordinate> {
+        let chain = self.ordered_checkpoint_ancestry();
+        let position = chain.iter().position(|(node, _)| *node == endpoint)?;
+        if chain
+            .windows(2)
+            .any(|pair| pair[0].1 == pair[1].1 && pair[0].0 != pair[1].0)
+        {
+            return None;
+        }
+        Some(super::precedence::BindingScopeCoordinate {
+            endpoint,
+            outward: chain[position + 1..]
+                .iter()
+                .map(|(node, _)| *node)
+                .collect(),
+        })
     }
 
     pub(crate) const fn local_bindings_certified(&self) -> bool {
@@ -12796,6 +12833,7 @@ fn select_seed_answers(
     let mut batch_completion = BatchCompletionLedger::default();
     let mut cancelled = force_cancelled | cancellation.is_cancelled();
     for mut seed in seeds {
+        let selection_rules = super::precedence::rules_for_language(seed.language);
         cancelled |= poll_reverse_completion(cancellation, completion_work);
         let (completion, observed_completion, completion_cancelled) = finish_seed_completions(
             seed.completion,
@@ -12840,12 +12878,13 @@ fn select_seed_answers(
                 access.is_none(),
                 "receiver overlay access is refined after selection"
             );
-            select_paths_with_lazy_candidate_filter(
+            super::engine::select_paths_with_lazy_candidate_filter_using_rules(
                 reference,
                 seed.completed,
                 seed.terminals,
                 completion,
                 observed_completion,
+                selection_rules,
                 cancellation,
                 &mut |_, targets| {
                     Ok(Some(
@@ -12858,22 +12897,24 @@ fn select_seed_answers(
                 },
             )?
         } else if let Some(access) = access {
-            select_paths_with_lazy_access(
+            super::engine::select_paths_with_lazy_access_using_rules(
                 reference,
                 seed.completed,
                 seed.terminals,
                 completion,
                 observed_completion,
+                selection_rules,
                 cancellation,
                 &mut |reference, definitions| access.lookup(reference, definitions),
             )?
         } else {
-            select_paths_with_cancellation_evidence(
+            super::engine::select_paths_with_rules(
                 reference,
                 &seed.completed,
                 &seed.terminals,
                 completion,
                 observed_completion,
+                selection_rules,
                 cancellation,
             )
         };

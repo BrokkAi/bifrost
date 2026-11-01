@@ -58,13 +58,16 @@ mod csharp_extraction_tests {
             cost.statement_count(),
             cost.decoded_rows
         );
+        if std::env::var_os("BIFROST_SQL_PROFILE").is_some() {
+            // The production trace owns SQLite's hook during this scan.
+            eprintln!("warm C# SQL statements: {cost:#?}");
+        }
         // Bound request work rather than elapsed time. Nested per-file scopes
         // must retain the outer scan's definition and source read caches.
-        // With the fix this scan runs 166 statements; when each per-file scope
-        // queried through a cloned analyzer, every nested scope reset the
-        // request caches and the scan ran 279. The fixture is small, so a rise
-        // of about 35 statements is the whole regression; on Dapper the same
-        // defect took a warm scan from 26,849 to 630,115 statements.
+        // The warm scan ran 180 statements before C# unseen-branch checking.
+        // That check adds one indexed SELECT. The cloned-analyzer regression
+        // ran 279 statements; on Dapper it raised a warm scan from 26,849 to
+        // 630,115 statements.
         assert!(cost.statement_count() < 200, "{cost:#?}");
     }
     #[test]

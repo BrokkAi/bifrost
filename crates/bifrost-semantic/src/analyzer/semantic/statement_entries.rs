@@ -79,8 +79,11 @@ impl StatementEntryIndex {
             brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
             StatementEntryOpen::SourceSnapshotMismatch
         })?;
-        let content =
-            ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
+        let content = ContentIdentity::from_source_digest(
+            StableDigest::from_array(prepared.source_sha256()),
+            prepared.dialect().language(),
+            prepared.parse_variant(),
+        );
         let revision_matches = match (key.revision(), prepared.origin()) {
             (SourceRevision::Disk { content: expected }, PreparedSourceOrigin::Disk) => {
                 content == expected

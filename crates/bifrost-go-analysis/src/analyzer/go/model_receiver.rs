@@ -37,9 +37,8 @@ pub(crate) fn transient_selection(
         brokk_bifrost_go::references::go_selector_descriptor(tree.root_node(), query.site)?;
     let member = descriptor.focused_node();
     let candidates = selection
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.selected && !candidate.rejected)
+        .selected_candidate()
+        .into_iter()
         .collect::<Vec<_>>();
     Some(DeferredMemberSelection {
         member: query.source.get(member.byte_range())?.into(),
@@ -88,9 +87,8 @@ pub(crate) fn go_selected_model_receiver_call(
         reasons: Vec::new(),
     };
     let candidates = selection
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.selected && !candidate.rejected)
+        .selected_candidate()
+        .into_iter()
         .collect::<Vec<_>>();
     let [candidate] = candidates.as_slice() else {
         result

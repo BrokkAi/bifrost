@@ -80,6 +80,8 @@ const PYTHON_HALF_PLACEMENTS: &str = "SELECT providers.container_path
                ON mounted.blob_id=members.blob_id AND mounted.persisted_relative_path=members.rel_path
              WHERE providers.summary_id=?1 AND mounted.mount_ordinal=?2
                AND providers.state IN ('selected','alternative')";
+const PYTHON_BINDING_SOURCE_FORMAT: &str =
+    "SELECT format FROM python_binding_source WHERE blob_id=?1";
 
 /// Survivors receive a cohort only after temporal reduction. Origin and source
 /// byte position are deliberately absent from the ordering.
@@ -883,6 +885,7 @@ struct PythonModuleBindingSelection {
 }
 
 pub(super) struct PythonHalf<'a, 'store, 'input> {
+    open: Option<OpenHalf>,
     query_obligations: std::rc::Rc<RefCell<NodeQueryObligations>>,
     pub(super) rules: &'a PythonRules<'a, 'store, 'input>,
     pub(super) source: &'a SourceHalf,
@@ -903,6 +906,71 @@ pub(super) struct PythonHalf<'a, 'store, 'input> {
     pub(super) member_observations:
         RefCell<Vec<crate::analyzer::resolution::HierarchyProviderObservation>>,
     pub(super) rendered_order: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<'a, 'store, 'input> PythonHalf<'a, 'store, 'input> {
+    fn new(
+        rules: &'a PythonRules<'a, 'store, 'input>,
+        source: &'a SourceHalf,
+        completion: ResolutionCompletion,
+        query_obligations: std::rc::Rc<RefCell<NodeQueryObligations>>,
+        rows: std::sync::Arc<PythonBindingRows>,
+        blob: i64,
+        rendered_order: std::rc::Rc<std::cell::Cell<bool>>,
+    ) -> Self {
+        Self {
+            open: None,
+            query_obligations,
+            rules,
+            source,
+            placements: Vec::new(),
+            import_site: None,
+            import_name: None,
+            rows,
+            fragment: source.identity.fragment(),
+            blob,
+            reference_site: None,
+            deferred_module_scope: None,
+            prefix: None,
+            universe_unmutated: false,
+            import_aliases: Vec::new().into(),
+            module_mutations: Vec::new().into(),
+            completion,
+            stopped: std::cell::Cell::new(false),
+            member_observations: RefCell::new(Vec::new()),
+            rendered_order,
+        }
+    }
+
+    fn open(
+        rules: &'a PythonRules<'a, 'store, 'input>,
+        source: &'a SourceHalf,
+        completion: ResolutionCompletion,
+        label: &'static str,
+        evidence: &str,
+    ) -> Self {
+        let mut hash = CanonicalHasher::new(b"python-open-source-half:v1");
+        hash.field("source", &source.token.get().to_le_bytes());
+        hash.field("label", label.as_bytes());
+        let reason = rules
+            .ready
+            .context_identities
+            .named_semantic(hash.finish(), label, evidence);
+        Self {
+            open: Some(OpenHalf::new(ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(reason),
+            ]))),
+            ..Self::new(
+                rules,
+                source,
+                completion,
+                std::rc::Rc::new(RefCell::new(NodeQueryObligations::empty())),
+                std::sync::Arc::new(PythonBindingRows::default()),
+                0,
+                std::rc::Rc::new(std::cell::Cell::new(false)),
+            )
+        }
+    }
 }
 
 struct PythonHalfInputs {
@@ -933,11 +1001,9 @@ impl PythonHalfInputs {
         completion: ResolutionCompletion,
     ) -> PythonHalf<'a, 'store, 'input> {
         // This is the consuming accessor, reached for both memo hits and misses.
+        debug_assert_eq!(self.fragment, source.identity.fragment());
         rules.record_unplaced_scope(source.token, &self.query_obligations, &self.requesting_path);
         PythonHalf {
-            query_obligations: std::rc::Rc::clone(&self.query_obligations),
-            rules,
-            source,
             placements: self
                 .containers
                 .iter()
@@ -950,19 +1016,21 @@ impl PythonHalfInputs {
                 .collect(),
             import_site: self.import_site,
             import_name: self.import_name.clone(),
-            rows: std::sync::Arc::clone(&self.rows),
-            fragment: self.fragment,
-            blob: self.blob,
             reference_site: self.reference_site,
             deferred_module_scope: self.deferred_module_scope,
             prefix: self.prefix.clone(),
             universe_unmutated: self.universe_unmutated,
             import_aliases: std::rc::Rc::clone(&self.import_aliases),
             module_mutations: std::rc::Rc::clone(&self.module_mutations),
-            completion: completion.combine(&self.endpoint_completion),
-            stopped: std::cell::Cell::new(false),
-            member_observations: RefCell::new(Vec::new()),
-            rendered_order: std::rc::Rc::clone(&self.rendered_order),
+            ..PythonHalf::new(
+                rules,
+                source,
+                completion.combine(&self.endpoint_completion),
+                std::rc::Rc::clone(&self.query_obligations),
+                std::sync::Arc::clone(&self.rows),
+                self.blob,
+                std::rc::Rc::clone(&self.rendered_order),
+            )
         }
     }
 }
@@ -2258,14 +2326,27 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         _: &'b crate::analyzer::store::resolution_lexical::NodeSourceScopes,
         _: &'b dyn HalfSource,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-    ) -> Result<Option<Self::Half<'b>>> {
+    ) -> Result<HalfRowsOutcome<Self::Half<'b>>> {
+        if self.cancellation.is_cancelled() {
+            return Ok(HalfRowsOutcome::Stopped);
+        }
         if let Some(inputs) = self.source_inputs.borrow().get(&source.identity) {
-            return Ok(Some(inputs.view(self, source, frame.completion.clone())));
+            return Ok(HalfRowsOutcome::Rows(inputs.view(
+                self,
+                source,
+                frame.completion.clone(),
+            )));
         }
         let Some(mount) = SelectedMountTable::new(&self.ready.inventory)
             .mount_for_fragment(source.identity.fragment())?
         else {
-            return Ok(None);
+            // #7314: planned halves come from selected mount and stage rows;
+            // the rebaser accepts every selected ordinal. A missing mount
+            // therefore violates the selected store contract.
+            return Err(StoreError::corrupt(format!(
+                "planned Python half fragment {:?} has no selected mount",
+                source.identity.fragment()
+            )));
         };
         let mount_record = self
             .ready
@@ -2324,7 +2405,38 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
             None => None,
         };
         let Some(rows) = self.load_binding_rows(blob, Some(mount_record.blob_oid()))? else {
-            return Ok(None);
+            if self.cancellation.is_cancelled() {
+                return Ok(HalfRowsOutcome::Stopped);
+            }
+            let format = self
+                .ready
+                .inventory
+                .connection()
+                .prepare_cached(PYTHON_BINDING_SOURCE_FORMAT)?
+                .query_row([blob], |row| row.get::<_, i64>(0))
+                .optional()?;
+            let (label, evidence) = match format {
+                Some(format)
+                    if format
+                        != crate::analyzer::store::python_binding_rows::NATIVE_SOURCE_FORMAT =>
+                {
+                    (
+                        "python_binding_format_stale",
+                        format!("native binding source format {format} is stale"),
+                    )
+                }
+                _ => (
+                    "python_binding_rows_missing",
+                    format!("native binding rows are unavailable for blob {blob}"),
+                ),
+            };
+            return Ok(HalfRowsOutcome::Rows(PythonHalf::open(
+                self,
+                source,
+                frame.completion.clone(),
+                label,
+                &evidence,
+            )));
         };
         let reference_site = self.ready.inventory.connection().query_row(
             "SELECT reference_source_site FROM resolution_root_route_segments WHERE blob_id=?1 AND path_key=?2 AND reference_source_site IS NOT NULL
@@ -2486,7 +2598,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 .insert(source.identity, prepared)
                 .is_none()
         );
-        Ok(Some(view))
+        Ok(HalfRowsOutcome::Rows(view))
     }
     fn activation(&self, frame: &RootFrame, half: HalfId) -> CandidateDecision {
         match &frame.halves[half.0] {
@@ -3219,6 +3331,9 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
         _: &EndpointSignature,
         _: &ReadySelectedResolution<'_, '_>,
     ) -> Option<ResolutionCompletion> {
+        if self.open.is_some() {
+            return None;
+        }
         let inputs = self.rules.source_inputs.borrow();
         let completion = &inputs
             .get(&source.identity)
@@ -3321,7 +3436,10 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
         std::mem::take(&mut self.placements)
     }
     fn initial_completion(&self) -> ResolutionCompletion {
-        self.completion.clone()
+        self.open.as_ref().map_or_else(
+            || self.completion.clone(),
+            |open| self.completion.combine(open.completion()),
+        )
     }
     fn placement(
         &self,

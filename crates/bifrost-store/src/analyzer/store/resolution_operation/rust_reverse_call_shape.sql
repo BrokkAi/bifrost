@@ -23,9 +23,17 @@ SELECT CASE
       )
   ) THEN 1
   WHEN json_extract(arena.spans,'$[' || context.source_occurrence || '][4]') IS NOT ?8 THEN 1
+  -- A non-callee reference lets the callable escape only as a value, and
+  -- Rust names a fn item or associated fn as a value only by a path
+  -- expression: a ValueReference (struct shorthand `S { f }` lowers to one).
+  -- Unsupported and synthetic sites may hide one, so they are retained too;
+  -- the shared incoming projector marks the caller inventory Incomplete for
+  -- each. Import, field, type, module and macro sites cannot denote the
+  -- callable's value and stay excluded.
   WHEN obligation.callee_reference IS NULL
        AND site.site_kind<>?4
-       AND NOT (site.site_kind=?5 AND site.namespace=?6) THEN 0
+       AND NOT (site.site_kind=?5 AND site.namespace=?6)
+    THEN site.site_kind IN (?11,?12,?13,?14)
   -- An absent obligation or exact-argument eligibility means unknown actuals,
   -- including empty-looking macro transcribers and cfg-attributed arguments.
   WHEN obligation.callee_reference IS NULL OR NOT EXISTS (

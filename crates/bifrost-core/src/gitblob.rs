@@ -39,13 +39,22 @@ impl BlobKey {
 }
 
 /// The configuration-dependent component of a blob's parse identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ParseVariant {
     Empty,
     Digest([u8; 32]),
 }
 
 impl ParseVariant {
+    /// Optional File read-key field, shared by canonical and persisted forms.
+    /// Omitting Empty preserves the encoding of pre-variant receipts.
+    pub fn file_read_key_field(&self) -> Option<&[u8]> {
+        match self {
+            Self::Empty => None,
+            Self::Digest(digest) => Some(digest),
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Empty => &[],

@@ -304,6 +304,7 @@ labelled_enum! {
         OverloadIdentityUnproven => "overload_identity_unproven",
         AncestorExternalUnindexed => "ancestor_external_unindexed",
         HierarchyTruncated => "hierarchy_truncated",
+        HierarchyAmbiguous => "hierarchy_ambiguous",
         FamilyRootNotCanonical => "family_root_not_canonical",
     }
 }

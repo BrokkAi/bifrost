@@ -14,7 +14,6 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use chrono::{DateTime, SecondsFormat, Utc};
 use git2::{Commit, DiffFindOptions, DiffOptions, Repository, Sort};
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 use std::collections::HashMap as StdHashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,6 +66,7 @@ impl HotspotCategory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthorInfo {
     name: String,
+    email: String,
     commits: usize,
 }
 
@@ -86,6 +86,7 @@ struct HotspotReport {
     timeframe: String,
     total_unique_files: usize,
     truncated: bool,
+    history_errors: Vec<String>,
     files: Vec<FileHotspotInfo>,
 }
 
@@ -94,7 +95,6 @@ struct FileStats {
     churn: usize,
     author_counts: StdHashMap<String, usize>,
     author_names: StdHashMap<String, String>,
-    last_modified_epoch_secs: Option<i64>,
 }
 
 pub fn analyze_git_hotspots(
@@ -146,6 +146,7 @@ fn analyze_report(
             timeframe,
             total_unique_files: 0,
             truncated: false,
+            history_errors: Vec::new(),
             files: Vec::new(),
         });
     }
@@ -155,16 +156,27 @@ fn analyze_report(
 
     let mut stats_by_file: StdHashMap<ProjectFile, FileStats> = StdHashMap::new();
     let mut analyzed_commits = 0usize;
+    let mut history_errors = Vec::new();
+    let mut commits_truncated = false;
 
     for (examined_commits, oid) in walker.enumerate() {
         if examined_commits >= max_commits {
+            commits_truncated = true;
             break;
         }
-        let Ok(oid) = oid else {
-            continue;
+        let oid = match oid {
+            Ok(oid) => oid,
+            Err(err) => {
+                history_errors.push(format!("revwalk failed: {err}"));
+                break;
+            }
         };
-        let Ok(commit) = repo.find_commit(oid) else {
-            continue;
+        let commit = match repo.find_commit(oid) {
+            Ok(commit) => commit,
+            Err(err) => {
+                history_errors.push(format!("could not read commit {oid}: {err}"));
+                continue;
+            }
         };
         if !commit_in_window(&commit, &since, until.as_ref()) {
             continue;
@@ -184,12 +196,17 @@ fn analyze_report(
         .into_iter()
         .filter(|(file, _)| file.exists())
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|(_, stats)| Reverse(stats.churn));
+    candidates.sort_by(|(left_file, left_stats), (right_file, right_stats)| {
+        right_stats
+            .churn
+            .cmp(&left_stats.churn)
+            .then_with(|| left_file.cmp(right_file))
+    });
 
     let total_unique_files = candidates.len();
     let cap = max_files.min(MAX_FILES_IN_REPORT_HARD_CAP);
-    let truncated = total_unique_files > cap;
-    if truncated {
+    let files_truncated = total_unique_files > cap;
+    if files_truncated {
         candidates.truncate(cap);
     }
     let files = candidates
@@ -202,7 +219,8 @@ fn analyze_report(
         analyzed_commits,
         timeframe,
         total_unique_files,
-        truncated,
+        truncated: commits_truncated || files_truncated,
+        history_errors,
         files,
     })
 }
@@ -286,7 +304,6 @@ fn process_commit(
     let author = commit.author();
     let email = author.email().unwrap_or_default().to_string();
     let name = author.name().unwrap_or_default().to_string();
-    let commit_secs = author.when().seconds();
 
     let changed_files = changed_project_files_for_commit(
         repo,
@@ -304,12 +321,6 @@ fn process_commit(
             .author_names
             .entry(email.clone())
             .or_insert(name.clone());
-        if stats
-            .last_modified_epoch_secs
-            .is_none_or(|current| commit_secs > current)
-        {
-            stats.last_modified_epoch_secs = Some(commit_secs);
-        }
     }
     Ok(())
 }
@@ -433,10 +444,17 @@ fn create_file_info(
         .into_iter()
         .map(|(email, commits)| AuthorInfo {
             name: stats.author_names.get(&email).cloned().unwrap_or_default(),
+            email,
             commits,
         })
         .collect::<Vec<_>>();
-    top_authors.sort_by_key(|author| Reverse(author.commits));
+    top_authors.sort_by(|left, right| {
+        right
+            .commits
+            .cmp(&left.commits)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.email.cmp(&right.email))
+    });
     top_authors.truncate(5);
 
     Some(FileHotspotInfo {
@@ -482,6 +500,12 @@ fn format_hotspot_report_markdown(report: &HotspotReport) -> String {
         report.total_unique_files
     ));
     lines.line(format!("- Truncated: {}", report.truncated));
+    for error in &report.history_errors {
+        lines.line(format!(
+            "- History incomplete: {}",
+            sanitize_table_cell(error)
+        ));
+    }
     lines.blank();
 
     if report.files.is_empty() {
@@ -516,6 +540,7 @@ mod tests {
     use crate::code_quality::git_hotspots::*;
 
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
     use git2::{Repository, Signature};
     use std::fs;
     use std::path::MAIN_SEPARATOR_STR;
@@ -616,6 +641,486 @@ mod tests {
 
     fn rel(rel: &str) -> String {
         rel.replace('/', MAIN_SEPARATOR_STR)
+    }
+
+    fn report_for(fixture: &AnalyzerFixture, max_commits: i32, max_files: i32) -> String {
+        analyze_git_hotspots(
+            fixture.analyzer.analyzer(),
+            AnalyzeGitHotspotsParams {
+                since_days: 0,
+                since_iso: "2020-06-01T00:00:00Z".to_string(),
+                until_iso: String::new(),
+                max_commits,
+                max_files,
+            },
+        )
+        .report
+    }
+
+    #[hardwon("969d61d302f9: commit cap hid a cut history")]
+    #[test]
+    fn commit_cap_reports_a_cut_only_when_more_history_exists() {
+        let fixture = fixture_with_repo();
+        let cut = report_for(&fixture, 1, 75);
+        assert!(cut.contains("- Truncated: true"), "{cut}");
+        assert!(cut.contains("- Analyzed commits: 1"), "{cut}");
+        let complete = report_for(&fixture, 15, 75);
+        assert!(complete.contains("- Truncated: false"), "{complete}");
+        assert!(complete.contains("- Analyzed commits: 15"), "{complete}");
+    }
+
+    #[hardwon("aae03f4e5a48: equal churn rows depended on hash iteration")]
+    #[test]
+    fn equal_score_rows_are_repeatable() {
+        let fixture = AnalyzerFixture::new(&[
+            ("src/A.java", "class A {}\n"),
+            ("src/B.java", "class B {}\n"),
+        ]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "both",
+            "Alice",
+            "a@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/A.java", "src/B.java"],
+        );
+        let first = report_for(&fixture, 1, 75);
+        assert!(
+            first.contains(&format!("| `{}` | 1 |", rel("src/A.java"))),
+            "{first}"
+        );
+        assert!(
+            first.contains(&format!("| `{}` | 1 |", rel("src/B.java"))),
+            "{first}"
+        );
+        for _ in 0..16 {
+            assert_eq!(report_for(&fixture, 1, 75), first);
+        }
+    }
+
+    #[hardwon("969d61d302f9: equal author counts depended on hash iteration")]
+    #[test]
+    fn equal_author_counts_are_repeatable() {
+        let fixture = AnalyzerFixture::new(&[("src/A.java", "class A {}\n")]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "a",
+            "Alice",
+            "a@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/A.java"],
+        );
+        fs::write(
+            fixture.project_root().join("src/A.java"),
+            "class A { int n; }\n",
+        )
+        .expect("rewrite");
+        commit_paths(
+            &repo,
+            "b",
+            "Bob",
+            "b@example.com",
+            "2020-06-02T00:00:00Z",
+            &["src/A.java"],
+        );
+        let first = report_for(&fixture, 2, 75);
+        assert!(
+            first.contains("Alice(1)") && first.contains("Bob(1)"),
+            "{first}"
+        );
+        for _ in 0..16 {
+            assert_eq!(report_for(&fixture, 2, 75), first);
+        }
+    }
+
+    #[test]
+    fn hotspot_history_renders_counts_categories_and_limits() {
+        let fixture = fixture_with_repo();
+        let full = report_for(&fixture, 15, 75);
+        assert!(full.contains("- Analyzed commits: 15"), "{full}");
+        assert!(full.contains("- Unique files (before cap): 3"), "{full}");
+        assert!(
+            full.contains(&format!(
+                "| `{}` | 15 | 16 | HOTSPOT |",
+                rel("src/ComplexService.java")
+            )),
+            "{full}"
+        );
+        assert!(
+            full.contains(&format!(
+                "| `{}` | 1 | 1 | STABLE |",
+                rel("src/StableService.java")
+            )),
+            "{full}"
+        );
+        assert!(
+            full.contains(&format!(
+                "| `{}` | 1 | 16 | ABANDONWARE |",
+                rel("src/UnusedService.java")
+            )),
+            "{full}"
+        );
+        assert!(full.contains("dev0(5)"), "{full}");
+        let capped = report_for(&fixture, 15, 1);
+        assert!(capped.contains("- Truncated: true"), "{capped}");
+        assert_eq!(
+            capped
+                .lines()
+                .filter(|line| line.starts_with("| `"))
+                .count(),
+            1,
+            "{capped}"
+        );
+        assert!(capped.contains(&rel("src/ComplexService.java")), "{capped}");
+        let defaulted = report_for(&fixture, 0, 0);
+        assert!(defaulted.contains("- Analyzed commits: 15"), "{defaulted}");
+        assert!(
+            defaulted.contains("- Unique files (before cap): 3"),
+            "{defaulted}"
+        );
+        assert!(!defaulted.ends_with('\n'), "{defaulted}");
+    }
+
+    #[test]
+    fn file_complexity_uses_most_complex_method() {
+        let source = format!(
+            "class Mixed {{ void simple() {{}} void complex(int x) {{\n{}}} }}\n",
+            (0..16)
+                .map(|n| format!("if (x > {n}) {{}}\n"))
+                .collect::<String>()
+        );
+        let fixture = AnalyzerFixture::new(&[("src/Mixed.java", source.as_str())]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "mixed",
+            "Alice",
+            "a@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/Mixed.java"],
+        );
+        let report = report_for(&fixture, 1, 75);
+        assert!(
+            report.contains(&format!(
+                "| `{}` | 1 | 17 | ABANDONWARE |",
+                rel("src/Mixed.java")
+            )),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn time_window_and_iso_inputs_are_honored() {
+        let fixture = fixture_with_repo();
+        let params = |since: &str, until: &str| AnalyzeGitHotspotsParams {
+            since_days: 1,
+            since_iso: since.to_string(),
+            until_iso: until.to_string(),
+            max_commits: 100,
+            max_files: 75,
+        };
+        let at_lower = analyze_git_hotspots(
+            fixture.analyzer.analyzer(),
+            params("2020-06-01T00:00:00Z", "2020-06-02T00:00:00Z"),
+        )
+        .report;
+        assert!(at_lower.contains("- Analyzed commits: 1"), "{at_lower}");
+        assert!(
+            at_lower.contains("- Timeframe: since 2020-06-01T00:00:00Z until 2020-06-02T00:00:00Z"),
+            "{at_lower}"
+        );
+        let before_upper = analyze_git_hotspots(
+            fixture.analyzer.analyzer(),
+            params("2020-06-02T00:00:00Z", "2020-06-03T00:00:00Z"),
+        )
+        .report;
+        assert!(
+            before_upper.contains("- Analyzed commits: 1"),
+            "{before_upper}"
+        );
+        let invalid = analyze_git_hotspots(
+            fixture.analyzer.analyzer(),
+            params("2020-06-01T00:00:00Z", "X"),
+        )
+        .report;
+        assert_eq!(invalid, "Invalid ISO-8601 instant: X");
+        let open = analyze_git_hotspots(
+            fixture.analyzer.analyzer(),
+            params("2020-06-01T00:00:00Z", ""),
+        )
+        .report;
+        assert!(open.contains("- Analyzed commits: 15"), "{open}");
+        assert!(
+            open.contains("- Timeframe: since 2020-06-01T00:00:00Z\n"),
+            "{open}"
+        );
+    }
+
+    #[test]
+    fn renamed_file_keeps_its_history() {
+        let fixture = AnalyzerFixture::new(&[("src/Before.java", "class Before { int value; }\n")]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "initial",
+            "Alice",
+            "a@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/Before.java"],
+        );
+        fs::rename(
+            fixture.project_root().join("src/Before.java"),
+            fixture.project_root().join("src/After.java"),
+        )
+        .expect("rename");
+        let mut index = repo.index().expect("index");
+        index
+            .remove_path(Path::new("src/Before.java"))
+            .expect("remove old path");
+        index.write().expect("index write");
+        commit_paths(
+            &repo,
+            "rename",
+            "Bob",
+            "b@example.com",
+            "2020-06-02T00:00:00Z",
+            &["src/After.java"],
+        );
+        let report = report_for(&fixture, 2, 75);
+        assert!(
+            report.contains(&format!("| `{}` | 1 |", rel("src/After.java"))),
+            "{report}"
+        );
+        assert!(!report.contains("Before.java"), "{report}");
+    }
+
+    #[test]
+    fn authors_are_counted_and_ranked_from_commit_history() {
+        let fixture =
+            AnalyzerFixture::new(&[("src/Authors.java", "class Authors { int n = 0; }\n")]);
+        let repo = init_repo(&fixture.project_root());
+        for (i, (name, email)) in [
+            ("Alice", "a@example.com"),
+            ("Bob", "b@example.com"),
+            ("Bob", "b@example.com"),
+            ("Carol", "c@example.com"),
+            ("Dave", "d@example.com"),
+            ("Eve", "e@example.com"),
+            ("Frank", "f@example.com"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fs::write(
+                fixture.project_root().join("src/Authors.java"),
+                format!("class Authors {{ int n = {i}; }}\n"),
+            )
+            .expect("rewrite");
+            commit_paths(
+                &repo,
+                "change",
+                name,
+                email,
+                &format!("2020-06-{:02}T00:00:00Z", i + 1),
+                &["src/Authors.java"],
+            );
+        }
+        let report = report_for(&fixture, 7, 75);
+        assert!(report.contains("| 7 |"), "{report}");
+        assert!(report.contains("Bob(2)"), "{report}");
+        assert_eq!(report.matches("(1)").count(), 4, "{report}");
+    }
+
+    #[test]
+    fn churn_and_complexity_boundaries_classify_files() {
+        let complex = format!(
+            "class Boundary {{ void run(int x) {{ {} }} }}\n",
+            (0..14)
+                .map(|n| format!("if (x == {n}) {{}} "))
+                .collect::<String>()
+        );
+        let fixture = AnalyzerFixture::new(&[
+            ("src/Boundary.java", &complex),
+            ("src/Active.java", "class Active { int n; }\n"),
+        ]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "initial",
+            "Alice",
+            "a@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/Boundary.java", "src/Active.java"],
+        );
+        for i in 1..11 {
+            fs::write(
+                fixture.project_root().join("src/Active.java"),
+                format!("class Active {{ int n = {i}; }}\n"),
+            )
+            .expect("rewrite");
+            commit_paths(
+                &repo,
+                "change",
+                "Alice",
+                "a@example.com",
+                &format!("2020-06-{:02}T00:00:00Z", i + 1),
+                &["src/Active.java"],
+            );
+        }
+        let report = report_for(&fixture, 11, 75);
+        assert!(
+            report.contains(&format!("| `{}` | 11 |", rel("src/Active.java"))),
+            "{report}"
+        );
+        assert!(
+            report.contains("| 11 | 0 | ACTIVE |") || report.contains("| 11 | 1 | ACTIVE |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "| `{}` | 1 | 15 | STABLE |",
+                rel("src/Boundary.java")
+            )),
+            "{report}"
+        );
+    }
+
+    #[hardwon("969d61d302f9: revwalk errors silently dropped history")]
+    #[test]
+    fn broken_history_reports_incompleteness() {
+        let fixture = AnalyzerFixture::new(&[("src/A.java", "class A {}\n")]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "initial",
+            "Alice",
+            "a@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/A.java"],
+        );
+        let mut head = repo.head().expect("head");
+        let parent = repo
+            .find_commit(head.target().expect("head oid"))
+            .expect("commit");
+        let raw = format!(
+            "tree {}\nparent {}\nparent 1111111111111111111111111111111111111111\nauthor Alice <a@example.com> 1591056000 +0000\ncommitter Alice <a@example.com> 1591056000 +0000\n\nbroken second parent\n",
+            parent.tree_id(),
+            parent.id()
+        );
+        let oid = repo
+            .odb()
+            .expect("odb")
+            .write(git2::ObjectType::Commit, raw.as_bytes())
+            .expect("write commit");
+        head.set_target(oid, "test broken history")
+            .expect("move head");
+        let report = report_for(&fixture, 10, 75);
+        assert!(report.contains("- History incomplete: "), "{report}");
+        assert!(
+            report.contains("revwalk failed") || report.contains("could not read commit"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn relative_day_window_and_blank_iso_include_recent_history() {
+        let fixture = AnalyzerFixture::new(&[("src/Recent.java", "class Recent {}\n")]);
+        let repo = init_repo(&fixture.project_root());
+        let when = SystemTime::now() - Duration::from_secs(12 * 60 * 60);
+        let iso = system_time_to_iso8601(when);
+        commit_paths(
+            &repo,
+            "recent",
+            "Alice",
+            "a@example.com",
+            &iso,
+            &["src/Recent.java"],
+        );
+        let report = analyze_git_hotspots(
+            fixture.analyzer.analyzer(),
+            AnalyzeGitHotspotsParams {
+                since_days: 1,
+                since_iso: "   ".to_string(),
+                until_iso: "   ".to_string(),
+                max_commits: 1,
+                max_files: 1,
+            },
+        )
+        .report;
+        assert!(report.contains("- Analyzed commits: 1"), "{report}");
+        assert!(report.contains(&rel("src/Recent.java")), "{report}");
+    }
+
+    #[test]
+    fn merge_churn_uses_first_parent_diff() {
+        let fixture = AnalyzerFixture::new(&[
+            ("src/A.java", "class A { int n = 0; }\n"),
+            ("src/B.java", "class B { int n = 0; }\n"),
+        ]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "base",
+            "Alice",
+            "a@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/A.java", "src/B.java"],
+        );
+        let mut head = repo.head().expect("head");
+        let base = repo
+            .find_commit(head.target().expect("base oid"))
+            .expect("base");
+        let signature = Signature::new("Alice", "a@example.com", &git2::Time::new(1591056000, 0))
+            .expect("signature");
+        let make_commit = |message: &str, parents: &[&Commit<'_>]| {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("src/A.java")).expect("add A");
+            index.add_path(Path::new("src/B.java")).expect("add B");
+            index.write().expect("index write");
+            let tree = repo
+                .find_tree(index.write_tree().expect("tree id"))
+                .expect("tree");
+            let oid = repo
+                .commit(None, &signature, &signature, message, &tree, parents)
+                .expect("commit");
+            repo.find_commit(oid).expect("find commit")
+        };
+        fs::write(
+            fixture.project_root().join("src/A.java"),
+            "class A { int n = 1; }\n",
+        )
+        .expect("A change");
+        let branch_a = make_commit("A branch", &[&base]);
+        fs::write(
+            fixture.project_root().join("src/A.java"),
+            "class A { int n = 0; }\n",
+        )
+        .expect("restore A");
+        fs::write(
+            fixture.project_root().join("src/B.java"),
+            "class B { int n = 1; }\n",
+        )
+        .expect("B change");
+        let branch_b = make_commit("B branch", &[&base]);
+        fs::write(
+            fixture.project_root().join("src/A.java"),
+            "class A { int n = 1; }\n",
+        )
+        .expect("merge A");
+        let merge = make_commit("merge", &[&branch_a, &branch_b]);
+        head.set_target(merge.id(), "merge test")
+            .expect("move head");
+        let report = report_for(&fixture, 4, 75);
+        assert!(
+            report.contains(&format!("| `{}` | 2 |", rel("src/A.java"))),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("| `{}` | 3 |", rel("src/B.java"))),
+            "{report}"
+        );
     }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
@@ -809,6 +1314,7 @@ mod tests {
         assert_eq!(
             info.top_authors,
             vec![AuthorInfo {
+                email: "dev0@example.com".to_string(),
                 name: "dev0".to_string(),
                 commits: 1,
             }]

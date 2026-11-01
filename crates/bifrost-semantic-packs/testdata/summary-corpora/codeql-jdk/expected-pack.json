@@ -1,5 +1,5 @@
 {
-  "schema_version": 20,
+  "schema_version": 21,
   "pack_id": "codeql.jdk21.summaries",
   "version": "1.0.0",
   "producer": {

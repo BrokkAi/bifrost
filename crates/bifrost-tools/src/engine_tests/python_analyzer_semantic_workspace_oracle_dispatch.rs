@@ -328,7 +328,7 @@ mod python_extraction_tests {
             )
             .expect("unhinted dispatch");
         let unhinted_result = unhinted_outcome.available_value().expect("unhinted answer");
-        assert_eq!(unhinted_result.coverage(), CandidateCoverage::Truncated);
+        assert_eq!(unhinted_result.coverage(), CandidateCoverage::Open);
         assert!(unhinted_result.complete_receiver_hint_refinable());
         assert!(
             unhinted_result
@@ -382,7 +382,7 @@ mod python_extraction_tests {
         let incomplete_result = incomplete_outcome
             .available_value()
             .expect("incompletely hinted answer");
-        assert_eq!(incomplete_result.coverage(), CandidateCoverage::Truncated);
+        assert_eq!(incomplete_result.coverage(), CandidateCoverage::Open);
         assert_eq!(
             incomplete_result.candidates().len(),
             1,

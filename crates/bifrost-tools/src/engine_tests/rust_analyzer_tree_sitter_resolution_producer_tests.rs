@@ -1079,6 +1079,7 @@ passthrough! {
                 let request = SelectedResolutionContentMountRequest::new(
                     witness,
                     WorkspaceFileRow {
+                        decision: None,
                         rel_path: "src/lib.rs".to_owned(),
                         blob_oid: oid,
                     },

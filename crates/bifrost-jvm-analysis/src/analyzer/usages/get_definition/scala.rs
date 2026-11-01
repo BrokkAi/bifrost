@@ -7771,6 +7771,21 @@ fn resolve_scala_type(
         }
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
+    // SCALA_PRECEDENCE_RULES (SLS 2): this compilation unit's package
+    // declarations precede imports, just as in the shared owner/type ladders.
+    match scala_same_file_type_owner(ctx, &type_segments, scala_type_node_owner_kind(node)) {
+        ScalaNameResolution::Resolved(owner) => {
+            return candidates_outcome(vec![owner._declaration]);
+        }
+        ScalaNameResolution::Ambiguous(owners) => {
+            return scala_ambiguous_outcome(
+                "ambiguous_scala_type",
+                scala_owner_declarations(owners),
+                format!("`{text}` has multiple same-file Scala type declarations"),
+            );
+        }
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
+    }
     if let Some((name, tail)) = type_segments.split_first() {
         let mut imported =
             match scala_value_import_namespace_candidates(ctx, token, resolver, root, name) {

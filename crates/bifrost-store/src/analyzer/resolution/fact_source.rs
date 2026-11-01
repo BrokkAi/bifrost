@@ -184,6 +184,8 @@ pub struct ModelCallableResultDeclaration {
     pub selection: crate::analyzer::semantic_model::overlay::ModelProviderSelection,
     pub declaration: crate::analyzer::semantic_model::overlay::SemanticModelSymbol,
     pub signature: Option<super::LoweredCallableSignatureProperty>,
+    /// Query-local lowering telemetry; never authority or persisted state.
+    pub lowering_work: usize,
 }
 
 /// One reached modeled receiver candidate. This is query-only provenance,
@@ -2739,48 +2741,9 @@ pub(crate) fn language_jvm_declaration_access_rules(
 }
 
 #[doc(hidden)]
-/// An implicit provider that can make a bare JVM name visible without an
-/// explicit import in the source file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum JvmImplicitRootProvider {
-    Package(&'static str),
-    ScalaPredef,
-}
-
-const JAVA_IMPLICIT_ROOT_PROVIDERS: &[JvmImplicitRootProvider] =
-    &[JvmImplicitRootProvider::Package("java.lang")];
-const KOTLIN_IMPLICIT_ROOT_PROVIDERS: &[JvmImplicitRootProvider] = &[
-    JvmImplicitRootProvider::Package("kotlin"),
-    JvmImplicitRootProvider::Package("kotlin.annotation"),
-    JvmImplicitRootProvider::Package("kotlin.collections"),
-    JvmImplicitRootProvider::Package("kotlin.comparisons"),
-    JvmImplicitRootProvider::Package("kotlin.io"),
-    JvmImplicitRootProvider::Package("kotlin.ranges"),
-    JvmImplicitRootProvider::Package("kotlin.sequences"),
-    JvmImplicitRootProvider::Package("kotlin.text"),
-    JvmImplicitRootProvider::Package("kotlin.jvm"),
-    JvmImplicitRootProvider::Package("java.lang"),
-];
-const SCALA_IMPLICIT_ROOT_PROVIDERS: &[JvmImplicitRootProvider] = &[
-    JvmImplicitRootProvider::Package("java.lang"),
-    JvmImplicitRootProvider::Package("scala"),
-    JvmImplicitRootProvider::ScalaPredef,
-];
-
-/// The implicit package and singleton providers whose missing inventory keeps
-/// a bare-name lookup open for one JVM language.
-#[doc(hidden)]
-pub const fn language_implicit_root_providers(
-    language: Language,
-) -> &'static [JvmImplicitRootProvider] {
-    match language {
-        Language::Java => JAVA_IMPLICIT_ROOT_PROVIDERS,
-        Language::Kotlin => KOTLIN_IMPLICIT_ROOT_PROVIDERS,
-        Language::Scala => SCALA_IMPLICIT_ROOT_PROVIDERS,
-        _ => &[],
-    }
-}
+pub use brokk_bifrost_jvm::intrinsics::{
+    JvmImplicitRootProvider, language_implicit_root_providers,
+};
 
 /// Java package imports supply types, whereas Kotlin and Scala also import
 /// terms. A widened type/value reference must not invent a value provider.

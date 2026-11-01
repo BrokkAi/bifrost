@@ -589,8 +589,6 @@ fn resolve_active_semantic_models_with_loader(
     report.phase_measurements.selection_nanos = elapsed_ns(selection_started);
 
     let mut selected = Vec::<CandidateSelection>::new();
-    // Bounded by max_catalog_candidates and retained only for this activation.
-    let mut newest_approximate_versions = HashMap::<String, Version>::default();
     let mut incomplete = false;
     let mut decode_hydration_nanos = 0u64;
     for candidate in candidates.into_values() {
@@ -649,12 +647,6 @@ fn resolve_active_semantic_models_with_loader(
             // An expectation requests a pack; it does not prove any of that
             // pack's toolchain coordinates or artifact digests exist locally.
             // Catalog discovery already checked engine compatibility.
-            let version = Version::parse(&loaded.manifest.version)
-                .expect("validated manifest version is semver");
-            newest_approximate_versions
-                .entry(loaded.manifest.pack_id.clone())
-                .and_modify(|newest| *newest = newest.clone().max(version.clone()))
-                .or_insert(version);
             let row = SemanticModelActivationEvidence {
                 language: loaded.manifest.language.clone(),
                 ecosystem: loaded.manifest.ecosystem.clone(),
@@ -780,12 +772,105 @@ fn resolve_active_semantic_models_with_loader(
         });
     }
 
+    // One active version per authored pack_id (#8405): two versions of one
+    // pack are one provider, not two, so model lookups must not see both. The
+    // higher-precedence source wins, then the newer version. Manifests that
+    // tie on both but differ in content are a genuine conflict, not versions
+    // of each other, so all of them stay active and composition reports the
+    // conflict; the manifest digest only picks which winner a Shadowed reason
+    // names. The same manifest from several sources survives here and meets
+    // the equivalent-shard rule below.
+    // Generated and workspace-produced packs are exact output for one
+    // dependency or source set: their pack_id names the producer family (for
+    // example bifrost.external.go) and their version is the engine's, so they
+    // are not versions of one pack and strict activation already selects them.
+    // Bounded by max_catalog_candidates and retained only for this activation.
+    let authored = |selection: &CandidateSelection| {
+        !matches!(
+            selection.active.source_kind,
+            CatalogPackSourceKind::Generated | CatalogPackSourceKind::WorkspaceProduced
+        )
+    };
+    let pack_keys = selected
+        .iter()
+        .map(|selection| {
+            (
+                selection.source_rank,
+                Version::parse(&selection.active.manifest.version)
+                    .expect("validated manifest version is semver"),
+                selection.active.manifest.content_sha256.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut pack_winners = HashMap::<&str, usize>::default();
+    for (index, selection) in selected.iter().enumerate() {
+        if !authored(selection) {
+            continue;
+        }
+        let winner = pack_winners
+            .entry(selection.active.manifest.pack_id.as_str())
+            .or_insert(index);
+        if pack_keys[index] > pack_keys[*winner] {
+            *winner = index;
+        }
+    }
+    let pack_winners = pack_winners
+        .into_iter()
+        .map(|(pack_id, index)| {
+            let winner = &selected[index].active;
+            (
+                pack_id.to_owned(),
+                (
+                    (pack_keys[index].0, pack_keys[index].1.clone()),
+                    winner.manifest.content_sha256.clone(),
+                    winner.source_kind,
+                    winner.source_id.clone(),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let pack_ranks = pack_keys
+        .into_iter()
+        .map(|(rank, version, _)| (rank, version))
+        .collect::<Vec<_>>();
+    let mut position = 0;
     selected.retain(|selection| {
-        !selection.active.approximate
-            || newest_approximate_versions
-                .get(&selection.active.manifest.pack_id)
-                .is_some_and(|newest| newest.to_string() == selection.active.manifest.version)
+        let rank = &pack_ranks[position];
+        position += 1;
+        if !authored(selection) {
+            return true;
+        }
+        let manifest = &selection.active.manifest;
+        let (winner_rank, digest, source_kind, source_id) = &pack_winners[&manifest.pack_id];
+        if rank == winner_rank || *digest == manifest.content_sha256 {
+            return true;
+        }
+        push_explanation(
+            &mut report,
+            request.limits,
+            SemanticModelActivationExplanation {
+                manifest_digest: manifest.content_sha256.clone(),
+                pack_id: Some(manifest.pack_id.clone()),
+                shard_id: selection.active.descriptor.shard_id.as_str().to_owned(),
+                source_kind: selection.active.source_kind,
+                source_id: selection.active.source_id.clone(),
+                status: SemanticModelActivationStatus::Shadowed,
+                reason: format!(
+                    "pack {} keeps one active version: version {} from {} source {source_id} takes precedence over version {}",
+                    manifest.pack_id,
+                    winner_rank.1,
+                    source_kind.as_str(),
+                    manifest.version
+                ),
+            },
+        );
+        false
     });
+    debug_assert_eq!(
+        position,
+        pack_ranks.len(),
+        "retain visits every selection once, in order"
+    );
     selected.sort_by(compare_selection);
     let mut active = Vec::new();
     let mut by_semantic_shard = BTreeMap::<(String, PayloadKind), usize>::new();

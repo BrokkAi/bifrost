@@ -1,27 +1,9 @@
 use crate::mcp_common::{
-    McpRenderOptions, json_schema_object, mutating_tool_descriptor, run_stdio_server,
-    summaries_schema, symbol_names_schema, tool_descriptor,
+    json_schema_object, mutating_tool_descriptor, summaries_schema, symbol_names_schema,
+    tool_descriptor,
 };
 use crate::searchtools::{SEARCH_SYMBOL_MAX_PATTERN_BYTES, SEARCH_SYMBOL_MAX_PATTERNS};
 use serde_json::{Value, json};
-use std::path::PathBuf;
-
-pub fn run_core_stdio_server(
-    root: PathBuf,
-    render_options: McpRenderOptions,
-) -> Result<(), String> {
-    let spec = crate::mcp_registry::resolve_server_spec_for_render_options("core", render_options)?;
-    run_stdio_server(Some(root), render_options, &spec, None)
-}
-
-pub fn run_searchtools_stdio_server(
-    root: PathBuf,
-    render_options: McpRenderOptions,
-) -> Result<(), String> {
-    let spec =
-        crate::mcp_registry::resolve_server_spec_for_render_options("searchtools", render_options)?;
-    run_stdio_server(Some(root), render_options, &spec, None)
-}
 
 pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
     let navigation_descriptors = if render_line_numbers {

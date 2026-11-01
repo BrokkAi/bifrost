@@ -40,6 +40,7 @@ use crate::kotlin::declarations::{
     KotlinClassLikeKind, kotlin_class_like_kind, kotlin_has_modifier, kotlin_package_name,
 };
 use crate::kotlin::imports::{kotlin_import_info_from_node, kotlin_import_path};
+use crate::kotlin::resolution::annotation_user_types;
 use crate::kotlin::supertypes::{extract_kotlin_supertype_segments, kotlin_user_type_segments};
 use crate::kotlin::syntax::{
     KotlinIntegerSuffix, kotlin_binding_type_node, kotlin_declared_type_parameter_names,
@@ -1507,23 +1508,6 @@ fn nominal_user_type(node: Node<'_>) -> Option<Node<'_>> {
         frontier = next;
     }
     None
-}
-
-/// The `user_type` nodes one `annotation` node spells. A multi-annotation
-/// (`@[A B]`) holds several; the ordinary form holds one, either directly or
-/// inside the `constructor_invocation` an annotation with arguments uses.
-fn annotation_user_types(annotation: Node<'_>) -> Vec<Node<'_>> {
-    named_children(annotation)
-        .into_iter()
-        .flat_map(|child| match child.kind() {
-            "user_type" => vec![child],
-            "constructor_invocation" => named_children(child)
-                .into_iter()
-                .filter(|inner| inner.kind() == "user_type")
-                .collect(),
-            _ => Vec::new(),
-        })
-        .collect()
 }
 
 /// Whether `name` is a type parameter of a declaration enclosing `scope`.

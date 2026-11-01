@@ -50,7 +50,11 @@ impl Producer<'_, '_> {
         self.facts.root_imports.push(ResolutionRootImportFact {
             site,
             root_scope: ctx.scope,
-            anchor: ResolutionRootImportAnchor::Lexical,
+            anchor: if csharp_using_directive_target_node(node).is_some_and(Self::absolute_path) {
+                ResolutionRootImportAnchor::Absolute
+            } else {
+                ResolutionRootImportAnchor::Lexical
+            },
             position: None,
         });
         if is_global {

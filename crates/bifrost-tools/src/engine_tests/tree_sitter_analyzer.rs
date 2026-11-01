@@ -234,6 +234,7 @@ mod tests {
 
     fn cache_key(name: &str) -> FileStateCacheKey {
         FileStateCacheKey {
+            variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
             oid: Oid::zero(),
             rel_path: PathBuf::from(name),
             admission_policy: SourceAdmissionPolicy::current(),
@@ -2525,6 +2526,13 @@ mod tests {
             cancellation: Option<CancellationToken>,
         }
         impl StoreLanguageAdapter for RangeAdapter {
+            // Test adapter.
+            fn parse_time_semantic_lowerer(
+                &self,
+            ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer>
+            {
+                None
+            }
             fn language(&self) -> Language {
                 Language::Cpp
             }
@@ -3783,6 +3791,8 @@ mod tests {
                 "python",
                 generation,
                 &[brokk_bifrost_analysis::analyzer::store::WorkspaceFileRow {
+                    // M4b-B2: decision
+                    decision: None,
                     rel_path: row.rel_path.clone(),
                     blob_oid: oid,
                 }],
@@ -5139,7 +5149,11 @@ mod tests {
             assert!(scope.read_completion().is_ok());
         }
         let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
-        assert!(ledger.keys().contains(&analyzer.file_read_key(&file, oid)));
+        assert!(ledger.keys().contains(&analyzer.file_read_key(
+            &file,
+            oid,
+            brokk_bifrost_core::gitblob::ParseVariant::Empty // M4b-B2: supply selected variant
+        )));
 
         let other_mount = analyzer
             .canonical_cpp_source_facts(&copy, "cpp", &cache)
@@ -6128,6 +6142,7 @@ mod tests {
 
         let key = |seed: u8| PreparedSyntaxCacheKey {
             file_state: FileStateCacheKey {
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 oid: Oid::hash_object(ObjectType::Blob, &[seed]).expect("blob oid"),
                 rel_path: PathBuf::from("src/main.rs"),
                 admission_policy: SourceAdmissionPolicy::current(),
@@ -6184,6 +6199,7 @@ mod tests {
         let mut store = PreparedSyntaxStore::new(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES);
         let key = PreparedSyntaxCacheKey {
             file_state: FileStateCacheKey {
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 oid: Oid::hash_object(ObjectType::Blob, b"oversized").expect("blob oid"),
                 rel_path: PathBuf::from("src/main.rs"),
                 admission_policy: SourceAdmissionPolicy::current(),
@@ -6215,6 +6231,7 @@ mod tests {
 
     fn import_key(seed: u8) -> FileStateCacheKey {
         FileStateCacheKey {
+            variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
             oid: Oid::hash_object(ObjectType::Blob, &[seed]).expect("blob oid"),
             rel_path: PathBuf::from("src/main.rs"),
             admission_policy: SourceAdmissionPolicy::current(),

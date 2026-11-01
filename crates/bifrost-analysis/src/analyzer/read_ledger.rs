@@ -88,8 +88,6 @@ pub use crate::analyzer::semantic::read_ledger::LookupQuestion;
 
 pub use crate::analyzer::semantic::read_ledger::CallSiteLocator;
 
-pub use crate::analyzer::semantic::read_ledger::ProcedureCallSiteLocator;
-
 /// The canonical digest of an answer that is a set of declarations.
 ///
 /// Sorted by mount-free identity, so it is a function of the set and not of the
@@ -212,7 +210,7 @@ pub fn signature_metadata_digest(
     );
     hasher.sequence("metadata", metadata, |hasher, metadata| {
         hasher.value(
-            &serde_json::to_vec(metadata)
+            &serde_json::to_vec(&metadata.without_source_positions())
                 .expect("signature metadata has a deterministic serialization"),
         );
     });
@@ -299,6 +297,10 @@ pub mod reason {
         };
     }
     reasons! {
+        JVM_INDEX_CAPPED_ENTRIES = "jvm.index.capped_entries" => None,
+        ARTIFACT_MEMBERS_LIMIT = "limit.artifact_members" => None,
+        KOTLIN_CLASSIFICATION_CAPPED = "kotlin.classification_capped" => None,
+        KOTLIN_CLASSIFICATION_MALFORMED = "kotlin.classification_malformed" => None,
         PREPROCESSING_PRESENT = "preprocessing_present" => None,
         MACRO_POSSIBLE = "macro_possible" => None,
         CPP_ANALYZER_UNAVAILABLE = "cpp_analyzer_unavailable" => Some(DerivationExecutionCause::Provider),
@@ -324,15 +326,30 @@ pub mod reason {
         CSHARP_COMPILATION_ACCESS_UNKNOWN = "csharp-compilation-access-unknown" => Some(DerivationExecutionCause::Provider),
         // The unmodeled tier includes compilation-wide usings, whose selected
         // extent is not yet ledgered. Preserve provider uncertainty.
-        CSHARP_USING_TIER_UNMODELED = "csharp_using_tier_unmodeled" => Some(DerivationExecutionCause::Provider),
+        CSHARP_COMPILATION_USINGS_INCOMPLETE = "csharp_compilation_usings_incomplete" => Some(DerivationExecutionCause::Provider),
+        CSHARP_CONDITIONAL_BRANCH_UNSEEN = "csharp_conditional_branch_unseen" => None,
+        CSHARP_MEMBER_ACCESS_UNMODELED = "csharp_member_access_unmodeled" => Some(DerivationExecutionCause::Provider),
+        CSHARP_SOURCE_ANCHOR_UNMODELED = "csharp_source_anchor_unmodeled" => Some(DerivationExecutionCause::Provider),
+        CSHARP_SOURCE_IMPORT_UNMODELED = "csharp_source_import_unmodeled" => Some(DerivationExecutionCause::Provider),
+        PYTHON_BINDING_ROWS_MISSING = "python_binding_rows_missing" => Some(DerivationExecutionCause::Provider),
+        PYTHON_BINDING_FORMAT_STALE = "python_binding_format_stale" => Some(DerivationExecutionCause::Provider),
+        CSHARP_ALIAS_CYCLE = "csharp_alias_cycle" => Some(DerivationExecutionCause::Provider),
         CSHARP_EXTERNAL_UNINDEXED = "csharp_external_unindexed" => Some(DerivationExecutionCause::Provider),
         CSHARP_INHERITED_TYPES_UNMODELED = "csharp_inherited_types_unmodeled" => Some(DerivationExecutionCause::Provider),
+        CSHARP_METHOD_APPLICABILITY_UNMODELED = "csharp_method_applicability_unmodeled" => Some(DerivationExecutionCause::Provider),
         OPEN_BOUNDARY = "OpenBoundary" => Some(DerivationExecutionCause::Provider),
         EXTERNAL_DECLARED_UNINDEXED = "external_declared_unindexed" => Some(DerivationExecutionCause::Provider),
         // A Go import is incomplete when its package rows are missing or
         // unconfirmed, which also depends on the selected external inventory.
         GO_IMPORT_INCOMPLETE = "go-import-incomplete" => Some(DerivationExecutionCause::Provider),
         OWNER_INVENTORY_OPEN = "OwnerInventoryOpen" => Some(DerivationExecutionCause::Provider),
+        HIERARCHY_INCOMPLETE = "hierarchy_incomplete" => None,
+        HIERARCHY_AMBIGUOUS = "hierarchy_ambiguous" => None,
+        // These explicit registrations preserve the prior unknown-label fallback.
+        JVM_IMPORT_SELECTOR_OPEN = "jvm-import-selector-open" => Some(DerivationExecutionCause::Provider),
+        JVM_IMPORT_OWNER_OPEN = "jvm-import-owner-open" => Some(DerivationExecutionCause::Provider),
+        JVM_PACK_PACKAGE_MEMBER = "jvm-pack-package-member" => Some(DerivationExecutionCause::Provider),
+        JVM_PACK_PACKAGE_MEMBER_OPEN = "JvmPackPackageMemberOpen" => Some(DerivationExecutionCause::Provider),
         AMBIGUOUS_MEMBER = "ambiguous_member" => None,
         AMBIGUOUS_PROCEDURE = "ambiguous_procedure" => None,
         AMBIGUOUS_STATEMENT_SPAN = "ambiguous_statement_span" => None,
@@ -406,6 +423,16 @@ pub mod reason {
                 DerivationExecutionCause::from_reason(label),
                 expected,
                 "{label}"
+            );
+        }
+        for label in [JVM_IMPORT_SELECTOR_OPEN, JVM_IMPORT_OWNER_OPEN] {
+            assert_eq!(
+                classify_known(label),
+                Some(Some(DerivationExecutionCause::Provider))
+            );
+            assert_eq!(
+                DerivationExecutionCause::from_reason(label),
+                DerivationExecutionCause::from_reason("future_execution_stop")
             );
         }
         assert_eq!(
@@ -581,6 +608,10 @@ pub struct ReadLedger {
     keys: Mutex<RecordedKeys>,
     unattributed_reads: AtomicUsize,
     execution_dependences: AtomicUsize,
+    first_refusal: OnceLock<brokk_bifrost_core::profiling::ReadRefusal>,
+    // Nested resolver funnels subsume unattributed inputs, but still forward
+    // execution dependence. Retain its origin independently for that channel.
+    first_execution_refusal: OnceLock<brokk_bifrost_core::profiling::ReadRefusal>,
 }
 
 impl Default for ReadLedger {
@@ -593,6 +624,8 @@ impl Default for ReadLedger {
             keys: Mutex::default(),
             unattributed_reads: AtomicUsize::default(),
             execution_dependences: AtomicUsize::default(),
+            first_refusal: OnceLock::new(),
+            first_execution_refusal: OnceLock::new(),
         }
     }
 }
@@ -745,23 +778,57 @@ impl ReadLedger {
     /// This is the self-check that makes the reuse claim sound: a unit whose
     /// ledger counted one of these read something the ledger cannot verify, so
     /// the unit is `Unbounded` and is never reused.
+    #[track_caller]
     pub fn record_unattributed(&self) {
         self.record_unattributed_reads(1);
     }
 
+    #[track_caller]
     pub fn record_unattributed_reads(&self, count: usize) {
+        if count > 0
+            && brokk_bifrost_core::profiling::enabled()
+            && self.first_refusal.get().is_none()
+        {
+            let refusal = brokk_bifrost_core::profiling::current_read_refusal("unattributed")
+                .expect("timing is enabled");
+            self.first_refusal.get_or_init(|| refusal);
+        }
         self.unattributed_reads.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Execution depended on state that named content reads cannot reproduce.
     /// Use the same admission rule as an unattributable read.
+    #[track_caller]
     pub fn mark_execution_dependent(&self) {
         self.mark_execution_dependent_reads(1);
     }
 
+    #[track_caller]
     pub fn mark_execution_dependent_reads(&self, count: usize) {
+        if count > 0
+            && brokk_bifrost_core::profiling::enabled()
+            && self.first_execution_refusal.get().is_none()
+        {
+            let refusal =
+                brokk_bifrost_core::profiling::current_read_refusal("execution_dependent")
+                    .expect("timing is enabled");
+            self.first_refusal.get_or_init(|| refusal.clone());
+            let execution = brokk_bifrost_core::profiling::current_execution_read_refusal()
+                .expect("timing is enabled");
+            self.first_execution_refusal.get_or_init(|| execution);
+        }
         self.execution_dependences
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub(crate) fn first_execution_refusal(
+        &self,
+    ) -> Option<brokk_bifrost_core::profiling::ReadRefusal> {
+        self.first_execution_refusal.get().cloned()
+    }
+
+    pub fn first_refusal(&self) -> Option<brokk_bifrost_core::profiling::ReadRefusal> {
+        self.first_refusal.get().cloned()
     }
 
     /// Execution events survive resolver narrowing: they are not input reads.
@@ -845,7 +912,12 @@ mod tests {
     use crate::test_support::synthetic_oid as oid;
 
     fn file_key(path: &str, byte: u8) -> ReadKey {
-        ReadKey::file(Language::Rust, path, oid(byte))
+        ReadKey::file(
+            Language::Rust,
+            path,
+            oid(byte),
+            brokk_bifrost_core::gitblob::ParseVariant::Empty,
+        )
     }
 
     #[test]
@@ -1094,11 +1166,8 @@ mod tests {
             },
             LookupQuestion::CallSite {
                 rel_path: Box::from("src/a.rs"),
-                artifact: StableDigest::sha256("artifact"),
-                site: CallSiteLocator {
-                    start_byte: 0,
-                    end_byte: 0,
-                },
+                procedure: StableDigest::sha256("artifact"),
+                site: CallSiteLocator { ordinal: 0 },
             },
             LookupQuestion::Summary {
                 identity: StableDigest::sha256("artifact"),
@@ -1136,25 +1205,18 @@ mod tests {
                 LookupKind::Dispatch,
                 LookupQuestion::CallSite {
                     rel_path: Box::from("src/a.rs"),
-                    artifact: subject,
-                    site: CallSiteLocator {
-                        start_byte: 10,
-                        end_byte: 20,
-                    },
+                    procedure: subject,
+                    site: CallSiteLocator { ordinal: 0 },
                 },
                 answer,
             )
             .canonical_digest(),
             ReadKey::lookup(
                 LookupKind::ProcedureDispatch,
-                LookupQuestion::ProcedureCallSite {
+                LookupQuestion::CallSite {
                     rel_path: Box::from("src/a.rs"),
                     procedure: subject,
-                    site: ProcedureCallSiteLocator {
-                        start_byte: 10,
-                        end_byte: 20,
-                        ordinal: 0,
-                    },
+                    site: CallSiteLocator { ordinal: 0 },
                 },
                 answer,
             )
@@ -1212,29 +1274,18 @@ mod tests {
             },
             LookupQuestion::CallSite {
                 rel_path: Box::from("src/a.rs"),
-                artifact: StableDigest::sha256("artifact"),
-                site: CallSiteLocator {
-                    start_byte: 10,
-                    end_byte: 20,
-                },
+                procedure: StableDigest::sha256("artifact"),
+                site: CallSiteLocator { ordinal: 0 },
             },
-            LookupQuestion::ProcedureCallSite {
+            LookupQuestion::CallSite {
                 rel_path: Box::from("src/a.rs"),
                 procedure: StableDigest::sha256("procedure"),
-                site: ProcedureCallSiteLocator {
-                    start_byte: 3,
-                    end_byte: 13,
-                    ordinal: 1,
-                },
+                site: CallSiteLocator { ordinal: 1 },
             },
-            LookupQuestion::ProcedureCallSite {
+            LookupQuestion::CallSite {
                 rel_path: Box::from("src/a.rs"),
                 procedure: StableDigest::sha256("artifact"),
-                site: ProcedureCallSiteLocator {
-                    start_byte: 0,
-                    end_byte: 0,
-                    ordinal: 0,
-                },
+                site: CallSiteLocator { ordinal: 0 },
             },
             LookupQuestion::Summary {
                 identity: StableDigest::sha256("summary"),

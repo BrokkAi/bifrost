@@ -1,3 +1,4 @@
+-- Rust-only module placement uses the empty parse variant.
 -- A module declaration resolves against one of two bases, and the walk carries
 -- both because Rust does.
 --

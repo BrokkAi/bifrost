@@ -1710,6 +1710,9 @@ fn project_boundary_effect(
         crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. } => b"deferred",
         crate::analyzer::semantic::DispatchBoundaryKind::Unresolved => b"unresolved",
         crate::analyzer::semantic::DispatchBoundaryKind::Truncated => b"truncated",
+        crate::analyzer::semantic::DispatchBoundaryKind::HierarchyUnenumerated => {
+            b"hierarchy_unenumerated"
+        }
     });
     Ok(SummaryEffect::new(
         SummaryEffectKey::UnknownCallBoundary {

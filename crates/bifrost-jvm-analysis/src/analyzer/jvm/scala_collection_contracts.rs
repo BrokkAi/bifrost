@@ -432,7 +432,9 @@ pub(super) fn scala_standard_collection_contracts(
     else {
         return products;
     };
-    let mut unproven = Vec::new();
+    // Each withheld declaration is reported on its own, so release verification
+    // accounts every reject as a declaration gap.
+    let mut unproven: Vec<(String, String)> = Vec::new();
 
     // `Map` declares the protocol only in a reduced artifact; the real library
     // inherits it. Either way it describes the declared receiver type, which
@@ -449,7 +451,7 @@ pub(super) fn scala_standard_collection_contracts(
                     member
                 }
                 Err(reason) => {
-                    unproven.push(format!("{SCALA_MUTABLE_MAP}.{name}: {reason}"));
+                    unproven.push((format!("{SCALA_MUTABLE_MAP}.{name}"), reason));
                     continue;
                 }
             },
@@ -480,22 +482,32 @@ pub(super) fn scala_standard_collection_contracts(
                         products.complete_families.push(member.id.clone());
                         products.flows.push(flow);
                     }
-                    None => unproven.push(format!("{SCALA_MUTABLE_HASH_MAP}.{name}")),
+                    None => unproven.push((
+                        format!("{SCALA_MUTABLE_HASH_MAP}.{name}"),
+                        "no sole protocol member with a complete contract".to_owned(),
+                    )),
                 }
             }
             match map_factory_member(&names, scopes, members, map, hash_map) {
                 Some(factory) => products.members.push(factory),
-                None => unproven.push(format!("{SCALA_MUTABLE_MAP}.apply factory")),
+                None => unproven.push((
+                    format!("{SCALA_MUTABLE_MAP}.apply"),
+                    "the HashMap-backed factory cannot be proven".to_owned(),
+                )),
             }
         }
-        None => unproven.push(SCALA_MUTABLE_HASH_MAP.to_owned()),
+        None => unproven.push((
+            SCALA_MUTABLE_HASH_MAP.to_owned(),
+            "the artifact has no two-parameter HashMap class".to_owned(),
+        )),
     }
-    if !unproven.is_empty() {
-        diagnostics.warning(
+    for (declaration, reason) in unproven {
+        diagnostics.warning_for_declaration(
             "scala.collection_flow.unproven",
             None,
+            declaration.clone(),
             format!(
-                "Scala standard-library collection contracts were withheld because the artifact does not prove these declarations: {unproven:?}"
+                "Scala standard-library collection contracts were withheld because the artifact does not prove {declaration}: {reason}"
             ),
         );
     }

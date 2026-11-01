@@ -298,6 +298,9 @@ pub struct RowJoin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowJoinKind {
     Inner,
+    /// Keep every left row. A left row with no partner contributes one row
+    /// whose right-side fields are absent.
+    Left,
     /// Keep the left rows that have at least one partner, without carrying the
     /// right side's columns. A semi join filters instead of multiplying rows.
     Semi,
@@ -308,6 +311,7 @@ impl RowJoinKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Inner => "inner",
+            Self::Left => "left",
             Self::Semi => "semi",
             Self::Anti => "anti",
         }

@@ -351,6 +351,7 @@ pub fn visibility_workspace(
             "java",
             generation,
             &[WorkspaceFileRow {
+                decision: None,
                 rel_path: "src/Container.java".into(),
                 blob_oid: oid,
             }],
