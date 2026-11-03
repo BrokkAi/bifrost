@@ -80,3 +80,63 @@ pub struct CodeQueryTopologyEdge {
     pub build_file: String,
     pub completeness: &'static str,
 }
+
+/// The build configuration one file is analyzed under, and the file's standing
+/// in it, as a query row (#9048).
+///
+/// The row separates two claims a platform-specific rule must not conflate.
+/// `os`, `arch` and `file_status` describe the configuration the analysis
+/// selected, which a host or a toolchain default may have chosen. `os_scope`
+/// and `arch_scope` describe the file's own constraint, independent of any
+/// host: `any` is a platform-neutral file, which is never evidence that it is
+/// built for one particular target.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryBuildConfiguration {
+    /// Identity of this file under this configuration.
+    pub id: String,
+    /// Identity of the selected configuration alone, equal on every file the
+    /// same configuration selects.
+    pub configuration_id: String,
+    pub language: &'static str,
+    /// Workspace-relative path of the file.
+    pub path: String,
+    /// The selected target triple: Rust's rustc target. Go has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The selected target operating system (Go's `GOOS`, Rust's
+    /// `target_os`). Absent when the target is not one rustc knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Where `os` came from: `configuration`, `toolchain` or `host`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_source: Option<&'static str>,
+    /// The selected target architecture (Go's `GOARCH`, Rust's
+    /// `target_arch`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch_source: Option<&'static str>,
+    /// `included`, `excluded` or `unknown`: whether the selected configuration
+    /// compiles this file.
+    pub file_status: &'static str,
+    /// The file's build constraint in canonical spelling: filename suffix and
+    /// directive conjoined. Absent for an unconstrained file; the directive as
+    /// written when it is invalid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
+    /// `any`, `restricted`, `none` or `unknown`: which operating systems the
+    /// constraint admits for some choice of every other tag.
+    pub os_scope: &'static str,
+    /// The admitted operating systems, space-separated, when `os_scope` is
+    /// `restricted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_values: Option<String>,
+    pub arch_scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch_values: Option<String>,
+}
+
+pub const BUILD_SETTING_SOURCE_LABELS: &[&str] = &["configuration", "toolchain", "host"];
+pub const BUILD_FILE_STATUS_LABELS: &[&str] = &["included", "excluded", "unknown"];
+pub const BUILD_TARGET_SCOPE_LABELS: &[&str] = &["any", "restricted", "none", "unknown"];

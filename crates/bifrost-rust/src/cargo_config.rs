@@ -215,8 +215,28 @@ impl RustCargoConfiguration {
     }
 
     fn build_targets(&self, directory: &Path) -> Vec<String> {
+        let mut targets = self.configured_build_targets(directory).0;
+        if targets.is_empty() {
+            targets.push(HOST_TRIPLE.to_string());
+        }
+        targets
+    }
+
+    /// The `build.target` values a build started in `directory` compiles for,
+    /// merged across the files Cargo reads, and the directories whose file
+    /// sets `build.target`, shallowest first. No targets means the build
+    /// compiles for the host.
+    pub fn configured_build_targets<'a>(
+        &'a self,
+        directory: &'a Path,
+    ) -> (Vec<String>, Vec<&'a Path>) {
         let levels = self.levels(directory);
-        let mut targets = match merged(levels.iter().filter_map(|(_, file)| file.build("target"))) {
+        let defining = levels
+            .iter()
+            .filter(|(_, file)| file.build("target").is_some())
+            .map(|(level, _)| *level)
+            .collect();
+        let targets = match merged(levels.iter().filter_map(|(_, file)| file.build("target"))) {
             Some(toml::Value::Array(items)) => items
                 .iter()
                 .filter_map(toml::Value::as_str)
@@ -225,10 +245,7 @@ impl RustCargoConfiguration {
             Some(toml::Value::String(target)) => vec![target],
             _ => Vec::new(),
         };
-        if targets.is_empty() {
-            targets.push(HOST_TRIPLE.to_string());
-        }
-        targets
+        (targets, defining)
     }
 
     /// Target dependency tables follow the configured build targets. If the
@@ -294,6 +311,22 @@ impl RustCargoConfiguration {
         }
         patches
     }
+}
+
+/// The target triple a build that names no target compiles for.
+pub fn host_target_triple() -> &'static str {
+    HOST_TRIPLE
+}
+
+/// The `target_os` and `target_arch` of a target rustc knows, or `None` for
+/// a target it does not, such as a custom target file.
+pub fn builtin_target_platform(target: &str) -> Option<(&'static str, &'static str)> {
+    let info = get_builtin_target_by_triple(target)?;
+    // rustc spells a bare-metal target's absent operating system "none".
+    Some((
+        info.os.as_ref().map_or("none", |os| os.as_str()),
+        info.arch.as_str(),
+    ))
 }
 
 /// Cargo's merge of one key's values, shallowest first: two arrays join with

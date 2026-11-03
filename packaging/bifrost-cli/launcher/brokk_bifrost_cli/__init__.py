@@ -42,4 +42,3 @@ def main():
 def unpacked_executable():
     """Return the verified, unpacked binary, unpacking it on first use."""
     return _xz_payload.unpacked_file(_PACKAGE, "brokk-bifrost")
-

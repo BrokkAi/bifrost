@@ -24,6 +24,9 @@
 //!   whose fields are inert and for which the analyzer indexes no `drop`
 //!   member. `Drop` may be implemented only in the type's own crate, which the
 //!   workspace indexes.
+//! - an activated model's Rust struct, enum, or union whose declaration
+//!   reviews its drop glue as inert (#9057), with inert type arguments,
+//!   including the defaults an application omits.
 //!
 //! An expression's type comes from literals, the declared type of the
 //! parameter or `let` a name resolves to, the declared return type of the
@@ -52,6 +55,7 @@ use brokk_bifrost_rust::prelude::{
     RustStdAssociatedFact, RustStdReceiver, RustStdValue, rust_std_associated_fact,
     rust_std_constructor_fact, rust_std_method_fact, rust_std_type_fact,
 };
+use brokk_bifrost_rust::rust_unwrap_operand;
 use brokk_bifrost_rust::structural::call_function_target;
 use brokk_bifrost_rust::syntax::{item_has_path_attribute, outer_attributes};
 use tree_sitter::{Node, Tree};
@@ -74,7 +78,8 @@ use brokk_bifrost_analysis::analyzer::languages::ExternalCalleeSite;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
 
 use crate::analyzer::semantic_model::{
-    SemanticModelCallApplication, SemanticModelCallableKey, TypeRef,
+    GenericParameterDefault, SemanticModelCallApplication, SemanticModelCallableKey,
+    SemanticModelSymbol, TypeDropGlue, TypeFact, TypeRef,
 };
 use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding;
 
@@ -150,11 +155,67 @@ pub(crate) fn incomplete_proof(reason: &'static str) {
     });
 }
 
+fn proof_stopped() -> bool {
+    PROOF_ATTEMPTS.with(|attempts| attempts.borrow().last().is_some_and(Option::is_some))
+}
+
 pub(crate) fn operational_proof_stop(reason: &'static str, cause: DerivationExecutionCause) {
     record_proof_stop(ProofStop {
         reason,
         cause: Some(cause),
     });
+}
+
+pub(crate) fn selected_import_infos(
+    analyzer: &dyn IAnalyzer,
+    operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+    file: &ProjectFile,
+    cancellation: &CancellationToken,
+) -> Option<Vec<brokk_bifrost_core::analyzer::model::ImportInfo>> {
+    selected_import_infos_from_read(analyzer, file, cancellation, || {
+        operation.selected_rust_import_infos(file, cancellation)
+    })
+}
+
+fn selected_import_infos_from_read(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    cancellation: &CancellationToken,
+    read: impl FnOnce() -> brokk_bifrost_analysis::analyzer::store::Result<
+        Option<(
+            git2::Oid,
+            Vec<brokk_bifrost_core::analyzer::model::ImportInfo>,
+        )>,
+    >,
+) -> Option<Vec<brokk_bifrost_core::analyzer::model::ImportInfo>> {
+    match read() {
+        Ok(Some((oid, imports))) => {
+            analyzer.record_read(
+                brokk_bifrost_analysis::analyzer::read_ledger::ReadKey::file(
+                    brokk_bifrost_core::analyzer::Language::Rust,
+                    brokk_bifrost_core::path_utils::rel_path_string(file),
+                    oid,
+                    brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                ),
+            );
+            Some(imports)
+        }
+        Ok(None) => {
+            if cancellation.is_cancelled() {
+                operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled);
+            } else {
+                operational_proof_stop(
+                    "selected_imports_unavailable",
+                    DerivationExecutionCause::Provider,
+                );
+            }
+            None
+        }
+        Err(_) => {
+            operational_proof_stop("store_error", DerivationExecutionCause::Provider);
+            None
+        }
+    }
 }
 
 fn record_proof_stop(stop: ProofStop) {
@@ -395,6 +456,12 @@ pub(crate) struct RustTypeProof<'a, R: RustTypeProofResolver = FactoryRustTypePr
 }
 
 pub(crate) trait RustTypeProofResolver {
+    fn import_infos(
+        &self,
+        file: &ProjectFile,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::model::ImportInfo>>;
+
     fn resolve(
         &self,
         query: BoundedReceiverQuery<'_>,
@@ -441,6 +508,19 @@ impl<'a> FactoryRustTypeProofResolver<'a> {
 }
 
 impl RustTypeProofResolver for FactoryRustTypeProofResolver<'_> {
+    fn import_infos(
+        &self,
+        file: &ProjectFile,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::model::ImportInfo>> {
+        Some(
+            self.analyzer
+                .import_analysis_provider_for_file(file)
+                .map(|provider| provider.import_info_of(token, file))
+                .unwrap_or_default(),
+        )
+    }
+
     fn resolve(
         &self,
         query: BoundedReceiverQuery<'_>,
@@ -494,6 +574,15 @@ struct SelectedRustTypeProofResolver<'analyzer, 'factory, 'selection, 'operation
 }
 
 impl RustTypeProofResolver for SelectedRustTypeProofResolver<'_, '_, '_, '_, '_> {
+    fn import_infos(
+        &self,
+        file: &ProjectFile,
+        _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::model::ImportInfo>> {
+        let cancellation = self.cancellation.cloned().unwrap_or_default();
+        selected_import_infos(self.analyzer, &self.operation.borrow(), file, &cancellation)
+    }
+
     fn resolve(
         &self,
         query: BoundedReceiverQuery<'_>,
@@ -1160,13 +1249,78 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 RustValueClass::Unknown
             };
         }
-        if !arguments.is_empty() {
+        if arguments.is_empty()
+            && let Some(unit) = self.workspace_definition(source, name)
+        {
+            return if self.workspace_type_is_inert(&unit, depth - 1) {
+                RustValueClass::Inert
+            } else {
+                RustValueClass::Unknown
+            };
+        }
+        self.modeled_nominal_type_class(source, ty, depth)
+    }
+
+    /// The class of a written application of an activated model type, from
+    /// the model's reviewed drop glue (#9057). Every written argument and
+    /// every defaulted one the application omits must be inert too.
+    fn modeled_nominal_type_class(
+        &self,
+        source: &RustSource,
+        ty: Node<'_>,
+        depth: usize,
+    ) -> RustValueClass {
+        let Some((owner, arguments)) = self.nominal_type_owner(source, ty) else {
             return RustValueClass::Unknown;
+        };
+        let Some(declaration) = self
+            .analyzer
+            .semantic_model_overlay()
+            .and_then(|overlay| overlay.symbols_named(&owner).unique())
+            .and_then(|symbol| self.modeled_inert_drop_glue_owner(&symbol))
+        else {
+            return RustValueClass::Unknown;
+        };
+        let written_inert = arguments
+            .iter()
+            .all(|argument| self.type_class(source, *argument, depth - 1).is_inert());
+        // `nominal_type_owner` admitted the application only when every
+        // omitted argument has a default.
+        let defaults_inert = declaration
+            .type_parameter_defaults
+            .iter()
+            .skip(arguments.len())
+            .all(|default| match default {
+                Some(GenericParameterDefault::Type { r#type }) => self
+                    .type_ref_class(r#type, depth - 1)
+                    .is_some_and(RustValueClass::is_inert),
+                _ => false,
+            });
+        if written_inert && defaults_inert {
+            RustValueClass::Inert
+        } else {
+            RustValueClass::Unknown
         }
-        match self.workspace_definition(source, name) {
-            Some(unit) if self.workspace_type_is_inert(&unit, depth - 1) => RustValueClass::Inert,
-            _ => RustValueClass::Unknown,
+    }
+
+    /// The selected declaration of the activated Rust model type `symbol`
+    /// when that model reviews the type's own drop glue as inert (#9057). A
+    /// generic application's type arguments are the caller's to prove.
+    fn modeled_inert_drop_glue_owner(&self, symbol: &SemanticModelSymbol) -> Option<Arc<TypeFact>> {
+        if symbol.provenance.ambiguous || symbol.language != Language::Rust.config_label() {
+            return None;
         }
+        let active = self.analyzer.active_semantic_models()?;
+        brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+            &active, symbol,
+        )
+        .filter(|declaration| {
+            declaration
+                .value_semantics
+                .as_ref()
+                .and_then(|semantics| semantics.drop_glue)
+                == Some(TypeDropGlue::Inert)
+        })
     }
 
     /// Whether a workspace struct or enum's drop glue runs no user code.
@@ -1800,28 +1954,85 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         depth: usize,
     ) -> Option<TypeRef> {
         for depth in (1..=depth).rev() {
+            if let Some(operand) = rust_unwrap_operand(expression, source.text()) {
+                let mut wrapped = self.modeled_receiver_type_bounded(source, operand, depth - 1)?;
+                if proof_stopped() {
+                    return None;
+                }
+                while let TypeRef::ByRef { element, .. } = wrapped {
+                    wrapped = *element;
+                }
+                let (name, arguments) = match wrapped {
+                    TypeRef::Named {
+                        name, arguments, ..
+                    } => (name, arguments),
+                    TypeRef::Declared { id, arguments, .. } => {
+                        let overlay = self.analyzer.semantic_model_overlay()?;
+                        (
+                            overlay
+                                .symbols_with_id(&id)
+                                .unique()?
+                                .qualified_name
+                                .clone(),
+                            arguments,
+                        )
+                    }
+                    _ => return None,
+                };
+                if !super::standard_unwrap_payload_name(&name) {
+                    return None;
+                }
+                return arguments.into_iter().next();
+            }
             match expression.kind() {
                 "call_expression" => {
                     return self.modeled_call_return_type(source, expression, depth);
                 }
-                "identifier" => expression = self.binding_initializer(source, expression)?,
+                "identifier" => {
+                    if let Some(ty) = self.declared_binding_type(source, expression) {
+                        let overlay = self.analyzer.semantic_model_overlay()?;
+                        let active = self.analyzer.active_semantic_models()?;
+                        let mut applicability = super::trait_applicability::ModelApplicability::new(
+                            self.analyzer,
+                            self.rust,
+                            &overlay,
+                            &active,
+                        );
+                        let typed =
+                            applicability.receiver_type_with(source.text(), ty, &mut |head| {
+                                self.nominal_type_owner(source, head)
+                            });
+                        return if proof_stopped() { None } else { typed };
+                    }
+                    expression = self.binding_initializer(source, expression)?;
+                }
                 _ => return None,
             }
         }
+        incomplete_proof("depth_limit");
         None
     }
 
-    /// The drop class of the model's structured return type. References,
-    /// pointers, and primitive scalars cannot run user drop glue. Nominal
-    /// results still need a reviewed drop fact; only the existing standard
-    /// owned-memory types are known here.
+    /// The drop class of the model's structured return type.
     fn modeled_call_result_class(
         &self,
         source: &RustSource,
         call: Node<'_>,
         depth: usize,
     ) -> Option<RustValueClass> {
-        match self.modeled_call_return_type(source, call, depth)? {
+        self.type_ref_class(&self.modeled_call_return_type(source, call, depth)?, depth)
+    }
+
+    /// The drop class of a model's structured type. References, pointers,
+    /// and primitive scalars cannot run user drop glue. A nominal type needs
+    /// a reviewed drop fact: one of the standard owned-memory types known
+    /// here, or the model's own drop glue with inert type arguments (#9057).
+    fn type_ref_class(&self, ty: &TypeRef, depth: usize) -> Option<RustValueClass> {
+        if depth == 0 {
+            incomplete_proof("depth_limit");
+            return None;
+        }
+        match ty {
             TypeRef::ByRef { element, .. } => Some(match element.as_ref() {
                 TypeRef::Named { name, .. }
                     if matches!(
@@ -1845,7 +2056,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                         let primitive = name
                             .strip_prefix("std.primitive.")
                             .or_else(|| name.strip_prefix("core.primitive."))
-                            .unwrap_or(&name);
+                            .unwrap_or(name);
                         matches!(
                             primitive,
                             "bool"
@@ -1868,11 +2079,57 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                                 | "f128"
                         )
                         .then_some(RustValueClass::Inert)
+                        .or_else(|| {
+                            let symbol = self
+                                .analyzer
+                                .semantic_model_overlay()?
+                                .symbols_named(name)
+                                .unique()?;
+                            self.modeled_type_ref_class(&symbol, &[], depth)
+                        })
                     }
                 }
             }
+            TypeRef::Named {
+                name, arguments, ..
+            } => {
+                let symbol = self
+                    .analyzer
+                    .semantic_model_overlay()?
+                    .symbols_named(name)
+                    .unique()?;
+                self.modeled_type_ref_class(&symbol, arguments, depth)
+            }
+            TypeRef::Declared { id, arguments, .. } => {
+                let symbol = self
+                    .analyzer
+                    .semantic_model_overlay()?
+                    .symbols_with_id(id)
+                    .unique()?;
+                self.modeled_type_ref_class(&symbol, arguments, depth)
+            }
             _ => None,
         }
+    }
+
+    /// The class of an application of the activated model type `symbol`,
+    /// from the model's reviewed drop glue.
+    fn modeled_type_ref_class(
+        &self,
+        symbol: &SemanticModelSymbol,
+        arguments: &[TypeRef],
+        depth: usize,
+    ) -> Option<RustValueClass> {
+        let declaration = self.modeled_inert_drop_glue_owner(symbol)?;
+        let mut arguments = arguments.to_vec();
+        super::trait_applicability::complete_type_arguments(&declaration, &mut arguments)?;
+        arguments
+            .iter()
+            .all(|argument| {
+                self.type_ref_class(argument, depth - 1)
+                    .is_some_and(RustValueClass::is_inert)
+            })
+            .then_some(RustValueClass::Inert)
     }
 
     /// The declared type of the parameter or annotated `let` that the name
@@ -1974,6 +2231,10 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         if receiver.kind() == "field_expression" {
             return self.field_receiver_owner(source, receiver);
         }
+        if rust_unwrap_operand(receiver, source.text()).is_some() {
+            let ty = self.modeled_receiver_type_bounded(source, receiver, depth)?;
+            return self.receiver_owner_from_type(ty);
+        }
         if receiver.kind() == "call_expression" {
             return self.modeled_call_result_owner(source, receiver, depth);
         }
@@ -2043,6 +2304,26 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         Some(RustReceiverOwner::Path(
             bounds.first()?.qualified_name.clone(),
         ))
+    }
+
+    fn receiver_owner_from_type(&self, mut ty: TypeRef) -> Option<RustReceiverOwner> {
+        while let TypeRef::ByRef { element, .. } = ty {
+            ty = *element;
+        }
+        match ty {
+            TypeRef::Named { name, .. } => Some(RustReceiverOwner::Path(name)),
+            TypeRef::Declared { id, .. } => {
+                let overlay = self.analyzer.semantic_model_overlay()?;
+                Some(RustReceiverOwner::Path(
+                    overlay
+                        .symbols_with_id(&id)
+                        .unique()?
+                        .qualified_name
+                        .clone(),
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// A field's declared type, after the resolver has selected its actual
@@ -2167,14 +2448,15 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                         let segments = rust_path_segments(ty)?;
                         let root = *segments.first()?;
                         let scope = AnalyzerQueryScope::new(self.analyzer);
+                        let imports = self.resolver.import_infos(&source.file, scope.token())?;
                         if !crate::analyzer::rust::external_calls::native_external_root_with_resolver(
                         self.analyzer,
-                        scope.token(),
                         &source.file,
                         source.text(),
                         source.tree(),
                         root,
                         self.resolver.cancellation(),
+                        &imports,
                         |query| self.resolver.resolve(query),
                     ) {
                         return None;
@@ -2411,6 +2693,35 @@ pub(crate) fn rust_method_receiver_owner(
             return None;
         };
         rust_method_receiver_owner_with_proof(&proof, file, source, method)
+    })
+    .into_value()
+}
+
+/// The owner of the type the Rust value expression spanning `expression`
+/// evaluates to. See [`RustTypeProof::receiver_owner`].
+pub(crate) fn rust_expression_receiver_owner(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    expression: ByteRange<usize>,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> Option<RustReceiverOwner> {
+    completed_proof(cancellation, || {
+        let Some(proof) = RustTypeProof::new(analyzer) else {
+            incomplete_proof("analyzer_unavailable");
+            return None;
+        };
+        let rust_source = proof.source(file)?;
+        if rust_source.text() != source {
+            operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
+            return None;
+        }
+        let receiver = rust_source
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(expression.start, expression.end)
+            .filter(|node| node.byte_range() == expression)?;
+        proof.receiver_owner(&rust_source, receiver)
     })
     .into_value()
 }
@@ -3071,6 +3382,73 @@ mod tests {
     use crate::analyzer::rust::std_types::*;
 
     #[test]
+    #[hardwon(
+        "#8866: unwrapping Option<&T> dropped the payload's reference in the typed receiver (review of #8899)"
+    )]
+    fn modeled_unwrap_keeps_payload_reference_but_not_wrapper_reference() {
+        let source = "fn receivers(by_ref: std::option::Option<&std::fs::File>, owned: std::option::Option<std::fs::File>, wrapper_ref: &std::option::Option<std::fs::File>) { let _ = by_ref.unwrap(); let _ = owned.unwrap(); let _ = wrapper_ref.unwrap(); }";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+        let mut option = rust_type("std.option.Option", "enum");
+        option["type_parameters"] = serde_json::json!(["T"]);
+        let model = serde_json::json!({
+            "schema_version": 2,
+            "pack_id": "fixture.rust-wrapper-reference",
+            "version": "1.0.0",
+            "producer": { "name": "rust-type-proof-test", "version": "1.0.0" },
+            "language": "rust", "ecosystem": "cargo",
+            "compatibility": { "bifrost": "*", "toolchains": [] },
+            "provenance": { "source": "test-only #8866 typed receiver regression" },
+            "license": "NOASSERTION", "completeness": "complete",
+            "safety": { "generated_code_only": false, "review_required": false },
+            "shards": [{
+                "id": "declarations.rust-wrapper-reference",
+                "activation": [{ "targets": [], "configurations": [] }],
+                "payload": { "kind": "declaration_facts", "types": [
+                    rust_type("std", "module"), rust_type("std.option", "module"),
+                    option, rust_type("std.fs", "module"), rust_type("std.fs.File", "struct")
+                ], "members": [], "relations": [] }
+            }]
+        });
+        activate_model_pack(&fixture, model, "fixture.rust-wrapper-reference", "std");
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let proof = RustTypeProof::new(fixture.analyzer.analyzer()).expect("Rust proof");
+        let prepared = proof.source(&file).expect("prepared source");
+        for (expression, borrowed) in [
+            ("by_ref.unwrap()", true),
+            ("owned.unwrap()", false),
+            ("wrapper_ref.unwrap()", false),
+        ] {
+            let start = source.find(expression).expect("receiver expression");
+            let node = prepared
+                .tree()
+                .root_node()
+                .named_descendant_for_byte_range(start, start + expression.len())
+                .expect("call expression");
+            assert_eq!(node.kind(), "call_expression");
+            let ty = proof
+                .modeled_receiver_type(&file, node)
+                .expect("modeled receiver type");
+            let expected = TypeRef::Declared {
+                id: "type.fixture.std-fs-file".into(),
+                arguments: vec![],
+                nullable: false,
+            };
+            let expected = if borrowed {
+                TypeRef::ByRef {
+                    element: Box::new(expected),
+                    reference_kind: crate::analyzer::semantic_model::TypeRefReferenceKind::Lvalue,
+                }
+            } else {
+                expected
+            };
+            assert_eq!(
+                ty, expected,
+                "{expression} has the wrong modeled receiver type"
+            );
+        }
+    }
+
+    #[test]
     fn standard_wrapper_owner_accepts_agreeing_external_claims() {
         use brokk_bifrost_analysis::analyzer::usages::get_definition::{
             ClaimSubjectRole, DefinitionLookupDiagnostic, UnindexedClaim,
@@ -3209,6 +3587,36 @@ mod tests {
 
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#8884: the selected import read recorded no file dependency (review of #8900)")]
+    fn selected_import_read_records_the_selected_file_oid() {
+        use brokk_bifrost_analysis::analyzer::read_ledger::{ReadKey, ReadLedger};
+        use brokk_bifrost_core::gitblob::ParseVariant;
+
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[("lib.rs", "use std::fs::File;\n")],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let selected_oid =
+            git2::Oid::hash_object(git2::ObjectType::Blob, b"selected import source").unwrap();
+        let ledger = Arc::new(ReadLedger::new());
+        let _scope = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+        assert!(
+            selected_import_infos_from_read(analyzer, &file, &CancellationToken::new(), || {
+                Ok(Some((selected_oid, Vec::new())))
+            })
+            .is_some()
+        );
+        assert!(ledger.keys().contains(&ReadKey::file(
+            Language::Rust,
+            brokk_bifrost_core::path_utils::rel_path_string(&file),
+            selected_oid,
+            ParseVariant::Empty,
+        )));
+    }
 
     #[hardwon("#4626: same-file type-proof leaves reused query-local macro frontier state")]
     #[test]

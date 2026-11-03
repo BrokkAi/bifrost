@@ -799,8 +799,10 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // #8387: regenerate bundles containing ranked synthetic identities.
         // v58 re-lands implicit Java record and annotation roots on #8427,
         // above master v57 and the earlier v55 revert.
+        // v60 (#7804): Java emits root rows for every level of a pure field-access
+        // chain, so bundles from v58 lack those rows (v59 is reserved for #8675).
         Language::Java => {
-            "resolution-bundle-java-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
         // v71: v70 (#7509) and v70 (#7391) landed together.
         // v70 (#7509): persist SpreadArgument type frontiers (role ordinal 8).
@@ -809,9 +811,10 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // v68 (#7509): an initialized type-switch clause binder no longer
         // carries an InferredType gap row.
         // #8387: regenerate bundles containing ranked synthetic identities.
+        // v74 (#8762): publish anonymous interface Identity slots for alias method-owner projection.
         // v73 (#7509): publish alias target terminal lookup rows.
         Language::Go => {
-            "resolution-bundle-go-v73-7509-alias-target-lookup-8387-ranked-synthetic-names-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
+            "resolution-bundle-go-v74-8762-anonymous-interface-identity-slot-7509-alias-target-lookup-8387-ranked-synthetic-names-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
         }
         // #8387: regenerate bundles containing ranked synthetic identities.
         Language::Cpp => {

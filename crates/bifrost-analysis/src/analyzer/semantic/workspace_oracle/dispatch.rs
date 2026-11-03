@@ -2814,7 +2814,11 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 "workspace dispatch produced invalid relation provenance: {error}"
             ))
         })?;
-        result.mark_member_receiver_preparation(member_receiver_preparation);
+        if go_interface_receiver {
+            result.mark_go_interface_receiver_preparation(member_receiver_preparation);
+        } else {
+            result.mark_member_receiver_preparation(member_receiver_preparation);
+        }
         result.mark_member_field_anchor(member_field_anchor);
         if resolver_proved_no_callee {
             result.mark_resolver_proved_no_callee();

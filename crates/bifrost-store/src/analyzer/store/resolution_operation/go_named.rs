@@ -15,6 +15,8 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionGoPackageImportKind, ResolutionNamespace, ResolutionSiteId,
 };
 
+pub(super) type GoSourceRoleReadKey = (i64, SelectedResolutionMountOrdinal, [u8; 32], (u64, u64));
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[doc(hidden)]
 pub enum GoExternalPackageProvenance {
@@ -338,6 +340,7 @@ impl GoPreparedImportContext {
                 RustPreludeReferences
                 | ExternalTypeImportPaths
                 | JavaImportRouteGapReasons
+                | JavaImportMemberScopes
                 | JvmExternalTypeIdentities
                 | JvmExternalTypeIdentitiesByReference
                 | JvmExternalTypeBoundaries
@@ -1094,6 +1097,15 @@ impl SelectedResolutionOperation<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
+        let key = (
+            context_id,
+            mount,
+            self.ready.inventory.scope_identity(),
+            self.ready.inventory.staged_read_epoch(),
+        );
+        if let Some(role) = self.go_source_roles.borrow().get(&key) {
+            return Ok(role.clone());
+        }
         let record = self.ready.inventory.mount_record_by_ordinal(mount)?;
         assert_eq!(record.semantic_language(), Language::Go);
         let connection = self.ready.inventory.connection();
@@ -1123,6 +1135,9 @@ impl SelectedResolutionOperation<'_, '_> {
             }
             source_role = Some(role);
         }
+        self.go_source_roles
+            .borrow_mut()
+            .insert_bounded(key, source_role.clone());
         Ok(source_role)
     }
 

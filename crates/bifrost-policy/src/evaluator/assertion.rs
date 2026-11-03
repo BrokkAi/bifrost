@@ -1,3 +1,4 @@
+use brokk_bifrost_analysis::analyzer::ReadKey;
 use brokk_bifrost_analysis::analyzer::structural::resolution::BindingKind;
 use brokk_bifrost_analysis::analyzer::usages::UsageHitKind;
 use brokk_bifrost_analysis::path_utils::workspace_relative_slash_path;
@@ -19,7 +20,7 @@ use crate::relational::{
 };
 
 use super::super::finding::InconclusiveScope;
-use super::super::unit_execution::{UnitSlice, evaluate_reusable_slice};
+use super::super::unit_execution::{UnitDecodeError, UnitSlice, evaluate_reusable_slice};
 use super::super::units::AssertFileProduct;
 use super::*;
 
@@ -451,11 +452,12 @@ where
         &self,
         (path, _): &Self::Seed,
         product: PolicyUnitProduct,
-    ) -> Result<Self::Prefix, WidenReason> {
+        _reads: &[ReadKey],
+    ) -> Result<Self::Prefix, UnitDecodeError> {
         product
             .into_assert_file()
             .map(|product| (*path, product))
-            .ok_or(WidenReason::ProductLoadFailed)
+            .ok_or(UnitDecodeError::Widen(WidenReason::ProductLoadFailed))
     }
 
     fn encode(&self, (_, product): &Self::Prefix) -> PolicyUnitProduct {
@@ -466,7 +468,11 @@ where
         check_exhaustive_assert_file(product)
     }
 
-    fn missing_reads(&self, attempt: &mut UnitAttempt) -> Result<(), WidenReason> {
+    fn missing_reads(
+        &self,
+        attempt: &mut UnitAttempt,
+        _prefix: &mut Self::Prefix,
+    ) -> Result<(), WidenReason> {
         attempt.unbounded();
         Err(WidenReason::UnitUnbounded)
     }

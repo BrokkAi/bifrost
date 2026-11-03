@@ -1381,6 +1381,9 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CSharpLookupContext {
     scopes: Vec<CSharpLookupScope>,
+    // The site reader cannot prove membership or base closure on its own.
+    // A caller may establish that proof from its workspace-backed resolver.
+    enclosing_types_closed: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1406,36 +1409,8 @@ impl CSharpLookupContext {
         node: Node<'_>,
         mut continue_lookup: impl FnMut() -> bool,
     ) -> Option<Self> {
-        let mut namespace_nodes = Vec::new();
-        let mut current = node;
-        while let Some(parent) = current.parent() {
-            if !continue_lookup() {
-                return None;
-            }
-            if parent.kind() == "namespace_declaration" {
-                namespace_nodes.push(parent);
-            }
-            current = parent;
-        }
-        let root = current;
-        namespace_nodes.reverse();
-
-        // File-scoped namespaces are compilation-unit siblings, not ancestors.
-        // Record one only when the requested node lies within its namespace
-        // body, including when that body contains a nested block namespace.
-        let mut root_cursor = root.walk();
-        let mut file_scoped = None;
-        for child in root.named_children(&mut root_cursor) {
-            if !continue_lookup() {
-                return None;
-            }
-            if child.kind() == "file_scoped_namespace_declaration"
-                && child.end_byte() <= node.start_byte()
-            {
-                file_scoped = Some(child);
-                break;
-            }
-        }
+        let (root, file_scoped, namespace_nodes) =
+            namespace_scope_nodes(node, &mut continue_lookup)?;
         let file_namespace_segments = file_scoped
             .and_then(|declaration| declaration.child_by_field_name("name"))
             .map(|name| csharp_type_node_segments(name, source))
@@ -1544,7 +1519,10 @@ impl CSharpLookupContext {
         )?;
         scopes.push(compilation_scope);
 
-        Some(Self { scopes })
+        Some(Self {
+            scopes,
+            enclosing_types_closed: false,
+        })
     }
 
     /// The namespace declared nearest the node; empty in the global namespace.
@@ -1552,10 +1530,75 @@ impl CSharpLookupContext {
         &self.scopes[0].namespace
     }
 
+    /// Record the caller's positive proof for every enclosing type crossed
+    /// before namespace lookup. The default remains open.
+    pub fn with_closed_enclosing_types(mut self) -> Self {
+        self.enclosing_types_closed = true;
+        self
+    }
+
     /// The enclosing namespaces, from the innermost through the global scope.
     pub fn namespaces(&self) -> impl Iterator<Item = &str> {
         self.scopes.iter().map(|scope| scope.namespace.as_str())
     }
+}
+
+/// The namespace containing a C# node, including a preceding file-scoped
+/// declaration whose members are siblings rather than AST descendants.
+pub fn csharp_enclosing_namespace_path(source: &str, node: Node<'_>) -> Vec<String> {
+    let (root, file_scoped, namespace_nodes) =
+        namespace_scope_nodes(node, &mut || true).expect("unbounded namespace walk completes");
+    debug_assert!(root.parent().is_none());
+    let mut path = Vec::new();
+    if let Some(name) = file_scoped.and_then(|declaration| declaration.child_by_field_name("name"))
+    {
+        path.extend(csharp_type_node_segments(name, source));
+    }
+    for declaration in namespace_nodes {
+        if let Some(name) = declaration.child_by_field_name("name") {
+            path.extend(csharp_type_node_segments(name, source));
+        }
+    }
+    path
+}
+
+fn namespace_scope_nodes<'tree>(
+    node: Node<'tree>,
+    continue_lookup: &mut impl FnMut() -> bool,
+) -> Option<(Node<'tree>, Option<Node<'tree>>, Vec<Node<'tree>>)> {
+    let mut namespace_nodes = Vec::new();
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        if !continue_lookup() {
+            return None;
+        }
+        if parent.kind() == "namespace_declaration" {
+            namespace_nodes.push(parent);
+        }
+        root = parent;
+    }
+    namespace_nodes.reverse();
+
+    // File-scoped namespaces govern following compilation-unit siblings.
+    // On malformed repeated declarations, this context and transient lookup
+    // use the nearest preceding scope. Persisted naming cumulatively joins
+    // those declarations (#8957).
+    let mut file_scoped = None;
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if !continue_lookup() {
+            return None;
+        }
+        if child.start_byte() > node.start_byte() {
+            break;
+        }
+        if child.kind() == "file_scoped_namespace_declaration"
+            && child.end_byte() <= node.start_byte()
+        {
+            file_scoped = Some(child);
+        }
+    }
+    Some((root, file_scoped, namespace_nodes))
 }
 
 fn collect_context_usings(
@@ -1677,12 +1720,13 @@ where
         .partition(|unresolved| proven_name(unresolved));
     let mut declarations = result.declarations;
     declarations.retain(|declaration| !covered.contains(declaration));
-    if result.imported_scope {
+    if result.dedup_imported {
         sort_dedup_type_candidates(&mut declarations);
     }
     Some(VisibleTypes {
         declarations,
         unproven,
+        tier: result.tier,
     })
 }
 
@@ -1735,16 +1779,31 @@ where
     Some(VisibleTypes {
         declarations,
         unproven: result.unresolved,
+        tier: result.tier,
     })
 }
 
 #[derive(Debug)]
 struct VisibleTypeLookupResult {
     declarations: Vec<CodeUnit>,
-    imported_scope: bool,
+    tier: CSharpLookupTier,
+    // Candidate shape is independent of closure: Open also includes outer
+    // namespace and qualified lookups, whose physical parts stay distinct.
+    dedup_imported: bool,
     /// Global-namespace declarations in `declarations` whose compilation
     /// membership is unproven.
     unresolved: Vec<CodeUnit>,
+}
+
+/// The scope that decided a C# type name. An open tier can be shadowed by
+/// declarations or directives added to an open compilation inventory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CSharpLookupTier {
+    TypeParameter,
+    EnclosingType,
+    InnermostNamespace,
+    #[default]
+    Open,
 }
 
 /// The types a name denotes at one site.
@@ -1756,6 +1815,7 @@ pub struct VisibleTypes {
     /// proven resolution, even if it names one type: a caller reports the
     /// doubt instead of resolving.
     pub unproven: Vec<CodeUnit>,
+    pub tier: CSharpLookupTier,
 }
 
 impl VisibleTypes {
@@ -1795,7 +1855,8 @@ where
     if normalized.is_empty() {
         return Some(VisibleTypeLookupResult {
             declarations: Vec::new(),
-            imported_scope: false,
+            tier: CSharpLookupTier::Open,
+            dedup_imported: false,
             unresolved: Vec::new(),
         });
     }
@@ -1818,12 +1879,13 @@ where
         }
         Some(visible)
     };
-    let found = |mut declarations: Vec<CodeUnit>, imported_scope: bool| {
+    let found = |mut declarations: Vec<CodeUnit>, tier: CSharpLookupTier, dedup_imported: bool| {
         let unresolved = unresolved.take();
         declarations.extend(unresolved.iter().cloned());
         VisibleTypeLookupResult {
             declarations,
-            imported_scope,
+            tier,
+            dedup_imported,
             unresolved,
         }
     };
@@ -1832,12 +1894,12 @@ where
         if alias == "global" {
             let declarations =
                 lookup_exact_type_candidates(suffix, &mut visible_candidates, continue_lookup)?;
-            return Some(found(declarations, false));
+            return Some(found(declarations, CSharpLookupTier::Open, false));
         }
         let Some(target) =
             lookup_alias_target(alias, context, global_alias_target, continue_lookup)?
         else {
-            return Some(found(Vec::new(), false));
+            return Some(found(Vec::new(), CSharpLookupTier::Open, false));
         };
         let declarations = lookup_scoped_alias_target(
             &target.target,
@@ -1846,11 +1908,11 @@ where
             &mut visible_candidates,
             continue_lookup,
         )?;
-        return Some(found(declarations, false));
+        return Some(found(declarations, CSharpLookupTier::Open, false));
     }
 
     let bare_name = !normalized.contains(['.', '$', '+']);
-    for scope in &context.scopes {
+    for (scope_index, scope) in context.scopes.iter().enumerate() {
         if !continue_lookup() {
             return None;
         }
@@ -1867,7 +1929,7 @@ where
                 &mut visible_candidates,
                 continue_lookup,
             )?;
-            return Some(found(declarations, false));
+            return Some(found(declarations, CSharpLookupTier::Open, false));
         }
 
         // The global namespace is the containing namespace of the
@@ -1882,7 +1944,16 @@ where
         let candidates =
             lookup_exact_type_candidates(&fqn, &mut visible_candidates, continue_lookup)?;
         if !candidates.is_empty() {
-            return Some(found(candidates, false));
+            return Some(found(
+                candidates,
+                if scope_index == 0 && !scope.namespace.is_empty() && context.enclosing_types_closed
+                {
+                    CSharpLookupTier::InnermostNamespace
+                } else {
+                    CSharpLookupTier::Open
+                },
+                false,
+            ));
         }
         if scope.namespace.is_empty() && bare_name {
             if !continue_lookup() {
@@ -1896,7 +1967,7 @@ where
                     &mut visible_candidates,
                     continue_lookup,
                 )?;
-                return Some(found(declarations, false));
+                return Some(found(declarations, CSharpLookupTier::Open, false));
             }
         }
 
@@ -1951,13 +2022,13 @@ where
             }
         }
         if !visible.is_empty() {
-            return Some(found(visible, true));
+            return Some(found(visible, CSharpLookupTier::Open, true));
         }
     }
 
     // `CSharpLookupContext::at` always appends a compilation-unit scope. Set
     // aside candidates are all that remains, and all are doubt.
-    Some(found(Vec::new(), false))
+    Some(found(Vec::new(), CSharpLookupTier::Open, false))
 }
 
 fn lookup_alias_target(
@@ -2598,8 +2669,8 @@ pub fn compute_implicit_reference_index(
 #[cfg(test)]
 mod lookup_context_tests {
     use super::{
-        CSharpCompilationVisibility, CSharpLookupContext, visible_type_candidates_at_with_lookups,
-        visible_type_declarations_at_with_lookups,
+        CSharpCompilationVisibility, CSharpLookupContext, csharp_enclosing_namespace_path,
+        visible_type_candidates_at_with_lookups, visible_type_declarations_at_with_lookups,
     };
     use brokk_bifrost_core::analyzer::model::CodeUnitType;
     use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
@@ -2631,6 +2702,34 @@ mod lookup_context_tests {
             .named_descendant_for_byte_range(start, start + marker.len())
             .expect("marker has a syntax node");
         CSharpLookupContext::at(source, node, || true).expect("lookup context completes")
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8803: file-scoped sibling namespaces made an external call look source-local"
+    )]
+    fn file_scoped_namespace_path_follows_nearest_preceding_declaration() {
+        let source = "namespace Verify.AssemblyPath; class Probe { Assembly a; } namespace Other; class Assembly { } namespace Third { class Nested { } }";
+        let tree = parsed_tree(source);
+        for (marker, expected) in [
+            ("Probe", &["Verify", "AssemblyPath"][..]),
+            ("Assembly a", &["Verify", "AssemblyPath"]),
+            ("class Assembly", &["Other"]),
+            ("Nested", &["Other", "Third"]),
+        ] {
+            let start = source.find(marker).expect("marker exists");
+            let node = tree
+                .root_node()
+                .named_descendant_for_byte_range(start, start + marker.len())
+                .expect("marker has a syntax node");
+            assert_eq!(csharp_enclosing_namespace_path(source, node), expected);
+            assert_eq!(
+                CSharpLookupContext::at(source, node, || true)
+                    .expect("context completes")
+                    .namespace(),
+                expected.join(".")
+            );
+        }
     }
 
     fn unit(path: &str, namespace: &str, name: &str) -> CodeUnit {

@@ -68,7 +68,7 @@ use brokk_bifrost_analysis::analyzer::structural::{
 use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
 use brokk_bifrost_core::profiling;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use tree_sitter::Node;
 
 /// Execute one topology-sensitive operation against the raw graph when no
@@ -4529,6 +4529,7 @@ pub struct FlowStateRequest<'request> {
     /// `Some(None)` deliberately freezes no publication; `Some(Some(_))`
     /// freezes the exact active/overlay pair selected by the request owner.
     active_semantic_model_snapshot: Option<Option<Arc<ActiveSemanticModelSnapshot>>>,
+    nonreturn_discovery_cache: Option<&'request NonreturnDiscoveryCache>,
 }
 
 impl<'request> FlowStateRequest<'request> {
@@ -4542,6 +4543,7 @@ impl<'request> FlowStateRequest<'request> {
             cfg_budget: CfgAlgorithmBudget::default(),
             control_projection: None,
             active_semantic_model_snapshot: None,
+            nonreturn_discovery_cache: None,
         }
     }
 
@@ -4566,6 +4568,14 @@ impl<'request> FlowStateRequest<'request> {
         snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Self {
         self.active_semantic_model_snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn with_nonreturn_discovery_cache(
+        mut self,
+        cache: &'request NonreturnDiscoveryCache,
+    ) -> Self {
+        self.nonreturn_discovery_cache = Some(cache);
         self
     }
 }
@@ -4693,7 +4703,7 @@ impl ModeledControlProjectionDerivation {
 
 /// One exact root- or dependency-procedure call whose complete dispatch set
 /// could become non-returning when all of its workspace callees do.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct WorkspaceNonreturnCall {
     call: CallSiteId,
     transfers: CallTransferSet,
@@ -4702,13 +4712,29 @@ struct WorkspaceNonreturnCall {
 /// Request-local control evidence for one procedure reached from the file
 /// being derived. Handles keep every dense ID scoped to its exact immutable
 /// artifact; nothing in this proof is persisted across requests.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct WorkspaceNonreturnProcedure {
     handle: ProcedureHandle,
     exact_call_resolutions: HashSet<CallSiteId>,
     nonreturn_candidates: Vec<WorkspaceNonreturnCall>,
     abort_path_user_code: WorkspaceAbortPathUserCode,
     incomplete_detail: Option<Box<str>>,
+}
+
+/// Completed discovery shared only by one query. The Boolean distinguishes
+/// a root procedure, whose calls all require adjudication, from a dependency
+/// that may return after the conservative CFG prefilter.
+#[derive(Default, Debug)]
+pub struct NonreturnDiscoveryCache {
+    entries: Mutex<HashMap<(ProcedureHandle, bool, usize), CachedNonreturnDiscovery>>,
+}
+
+#[derive(Debug)]
+struct CachedNonreturnDiscovery {
+    procedure: WorkspaceNonreturnProcedure,
+    callees: Vec<ProcedureHandle>,
+    reads: Arc<crate::analyzer::usages::common::QueryMemoReads>,
+    _snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
 }
 
 impl WorkspaceNonreturnProcedure {
@@ -5422,6 +5448,8 @@ fn derive_workspace_nonreturn_projection(
     semantic_budget: &mut SemanticBudget,
     cfg_budget: &mut CfgAlgorithmBudget,
     cancellation: &CancellationToken,
+    shared_provider: Option<&WorkspaceIcfgProvider<'_>>,
+    discovery_cache: Option<&NonreturnDiscoveryCache>,
 ) -> ModeledControlProjectionDerivation {
     let language = crate::analyzer::common::language_for_file(file);
     let go_models_can_diverge = language == Language::Go
@@ -5436,8 +5464,6 @@ fn derive_workspace_nonreturn_projection(
         return ModeledControlProjectionDerivation::default();
     }
 
-    let provider =
-        WorkspaceIcfgProvider::with_active_semantic_model_snapshot(workspace, snapshot.cloned());
     let roots = artifact
         .procedures()
         .iter()
@@ -5448,14 +5474,44 @@ fn derive_workspace_nonreturn_projection(
                 .expect("a validated artifact owns every procedure it lists")
         })
         .collect::<Vec<_>>();
-    derive_nonreturn_projection(
-        &provider,
-        artifact,
-        roots,
-        semantic_budget,
-        cfg_budget,
-        cancellation,
-    )
+    if let Some(provider) = shared_provider {
+        assert!(
+            std::ptr::eq(provider.workspace(), workspace),
+            "shared non-return provider belongs to this workspace"
+        );
+        let provider_snapshot = provider.oracle().active_semantic_model_snapshot();
+        assert!(
+            match (provider_snapshot.as_ref(), snapshot) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            },
+            "shared non-return provider uses this model snapshot"
+        );
+        derive_nonreturn_projection(
+            provider,
+            artifact,
+            roots,
+            semantic_budget,
+            cfg_budget,
+            cancellation,
+            discovery_cache,
+        )
+    } else {
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            workspace,
+            snapshot.cloned(),
+        );
+        derive_nonreturn_projection(
+            &provider,
+            artifact,
+            roots,
+            semantic_budget,
+            cfg_budget,
+            cancellation,
+            discovery_cache,
+        )
+    }
 }
 
 fn python_has_local_nonreturn_candidate(
@@ -5690,6 +5746,7 @@ pub fn procedure_continuation_projection(
         semantic_budget,
         cfg_budget,
         cancellation,
+        None,
     );
     continuation_projection_from_derivation(procedure, derived, cancellation)
 }
@@ -5731,6 +5788,7 @@ fn derive_nonreturn_projection(
     semantic_budget: &mut SemanticBudget,
     cfg_budget: &mut CfgAlgorithmBudget,
     cancellation: &CancellationToken,
+    discovery_cache: Option<&NonreturnDiscoveryCache>,
 ) -> ModeledControlProjectionDerivation {
     let mut scheduled = roots.iter().cloned().collect::<HashSet<_>>();
     let mut pending = roots.into_iter().collect::<VecDeque<_>>();
@@ -5739,14 +5797,74 @@ fn derive_nonreturn_projection(
         if cancellation.is_cancelled() {
             return ModeledControlProjectionDerivation::default();
         }
-        let discovery = discover_workspace_nonreturn_procedure(
-            provider,
-            artifact,
-            handle,
-            semantic_budget,
-            cfg_budget,
-            cancellation,
+        let root = Arc::ptr_eq(handle.artifact(), artifact);
+        let snapshot = provider.oracle().active_semantic_model_snapshot();
+        let key = (
+            handle.clone(),
+            root,
+            snapshot
+                .as_ref()
+                .map_or(0, |snapshot| Arc::as_ptr(snapshot) as usize),
         );
+        let cached = discovery_cache.and_then(|cache| {
+            cache
+                .entries
+                .lock()
+                .expect("nonreturn discovery cache mutex is not poisoned")
+                .get(&key)
+                .map(|entry| {
+                    crate::analyzer::usages::common::replay_memo_reads(
+                        &entry.reads,
+                        provider.workspace().analyzer(),
+                    );
+                    WorkspaceNonreturnDiscovery::Complete {
+                        procedure: entry.procedure.clone(),
+                        callees: entry.callees.clone(),
+                    }
+                })
+        });
+        let discovery = cached.unwrap_or_else(|| {
+            let (discovery, reads) = crate::analyzer::usages::common::capture_memo_reads(
+                provider.workspace().analyzer(),
+                || {
+                    discover_workspace_nonreturn_procedure(
+                        provider,
+                        artifact,
+                        handle,
+                        semantic_budget,
+                        cfg_budget,
+                        cancellation,
+                    )
+                },
+            );
+            if let (Some(cache), WorkspaceNonreturnDiscovery::Complete { procedure, callees }) =
+                (discovery_cache, &discovery)
+                && procedure.incomplete_detail.is_none()
+                && procedure.exact_call_resolutions.len()
+                    == procedure
+                        .handle
+                        .semantics()
+                        .call_sites()
+                        .iter()
+                        .filter(|call| call.invocation_mode == CallInvocationMode::Ordinary)
+                        .count()
+            {
+                cache
+                    .entries
+                    .lock()
+                    .expect("nonreturn discovery cache mutex is not poisoned")
+                    .insert(
+                        key,
+                        CachedNonreturnDiscovery {
+                            procedure: procedure.clone(),
+                            callees: callees.clone(),
+                            reads: Arc::new(reads),
+                            _snapshot: snapshot,
+                        },
+                    );
+            }
+            discovery
+        });
         let (procedure, callees) = match discovery {
             WorkspaceNonreturnDiscovery::Complete { procedure, callees } => (procedure, callees),
             WorkspaceNonreturnDiscovery::Cancelled => {
@@ -5988,6 +6106,7 @@ pub fn flow_state_for_file(
         active_model_set_hash,
         &mut budget,
         request,
+        None,
     )
 }
 
@@ -6020,7 +6139,18 @@ pub fn flow_state_for_materialized_artifact(
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
     request: &mut FlowStateRequest<'_>,
 ) -> FileFlowState {
-    flow_state_for_materialized_selection(workspace, file, outcome, None, request)
+    flow_state_for_materialized_selection(workspace, file, outcome, None, request, None)
+}
+
+/// Derive all procedures while reusing one query's ICFG provider.
+pub fn flow_state_for_materialized_artifact_with_provider(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+    request: &mut FlowStateRequest<'_>,
+    provider: &WorkspaceIcfgProvider<'_>,
+) -> FileFlowState {
+    flow_state_for_materialized_selection(workspace, file, outcome, None, request, Some(provider))
 }
 
 /// Derive state events and flow relations for one procedure from the exact
@@ -6045,7 +6175,36 @@ pub fn flow_state_for_materialized_procedure(
         );
     }
 
-    flow_state_for_materialized_selection(workspace, file, outcome, Some(procedure.id()), request)
+    flow_state_for_materialized_selection(
+        workspace,
+        file,
+        outcome,
+        Some(procedure.id()),
+        request,
+        None,
+    )
+}
+
+/// Derive one exact procedure while reusing one query's ICFG provider.
+pub fn flow_state_for_materialized_procedure_with_provider(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+    procedure: &ProcedureHandle,
+    request: &mut FlowStateRequest<'_>,
+    provider: &WorkspaceIcfgProvider<'_>,
+) -> FileFlowState {
+    if let Some(artifact) = outcome.available_value() {
+        assert!(Arc::ptr_eq(artifact, procedure.artifact()));
+    }
+    flow_state_for_materialized_selection(
+        workspace,
+        file,
+        outcome,
+        Some(procedure.id()),
+        request,
+        Some(provider),
+    )
 }
 
 /// Prove only the reaching relations of the property read at one exact point.
@@ -6256,6 +6415,7 @@ fn flow_state_for_materialized_selection(
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
     requested_procedure: Option<ProcedureId>,
     request: &mut FlowStateRequest<'_>,
+    provider: Option<&WorkspaceIcfgProvider<'_>>,
 ) -> FileFlowState {
     let analyzer = workspace.analyzer();
     let _semantic_model_scope = request
@@ -6304,6 +6464,7 @@ fn flow_state_for_materialized_selection(
         active_model_set_hash,
         &mut budget,
         request,
+        provider,
     )
 }
 
@@ -6318,6 +6479,7 @@ fn flow_state_for_materialized_outcome(
     active_model_set_hash: Option<Box<str>>,
     budget: &mut SemanticBudget,
     request: &mut FlowStateRequest<'_>,
+    provider: Option<&WorkspaceIcfgProvider<'_>>,
 ) -> FileFlowState {
     let analyzer = workspace.analyzer();
     let active_models = active_snapshot
@@ -6477,6 +6639,8 @@ fn flow_state_for_materialized_outcome(
             budget,
             &mut nonreturn_cfg_budget,
             request.cancellation,
+            provider,
+            request.nonreturn_discovery_cache,
         ));
     }
     file_reasons.extend(modeled_projection.file_reasons);
@@ -15664,6 +15828,35 @@ func liveMutual(stop bool) { baseFirst(stop); value := 1; _ = value }
                     .reasons
                     .contains(&FlowStateIncompleteReason::Cancelled)
             );
+        }
+    }
+
+    #[test]
+    #[hardwon("#9015: shared Go nonreturn callees were rediscovered for every root")]
+    fn shared_nonreturn_callee_across_go_roots() {
+        const ROOTS: &str = "package sample\nfunc r0(){ shared() }\nfunc r1(){ shared() }\nfunc r2(){ shared() }\nfunc r3(){ shared() }\nfunc r4(){ shared() }\nfunc r5(){ shared() }\nfunc r6(){ shared() }\nfunc r7(){ shared() }\n";
+        const HELPER: &str = "package sample\nfunc shared(){ deep() }\nfunc deep(){ for {} }\n";
+        let fixture = Fixture::new(Language::Go, &[("roots.go", ROOTS), ("helper.go", HELPER)]);
+        let artifact = fixture.materialized(0).available_value().cloned().unwrap();
+        let provider =
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(&fixture.workspace, None);
+        let cancellation = CancellationToken::default();
+        let cache = NonreturnDiscoveryCache::default();
+        for procedure in artifact.procedures() {
+            let handle = artifact.procedure_handle(procedure.id()).unwrap();
+            let derived = derive_nonreturn_projection(
+                &provider,
+                &artifact,
+                vec![handle.clone()],
+                &mut SemanticBudget::default(),
+                &mut CfgAlgorithmBudget::default(),
+                &cancellation,
+                Some(&cache),
+            );
+            let projection =
+                continuation_projection_from_derivation(&handle, derived, &cancellation);
+            assert!(projection.normal_return_absent, "{projection:?}");
+            assert!(projection.reasons.is_empty(), "{projection:?}");
         }
     }
 

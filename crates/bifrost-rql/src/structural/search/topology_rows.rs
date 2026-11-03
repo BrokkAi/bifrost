@@ -41,13 +41,15 @@ use super::results::{
     CodeQueryBuildTarget, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
     CodeQueryResultRef, CodeQuerySourceSet, CodeQueryTopologyEdge, DetailedCodeQueryKey,
 };
+use crate::analyzer::languages::workspace_topology;
 use crate::analyzer::topology::{
     FileOwnership, FileOwnershipState, TopologyAxis, TopologyCompleteness, TopologyEntity,
-    TopologyEntityKind, WorkspaceTopology, workspace_topology,
+    TopologyEntityKind, WorkspaceTopology,
 };
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use crate::path_utils::rel_path_string;
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidence;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use std::sync::Arc;
 
@@ -62,6 +64,9 @@ use std::sync::Arc;
 pub(super) struct TopologyTraversalCache {
     topology: CaptureScopedMemo<Option<Arc<WorkspaceTopology>>>,
     reported: HashSet<(String, &'static str)>,
+    /// The workspace's `rust-toolchain` evidence rows, read once per query
+    /// for Rust build-configuration rows.
+    pub(super) rust_toolchain: Option<Result<Arc<[DependencyEvidence]>, String>>,
 }
 
 impl TopologyTraversalCache {
@@ -77,7 +82,7 @@ impl TopologyTraversalCache {
         }) {
             return cached;
         }
-        let derived = Arc::new(workspace_topology(analyzer.project()));
+        let derived = Arc::new(workspace_topology(analyzer));
         self.topology
             .read_mut(&memo_attribution(analyzer), |topology| {
                 *topology = Some(Arc::clone(&derived))
@@ -140,6 +145,11 @@ impl TopologyTraversalCache {
         }
     }
 
+    /// Whether `subject` has not yet been reported for `family`; records it.
+    pub(super) fn first_report(&mut self, subject: String, family: &'static str) -> bool {
+        self.reported.insert((subject, family))
+    }
+
     /// Report that the build model does not say which source set compiles one
     /// file.
     fn report_ambiguous_ownership(
@@ -156,6 +166,25 @@ impl TopologyTraversalCache {
                 "more than one declared source set claims {path}, and the build model does not \
                  say which one compiles it, so no owner row is published for it"
             ),
+            diagnostics,
+        );
+    }
+
+    /// Report that the build model cannot say which build project compiles
+    /// one file, or does not answer the requested axis for the build model
+    /// that owns it. Either way the file's missing row is not an absence.
+    fn report_unresolved_ownership(
+        &mut self,
+        file: &ProjectFile,
+        detail: &'static str,
+        diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    ) {
+        let path = rel_path_string(file);
+        self.report(
+            &path,
+            CodeQueryDiagnosticCode::TopologyDerivationIncomplete,
+            detail,
+            format!("{detail}: {path}, so no owner row is published for it"),
             diagnostics,
         );
     }
@@ -356,7 +385,8 @@ fn entities_owned_by_file(
 ///
 /// `Ambiguous` is the case worth naming: it is a build model that declares two
 /// claimants and does not resolve them, which is different in kind from a file
-/// nothing claims.
+/// nothing claims. `Unresolved`, and an owned file whose build model does not
+/// answer this axis, are incomplete answers rather than absences.
 fn owner_name(
     cache: &mut TopologyTraversalCache,
     file: &ProjectFile,
@@ -364,11 +394,32 @@ fn owner_name(
     axis: impl FnOnce(FileOwnership) -> Option<String>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Option<String> {
-    if ownership.state == FileOwnershipState::Ambiguous {
-        cache.report_ambiguous_ownership(file, diagnostics);
-        return None;
+    match ownership.state {
+        FileOwnershipState::Ambiguous => {
+            cache.report_ambiguous_ownership(file, diagnostics);
+            None
+        }
+        FileOwnershipState::Unresolved => {
+            cache.report_unresolved_ownership(
+                file,
+                "the build model cannot say which build project compiles this file",
+                diagnostics,
+            );
+            None
+        }
+        FileOwnershipState::Unknown => None,
+        FileOwnershipState::Owned => {
+            let owner = axis(ownership.clone());
+            if owner.is_none() {
+                cache.report_unresolved_ownership(
+                    file,
+                    "the build model that owns this file does not answer this topology axis",
+                    diagnostics,
+                );
+            }
+            owner
+        }
     }
-    axis(ownership.clone())
 }
 
 fn entity_rows(

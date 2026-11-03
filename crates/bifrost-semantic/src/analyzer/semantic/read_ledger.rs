@@ -153,6 +153,7 @@ pub enum WorkspaceFactFamily {
     JavaUsageEvidence,
     JavaImportInventory,
     JavaWorkspaceClasses,
+    JvmSelectedRootPresence,
     JavaReferencingFiles,
     JavaReverseImports,
     JavaSamePackageReferences,
@@ -369,6 +370,7 @@ impl WorkspaceFactFamily {
         (Self::JavaUsageEvidence, "java_usage_evidence"),
         (Self::JavaImportInventory, "java_import_inventory"),
         (Self::JavaWorkspaceClasses, "java_workspace_classes"),
+        (Self::JvmSelectedRootPresence, "jvm_selected_root_presence"),
         (Self::JavaReferencingFiles, "java_referencing_files"),
         (Self::JavaReverseImports, "java_reverse_imports"),
         (

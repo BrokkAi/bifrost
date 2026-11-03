@@ -20,11 +20,13 @@ use rusqlite::{Connection, Row};
 // Every seek binds the selected host as well as the full runtime identity.
 // Producer-local dense keys are never interpreted as ordinary host keys.
 pub(in crate::analyzer::store) const HYDRATE_PATHS_SQL: &str = r#"
-SELECT input.key,path.start_node,path.end_node,json(path.body)
+SELECT input.key,path.start_node,path.end_node,site.role,site.site_kind,json(path.body)
 FROM json_each(?1) input
 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=input.value->>0
 JOIN temp.selected_resolution_stage_paths path
  ON path.host_ordinal=scope.mount_ordinal AND path.path=input.value->>1
+LEFT JOIN temp.selected_resolution_stage_semantics site INDEXED BY selected_resolution_stage_semantics_node
+ ON site.host_ordinal=path.host_ordinal AND site.producer_id=path.producer_id AND site.node=path.start_node
 "#;
 
 #[doc(hidden)]
@@ -33,6 +35,21 @@ pub fn hydrate_candidate_paths(
     candidates: &[CandidatePathIdentity],
     cancellation: &CancellationToken,
 ) -> Result<Option<Vec<Option<PartialPath>>>> {
+    Ok(
+        hydrate_candidate_paths_with_origin(selection, candidates, cancellation)?.map(|rows| {
+            rows.into_iter()
+                .map(|row| row.map(|row| row.path))
+                .collect()
+        }),
+    )
+}
+
+#[doc(hidden)]
+pub fn hydrate_candidate_paths_with_origin(
+    selection: &SelectedResolutionMountInventory<'_>,
+    candidates: &[CandidatePathIdentity],
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<Option<crate::analyzer::resolution::HydratedCandidatePath>>>> {
     let parameters = serde_json::to_string(
         &candidates
             .iter()
@@ -63,11 +80,14 @@ pub fn hydrate_candidate_paths(
                     result[position].is_none(),
                     "one host owns a path identity once"
                 );
-                result[position] = Some(codec::decode_path(
-                    row.get(1)?,
-                    row.get(2)?,
-                    &row.get::<_, String>(3)?,
-                ));
+                let origin = crate::analyzer::resolution::CandidatePathOrigin {
+                    role: row.get(3)?,
+                    site_kind: row.get(4)?,
+                };
+                result[position] = Some(crate::analyzer::resolution::HydratedCandidatePath {
+                    path: codec::decode_path(row.get(1)?, row.get(2)?, &row.get::<_, String>(5)?),
+                    origin,
+                });
             }
             Ok(Some(result))
         },

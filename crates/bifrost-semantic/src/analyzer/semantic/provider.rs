@@ -668,9 +668,17 @@ impl SemanticBudget {
     }
 
     pub fn check_admission(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
+        self.check_admission_without_recording(work)
+            .inspect_err(|_| self.ledger.record_refusal())
+    }
+
+    fn check_admission_without_recording(
+        &self,
+        work: SemanticWork,
+    ) -> Result<(), SemanticBudgetExceeded> {
         self.ledger
             .with_used(self.resident())
-            .check(work)
+            .check_without_recording(work)
             .map_err(SemanticBudgetExceeded::from)?;
         let Some(limit) = self.shared_summary_expansion_limit else {
             return Ok(());
@@ -688,7 +696,6 @@ impl SemanticBudget {
             assert!(work.captures > 0, "summary expansion charge is non-empty");
             SemanticBudgetDimension::Captures
         };
-        self.ledger.record_refusal();
         Err(SemanticBudgetExceeded {
             dimension,
             limit,
@@ -918,6 +925,12 @@ impl SemanticBudget {
         staged.observe_completed_root(replay.root_work_peak);
         *self = staged;
         Ok(())
+    }
+
+    /// Check replay's retained admission without changing budget or refusal state.
+    pub fn replay_product_fits(&self, replay: SemanticBudgetReplay) -> bool {
+        self.check_admission_without_recording(replay.retained)
+            .is_ok()
     }
 
     /// A cached derivation continues the current root rather than completing
@@ -1671,6 +1684,22 @@ impl SemanticExecutionBudget {
         self.charge_external_work(materialized_files, traversal_steps)
     }
 
+    pub fn external_query_work_fits(
+        &self,
+        materialized_files: usize,
+        traversal_steps: usize,
+    ) -> bool {
+        let state = self.state.lock().expect("semantic execution budget lock");
+        state
+            .externally_materialized_files
+            .checked_add(state.materialized_files.len())
+            .and_then(|used| used.checked_add(materialized_files))
+            .is_some_and(|attempted| attempted <= state.max_materialized_files)
+            && state
+                .max_traversal_steps
+                .is_none_or(|limit| traversal_steps <= limit.saturating_sub(state.traversal_steps))
+    }
+
     fn charge_external_work(&self, materialized_files: usize, traversal_steps: usize) -> bool {
         let mut state = self.state.lock().expect("semantic execution budget lock");
         let Some(attempted_files) = state
@@ -2307,6 +2336,25 @@ impl ProgramSemanticsProvider for UnsupportedProgramSemantics {
 mod tests {
     use crate::analyzer::semantic::provider::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#8389: refused replay preflight recorded a refusal on the live budget")]
+    fn replay_fit_does_not_record_a_refusal() {
+        let mut budget = SemanticBudget::uniform(2).unwrap();
+        let replay = SemanticBudgetReplay {
+            retained: SemanticWork {
+                events: 3,
+                ..SemanticWork::default()
+            },
+            ..SemanticBudgetReplay::default()
+        };
+        assert!(!budget.replay_product_fits(replay));
+        assert_eq!(budget.refusal_count(), 0);
+        assert!(budget.first_refusal().is_none());
+        assert!(budget.replay_product(replay).is_err());
+        assert_eq!(budget.refusal_count(), 1);
+        assert!(budget.first_refusal().is_some());
+    }
 
     #[test]
     #[hardwon("#7421: a revived cached consumer kept an artifact after its census was refunded")]

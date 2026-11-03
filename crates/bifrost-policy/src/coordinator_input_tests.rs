@@ -622,12 +622,20 @@ fn completed_unqualified_persisted_base_is_not_admitted() {
     let mut key = base_evaluation_key(
         &crate::test_support::evaluation_options("2026-07-27"),
         None,
-        PolicyBatchBudget::default(),
-        PolicyRegistryLimits::default(),
         inputs,
     );
     key.base_tree_oid = subtree.tree_id().to_string();
+    let evidence = replay_evidence(
+        effective_grant(
+            PolicyBatchBudget::default(),
+            certified_source_census(&workspace, &subtree).unwrap(),
+        ),
+        PolicyRegistryLimits::default(),
+        certified_source_census(&workspace, &subtree).unwrap(),
+    );
     let row = PolicyEvaluationRow {
+        evidence: Some(evidence.clone()),
+        evidence_complete: Some(false),
         key: key.clone(),
         resolved_commit: subtree.commit_id().to_string(),
         policy_set_digest: policy_set_digest(&policies),
@@ -636,6 +644,7 @@ fn completed_unqualified_persisted_base_is_not_admitted() {
         base_content_identity: [1; 32],
         unqualified_policy_ids: vec!["test.persisted".to_owned()],
         policies: vec![PolicyEvaluationPolicyRow {
+            evidence: Some(evidence.clone()),
             policy_id: "test.persisted".to_owned(),
             source_hash: policy.source_hash().to_string(),
             semantic_hash: policy.semantic_hash().to_string(),
@@ -656,9 +665,17 @@ fn completed_unqualified_persisted_base_is_not_admitted() {
         .store()
         .publish_policy_evaluation(row)
         .unwrap();
-    let replay =
-        reuse_persisted_diff_baseline(root.path(), &workspace, "HEAD", &policies, &store, &key)
-            .expect("persisted base reused");
+    let replay = reuse_persisted_diff_baseline(
+        root.path(),
+        &workspace,
+        "HEAD",
+        &policies,
+        &store,
+        &key,
+        PolicyBatchBudget::default(),
+        PolicyRegistryLimits::default(),
+    )
+    .expect("persisted base reused");
     assert_eq!(replay.state, IncrementalBaseState::Reused);
     assert_eq!(replay.baseline.unqualified_policies.len(), 1);
     assert_eq!(

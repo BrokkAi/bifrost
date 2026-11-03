@@ -2024,6 +2024,63 @@ pub(super) const ROOT_MEMBERS: &[(&str, &[super::IntrinsicMember])] = &[
     ),
 ];
 pub(super) const CLOSED_OWNER_MEMBERS: &[(&str, &[super::ClosedOwnerMember])] = &[
+    // Java compiler-owner names: fixed Temurin 21 platform envelope
+    // (JAVA_LANG_VERSION), not runtime version selection. JLS 8.10, 9.2/9.6;
+    // https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Record.html
+    // https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/annotation/Annotation.html
+    // javap -protected Record/Annotation/Object supplies declared and inherited
+    // names; interfaces include Object's public names under JLS 9.2.
+    // No constructors, signatures, member declarations or closed parent graph.
+    (
+        "java.lang.Record",
+        &[
+            super::ClosedOwnerMember {
+                name: "clone",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "protected",
+            },
+            super::ClosedOwnerMember {
+                name: "equals",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "finalize",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "protected",
+            },
+            super::ClosedOwnerMember {
+                name: "getClass",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "hashCode",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "notify",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "notifyAll",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "toString",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "wait",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+        ],
+    ),
     (
         "java.lang.String",
         &[
@@ -2761,6 +2818,51 @@ pub(super) const CLOSED_OWNER_MEMBERS: &[(&str, &[super::ClosedOwnerMember])] = 
                 name: "wait0",
                 kind: super::ClosedMemberKind::Callable,
                 visibility: "private",
+            },
+        ],
+    ),
+    (
+        "java.lang.annotation.Annotation",
+        &[
+            super::ClosedOwnerMember {
+                name: "annotationType",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "equals",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "getClass",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "hashCode",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "notify",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "notifyAll",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "toString",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
+            },
+            super::ClosedOwnerMember {
+                name: "wait",
+                kind: super::ClosedMemberKind::Callable,
+                visibility: "public",
             },
         ],
     ),

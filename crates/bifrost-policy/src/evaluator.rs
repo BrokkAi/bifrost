@@ -141,6 +141,7 @@ use super::units::{
 
 const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 const WEAK_KEY_DOMAIN: &[u8] = b"bifrost-policy-match-weak-key/v1";
+const DECLARATION_SELECTION_DOMAIN: &[u8] = b"bifrost-policy-declaration-selection/v1";
 const CVSS_OVERLAY_HASH_DOMAIN: &[u8] = b"bifrost-policy-cvss-overlay/v1";
 const MAX_OVERLAY_ASSUMPTIONS: usize = 64;
 
@@ -2812,6 +2813,7 @@ fn executable_match_query(
             | QueryValueKind::SourceSet
             | QueryValueKind::BuildTarget
             | QueryValueKind::TopologyEdge
+            | QueryValueKind::BuildConfiguration
             | QueryValueKind::RewritePath
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
@@ -3195,6 +3197,7 @@ fn adapt_match_candidates(
         u64::try_from(result_count.saturating_sub(paired_count)).unwrap_or(u64::MAX);
     let mut incomplete_reasons = Vec::new();
     let mut ordinals: HashMap<StrongOrdinalKey, u32> = HashMap::new();
+    let mut weak_ordinals: HashMap<[u8; 32], u32> = HashMap::new();
     let mut candidates = Vec::with_capacity(paired_count);
     for (item, evidence) in rows.into_iter().zip(evidence) {
         if match_domain(evidence.domain).is_none()
@@ -3214,7 +3217,14 @@ fn adapt_match_candidates(
             incomplete_reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
             continue;
         }
-        match adapt_match_candidate(policy_id, item, evidence, query_diagnostics, &mut ordinals) {
+        match adapt_match_candidate(
+            policy_id,
+            item,
+            evidence,
+            query_diagnostics,
+            &mut ordinals,
+            &mut weak_ordinals,
+        ) {
             Ok(candidate) => candidates.push(candidate),
             Err(()) => {
                 conversion_failed = true;
@@ -3250,6 +3260,7 @@ fn adapt_match_candidate(
     evidence: UnitRowEvidence,
     query_diagnostics: &[CodeQueryDiagnostic],
     ordinals: &mut HashMap<StrongOrdinalKey, u32>,
+    weak_ordinals: &mut HashMap<[u8; 32], u32>,
 ) -> Result<EvaluatedMatchCandidate, ()> {
     let result_domain = match_domain(evidence.domain)
         .or_else(|| {
@@ -3314,12 +3325,13 @@ fn adapt_match_candidate(
         &location,
     )?;
 
+    let declaration_selection = declaration_selection_hash(&evidence);
     let anchor = if result_domain == MatchResultDomain::File {
         MatchFindingAnchor::strong(result_domain, path.clone(), None, None, 0).map_err(|_| ())?
     } else if let (Some(source_hash), false) = (
-        evidence
-            .source_slice_sha256
-            .map(SourceSliceHash::from_bytes),
+        evidence.source_slice_sha256.map(|slice| {
+            declaration_selection.unwrap_or_else(|| SourceSliceHash::from_bytes(slice))
+        }),
         matches!(owner, OwnerCandidate::Rejected),
     ) {
         let owner = match owner {
@@ -3345,10 +3357,14 @@ fn adapt_match_candidate(
         )
         .map_err(|_| ())?
     } else {
+        let digest = weak_finding_digest(&evidence, &path, declaration_selection);
+        let ordinal = weak_ordinals.entry(digest).or_default();
+        let current = *ordinal;
+        *ordinal = ordinal.checked_add(1).ok_or(())?;
         MatchFindingAnchor::weak(
             result_domain,
             path.clone(),
-            weak_finding_key(&evidence, &path),
+            weak_finding_key(digest, current),
         )
     };
 
@@ -5507,6 +5523,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::SourceSet
         | DetailedCodeQueryDomain::BuildTarget
         | DetailedCodeQueryDomain::TopologyEdge
+        | DetailedCodeQueryDomain::BuildConfiguration
         | DetailedCodeQueryDomain::RewritePath
         | DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
@@ -5555,13 +5572,69 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
     }
 }
 
-/// The opaque identity of a finding with no strong anchor.
+/// The identity of a row that selects a whole declaration, used in place of
+/// its source slice and byte span.
+///
+/// A declaration row and a Python class-hierarchy fact both select the full
+/// source range of a declaration, so its slice hash and byte span change with
+/// every edit inside the body or above it, and an ignored finding came back
+/// under a new id after an unrelated edit (#9084). The row's key already
+/// names what the row is about without coordinates: a declaration's analyzer
+/// id (language, path, kind and qualified name), or a hierarchy fact's own
+/// digest over the class, fact kind, outcome, base position and spelling, and
+/// endpoints. Anchoring on it keeps the id through body edits, while a rename
+/// or a different base still changes it.
+fn declaration_selection_hash(evidence: &UnitRowEvidence) -> Option<SourceSliceHash> {
+    let id = match &evidence.key {
+        DetailedCodeQueryKey::Declaration {
+            analyzer_id: Some(id),
+            ..
+        }
+        | DetailedCodeQueryKey::PythonHierarchyFact { id, .. } => id,
+        _ => return None,
+    };
+    let mut hasher = Sha256::new();
+    update_hash(&mut hasher, DECLARATION_SELECTION_DOMAIN);
+    update_hash(&mut hasher, evidence.domain.label().as_bytes());
+    update_hash(&mut hasher, id.as_bytes());
+    Some(SourceSliceHash::from_bytes(hasher.finalize().into()))
+}
+
+/// The opaque identity of a finding with no strong anchor: the row's digest,
+/// separated from earlier rows with the same digest by its occurrence.
+///
+/// The first occurrence keeps the bare digest. Only a row whose digest omits
+/// its coordinates -- a declaration selection -- can repeat one, for example
+/// a Python class defined twice under one name in one file.
+fn weak_finding_key(digest: [u8; 32], occurrence: u32) -> OpaqueFindingKey {
+    let digest: [u8; 32] = if occurrence == 0 {
+        digest
+    } else {
+        let mut hasher = Sha256::new();
+        update_hash(&mut hasher, &digest);
+        update_hash(&mut hasher, &occurrence.to_be_bytes());
+        hasher.finalize().into()
+    };
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String is infallible");
+    }
+    OpaqueFindingKey::try_new("code-query", encoded)
+        .expect("a SHA-256 key and static namespace satisfy opaque-key bounds")
+}
+
+/// The digest behind [`weak_finding_key`].
 ///
 /// `path` is the normalized workspace-relative spelling the adapter already
 /// derived, not a second rendering of the evidence file: a unit produced at
 /// one workspace root is adapted at another, so the one spelling that is the
 /// same in both is the only sound input to a pinned finding identity.
-fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) -> OpaqueFindingKey {
+fn weak_finding_digest(
+    evidence: &UnitRowEvidence,
+    path: &WorkspaceRelativePath,
+    declaration_selection: Option<SourceSliceHash>,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
     update_hash(&mut hasher, WEAK_KEY_DOMAIN);
     // The registry's own label, never a second copy of it: this byte
@@ -5569,6 +5642,10 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
     // duplicate would silently change every finding id (issue #2498).
     update_hash(&mut hasher, evidence.domain.label().as_bytes());
     update_hash(&mut hasher, path.as_str().as_bytes());
+    if let Some(selection) = declaration_selection {
+        update_hash(&mut hasher, selection.as_bytes());
+        return hasher.finalize().into();
+    }
     if let Some(span) = &evidence.byte_span {
         update_hash(&mut hasher, &span.start.to_be_bytes());
         update_hash(&mut hasher, &span.end.to_be_bytes());
@@ -5828,6 +5905,13 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, to_name.as_bytes());
             update_hash(&mut hasher, scope.as_bytes());
         }
+        DetailedCodeQueryKey::BuildConfiguration {
+            id,
+            configuration_id,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, configuration_id.as_bytes());
+        }
         DetailedCodeQueryKey::RewritePath {
             id,
             domain,
@@ -6032,14 +6116,7 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, root_id.as_bytes());
         }
     }
-    let digest: [u8; 32] = hasher.finalize().into();
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut encoded, "{byte:02x}").expect("writing to String is infallible");
-    }
-    OpaqueFindingKey::try_new("code-query", encoded)
-        .expect("a SHA-256 key and static namespace satisfy opaque-key bounds")
+    hasher.finalize().into()
 }
 
 fn update_optional_hash(hasher: &mut Sha256, value: Option<&str>) {

@@ -215,8 +215,18 @@ pub(crate) fn select<'analyzer>(
             crate::analyzer::rust::std_types::operational_proof_stop("store_error", brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider);
             None
         })?;
-        let imports = analyzer.import_analysis_provider_for_file(file)?;
-        let imports = imports.import_info_of(scope.token(), file);
+        let imports = if let Some(selected) = operation.as_deref_mut() {
+            crate::analyzer::rust::std_types::selected_import_infos(
+                analyzer,
+                selected,
+                file,
+                &cancellation,
+            )?
+        } else {
+            analyzer
+                .import_analysis_provider_for_file(file)?
+                .import_info_of(scope.token(), file)
+        };
         let visible_imports = imports
             .iter()
             .filter(|import| {
@@ -280,12 +290,12 @@ pub(crate) fn select<'analyzer>(
             }
             if crate::analyzer::rust::external_calls::native_external_root_with_resolver(
                 analyzer,
-                scope.token(),
                 file,
                 source,
                 tree,
                 written.root,
                 None,
+                &imports,
                 |query| match operation.as_deref_mut() {
                     Some(operation) => {
                         native_points::resolve_rust_definition_in_operation(query, operation)

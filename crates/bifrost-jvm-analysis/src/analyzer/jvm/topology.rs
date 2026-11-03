@@ -30,9 +30,15 @@ use std::path::{Path, PathBuf};
 
 use crate::analyzer::jvm::dependency_discovery::is_maven_pom;
 
+use brokk_bifrost_core::analyzer::common::language_for_file;
+
+use brokk_bifrost_core::analyzer::model::Language;
+
 use brokk_bifrost_core::analyzer::project::Project;
 
-use brokk_bifrost_analysis::analyzer::topology::BuildModelProvider;
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
+
+use brokk_bifrost_analysis::analyzer::languages::BuildModelProvider;
 
 use brokk_bifrost_analysis::analyzer::topology::DependencyScope;
 
@@ -79,8 +85,8 @@ impl BuildModelProvider for JvmBuildModel {
         &JVM_TOPOLOGY_SUPPORT
     }
 
-    fn topology(&self, project: &dyn Project) -> WorkspaceTopology {
-        maven_topology(project)
+    fn topology(&self, analyzer: &dyn IAnalyzer) -> Option<WorkspaceTopology> {
+        maven_topology(analyzer.project())
     }
 }
 
@@ -104,12 +110,23 @@ struct MavenDependency {
     kind: DependencyScope,
 }
 
-fn maven_topology(project: &dyn Project) -> WorkspaceTopology {
+/// `None` when the workspace holds no pom and no JVM source: the Maven model
+/// then has nothing to own.
+fn maven_topology(project: &dyn Project) -> Option<WorkspaceTopology> {
     let Ok(files) = project.all_files() else {
         let mut topology = WorkspaceTopology::incomplete(JVM_TOPOLOGY_SUPPORT.clone());
         topology.mark_provider_failed();
-        return topology;
+        return Some(topology);
     };
+    if !files.iter().any(|file| {
+        is_maven_pom(file)
+            || matches!(
+                language_for_file(file),
+                Language::Java | Language::Kotlin | Language::Scala
+            )
+    }) {
+        return None;
+    }
     let configurations: Vec<_> = files
         .iter()
         .filter(|file| is_maven_pom(file))
@@ -124,12 +141,12 @@ fn maven_topology(project: &dyn Project) -> WorkspaceTopology {
             )
         })
         .collect();
-    maven_topology_from_inputs(
+    Some(maven_topology_from_inputs(
         files.iter().map(|file| file.rel_path()),
         configurations
             .iter()
             .map(|(path, source)| (*path, source.as_ref().map(|source| source.as_bytes()))),
-    )
+    ))
 }
 
 /// Interpret one selected inventory without reading current project files.
@@ -429,7 +446,7 @@ mod tests {
             std::fs::write(path, source).unwrap();
         }
         let project = TestProject::new(root, Language::Java);
-        JVM_BUILD_MODEL.topology(&project)
+        maven_topology(&project).expect("a fixture with a pom applies the Maven model")
     }
 
     #[test]

@@ -264,7 +264,10 @@ For Go, the go command is the package authority. In module mode, vendoring
 uses the main module root's `vendor` directory; nested `vendor` directories
 are not providers. Bifrost reports the tool's discovery error for an unresolved
 import, including the import path, rather than selecting a nearby source copy.
-This retires the legacy nearest-vendor guarantee (#5697).
+This retires the legacy nearest-vendor guarantee (#5697). A package in a vendor
+tree, a `vendor` directory that holds `modules.txt`, has the import path below
+`vendor/` as its identity: `vendor/github.com/x/y` declares `github.com/x/y`,
+as the go command builds it, not a subpackage of the enclosing module (#9052).
 
 After a workspace update, native Go discovery includes unsaved Go source when
 an edit changes build constraints, the package clause, cgo use, or imports.

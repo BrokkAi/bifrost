@@ -553,6 +553,8 @@ impl NavigationLookupOutcome {
 #[derive(Debug, Clone)]
 pub struct CallTargetLookupOutcome {
     #[doc(hidden)]
+    pub source_member_evidence: Option<Box<[SourceMemberCallEvidence]>>,
+    #[doc(hidden)]
     pub native_resolution: Option<Box<NativeResolutionCompletion>>,
     #[doc(hidden)]
     pub model_member_selection: Option<Box<crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>>,
@@ -601,6 +603,7 @@ impl CallTargetLookupOutcome {
     #[doc(hidden)]
     pub fn from_resolution(resolution: DefinitionResolution) -> Self {
         Self {
+            source_member_evidence: resolution.evidence.source_member_evidence,
             native_resolution: resolution.evidence.native_resolution,
             model_member_selection: resolution.evidence.model_member_selection,
             outcome: resolution.outcome,
@@ -1224,6 +1227,8 @@ pub struct NativeResolutionCompletion {
 #[doc(hidden)]
 pub struct CallEvidence {
     #[doc(hidden)]
+    pub source_member_evidence: Option<Box<[SourceMemberCallEvidence]>>,
+    #[doc(hidden)]
     pub native_resolution: Option<Box<NativeResolutionCompletion>>,
     #[doc(hidden)]
     pub model_member_selection: Option<Box<crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>>,
@@ -1237,6 +1242,20 @@ pub struct CallEvidence {
     pub exact_external_call: Option<ExactExternalCallProof>,
     #[doc(hidden)]
     pub external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
+}
+
+/// Query-local facts for one projected member association at the caller site.
+/// The canonical unit also appears in the definition answer. Multiple rows
+/// may project to the same unit and must agree before a call-level fact is used.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct SourceMemberCallEvidence {
+    pub definition: CodeUnit,
+    pub kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind,
+    pub call_application: CallApplicationKind,
+    pub method_owner_is_interface: Option<bool>,
+    pub receiver_preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
+    pub field_anchor: Option<crate::analyzer::semantic::SourceAnchor>,
 }
 
 impl CallEvidence {
@@ -1338,6 +1357,11 @@ pub struct DefinitionResolution {
     pub outcome: DefinitionLookupOutcome,
     #[doc(hidden)]
     pub evidence: CallEvidence,
+    /// Exact call-binding obligations discharged by this selected answer.
+    /// Derived under the same frozen operation inputs and read ledger as `outcome`;
+    /// the query-local native point memo replays them together.
+    #[doc(hidden)]
+    pub call_binding_discharge_digests: Vec<[u8; 32]>,
 }
 
 impl From<DefinitionLookupOutcome> for DefinitionResolution {
@@ -1345,6 +1369,7 @@ impl From<DefinitionLookupOutcome> for DefinitionResolution {
         Self {
             outcome,
             evidence: CallEvidence::default(),
+            call_binding_discharge_digests: Vec::new(),
         }
     }
 }
@@ -2999,6 +3024,7 @@ pub(crate) fn resolve_generic_call_target_batch(
         )
         .into_iter()
         .map(|navigation| CallTargetLookupOutcome {
+            source_member_evidence: navigation.evidence.source_member_evidence,
             native_resolution: navigation.evidence.native_resolution,
             model_member_selection: navigation.evidence.model_member_selection,
             authority: navigation.evidence.authority,
@@ -3494,6 +3520,7 @@ pub fn resolve_one_with_evidence<'a>(
             BoundedResolution::Complete { value, .. } => DefinitionResolution {
                 outcome: value,
                 evidence: CallEvidence::default(),
+                call_binding_discharge_digests: Vec::new(),
             },
             BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
                 limit,
@@ -3540,6 +3567,7 @@ pub fn resolve_one_with_evidence<'a>(
     let DefinitionResolution {
         outcome: resolved,
         evidence,
+        call_binding_discharge_digests,
     } = match resolution {
         std::ops::ControlFlow::Break(resolution) => return resolution,
         std::ops::ControlFlow::Continue(resolution) => resolution,
@@ -3558,6 +3586,7 @@ pub fn resolve_one_with_evidence<'a>(
     DefinitionResolution {
         outcome: finish_lookup_outcome(resolved, site),
         evidence,
+        call_binding_discharge_digests,
     }
 }
 
@@ -3841,7 +3870,9 @@ pub fn navigation_lookup_outcome(
     language: Language,
     operation: NavigationOperation,
 ) -> NavigationLookupOutcome {
-    let DefinitionResolution { outcome, evidence } = resolution;
+    let DefinitionResolution {
+        outcome, evidence, ..
+    } = resolution;
     let DefinitionLookupOutcome {
         mut modeled_definitions,
         mut status,
@@ -4452,7 +4483,12 @@ mod native_point_identity {
             }
         };
     }
-    fields!(DefinitionResolution, outcome, evidence);
+    fields!(
+        DefinitionResolution,
+        outcome,
+        evidence,
+        call_binding_discharge_digests
+    );
     fields!(
         DefinitionLookupOutcome,
         modeled_definitions,
@@ -4467,6 +4503,7 @@ mod native_point_identity {
     impl NativePointRegistryIndependent for CallEvidence {
         fn registry_independent(&self) -> bool {
             let Self {
+                source_member_evidence,
                 native_resolution,
                 model_member_selection,
                 authority,
@@ -4479,6 +4516,7 @@ mod native_point_identity {
             // its query-local registry must never cross selected operations.
             // Java currently leaves this field None; only Go publishes it.
             native_resolution.is_none()
+                && source_member_evidence.is_none()
                 && model_member_selection.registry_independent()
                 && authority.registry_independent()
                 && call_application.registry_independent()

@@ -584,6 +584,9 @@ impl Hasher for ValueFlowPlanDigestHasher {
 }
 
 fn value_flow_plan_digest(plan: &ValueFlowPlan) -> String {
+    // ProcedureHandle::hash contains an allocation pointer. This digest is
+    // only for registration allocation validation and must never enter a
+    // public or persisted identity. Use ValueFlowPlan::public_fingerprint.
     let mut hasher = ValueFlowPlanDigestHasher::default();
     plan.hash(&mut hasher);
     let mut digest = LengthDelimitedDigest::new(b"bifrost.value_flow_plan.registration.v1");

@@ -1038,25 +1038,15 @@ fn scalar_condition_expansions(
         );
     };
     let uncancelled = CancellationToken::new();
-    let reference_calls = semantic.reference_receiver_calls(&seed.file, &procedure.handle);
-    let outcome = cache
-        .scalar
-        .read_mut(&memo_attribution(workspace.analyzer()), |scalar| {
-            scalar
-                .entry(procedure.handle.clone())
-                .or_insert_with(|| {
-                    scalar_condition_outcomes(
-                        workspace,
-                        &seed.file,
-                        &procedure.handle,
-                        Arc::clone(syntax),
-                        cancellation.unwrap_or(&uncancelled),
-                        &reference_calls,
-                    )
-                    .map(Arc::new)
-                })
-                .clone()
-        });
+    let outcome = scalar_outcomes_for_procedure(
+        workspace,
+        semantic,
+        cache,
+        &seed.file,
+        procedure,
+        syntax,
+        cancellation.unwrap_or(&uncancelled),
+    );
     let verdicts = conditions
         .into_iter()
         .enumerate()

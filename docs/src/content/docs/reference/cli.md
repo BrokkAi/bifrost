@@ -209,7 +209,7 @@ a built-in selector.
 | Flag | Behavior |
 | --- | --- |
 | `--server MODE` | Deprecated alias for `--mcp MODE`. Prints `bifrost: --server is deprecated; use --mcp <toolsets>` on stderr, then behaves like `--mcp MODE`. `bifrost --help` does not list it. |
-| `--lsp` | Prints `the LSP server has moved out of this repository` and exits 1. The language server is the separate `bifrost-lsp` program. [LSP Server](/lsp/) describes it and the earlier releases that still accept `--lsp`. |
+| `--lsp` | Prints `the LSP server has moved out of this repository` and exits 1. The language server is the separate `bifrost-lsp` program. [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md) describes it and the earlier releases that still accept `--lsp`. |
 | `--server lsp` | Prints the `--server` deprecation warning, then the same message as `--lsp`, and exits 1. |
 
 ## Conflict Rules

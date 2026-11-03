@@ -21,8 +21,8 @@ use crate::dataflow::{SemanticInputStatus, SolverTermination, UnmodeledCallBehav
 use crate::hash::HashMap;
 use crate::inline_project::InlineTestProject;
 use crate::taint::{
-    SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintFindingReport,
-    TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding, TaintUniverse,
+    SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction,
+    TaintFindingReport, TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding, TaintUniverse,
 };
 use crate::value_flow::{
     AuthoredArmClosure, DurableCallSiteKey, DurableProcedureKey, ValueFlowCarrier,
@@ -324,6 +324,8 @@ struct FakeGraph {
     filtered_flows: HashMap<DurableProcedureKey, Arc<ProcedurePartialFlows>>,
     filtered_crossed: HashMap<DurableProcedureKey, Box<[CallSiteId]>>,
     proof_reads: std::cell::RefCell<Vec<DurableCallSiteKey>>,
+    store_writes: Vec<StoreWriteObservation>,
+    store_links: HashMap<(DurableProcedureKey, PartialFlowPort), StoreChannelLinks>,
 
     interior: HashMap<DurableProcedureKey, Vec<(InteriorSeed, FakeTarget)>>,
     dispatches: HashMap<DurableCallSiteKey, Dispatch>,
@@ -414,6 +416,23 @@ impl FakeGraph {
 
 impl CompositionProvider for FakeGraph {
     type Error = String;
+    type Fact = TaintClassSet;
+    type Function = TaintEdgeFunction;
+
+    fn store_writes(&self) -> Vec<StoreWriteObservation> {
+        self.store_writes.clone()
+    }
+
+    fn store_links(
+        &self,
+        procedure: &DurableProcedureKey,
+        output: &PartialFlowPort,
+    ) -> StoreChannelLinks {
+        self.store_links
+            .get(&(procedure.clone(), output.clone()))
+            .cloned()
+            .unwrap_or_default()
+    }
 
     fn has_value_type_barriers(&self) -> bool {
         self.barriers
@@ -706,6 +725,7 @@ fn plain_candidate(procedure: &ProcedureHandle, call: CallSiteId) -> DispatchCan
     DispatchCandidate {
         procedure: procedure.durable_key(),
         arguments: vec![(argument(call, 0), parameter(0))].into_boxed_slice(),
+        writeback: Box::default(),
         returns: vec![(PartialFlowPort::NormalReturn, result(call))].into_boxed_slice(),
     }
 }
@@ -782,6 +802,78 @@ fn a_source_reaches_a_sink_in_the_same_procedure() {
     assert!(finding.is_proven() && finding.is_complete() && report.is_complete());
     assert_eq!(finding.origins().evidence()[0].witnesses().len(), 1);
     assert!(finding.origins().is_complete());
+}
+
+#[test]
+fn a_store_read_wakes_only_after_a_source_reaches_a_linked_write() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["caller"], None);
+    let origin = &fixture.procedures["origin"];
+    let caller = &fixture.procedures["caller"];
+    let call = fixture.helper_call().id;
+    let relation = &fixture.first_relation["origin"];
+    let write = StoreWriteObservation {
+        procedure: origin.durable_key(),
+        owner: origin.clone(),
+        point: relation.point().id(),
+        phase: ValueFlowObservationPhase::AfterEffects,
+        carrier: ValueFlowCarrier::from(&relation.target),
+    };
+    let observation = InteriorObservation::Sink {
+        point: write.point,
+        phase: write.phase,
+        carrier: write.carrier.clone(),
+    };
+    let mut graph = FakeGraph::new(&fixture);
+    graph.store_writes.push(write);
+    graph.store_links.insert(
+        (caller.durable_key(), result(call)),
+        StoreChannelLinks {
+            writes: vec![StoreChannelLink {
+                write: 0,
+                write_call: (origin.durable_key(), CallSiteId::new(77)),
+                read_call: (caller.durable_key(), call),
+                read_origin: plan.sources()[0].origin().clone(),
+                read_phase: ValueFlowObservationPhase::AfterEffects,
+                read_carrier: ValueFlowCarrier::from(&relation.target),
+                uncertain: false,
+            }],
+            incomplete: None,
+        },
+    );
+    graph.stored(origin, &[], &[]);
+    graph.stored(caller, &[result(call)], &[]);
+    graph.interior(
+        caller,
+        InteriorSeed::Port(result(call)),
+        sink_in(&plan, caller),
+    );
+    assert!(compose(&plan, &graph, BUDGET).report.findings().is_empty());
+    graph.interior(
+        origin,
+        seed_of_source(&plan, origin),
+        FakeTarget::Observe(observation),
+    );
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert!(
+        outcome.incompleteness.is_empty(),
+        "{:#?}",
+        outcome.incompleteness
+    );
+    assert_single_alpha_finding(&plan, &outcome.report);
+    graph
+        .store_links
+        .get_mut(&(caller.durable_key(), result(call)))
+        .expect("the read has selected store links")
+        .incomplete = Some("write selector stopped before inventory closure".into());
+    let incomplete = compose(&plan, &graph, BUDGET);
+    assert!(!incomplete.report.is_complete());
+    assert!(
+        incomplete
+            .incompleteness
+            .iter()
+            .any(|reason| matches!(reason, Incompleteness::StoreInventory { .. }))
+    );
 }
 
 #[test]
@@ -1058,6 +1150,7 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
         vec![DispatchCandidate {
             procedure: modeled.durable_key(),
             arguments: vec![(receiver.clone(), PartialFlowPort::Receiver)].into_boxed_slice(),
+            writeback: Box::default(),
             returns: vec![(PartialFlowPort::NormalReturn, result(call))].into_boxed_slice(),
         }],
         Completeness::Complete,
@@ -1068,8 +1161,7 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
         CallModel {
             transfers: vec![ModelTransfer {
                 actual: receiver.clone(),
-                moved: None,
-                removed: Box::default(),
+                function: TaintEdgeFunction::identity(plan.universe()),
             }],
             proven: true,
             completeness: Completeness::Complete,
@@ -1331,59 +1423,29 @@ fn a_callee_reading_a_tainted_field_of_its_parameter_is_a_finding() {
     assert_single_alpha_finding(&plan, &report);
 }
 
-/// `pair` lends `cell` to `fill`, which stores its source into the cell, and
-/// then to `show`, which logs the cell. The demand at `show`'s heap input
-/// climbs to the location in `pair`; the only call writing through the same
-/// binding is `fill`, whose heap output on that parameter holds the source.
 #[test]
-fn a_callee_writing_a_field_of_its_argument_reaches_a_later_reader() {
+#[hardwon("#9028: an unmodeled call silently dropped a post-call heap demand")]
+fn empty_dispatch_keeps_a_post_call_heap_demand_incomplete() {
     let fixture = fixture();
-    let plan = fixture.plan(&["fill"], &["show"], None);
-    let fill = &fixture.procedures["fill"];
-    let show = &fixture.procedures["show"];
+    let plan = fixture.plan(&["pair"], &["pair"], None);
     let pair = &fixture.procedures["pair"];
-    let (into_fill, into_show) = fixture.pair_calls();
-    let selectors: Box<[HeapSelector]> = vec![HeapSelector::AnyIndex].into_boxed_slice();
-    let field = PartialFlowPort::Heap {
-        root: Box::new(parameter(0)),
-        selectors: selectors.clone(),
+    let (call, _) = fixture.pair_calls();
+    let heap = PartialFlowPort::Heap {
+        root: Box::new(argument(call, 0)),
+        selectors: vec![HeapSelector::AnyIndex].into_boxed_slice(),
         tail: AccessPathTail::Exact,
     };
     let mut graph = FakeGraph::new(&fixture);
-    graph.stored(show, &[parameter(0), field.clone()], &[]);
-    graph.interior(
-        show,
-        InteriorSeed::Port(field.clone()),
-        sink_in(&plan, show),
+    graph.stored(pair, &[heap, parameter(0)], &[(0, 1)]);
+    graph.interior(pair, InteriorSeed::Port(parameter(0)), sink_in(&plan, pair));
+    graph.route(pair, call, Vec::new(), Completeness::Complete);
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert!(
+        outcome.report.findings().is_empty(),
+        "{:#?}",
+        outcome.report
     );
-    graph.callers.insert(
-        show.durable_key(),
-        Callers {
-            calls: vec![(pair.durable_key(), into_show)],
-            completeness: Completeness::Complete,
-        },
-    );
-    graph.route(
-        pair,
-        into_show,
-        vec![plain_candidate(show, into_show)],
-        Completeness::Complete,
-    );
-    graph.route(
-        pair,
-        into_fill,
-        vec![plain_candidate(fill, into_fill)],
-        Completeness::Complete,
-    );
-    graph.stored(fill, &[parameter(0), field.clone()], &[]);
-    graph.interior(fill, seed_of_source(&plan, fill), FakeTarget::Port(field));
-    let ComposeOutcome {
-        report,
-        incompleteness,
-        ..
-    } = compose(&plan, &graph, BUDGET);
-    assert!(incompleteness.is_empty(), "{incompleteness:#?}");
-    assert_single_alpha_finding(&plan, &report);
+    assert!(!outcome.report.is_complete(), "{:#?}", outcome.report);
 }
 
 /// `target`'s source is the argument of call 47, whose result reaches the
@@ -1792,4 +1854,563 @@ fn barriers_without_baseline_candidates_make_no_type_queries() {
     assert_eq!(outcome.stats.chop_procedures, 0);
     assert_eq!(graph.check_reads.get(), 0);
     assert!(!graph.filtering.get());
+}
+
+/// A closed timing family: SameInvocation is identity, repeated deferred
+/// execution is deferred, and a different task absorbs either schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ToyTiming {
+    Same,
+    Deferred,
+    Task,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToyLabels;
+
+impl ComposeLabels for ToyLabels {
+    type Fact = bool;
+    type Function = ToyTiming;
+
+    fn identity(&self) -> ToyTiming {
+        ToyTiming::Same
+    }
+    fn then(&self, first: &ToyTiming, second: &ToyTiming) -> ToyTiming {
+        match (first, second) {
+            (ToyTiming::Task, _) | (_, ToyTiming::Task) => ToyTiming::Task,
+            (ToyTiming::Deferred, _) | (_, ToyTiming::Deferred) => ToyTiming::Deferred,
+            _ => ToyTiming::Same,
+        }
+    }
+    fn apply(&self, _function: &ToyTiming, fact: &bool) -> bool {
+        *fact
+    }
+    fn intersects(&self, left: &bool, right: &bool) -> bool {
+        *left && *right
+    }
+}
+
+#[derive(Default)]
+struct ToyGraph {
+    inventories: HashMap<DurableProcedureKey, Invocations>,
+    dispatches: HashMap<DurableCallSiteKey, ExecutionDispatch<ToyTiming>>,
+    declarations: HashMap<ExecutionTarget, ExecutionEndpoints<bool>>,
+    arm_declarations: HashMap<(DurableCallSiteKey, usize), ExecutionEndpoints<bool>>,
+    allow_discharge: bool,
+}
+
+impl ToyGraph {
+    fn invoke(&mut self, procedure: &DurableProcedureKey, call: CallSiteId) {
+        self.inventories
+            .entry(procedure.clone())
+            .or_insert_with(|| Invocations {
+                sites: Vec::new(),
+                coverage: Completeness::Complete,
+            })
+            .sites
+            .push(InvocationSite {
+                call: (procedure.clone(), call),
+                source_site: call,
+                mode: crate::analyzer::semantic::CallInvocationMode::Ordinary,
+            });
+    }
+
+    fn arm(
+        target: ExecutionTarget,
+        timing: crate::analyzer::semantic::ExecutionTiming,
+        quality: HopQuality,
+    ) -> ExecutionArm<ToyTiming> {
+        let function = match timing {
+            crate::analyzer::semantic::ExecutionTiming::SameInvocation => ToyTiming::Same,
+            crate::analyzer::semantic::ExecutionTiming::AfterSuspension => ToyTiming::Deferred,
+            crate::analyzer::semantic::ExecutionTiming::DifferentTask => ToyTiming::Task,
+            _ => panic!("the toy covers three timings"),
+        };
+        ExecutionArm {
+            target,
+            function,
+            quality,
+            timing,
+        }
+    }
+
+    fn set_dispatch(&mut self, call: DurableCallSiteKey, arms: Vec<ExecutionArm<ToyTiming>>) {
+        self.dispatches.insert(
+            call,
+            ExecutionDispatch {
+                arms,
+                residuals: Vec::new(),
+                coverage: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
+                outcome: ExecutionDispatchOutcome::Complete,
+            },
+        );
+    }
+
+    fn declare(&mut self, target: ExecutionTarget, status: ExecutionEndpointStatus) {
+        self.declarations.insert(
+            target,
+            ExecutionEndpoints {
+                sources: vec![ExecutionSource {
+                    identity: "declared-effect".into(),
+                    fact: true,
+                    provenance: "toy".into(),
+                }],
+                status,
+                covers_overrides: true,
+            },
+        );
+    }
+}
+
+impl CompositionProvider for ToyGraph {
+    type Error = String;
+    type Fact = bool;
+    type Function = ToyTiming;
+
+    fn discharge_execution_residual(
+        &self,
+        _call: &DurableCallSiteKey,
+        _dispatch: &ExecutionDispatch<ToyTiming>,
+    ) -> bool {
+        self.allow_discharge
+    }
+
+    fn invocations(
+        &self,
+        procedure: &DurableProcedureKey,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<Invocations, String> {
+        Ok(self
+            .inventories
+            .get(procedure)
+            .cloned()
+            .unwrap_or(Invocations {
+                sites: Vec::new(),
+                coverage: Completeness::Complete,
+            }))
+    }
+    fn execution_dispatch(
+        &self,
+        call: &DurableCallSiteKey,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ExecutionDispatch<ToyTiming>, String> {
+        Ok(self
+            .dispatches
+            .get(call)
+            .expect("toy dispatch exists")
+            .clone())
+    }
+    fn execution_endpoints(
+        &self,
+        target: &ExecutionTarget,
+        incoming: Option<&ExecutionArmContext>,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ExecutionEndpoints<bool>, String> {
+        Ok(incoming
+            .and_then(|arm| self.arm_declarations.get(&(arm.call.clone(), arm.ordinal)))
+            .or_else(|| self.declarations.get(target))
+            .cloned()
+            .unwrap_or(ExecutionEndpoints {
+                sources: Vec::new(),
+                status: if matches!(target, ExecutionTarget::External(_)) {
+                    ExecutionEndpointStatus::Absent
+                } else {
+                    ExecutionEndpointStatus::Complete
+                },
+                covers_overrides: true,
+            }))
+    }
+    fn partial_flows(
+        &self,
+        _: &DurableProcedureKey,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<Arc<ProcedurePartialFlows>, String> {
+        unimplemented!("execution has no value flows")
+    }
+    fn interior_flows(
+        &self,
+        _: &DurableProcedureKey,
+        _: &[InteriorSeed],
+        _: &[InteriorObservation],
+        _: bool,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<InteriorFlows, String> {
+        unimplemented!("execution has no value flows")
+    }
+    fn dispatch(
+        &self,
+        _: &DurableCallSiteKey,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<Dispatch, String> {
+        unimplemented!("execution has no value dispatch")
+    }
+    fn callers(
+        &self,
+        _: &DurableProcedureKey,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<Callers, String> {
+        unimplemented!("execution has no reverse value search")
+    }
+    fn lexical_parent(
+        &self,
+        _: &DurableProcedureKey,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<Option<DurableProcedureKey>, String> {
+        unimplemented!("execution has no capture binding")
+    }
+    fn model(&self, _: &DurableCallSiteKey) -> Option<CallModel<ToyTiming>> {
+        unimplemented!("execution has no value model")
+    }
+    fn unmodeled_call_behavior(&self) -> UnmodeledCallBehavior {
+        unimplemented!("execution has no value fallback")
+    }
+    fn fallback_ports(
+        &self,
+        _: &DurableCallSiteKey,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<FallbackPorts, String> {
+        unimplemented!("execution has no value ports")
+    }
+    fn authored_models(&self) -> Vec<Box<[AuthoredArmClosure]>> {
+        unimplemented!("execution has no value models")
+    }
+    fn openness(
+        &self,
+        _: &DurableProcedureKey,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<Openness, String> {
+        unimplemented!("execution has its own coverage")
+    }
+    fn endpoints(
+        &self,
+        _: &DurableProcedureKey,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<ProcedureEndpoints<bool, ToyTiming>, String> {
+        unimplemented!("execution has no value endpoints")
+    }
+    fn source_evidence(
+        &self,
+        _: &BoundSource<bool>,
+        _: &mut SemanticRequest<'_>,
+    ) -> Result<HopQuality, String> {
+        unimplemented!("execution has no value sources")
+    }
+}
+
+fn toy_execution(root: DurableProcedureKey, graph: &ToyGraph) -> ExecutionOutcome<ToyLabels> {
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    search_execution(
+        vec![root],
+        ToyLabels,
+        graph,
+        BUDGET,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("toy execution search")
+}
+
+#[test]
+fn execution_relation_interns_cycles_and_keeps_timing_paths() {
+    use crate::analyzer::semantic::ExecutionTiming;
+    let fixture = fixture();
+    let caller = fixture.procedures["caller"].durable_key();
+    let call = fixture.helper_call().id;
+    let target = ExecutionTarget::Procedure(Box::new(caller.clone()));
+    let mut graph = ToyGraph::default();
+    graph.declare(target.clone(), ExecutionEndpointStatus::Complete);
+    graph.invoke(&caller, call);
+    graph.set_dispatch(
+        (caller.clone(), call),
+        vec![ToyGraph::arm(
+            target,
+            ExecutionTiming::SameInvocation,
+            HopQuality::CERTAIN,
+        )],
+    );
+    let answer = toy_execution(caller.clone(), &graph);
+    assert!(answer.incomplete.is_empty(), "{:?}", answer.incomplete);
+    assert!(answer.reaches.iter().any(|reach| reach.root == caller));
+    assert!(
+        answer
+            .reaches
+            .iter()
+            .any(|reach| matches!(reach.hops.as_slice(), [Hop::Invocation { .. }])),
+        "the self invocation must be traversed"
+    );
+    assert!(
+        answer.stats.hops < 12,
+        "cycle must intern before the hop budget: {:?}",
+        answer.stats
+    );
+
+    let pair = fixture.procedures["pair"].durable_key();
+    let callee = fixture.procedures["target"].durable_key();
+    let (first, second) = fixture.pair_calls();
+    let mut graph = ToyGraph::default();
+    graph.invoke(&pair, first);
+    graph.invoke(&pair, second);
+    graph.set_dispatch(
+        (pair.clone(), first),
+        vec![ToyGraph::arm(
+            ExecutionTarget::Procedure(Box::new(callee.clone())),
+            ExecutionTiming::AfterSuspension,
+            HopQuality::CERTAIN,
+        )],
+    );
+    graph.set_dispatch(
+        (pair.clone(), second),
+        vec![ToyGraph::arm(
+            ExecutionTarget::Procedure(Box::new(callee.clone())),
+            ExecutionTiming::DifferentTask,
+            HopQuality::CERTAIN,
+        )],
+    );
+    graph.declare(
+        ExecutionTarget::Procedure(Box::new(callee)),
+        ExecutionEndpointStatus::Complete,
+    );
+    let answer = toy_execution(pair, &graph);
+    assert_eq!(answer.reaches.len(), 2);
+    let mut timings = answer
+        .reaches
+        .iter()
+        .map(|reach| *answer.functions.function(reach.function))
+        .collect::<Vec<_>>();
+    timings.sort_by_key(|timing| match timing {
+        ToyTiming::Same => 0,
+        ToyTiming::Deferred => 1,
+        ToyTiming::Task => 2,
+    });
+    assert_eq!(timings, vec![ToyTiming::Deferred, ToyTiming::Task]);
+    assert!(
+        answer
+            .reaches
+            .iter()
+            .all(|reach| matches!(reach.hops.as_slice(), [Hop::Invocation { .. }]))
+    );
+}
+
+#[test]
+fn execution_relation_external_closure_and_interruption_are_per_arm() {
+    use crate::analyzer::semantic::{
+        CandidateCoverage, ExecutionTiming, SemanticLanguage, UnmaterializedExternalTarget,
+    };
+    let fixture = fixture();
+    let caller = fixture.procedures["caller"].durable_key();
+    let call = fixture.helper_call().id;
+    let external_target = UnmaterializedExternalTarget::new_modeled(
+        "toy.External",
+        "run",
+        SemanticLanguage::Standard(Language::Rust),
+        0,
+        false,
+    )
+    .expect("typed external");
+    let external = ExecutionTarget::External(Box::new(ExternalTargetIdentity::Unmaterialized {
+        boundary: crate::analyzer::semantic::DispatchBoundaryKind::Unmaterialized(
+            external_target.locator.clone(),
+        ),
+        target: Box::new(external_target),
+    }));
+    let mut graph = ToyGraph::default();
+    graph.invoke(&caller, call);
+    graph.set_dispatch(
+        (caller.clone(), call),
+        vec![ToyGraph::arm(
+            external.clone(),
+            ExecutionTiming::SameInvocation,
+            HopQuality::CERTAIN,
+        )],
+    );
+    graph.declarations.insert(
+        external.clone(),
+        ExecutionEndpoints {
+            sources: Vec::new(),
+            status: ExecutionEndpointStatus::Complete,
+            covers_overrides: true,
+        },
+    );
+    let answer = toy_execution(caller.clone(), &graph);
+    assert!(
+        answer.reaches.is_empty() && answer.incomplete.is_empty(),
+        "closed empty external: {answer:?}"
+    );
+    graph.declare(
+        external.clone(),
+        ExecutionEndpointStatus::Partial("missing summary".into()),
+    );
+    let answer = toy_execution(caller.clone(), &graph);
+    assert_eq!(answer.reaches.len(), 1);
+    assert!(!answer.incomplete.is_empty());
+
+    graph.declarations.remove(&external);
+    let answer = toy_execution(caller.clone(), &graph);
+    assert!(answer.reaches.is_empty());
+    assert!(!answer.incomplete.is_empty(), "absent external is open");
+
+    graph.set_dispatch(
+        (caller.clone(), call),
+        vec![ToyGraph::arm(
+            external.clone(),
+            ExecutionTiming::SameInvocation,
+            HopQuality::new(true, false),
+        )],
+    );
+    graph.declare(external.clone(), ExecutionEndpointStatus::Complete);
+    let answer = toy_execution(caller.clone(), &graph);
+    assert!(
+        answer.incomplete.is_empty(),
+        "covering external summary closes"
+    );
+    assert_eq!(answer.reaches.len(), 1);
+    assert!(
+        !answer.reaches[0].quality.complete,
+        "raw arm remains partial"
+    );
+    assert!(matches!(
+        answer.reaches[0].hops.as_slice(),
+        [Hop::Invocation { quality, .. }] if !quality.complete
+    ));
+
+    graph
+        .dispatches
+        .get_mut(&(caller.clone(), call))
+        .unwrap()
+        .arms
+        .clear();
+    let dispatch = graph.dispatches.get_mut(&(caller.clone(), call)).unwrap();
+    dispatch.outcome = ExecutionDispatchOutcome::Cancelled("interrupted".into());
+    dispatch.residuals.clear();
+    dispatch.coverage = CandidateCoverage::Exhaustive;
+    let answer = toy_execution(caller.clone(), &graph);
+    assert!(
+        answer.reaches.is_empty() && !answer.incomplete.is_empty(),
+        "interruption with zero residuals is open"
+    );
+    let dispatch = graph.dispatches.get_mut(&(caller.clone(), call)).unwrap();
+    dispatch.outcome = ExecutionDispatchOutcome::Complete;
+    let answer = toy_execution(caller.clone(), &graph);
+    assert!(
+        answer.reaches.is_empty() && !answer.incomplete.is_empty(),
+        "complete exhaustive armless dispatch is open"
+    );
+
+    graph.set_dispatch(
+        (caller.clone(), call),
+        vec![
+            ToyGraph::arm(
+                external.clone(),
+                ExecutionTiming::SameInvocation,
+                HopQuality::CERTAIN,
+            ),
+            ToyGraph::arm(
+                external.clone(),
+                ExecutionTiming::SameInvocation,
+                HopQuality::new(true, false),
+            ),
+        ],
+    );
+    graph.declare(external.clone(), ExecutionEndpointStatus::Complete);
+    graph.arm_declarations.insert(
+        ((caller.clone(), call), 1),
+        ExecutionEndpoints {
+            sources: vec![ExecutionSource {
+                identity: "partial-arm".into(),
+                fact: true,
+                provenance: "toy".into(),
+            }],
+            status: ExecutionEndpointStatus::Partial("partial arm".into()),
+            covers_overrides: false,
+        },
+    );
+    let answer = toy_execution(caller.clone(), &graph);
+    assert_eq!(
+        answer.reaches.len(),
+        2,
+        "the same target has distinct arm paths"
+    );
+    assert!(answer.reaches.iter().any(|reach| reach.quality.complete));
+    assert!(answer.reaches.iter().any(|reach| !reach.quality.complete));
+    assert!(!answer.incomplete.is_empty(), "the partial arm stays open");
+    let mut witnessed_arms = answer
+        .reaches
+        .iter()
+        .map(|reach| {
+            let [
+                Hop::Invocation {
+                    call: witnessed_call,
+                    ordinal,
+                    target,
+                    ..
+                },
+            ] = reach.hops.as_slice()
+            else {
+                panic!("each external reach has one invocation witness");
+            };
+            assert_eq!(witnessed_call, &(caller.clone(), call));
+            assert_eq!(target.as_ref(), &external);
+            assert_eq!(reach.incoming.as_ref().unwrap().ordinal, *ordinal);
+            *ordinal
+        })
+        .collect::<Vec<_>>();
+    witnessed_arms.sort_unstable();
+    assert_eq!(witnessed_arms, vec![0, 1]);
+
+    graph.arm_declarations.clear();
+    graph.allow_discharge = true;
+    let dispatch = graph.dispatches.get_mut(&(caller.clone(), call)).unwrap();
+    dispatch.coverage = CandidateCoverage::Open;
+    assert!(
+        !toy_execution(caller.clone(), &graph).incomplete.is_empty(),
+        "open coverage with no residual cannot be discharged"
+    );
+    let dispatch = graph.dispatches.get_mut(&(caller.clone(), call)).unwrap();
+    dispatch.coverage = CandidateCoverage::Truncated;
+    assert!(
+        !toy_execution(caller.clone(), &graph).incomplete.is_empty(),
+        "truncation cannot be discharged"
+    );
+    let dispatch = graph.dispatches.get_mut(&(caller.clone(), call)).unwrap();
+    dispatch.coverage = CandidateCoverage::Open;
+    dispatch.arms.clear();
+    assert!(
+        !toy_execution(caller, &graph).incomplete.is_empty(),
+        "an armless dispatch cannot be discharged"
+    );
+}
+
+#[test]
+fn execution_relation_declaring_body_still_descends_own_invocations() {
+    use crate::analyzer::semantic::ExecutionTiming;
+    let fixture = fixture();
+    let caller = fixture.procedures["caller"].durable_key();
+    let callee = fixture.procedures["target"].durable_key();
+    let call = fixture.helper_call().id;
+    let mut graph = ToyGraph::default();
+    graph.declare(
+        ExecutionTarget::Procedure(Box::new(caller.clone())),
+        ExecutionEndpointStatus::Complete,
+    );
+    graph.declare(
+        ExecutionTarget::Procedure(Box::new(callee.clone())),
+        ExecutionEndpointStatus::Complete,
+    );
+    graph.invoke(&caller, call);
+    graph.set_dispatch(
+        (caller.clone(), call),
+        vec![ToyGraph::arm(
+            ExecutionTarget::Procedure(Box::new(callee)),
+            ExecutionTiming::SameInvocation,
+            HopQuality::CERTAIN,
+        )],
+    );
+    let answer = toy_execution(caller, &graph);
+    assert_eq!(
+        answer.reaches.len(),
+        2,
+        "own declaration and invoked declaration both reach"
+    );
+    assert!(answer.reaches.iter().any(|reach| reach.hops.is_empty()));
+    assert!(answer.reaches.iter().any(|reach| !reach.hops.is_empty()));
 }

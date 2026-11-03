@@ -4498,7 +4498,7 @@ where
     > {
         if !matches!(
             language,
-            Language::JavaScript | Language::TypeScript | Language::CSharp
+            Language::JavaScript | Language::TypeScript | Language::CSharp | Language::Go
         ) {
             return Ok(None);
         }
@@ -19756,7 +19756,11 @@ where
     {
         if !matches!(
             self.adapter.language(),
-            Language::Rust | Language::JavaScript | Language::TypeScript | Language::CSharp
+            Language::Rust
+                | Language::JavaScript
+                | Language::TypeScript
+                | Language::CSharp
+                | Language::Go
         ) {
             return Err(crate::analyzer::store::StoreError::new(
                 "static dependency publication is unavailable for this language adapter",

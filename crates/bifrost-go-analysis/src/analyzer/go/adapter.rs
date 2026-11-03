@@ -15,7 +15,7 @@ use brokk_bifrost_go::adapter::{GO_COGNITIVE_CONFIG, GO_FILE_EXTENSION, go_extra
 use brokk_bifrost_go::declarations::{go_package_fq, parse_go_file};
 use brokk_bifrost_go::packages::{
     canonical_go_package_name, canonical_go_workspace_package_name, go_module_path_from_source,
-    go_vendor_package_alias,
+    go_vendor_package_alias, go_vendor_root,
 };
 use brokk_bifrost_go::parse::go_reparse_grammar_gap;
 use brokk_bifrost_go::queries::GO_QUERY_DIRECTORY;
@@ -133,6 +133,7 @@ impl LanguageAdapter for GoAdapter {
         file.rel_path()
             .file_name()
             .is_some_and(|name| name == "go.mod")
+            || go_vendor_root(file.rel_path()).is_some()
     }
 
     /// Only the `module` directive qualifies declarations: package identity
@@ -140,13 +141,18 @@ impl LanguageAdapter for GoAdapter {
     /// `require`, `replace`, `go` or `toolchain` edit reaches dependency packs,
     /// which the host reactivates from the changed path itself. A manifest
     /// that names no valid module leaves the inventory incomplete, so it is
-    /// compared by content and any edit to it rebuilds.
+    /// compared by content and any edit to it rebuilds. A vendor listing
+    /// qualifies the packages below it by its presence alone, so an edit to
+    /// it rekeys nothing; creating or deleting it rebuilds.
     fn workspace_package_identity_digest(
         &self,
-        _file: &ProjectFile,
+        file: &ProjectFile,
         source: &[u8],
     ) -> Option<[u8; 32]> {
         use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, sha256_bytes};
+        if go_vendor_root(file.rel_path()).is_some() {
+            return Some(hash_domain_bytes(b"go vendor tree", &[]));
+        }
         Some(
             match std::str::from_utf8(source)
                 .ok()

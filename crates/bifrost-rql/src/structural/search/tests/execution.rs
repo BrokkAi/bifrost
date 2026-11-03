@@ -245,6 +245,73 @@ fn native_go_result_obligation_projects_per_port_result_use() {
 }
 
 #[test]
+#[hardwon("3c85d1e757bf: a bounded stop in the Go function-value proof surfaced as Content")]
+fn go_function_value_proof_distinguishes_unsupported_content_from_cancellation() {
+    use crate::analyzer::i_analyzer::capture_read_execution_cause;
+    use crate::analyzer::read_ledger::DerivationExecutionCause;
+
+    let source = "package p\ntype F func() error\ntype Fn[T any] func() error\nfunc named(f F) { f() }\nfunc generic(f Fn[int]) { f() }\n";
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("main.go", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source(r#"(call-result-obligations (call-shape (call)))"#)
+        .expect("Go function-value obligation query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.iter().any(|item| matches!(
+        &item.value,
+        CodeQueryResultValue::CallResultObligation { value }
+            if value.range.start_line == 4
+                && value.provenance == Some("native")
+                && value.coverage == "exhaustive"
+    )));
+    assert!(result.results.iter().any(|item| matches!(
+        &item.value,
+        CodeQueryResultValue::CallResultObligation { value }
+            if value.range.start_line == 5
+                && value.reason == Some("dispatch_unresolved")
+                && value.coverage == "open"
+    )));
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.incompleteness == Incompleteness::Content })
+    );
+
+    let start_byte = source.find("f() }").expect("named function-value call");
+    let file = ProjectFile::new(project.root().to_path_buf(), PathBuf::from("main.go"));
+    let range = Range {
+        start_byte,
+        end_byte: start_byte + 3,
+        start_line: 4,
+        end_line: 4,
+    };
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+    let semantic = SemanticQueryContext::new(
+        &workspace,
+        Some(&cancellation),
+        CodeQuerySemanticLimits::default(),
+    );
+    let (obligation, cause) = capture_read_execution_cause(workspace.analyzer(), || {
+        brokk_bifrost_go_analysis::analyzer::go_native_error_function_value_obligation(
+            workspace.analyzer(),
+            &file,
+            range,
+            0,
+            semantic.cancellation(),
+        )
+    });
+    assert!(obligation.is_none());
+    assert_eq!(cause, Some(DerivationExecutionCause::Cancelled));
+}
+
+#[test]
 #[hardwon(
     "#8036: native Go dropped the pre-#7954 stdlib callee identities, losing never-error exclusions"
 )]

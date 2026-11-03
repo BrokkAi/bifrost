@@ -1046,6 +1046,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::FlowTarget
         | QueryStep::TargetOf
         | QueryStep::SourceSetOf
+        | QueryStep::BuildConfigurationOf
         | QueryStep::TopologyEdgesOf
         | QueryStep::GuardsOf
         | QueryStep::FailureHandlerState

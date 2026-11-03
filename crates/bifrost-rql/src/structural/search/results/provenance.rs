@@ -693,6 +693,13 @@ pub enum CodeQueryResultRef {
         to_name: String,
         scope: &'static str,
     },
+    /// A build-configuration row is about its whole file, so like the
+    /// topology rows it carries no range.
+    BuildConfiguration {
+        id: String,
+        path: String,
+        configuration_id: String,
+    },
     QualifiedPath {
         id: String,
         ast_id: String,
@@ -839,6 +846,7 @@ impl CodeQueryResultRef {
             Self::SourceSet { .. } => QueryKind::SourceSet,
             Self::BuildTarget { .. } => QueryKind::BuildTarget,
             Self::TopologyEdge { .. } => QueryKind::TopologyEdge,
+            Self::BuildConfiguration { .. } => QueryKind::BuildConfiguration,
             Self::QualifiedPath { .. } => QueryKind::QualifiedPath,
             Self::PathSegment { .. } => QueryKind::PathSegment,
             Self::GenerationSite { .. } => QueryKind::GenerationSite,
@@ -933,6 +941,7 @@ impl CodeQueryResultRef {
             | Self::SourceSet { path, .. }
             | Self::BuildTarget { path, .. }
             | Self::TopologyEdge { path, .. }
+            | Self::BuildConfiguration { path, .. }
             | Self::QualifiedPath { path, .. }
             | Self::PathSegment { path, .. }
             | Self::GenerationSite { path, .. }

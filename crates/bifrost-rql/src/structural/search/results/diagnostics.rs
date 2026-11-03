@@ -992,12 +992,14 @@ pub struct CodeQuerySemanticWork {
     pub value_flow: CodeQueryValueFlowWork,
     #[serde(skip_serializing_if = "CodeQueryTypeFlowWork::is_empty")]
     pub type_flow: CodeQueryTypeFlowWork,
+    #[serde(skip_serializing_if = "CodeQueryEffectWork::is_empty")]
+    pub effects: CodeQueryEffectWork,
 }
 
 impl CodeQuerySemanticWork {
     pub(crate) const fn saturating_add(self, other: Self) -> Self {
         let left = self;
-        let mut result = saturating_add_work!(left, other; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, cumulative, resident_nested_entries_peak, resident_retained_bytes_peak, traversal_steps, typestate, value_flow, type_flow]; [budget_exhausted]; [resident_peaks, root_work_peaks]);
+        let mut result = saturating_add_work!(left, other; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, cumulative, resident_nested_entries_peak, resident_retained_bytes_peak, traversal_steps, typestate, value_flow, type_flow, effects]; [budget_exhausted]; [resident_peaks, root_work_peaks]);
         result.resident_nested_entries_peak =
             if left.resident_nested_entries_peak > other.resident_nested_entries_peak {
                 left.resident_nested_entries_peak
@@ -1015,10 +1017,66 @@ impl CodeQuerySemanticWork {
 
     pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
         let left = self;
-        let mut result = saturating_sub_work!(left, earlier; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, cumulative, resident_nested_entries_peak, resident_retained_bytes_peak, traversal_steps, typestate, value_flow, type_flow]; [budget_exhausted]; [resident_peaks, root_work_peaks]);
+        let mut result = saturating_sub_work!(left, earlier; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, cumulative, resident_nested_entries_peak, resident_retained_bytes_peak, traversal_steps, typestate, value_flow, type_flow, effects]; [budget_exhausted]; [resident_peaks, root_work_peaks]);
         result.resident_nested_entries_peak = left.resident_nested_entries_peak;
         result.resident_retained_bytes_peak = left.resident_retained_bytes_peak;
         result
+    }
+}
+
+/// Invocation-local declared-effect work. Source acquisitions count fact-provider
+/// requests on a query-local miss, not disk reads or source parsing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeQueryEffectWork {
+    pub acquisitions: u64,
+    pub source_acquisitions: u64,
+    pub source_bytes: u64,
+    pub request_hits: u64,
+    pub acquired_procedures: u64,
+    pub acquired_edges: u64,
+    pub scc_node_visits: u64,
+    pub scc_edge_visits: u64,
+    /// Components used by propagation, including singleton fallback components
+    /// when the bounded SCC pass cannot complete.
+    pub scc_components: u64,
+    pub propagation_rounds: u64,
+    pub propagation_node_visits: u64,
+    pub propagation_edge_visits: u64,
+    pub inherited_effect_candidates: u64,
+    pub coverage_rounds: u64,
+    pub coverage_edge_visits: u64,
+    pub projected_rows: u64,
+}
+
+impl CodeQueryEffectWork {
+    pub const fn is_empty(&self) -> bool {
+        self.acquisitions == 0
+            && self.source_acquisitions == 0
+            && self.source_bytes == 0
+            && self.request_hits == 0
+            && self.acquired_procedures == 0
+            && self.acquired_edges == 0
+            && self.scc_node_visits == 0
+            && self.scc_edge_visits == 0
+            && self.scc_components == 0
+            && self.propagation_rounds == 0
+            && self.propagation_node_visits == 0
+            && self.propagation_edge_visits == 0
+            && self.inherited_effect_candidates == 0
+            && self.coverage_rounds == 0
+            && self.coverage_edge_visits == 0
+            && self.projected_rows == 0
+    }
+
+    pub(crate) const fn saturating_add(self, other: Self) -> Self {
+        let left = self;
+        saturating_add_work!(left, other; [acquisitions, source_acquisitions, source_bytes, request_hits, acquired_procedures, acquired_edges, scc_node_visits, scc_edge_visits, scc_components, propagation_rounds, propagation_node_visits, propagation_edge_visits, inherited_effect_candidates, coverage_rounds, coverage_edge_visits, projected_rows]; [])
+    }
+
+    pub(crate) const fn saturating_sub(self, other: Self) -> Self {
+        let left = self;
+        saturating_sub_work!(left, other; [acquisitions, source_acquisitions, source_bytes, request_hits, acquired_procedures, acquired_edges, scc_node_visits, scc_edge_visits, scc_components, propagation_rounds, propagation_node_visits, propagation_edge_visits, inherited_effect_candidates, coverage_rounds, coverage_edge_visits, projected_rows]; [])
     }
 }
 

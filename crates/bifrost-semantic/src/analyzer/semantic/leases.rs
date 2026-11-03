@@ -438,6 +438,16 @@ pub struct SemanticArtifactLeaseChild {
 }
 
 impl SemanticArtifactLeaseChild {
+    /// Check the same retained capacity as a new window without opening one.
+    pub fn window_fits(&self, other_live_bytes: usize) -> bool {
+        check_retained_capacity(
+            [&self.base.storage, self.additions.as_ref()],
+            other_live_bytes,
+            self.max_retained_bytes,
+        )
+        .is_ok()
+    }
+
     /// Start one discardable request/result window.
     pub fn begin_window(&mut self, other_live_bytes: usize) -> SemanticArtifactLeaseWindow {
         assert!(
@@ -507,6 +517,26 @@ impl SemanticArtifactLeaseChild {
             expected_generation: self.base.generation,
             additions,
         }
+    }
+}
+
+#[cfg(test)]
+mod replay_fit_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8389: cached root bytes exceeded the retained cap without another solve"
+    )]
+    fn replay_bytes_fit_matches_window_admission() {
+        let mut child = SemanticArtifactLeaseSet::new(100).snapshot().into_child();
+        assert!(child.window_fits(60));
+        assert!(!child.window_fits(120));
+        let window = child.begin_window(120);
+        assert!(matches!(
+            window.overflow(),
+            Some(SemanticArtifactLeaseError::Capacity(_))
+        ));
     }
 }
 

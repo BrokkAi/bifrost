@@ -8,12 +8,12 @@ import type { StarlightRouteData } from '@astrojs/starlight/route-data';
 const { siteTitleHref } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute;
 const root = siteTitleHref.endsWith('/') ? siteTitleHref : `${siteTitleHref}/`;
 const navItems = [
-	{ label: 'Overview', slug: 'overview/' },
-	{ label: 'Capabilities', slug: 'capabilities/' },
-	{ label: 'MCP', slug: 'mcp/' },
-	{ label: 'LSP', slug: 'lsp/' },
-	{ label: 'Querying', slug: 'code-querying/' },
-	{ label: 'Design', slug: 'design/' },
+	{ label: 'Overview', href: `${root}overview/` },
+	{ label: 'Capabilities', href: `${root}capabilities/` },
+	{ label: 'MCP', href: `${root}mcp/` },
+	{ label: 'LSP', href: 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md' },
+	{ label: 'Querying', href: `${root}code-querying/` },
+	{ label: 'Design', href: `${root}design/` },
 ];
 const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 ---
@@ -33,8 +33,7 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 	</div>
 	<nav class="bifrost-primary-nav print:hidden" aria-label="Primary">
 		{
-			navItems.map(({ label, slug }) => {
-				const href = `${root}${slug}`;
+			navItems.map(({ label, href }) => {
 				return (
 					<a href={href} aria-current={currentPath === href ? 'page' : undefined}>
 						{label}

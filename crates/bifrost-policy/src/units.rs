@@ -23,7 +23,7 @@ use std::time::Duration;
 use brokk_bifrost_analysis::analyzer::invalidation::{ArtifactVerdictLog, BudgetMode};
 use brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest;
 use brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetReplay;
-use brokk_bifrost_analysis::analyzer::semantic::ids::{LengthDelimitedDigest, StableDigest};
+use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
 use brokk_bifrost_analysis::analyzer::store::policy_units::{
@@ -377,8 +377,60 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 // #8025: JS/TS namespace import reads are static loads, so fields on them are property subjects.
 // #8836 (-8836-revert-js-call-throw-catch-binding): revert #7960; a JavaScript call's thrown value no longer binds the catch parameter, so catch-body field reads through the binder decide again.
 // #8831: C# target property assignments change compilation membership and symbol decisions.
+// #8896: returned-member ports and boundary coverage change composed taint answers.
+// #7509 3a (-7509-3a-native-call-application-roles): Go call application roles come from selected native evidence, so a method expression on a parenthesized type operand is Unknown instead of a guessed bound receiver.
 // #8872: Recompute receiver evidence that discarded a proven JS/TS package module.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5113-returned-refinement-census-v4-5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry-5721-python-local-import-bases-5738-intrinsic-root-evidence-5745-python-runtime-class-binding-5751-python-class-object-aliases-5812-iteration-value-origins-5113-reference-inventory-ownership-5920-performed-source-lane-5964-comparison-chain-demand-proof-7186-compact-constructor-bindings-7289-field-initializer-reads-7150-go-call-result-counts-7219-rust-concrete-receiver-closed-7183-unproven-family-dispatch-7179-incomplete-family-edges-and-coverage-2445-root-allotment-4365-javadoc-tag-anchors-7379-dereference-store-operations-7344-7345-csharp-compound-writes-5658-single-writer-identity-5658-structural-module-mutations-7373-csharp-contextual-keyword-binders-5658-python-attribute-space-owners-5658-python-argument-independent-calls-7371-nonlocal-branch-distinction-7372-initializer-body-relations-7179-java-unread-ancestors-4365-shared-statement-facts-7107-content-diagnostic-units-7220-php-terminal-case-fold-rust-deref-receiver-steps-7226-7464-csharp-incoming-overload-partition-7368-7369-csharp-equals-argument-identity-7150-open-member-calls-7340-live-region-overwrite-veto-7520-go-interface-dispatch-references-5658-python-global-writer-identity-5658-python-native-member-targets-7548-configuration-skips-bifrost-dir-analysis-quicksilver-round12-boolean-contexts-binder-spans-7202-classified-summary-identity-7547-java-string-literal-values-analysis-quicksilver-round12-fact-analyzers-7471-go-short-var-redeclaration-7386-conditional-compilation-regions-7341-7342-go-remainder-comma-ok-7617-go-direct-type-shapes-7343-go-static-type-failure-branches-7393-unproven-nonempty-failure-branches-7470-go-visible-binding-shapes-7616-go-modeled-package-result-unknown-analysis-quicksilver-round12-config-lookup-7518-go-undecided-receiver-candidates-7578-branch-conditioned-sanitizers-7618-java-creation-receiver-site-7560-csharp-row-backed-models-7348-7349-7369-java-compound-static-patterns-4379-m3b-csharp-statement-facts-7642-witness-budget-incomplete-5658-python-unplaced-file-references-7516-go-constructor-shadow-7673-python-qualified-module-members-7619-java-implicit-external-inherited-calls-7620-java-wildcard-sibling-applicability-7578-java-observed-value-type-7578-guard-writer-reachability-7735-binder-declaration-sites-5658-python-import-occurrence-kinds-7781-synthetic-members-completeness-7509-go-declaration-value-types-7755-refused-alternative-before-budget-3494-ruby-member-closure-7789-indexed-import-destinations-7817-external-supertype-kind-7849-java-external-owner-observed-type-7509-go-native-binding-proofs-2445-m4a-workspace-facts-qs13-flow-go-no-return-method-expressions-7350-nonbinding-rhs-distinct-qs13-flow-summary-payload-accounting-qs13-flow-typestate-byte-accounting-7918-go-field-selector-addressability-7536-initialization-retained-gaps-7915-flow-slot-identity-7508-csharp-conditional-branch-conversions-7803-external-field-value-types-2445-m4b-property-gaps-qs13-flow-store-error-kind-context-qs13-flow-taint-composition-quality-7779-exact-selection-owner-inventory-qs13-flow-call-transfer-canonical-order-7972-go-cross-file-global-self-assignment-7509-go-model-authority-7755-dead-value-liveness-7868-closure-open-relations-7876-query-incompleteness-scope-7509-go-relative-source-imports-qs13-flow-value-flow-survivors-7351-go-error-method-set-proof-7886-nested-budget-stop-propagation-qs13-flow-field-slot-source-kinds-8036-go-native-external-callee-identity-qs13-rql-pending-cleanup-nested-scope-qs13-rql-python-loop-exit-and-docstring-blocks-7968-go-satisfaction-membership-8108-java-inventory-stable-replay-qs13-rql-configuration-property-ancestor-7509-g1b-incomplete-import-owner-8097-assignment-flow-gap-scope-3800-static-rooted-property-bases-7362-query-obligation-ledger-7505-member-ids-carry-signature-7187-jvm-type-parameter-bindings-4379-m6-csharp-static-array-definitions-8146-boolean-patterns-unkinded-targets-4379-m6-csharp-nested-if-misleading-indentation-2445-content-partial-diagnostics-8148-binary-authority-inputs-6664-incomplete-descendant-queries-4379-m6-csharp-rethrow-throw-sites-8153-ambiguous-binding-no-proven-target-8000-jvm-on-demand-external-candidates-qs13-rql-order-independent-fixed-points-7509-g1b-callable-result-slots-7391-go-type-assertion-receivers-7153-cpp-field-guard-definitions-6945-curated-star-child-binding-8154-recursive-empty-arm-statements-7424-java-enum-switch-proof-7577-scala-cast-expression-types-8242-taint-endpoint-dominance-qs13-rql-file-joins-and-selected-property-admission-7240-imported-constructor-receivers-6234-kotlin-implicit-receiver-values-qs13-rql-source-and-language-survivors-8262-model-hierarchy-missing-endpoint-8264-go-predeclared-result-types-7509-g1b3-pointer-result-field-8147-m4a-csharp-preprocessor-decisions-8290-warm-closure-discharges-2445-content-cause-precision-7314-c1-4b-csharp-native-demand-qs13-rql-python-search-survivors-7509-b-unexported-pointee-owner-8167-java-callable-family-evidence-8222-scala-implicit-root-order-8300-resolved-value-proven-near-miss-8305-field-write-call-ports-8201-stable-capped-index-reads-7314-c1-4d1-csharp-qualified-heads-7314-c1-4d2-csharp-aliases-7314-c1-4d3-csharp-using-tiers-8403-rust-reverse-applicability-gaps-7314-c1-5a1-csharp-transient-membership-qs13-policy-source-survivors-7027-s2b-jvm-native-ancestors-7314-c1-5a2-csharp-global-aliases-qs13-policy-flow-survivors-7314-c1-5b-csharp-global-globs-7027-s2c-hierarchy-completeness-8411-static-openness-is-content-2445-unsupported-member-family-unresolved-8287-merged-limit-partition-7509-g1b3-exact-binding-identity-7314-c1-5c-csharp-root-closure-8385-position-free-read-keys-qs13-policy-catalog-identity-survivors-7314-c1-4e-ad1-csharp-membership-unproven-7027-s3-native-descendants-7761-memo-fill-own-completeness-8415-enclosing-type-parameters-8496-plan-provider-free-on-demand-packages-8306-await-value-transfer-8309-csharp-type-literal-values-7366-field-write-source-member-evidence-8308-csharp-call-points-string-guards-8388-caller-inventory-coverage-8486-stable-content-producer-diagnostics-8457-rust-unenumerable-dispatch-8453-go-method-unenumerable-dispatch-8513-scaled-retention-budget-8546-model-edit-recomputes-units-8402-go-parse-time-ir-7314-c1-4e-ad2-csharp-per-file-membership-8333-scala-compiler-root-owner-8279-scala-scope-shadowing-8147-m4b-csharp-parse-variants-7234-php-static-scope-dispatch-8579-native-parse-time-ir-7750-java-guarded-switch-edges-8283-structural-result-type-identity-7509-g1b3-f-nested-call-arity-8632-csharp-parent-relative-open-items-8602-exit-only-exceptional-routes-8586-one-budget-at-materialization-8665-scala-import-bridge-boundaries-8516-package-member-owner-providers-7314-csharp-method-applicability-open-8705-scala-implicit-root-own-gap-8147-m4c-csharp-unseen-branches-7314-demand-half-open-outcome-8667-go-nested-arity-gap-7509-g1b3-g-untyped-receiver-native-count-7027-s2b0-implicit-supertypes-7960-js-call-throw-catch-binding-8790-go-path-index-stable-gap-replay-7800-heuristic-structural-matches-8025-js-namespace-static-loads-8745-pre-kotlin-lambda-parameter-binders-7314-ad3b-csharp-get-path-of-file-above-8830-csharp-nuget-build-transitive-imports-8836-revert-js-call-throw-catch-binding-8831-csharp-target-property-scope-8845-csharp-multi-target-razor-paths-8872-js-ts-package-module-identity";
+// #7509 5b step 1 (-7509-m5b1-native-selector-refinement): Go source selector refinement uses selected native member evidence (preparation, field anchor, interface trigger) instead of the legacy typed selector target.
+// #8856: Diff-base replay records actual grants and certified census outside its budget-independent key.
+// #8388: an unproven Go builtin assumption keeps an ICFG snapshot open, so it is never refined into Complete.
+// #8389: typed unit keys separate root locator and compilation.
+// #8823 (-8823-jdk-pack-type-parameter-scope): the generated JDK pack keeps an inner class's enclosing type-parameter scope through the source/binary merge, so the JDK 21 pack validates and JDK calls rebind to its models.
+// #7509 5b step 2 (-7509-m5b2-native-allocation-refinement): Go allocation dispatch narrowing uses the selected allocation type and one complete native member instead of the legacy source inference, so a failed selection keeps broad dispatch.
+// #8870 (-8870-composed-entry-points): composed policies bind declared entry formals as origins.
+// #7509 (-7509-function-field-call-application): a function-valued Go field call has no bound receiver.
+// #8866: Rust receivers through std unwraps bind modeled methods.
+// #8884 (-8884-rust-selected-import-reads): Rust external proofs read imports from the selected operation.
+// #8822 (-8822-csharp-inventory-closed-derivations): a resolved C# definition lookup stays Resolved under an open package inventory when its derivation is proven closed under additions, so call targets and branch comparisons can complete.
+// #7509 5b step 3 (-7509-m5b3-native-nested-call-result-counts): Go nested-call result counts come from the selected native definition signature instead of the legacy source inference.
+// #7869 (-7869-package-boundary-per-alternative): an unacquired JVM package provider is a per-reference obligation, and a targetless answer stays open.
+// #8898 (-8898-cancelled-procedure-openness): a cancelled procedure openness request reports Cancelled instead of Complete; policy units built while that could happen are recomputed.
+// #7509 5b step 3 (-7509-retire-go-expression-inference): the legacy Go callee expression inference no longer backs function-value result obligations, so its reads and the false positives it could produce are retired.
+// #8803 (-8803-csharp-enclosing-namespace-scope): C# enclosing namespace scope selection changes query-time bindings.
+// #8870: composed store ends link remote writes to read origins.
+// #8870 (-8870-store-ended-candidates): composed candidate answers include store crossings.
+// #8870 (-8870-composed-conditional-sanitizers): composed taint applies policy-bound conditional edge kills by label group, changing policy answers.
+// #7619: parameterized JDK call results bind type-parameter-free receiver members.
+// #8487 (-8487-java-on-demand-package-outcomes): Java on-demand package reads now attach typed outcomes to the selected reference frame.
+// #8992 (-8992-jvm-on-demand-declaration-admission): JVM glob admission requires provider-declared existence before shadowing defaults.
+// #8389 (-8389-charge-reused-units): a reused policy unit debits this run's remaining allowance before later units execute.
+// #8389 (-8389-union-seed-local-suffix): union suffix admission changes unit slicing.
+// #7509 G2 (-7509-go-structural-signature-identity): Go interface satisfaction proves slice, map and predeclared error signature identity instead of leaving every structural slot Inconclusive, and shared projected type shapes fold every node's completion.
+// #7509 5b step 4 (-7509-m5b4b-native-function-value-proof): Go named function-value error obligations come from the selected declared type and its nominal declaration instead of the legacy type-name resolution, and a bounded stop in that proof is reported as operational incompleteness.
+// #8996 (-8996-diff-base-reliability): explicit NotRun head policies no longer condemn stored diff bases.
+// #7509 5b step 4 (-7509-m5b4a-selected-aggregate-owner): Go external field memory takes its aggregate owner from the selected native type through the shared nominal-owner admission, which also changes the declared-type proof behind function-value obligations.
+// #8963 (-8963-go-result-obligation-coverage): a Go call-result obligation row whose dispatch arms have an unknown signature and no derived obligation reports Open coverage, so the query records ResultObligationDerivationIncomplete instead of Complete.
+// #8870 (-8870-composed-flow-policies): complete flow endpoint inventory changes read receipts.
+// #8991 (-8991-rust-let-copy-allocation): a Rust by-value let of a struct owns its storage, which changes retained taint evaluations.
+// #2508: native Rust/Go effect results compose the stored invocation IR.
+// #8978 (-8978-rust-branch-value-join): Rust if, match and block values join their branch tails, which changes retained taint evaluations.
+// #7804 (-7804-java-fqn-expression-prefix): Java expression prefixes root package and type routes, and targetless answers need language-owned terminal proof to close.
+// #8389: intersect-prefix reuse changes the persisted product and policy slicing route.
+// #8896 (-8896-composed-member-call-bindings): composition binds callee heap writes back to shared caller storage.
+// #8389 (-8389-typestate-root-fit): a reused typestate root must fit every lane, including retained lease bytes, so evaluations retained under the old reuse charge are not replayed.
+// #9013 (-9013-rust-call-guard-truthy): a Rust call used as a condition is a Truthy guard and Rust barrier carriers are typed, which changes conditional-sanitizer answers.
+// #7314 M1f slice 6a (-7314-m1f-java-common-import-context): Java selected contexts use the shared JVM import assembly.
+// #9063 (-9063-go-certified-method-collision): a certified same-depth Go promotion collision is absent from the method set, so the type no longer satisfies the interface and retained policy units change.
+// #9084 (-9084-declaration-finding-anchors): a finding that selects a whole declaration is anchored on the declaration's identity instead of its source slice and span, so stored evaluations carry different finding ids.
+// #8741: implicit root edges are independent of publication order.
+// #8834: selected JVM root presence reads now invalidate reused policy units.
+// #8811 (-8675-pre-closed-relation-discharge-replay): closed relation discharges now reach newly built requests before their answers are retained.
+// #8386 (-8386-value-flow-neutral-endpoint-ids): public reached value-flow IDs use the plan and full event identities; Rust endpoint-only queries route through the shared composition client, retained_witnesses counts describe only requested witness steps, and endpoint evidence aggregates alternative derivations.
+// #9127 (-9127-mount-free-value-flow-plan-identity): the public value-flow plan fingerprint inside reached endpoint IDs no longer hashes the workspace mount, so stored value-flow IDs change.
+// #8896 (-8896-returned-member-ports): returned member ports and composition binding change retained policy answers.
+// #8940 (-8940-post-call-heap-ports): post-call shared storage ports change retained policy answers.
+// #8896 (-8896-icfg-member-call-bindings): ICFG call plans transport copied member contents.
+// #9162 (-9162-partial-flow-seed-canonicalization): every builtin partial-flow seed of one port shares one seed key, so stored partial-flow rows, and the composed and retained policy answers that read them, change.
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5113-returned-refinement-census-v4-5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry-5721-python-local-import-bases-5738-intrinsic-root-evidence-5745-python-runtime-class-binding-5751-python-class-object-aliases-5812-iteration-value-origins-5113-reference-inventory-ownership-5920-performed-source-lane-5964-comparison-chain-demand-proof-7186-compact-constructor-bindings-7289-field-initializer-reads-7150-go-call-result-counts-7219-rust-concrete-receiver-closed-7183-unproven-family-dispatch-7179-incomplete-family-edges-and-coverage-2445-root-allotment-4365-javadoc-tag-anchors-7379-dereference-store-operations-7344-7345-csharp-compound-writes-5658-single-writer-identity-5658-structural-module-mutations-7373-csharp-contextual-keyword-binders-5658-python-attribute-space-owners-5658-python-argument-independent-calls-7371-nonlocal-branch-distinction-7372-initializer-body-relations-7179-java-unread-ancestors-4365-shared-statement-facts-7107-content-diagnostic-units-7220-php-terminal-case-fold-rust-deref-receiver-steps-7226-7464-csharp-incoming-overload-partition-7368-7369-csharp-equals-argument-identity-7150-open-member-calls-7340-live-region-overwrite-veto-7520-go-interface-dispatch-references-5658-python-global-writer-identity-5658-python-native-member-targets-7548-configuration-skips-bifrost-dir-analysis-quicksilver-round12-boolean-contexts-binder-spans-7202-classified-summary-identity-7547-java-string-literal-values-analysis-quicksilver-round12-fact-analyzers-7471-go-short-var-redeclaration-7386-conditional-compilation-regions-7341-7342-go-remainder-comma-ok-7617-go-direct-type-shapes-7343-go-static-type-failure-branches-7393-unproven-nonempty-failure-branches-7470-go-visible-binding-shapes-7616-go-modeled-package-result-unknown-analysis-quicksilver-round12-config-lookup-7518-go-undecided-receiver-candidates-7578-branch-conditioned-sanitizers-7618-java-creation-receiver-site-7560-csharp-row-backed-models-7348-7349-7369-java-compound-static-patterns-4379-m3b-csharp-statement-facts-7642-witness-budget-incomplete-5658-python-unplaced-file-references-7516-go-constructor-shadow-7673-python-qualified-module-members-7619-java-implicit-external-inherited-calls-7620-java-wildcard-sibling-applicability-7578-java-observed-value-type-7578-guard-writer-reachability-7735-binder-declaration-sites-5658-python-import-occurrence-kinds-7781-synthetic-members-completeness-7509-go-declaration-value-types-7755-refused-alternative-before-budget-3494-ruby-member-closure-7789-indexed-import-destinations-7817-external-supertype-kind-7849-java-external-owner-observed-type-7509-go-native-binding-proofs-2445-m4a-workspace-facts-qs13-flow-go-no-return-method-expressions-7350-nonbinding-rhs-distinct-qs13-flow-summary-payload-accounting-qs13-flow-typestate-byte-accounting-7918-go-field-selector-addressability-7536-initialization-retained-gaps-7915-flow-slot-identity-7508-csharp-conditional-branch-conversions-7803-external-field-value-types-2445-m4b-property-gaps-qs13-flow-store-error-kind-context-qs13-flow-taint-composition-quality-7779-exact-selection-owner-inventory-qs13-flow-call-transfer-canonical-order-7972-go-cross-file-global-self-assignment-7509-go-model-authority-7755-dead-value-liveness-7868-closure-open-relations-7876-query-incompleteness-scope-7509-go-relative-source-imports-qs13-flow-value-flow-survivors-7351-go-error-method-set-proof-7886-nested-budget-stop-propagation-qs13-flow-field-slot-source-kinds-8036-go-native-external-callee-identity-qs13-rql-pending-cleanup-nested-scope-qs13-rql-python-loop-exit-and-docstring-blocks-7968-go-satisfaction-membership-8108-java-inventory-stable-replay-qs13-rql-configuration-property-ancestor-7509-g1b-incomplete-import-owner-8097-assignment-flow-gap-scope-3800-static-rooted-property-bases-7362-query-obligation-ledger-7505-member-ids-carry-signature-7187-jvm-type-parameter-bindings-4379-m6-csharp-static-array-definitions-8146-boolean-patterns-unkinded-targets-4379-m6-csharp-nested-if-misleading-indentation-2445-content-partial-diagnostics-8148-binary-authority-inputs-6664-incomplete-descendant-queries-4379-m6-csharp-rethrow-throw-sites-8153-ambiguous-binding-no-proven-target-8000-jvm-on-demand-external-candidates-qs13-rql-order-independent-fixed-points-7509-g1b-callable-result-slots-7391-go-type-assertion-receivers-7153-cpp-field-guard-definitions-6945-curated-star-child-binding-8154-recursive-empty-arm-statements-7424-java-enum-switch-proof-7577-scala-cast-expression-types-8242-taint-endpoint-dominance-qs13-rql-file-joins-and-selected-property-admission-7240-imported-constructor-receivers-6234-kotlin-implicit-receiver-values-qs13-rql-source-and-language-survivors-8262-model-hierarchy-missing-endpoint-8264-go-predeclared-result-types-7509-g1b3-pointer-result-field-8147-m4a-csharp-preprocessor-decisions-8290-warm-closure-discharges-2445-content-cause-precision-7314-c1-4b-csharp-native-demand-qs13-rql-python-search-survivors-7509-b-unexported-pointee-owner-8167-java-callable-family-evidence-8222-scala-implicit-root-order-8300-resolved-value-proven-near-miss-8305-field-write-call-ports-8201-stable-capped-index-reads-7314-c1-4d1-csharp-qualified-heads-7314-c1-4d2-csharp-aliases-7314-c1-4d3-csharp-using-tiers-8403-rust-reverse-applicability-gaps-7314-c1-5a1-csharp-transient-membership-qs13-policy-source-survivors-7027-s2b-jvm-native-ancestors-7314-c1-5a2-csharp-global-aliases-qs13-policy-flow-survivors-7314-c1-5b-csharp-global-globs-7027-s2c-hierarchy-completeness-8411-static-openness-is-content-2445-unsupported-member-family-unresolved-8287-merged-limit-partition-7509-g1b3-exact-binding-identity-7314-c1-5c-csharp-root-closure-8385-position-free-read-keys-qs13-policy-catalog-identity-survivors-7314-c1-4e-ad1-csharp-membership-unproven-7027-s3-native-descendants-7761-memo-fill-own-completeness-8415-enclosing-type-parameters-8496-plan-provider-free-on-demand-packages-8306-await-value-transfer-8309-csharp-type-literal-values-7366-field-write-source-member-evidence-8308-csharp-call-points-string-guards-8388-caller-inventory-coverage-8486-stable-content-producer-diagnostics-8457-rust-unenumerable-dispatch-8453-go-method-unenumerable-dispatch-8513-scaled-retention-budget-8546-model-edit-recomputes-units-8402-go-parse-time-ir-7314-c1-4e-ad2-csharp-per-file-membership-8333-scala-compiler-root-owner-8279-scala-scope-shadowing-8147-m4b-csharp-parse-variants-7234-php-static-scope-dispatch-8579-native-parse-time-ir-7750-java-guarded-switch-edges-8283-structural-result-type-identity-7509-g1b3-f-nested-call-arity-8632-csharp-parent-relative-open-items-8602-exit-only-exceptional-routes-8586-one-budget-at-materialization-8665-scala-import-bridge-boundaries-8516-package-member-owner-providers-7314-csharp-method-applicability-open-8705-scala-implicit-root-own-gap-8147-m4c-csharp-unseen-branches-7314-demand-half-open-outcome-8667-go-nested-arity-gap-7509-g1b3-g-untyped-receiver-native-count-7027-s2b0-implicit-supertypes-7960-js-call-throw-catch-binding-8790-go-path-index-stable-gap-replay-7800-heuristic-structural-matches-8025-js-namespace-static-loads-8745-pre-kotlin-lambda-parameter-binders-7314-ad3b-csharp-get-path-of-file-above-8830-csharp-nuget-build-transitive-imports-8836-revert-js-call-throw-catch-binding-8831-csharp-target-property-scope-8845-csharp-multi-target-razor-paths-7509-3a-native-call-application-roles-8872-js-ts-package-module-identity-7509-m5b1-native-selector-refinement-8856-budget-independent-base-replay-8388-icfg-go-builtin-assumptions-8389-prefix-merge-suffix-8823-jdk-pack-type-parameter-scope-7509-m5b2-native-allocation-refinement-8870-composed-entry-points-7509-function-field-call-application-8866-rust-unwrapped-receiver-8884-rust-selected-import-reads-8822-csharp-inventory-closed-derivations-7509-m5b3-native-nested-call-result-counts-7869-package-boundary-per-alternative-8898-cancelled-procedure-openness-7509-retire-go-expression-inference-8803-csharp-enclosing-namespace-scope-8870-composed-store-ends-7619-java-generic-result-receivers-8487-java-on-demand-package-outcomes-8992-jvm-on-demand-declaration-admission-8389-charge-reused-units-8389-union-seed-local-suffix-7509-go-structural-signature-identity-7509-m5b4b-native-function-value-proof-8996-diff-base-reliability-7509-m5b4a-selected-aggregate-owner-8963-go-result-obligation-coverage-8870-composed-flow-policies-8991-rust-let-copy-allocation-2508-native-composed-effects-8978-rust-branch-value-join-7804-java-fqn-expression-prefix-8389-intersect-prefix-reuse-8896-composed-member-call-bindings-8389-typestate-root-fit-9013-rust-call-guard-truthy-7314-m1f-java-common-import-context-8870-composed-conditional-sanitizers-9063-go-certified-method-collision-9084-declaration-finding-anchors-8741-implicit-root-edges-order-independent-8834-root-presence-read-key-8675-pre-closed-relation-discharge-replay-8386-value-flow-neutral-endpoint-ids-8870-store-ended-candidates-9127-mount-free-value-flow-plan-identity-8896-returned-member-ports-8940-post-call-heap-ports-8896-icfg-member-call-bindings-9162-partial-flow-seed-canonicalization";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {
@@ -461,6 +513,20 @@ pub enum UnitPartition {
         blob: Oid,
         selector: StableDigest,
     },
+    Prefix {
+        language: Language,
+        rel_path: Box<str>,
+        blob: Oid,
+        cut: StableDigest,
+        input: StableDigest,
+    },
+    Output {
+        language: Language,
+        rel_path: Box<str>,
+        blob: Oid,
+        anchor: StableDigest,
+        compilation: StableDigest,
+    },
     Whole,
 }
 
@@ -473,6 +539,8 @@ impl UnitPartition {
             Self::AssertFile { .. } => "assert_file",
             Self::Root { .. } => "root",
             Self::Selector { .. } => "selector",
+            Self::Prefix { .. } => "prefix",
+            Self::Output { .. } => "output",
             Self::Whole => "whole",
         }
     }
@@ -514,6 +582,7 @@ pub(crate) enum PolicyUnitProduct {
     AssertFile(AssertFileProduct),
     Root(RootProduct),
     Selector(Box<SelectorProduct>),
+    Prefix(String),
 }
 
 impl PolicyUnitProduct {
@@ -526,7 +595,7 @@ impl PolicyUnitProduct {
     pub(crate) fn into_rows(self) -> Option<UnitExecutionResult> {
         match self {
             Self::Rows(rows) => Some(rows),
-            Self::AssertFile(_) | Self::Root(_) | Self::Selector(_) => None,
+            Self::AssertFile(_) | Self::Root(_) | Self::Selector(_) | Self::Prefix(_) => None,
         }
     }
 
@@ -535,7 +604,7 @@ impl PolicyUnitProduct {
     pub(crate) fn into_assert_file(self) -> Option<AssertFileProduct> {
         match self {
             Self::AssertFile(product) => Some(product),
-            Self::Rows(_) | Self::Root(_) | Self::Selector(_) => None,
+            Self::Rows(_) | Self::Root(_) | Self::Selector(_) | Self::Prefix(_) => None,
         }
     }
 
@@ -544,7 +613,7 @@ impl PolicyUnitProduct {
     pub(crate) fn into_root(self) -> Option<RootProduct> {
         match self {
             Self::Root(product) => Some(product),
-            Self::Rows(_) | Self::AssertFile(_) | Self::Selector(_) => None,
+            Self::Rows(_) | Self::AssertFile(_) | Self::Selector(_) | Self::Prefix(_) => None,
         }
     }
 
@@ -553,7 +622,7 @@ impl PolicyUnitProduct {
     pub(crate) fn into_selector(self) -> Option<SelectorProduct> {
         match self {
             Self::Selector(product) => Some(*product),
-            Self::Rows(_) | Self::AssertFile(_) | Self::Root(_) => None,
+            Self::Rows(_) | Self::AssertFile(_) | Self::Root(_) | Self::Prefix(_) => None,
         }
     }
 
@@ -564,6 +633,7 @@ impl PolicyUnitProduct {
             Self::AssertFile(_) => "assert_file",
             Self::Root(_) => "root",
             Self::Selector(_) => "selector",
+            Self::Prefix(_) => "prefix",
         }
     }
 }
@@ -1312,15 +1382,6 @@ impl PolicyUnitStore for PersistedPolicyUnitStore {
 ///
 /// Digests become lowercase hex and the family becomes its stable label,
 /// because a persisted key is compared by SQL and must be one shape per value.
-/// The persisted partition digest of one solver root: its locator folded with
-/// the compile whose projections it holds.
-fn root_partition_digest(locator: StableDigest, compilation: StableDigest) -> StableDigest {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost-policy-root-partition/v1");
-    digest.push(locator.as_bytes());
-    digest.push(compilation.as_bytes());
-    digest.finish()
-}
-
 pub fn row_key(key: &PolicyUnitKey) -> PolicyUnitRowKey {
     PolicyUnitRowKey {
         policy_semantic_hash: StableDigest::from_array(*key.policy.as_bytes()).to_string(),
@@ -1371,12 +1432,8 @@ pub fn row_key(key: &PolicyUnitKey) -> PolicyUnitRowKey {
                 rel_path: rel_path.to_string(),
                 blob: *blob,
                 language: *language,
-                // The persisted column is one digest per partition, and both
-                // halves narrow the same question: which root, under which
-                // compile. Folding them here keeps the stored key columns as
-                // they are; nothing reads either half back out of the store,
-                // because the key a lookup asks with carries both.
-                locator: root_partition_digest(*locator, *compilation).to_string(),
+                locator: locator.to_string(),
+                compilation: compilation.to_string(),
             },
             UnitPartition::Selector {
                 language,
@@ -1388,6 +1445,32 @@ pub fn row_key(key: &PolicyUnitKey) -> PolicyUnitRowKey {
                 blob: *blob,
                 language: *language,
                 selector: selector.to_string(),
+            },
+            UnitPartition::Prefix {
+                language,
+                rel_path,
+                blob,
+                cut,
+                input,
+            } => PolicyUnitPartitionRow::Prefix {
+                language: *language,
+                rel_path: rel_path.to_string(),
+                blob: *blob,
+                cut: cut.to_string(),
+                input: input.to_string(),
+            },
+            UnitPartition::Output {
+                language,
+                rel_path,
+                blob,
+                anchor,
+                compilation,
+            } => PolicyUnitPartitionRow::Output {
+                language: *language,
+                rel_path: rel_path.to_string(),
+                blob: *blob,
+                anchor: anchor.to_string(),
+                compilation: compilation.to_string(),
             },
             UnitPartition::Whole => PolicyUnitPartitionRow::Whole,
         },
@@ -1409,6 +1492,7 @@ fn unit_row(unit: &PolicyUnit) -> Result<PolicyUnitRow, PolicyUnitStoreError> {
         PolicyUnitProduct::AssertFile(product) => serde_json::to_string(product),
         PolicyUnitProduct::Root(product) => serde_json::to_string(product),
         PolicyUnitProduct::Selector(product) => serde_json::to_string(product),
+        PolicyUnitProduct::Prefix(product) => Ok(product.clone()),
     }
     .map_err(|error| {
         PolicyUnitStoreError::new(format!("a unit product could not be serialized: {error}"))
@@ -1454,6 +1538,7 @@ fn product_of_row(
                 .map(PolicyUnitProduct::Root)
         }
         "selector" => serde_json::from_str(&row.product).map(PolicyUnitProduct::Selector),
+        "prefix" => return Ok(PolicyUnitProduct::Prefix(row.product.clone())),
         other => {
             return Err(PolicyUnitStoreError::new(format!(
                 "a published unit carries an unknown product kind `{other}`"
@@ -2373,9 +2458,14 @@ mod tests {
         );
         let policy = registry.policies().next().unwrap();
         for component in [
+            "-7619-java-generic-result-receivers",
             "-8333-scala-compiler-root-owner",
             "-8513-scaled-retention-budget",
+            "-8856-budget-independent-base-replay",
+            // Callee heap outputs bind to shared caller storage.
+            "-8896-composed-member-call-bindings",
             "-8415-enclosing-type-parameters",
+            "-8823-jdk-pack-type-parameter-scope",
             "-8546-model-edit-recomputes-units",
             "-8283-structural-result-type-identity",
             "-7577-scala-cast-expression-types",
@@ -2543,6 +2633,8 @@ mod tests {
             // C# call points are selectable; string equality guards are constant equality.
             "-8308-csharp-call-points-string-guards",
             "-8388-caller-inventory-coverage",
+            // #8870: composed policies now bind declared entry formals as origins.
+            "-8870-composed-entry-points",
             "-8457-rust-unenumerable-dispatch",
             "-8453-go-method-unenumerable-dispatch",
             // Go artifacts can come from parse-time rows, which admit by census.
@@ -2591,8 +2683,84 @@ mod tests {
             "-8830-csharp-nuget-build-transitive-imports",
             // A JavaScript call's thrown value no longer reaches the catch parameter.
             "-8836-revert-js-call-throw-catch-binding",
+            "-7509-3a-native-call-application-roles",
+            "-8896-returned-member-ports",
             // Proven package-module identities survive neutral static-load evidence.
             "-8872-js-ts-package-module-identity",
+            "-7509-m5b1-native-selector-refinement",
+            // An unproven Go builtin assumption keeps an ICFG snapshot open.
+            "-8388-icfg-go-builtin-assumptions",
+            // Typed partitions separate root locator and compilation keys.
+            "-8389-prefix-merge-suffix",
+            "-7509-m5b2-native-allocation-refinement",
+            "-7509-function-field-call-application",
+            // Rust receivers through std unwraps bind modeled methods.
+            "-8866-rust-unwrapped-receiver",
+            // Rust external proofs read imports from the selected operation.
+            "-8884-rust-selected-import-reads",
+            // Closed C# inventory derivations change selected policy bindings.
+            "-8822-csharp-inventory-closed-derivations",
+            "-7509-m5b3-native-nested-call-result-counts",
+            "-7869-package-boundary-per-alternative",
+            // Cancelled procedure openness no longer reports Complete.
+            "-8898-cancelled-procedure-openness",
+            "-7509-retire-go-expression-inference",
+            // C# enclosing namespace scope selection changes selected policy bindings.
+            "-8803-csharp-enclosing-namespace-scope",
+            // #8870: composed store links change policy answers and reads.
+            "-8870-composed-store-ends",
+            "-8487-java-on-demand-package-outcomes",
+            "-8992-jvm-on-demand-declaration-admission",
+            // A reused unit charges the same cumulative allowance as a recomputed unit.
+            "-8389-charge-reused-units",
+            // Union suffixes now run after the per-seed set merge.
+            "-8389-union-seed-local-suffix",
+            "-7509-go-structural-signature-identity",
+            "-7509-m5b4b-native-function-value-proof",
+            // #8996: stored base evaluations exclude head-only NotRun policies from reliability.
+            "-8996-diff-base-reliability",
+            "-7509-m5b4a-selected-aggregate-owner",
+            "-8963-go-result-obligation-coverage",
+            "-8870-composed-conditional-sanitizers",
+            // #8870: candidate explanations consume composed store crossings.
+            "-8870-store-ended-candidates",
+            // #8870: complete flow endpoint inventory changes policy read receipts.
+            "-8870-composed-flow-policies",
+            // #8991: a by-value let of a struct publishes an Allocation for its storage.
+            "-8991-rust-let-copy-allocation",
+            // Native declared effects use the shared execution relation.
+            "-2508-native-composed-effects",
+            // #8978: Rust branch values join into their expression result.
+            "-8978-rust-branch-value-join",
+            // Rooted Java expression prefixes change selected policy bindings.
+            "-7804-java-fqn-expression-prefix",
+            "-8389-intersect-prefix-reuse",
+            // A reused typestate root is admitted only if it fits every lane.
+            "-8389-typestate-root-fit",
+            // #9013: a Rust call condition is a Truthy guard.
+            "-9013-rust-call-guard-truthy",
+            // Java selected contexts now use the shared JVM assembly.
+            "-7314-m1f-java-common-import-context",
+            // #9063: certified Go promotion collisions leave the method set.
+            "-9063-go-certified-method-collision",
+            // #9084: whole-declaration findings anchor on the declaration identity.
+            "-9084-declaration-finding-anchors",
+            // Implicit-root edges close without reading the mutable identity claim.
+            "-8741-implicit-root-edges-order-independent",
+            // Selected JVM root decisions are now verified before policy-unit reuse.
+            "-8834-root-presence-read-key",
+            // #8811: a previously closed relation replays its discharge to each request owner.
+            "-8675-pre-closed-relation-discharge-replay",
+            // Reached value-flow rows use a plan/event pair identity across engines.
+            "-8386-value-flow-neutral-endpoint-ids",
+            // #9127: the public plan fingerprint in endpoint IDs is mount-free.
+            "-9127-mount-free-value-flow-plan-identity",
+            // #8940: continuation heap ports change composed policy answers.
+            "-8940-post-call-heap-ports",
+            // ICFG member input follows content-preserving argument copies.
+            "-8896-icfg-member-call-bindings",
+            // #9162: one seed key per partial-flow port changes stored partial-flow rows.
+            "-9162-partial-flow-seed-canonicalization",
         ] {
             assert_eq!(POLICY_SUBSTRATE_EPOCH.matches(component).count(), 1);
             let old_substrate = POLICY_SUBSTRATE_EPOCH.replacen(component, "", 1);

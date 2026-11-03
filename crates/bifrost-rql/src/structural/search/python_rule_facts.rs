@@ -4155,11 +4155,11 @@ fn report_uninitialized_variable_incomplete(
 /// for a complete may-be-uninitialized answer; module/class/global lookups,
 /// builtins and any unmatched flow identity stay typed-incomplete.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn uninitialized_variable_expansions(
+pub(super) fn uninitialized_variable_expansions<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     environment_cache: &mut EnvironmentTraversalCache,
     occurrence: &OccurrenceValue,
     cancellation: Option<&CancellationToken>,

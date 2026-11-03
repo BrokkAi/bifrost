@@ -1406,6 +1406,172 @@ fn failed_outcome(
     }
 }
 
+/// Append module activation rows for every module a validated
+/// `vendor/modules.txt` selects and the toolchain route did not already name
+/// (#9052).
+///
+/// A vendored build compiles exactly the listed module versions, and the
+/// files-only acquisition publishes such a module as a complete `locked` row
+/// only when the listing is consistent with its `go.mod` (#9047). That is
+/// exact activation evidence without a Go toolchain or module cache. Bare
+/// `go.mod` requirements, checksums, unvalidated listings and replaced modules
+/// name no selected version, so they activate nothing: their activation stays
+/// with `go list`, which reports the selected graph. A limit that may have
+/// omitted rows is reported, not dropped.
+pub(crate) fn append_vendor_activation_rows(
+    outcome: &mut DependencyDiscoveryOutcome,
+    config: &GoAnalyzerConfig,
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        DependencyEvidenceGapKind, DependencyEvidenceKind, DependencyFileEvidenceLimits,
+    };
+    if config.dependency_discovery.mode == GoDependencyDiscoveryMode::Disabled || outcome.cancelled
+    {
+        return;
+    }
+    let evidence_limits = DependencyFileEvidenceLimits::default();
+    let files = match project.all_files_shared() {
+        Ok(files) => files,
+        Err(error) => {
+            outcome.complete = false;
+            outcome.diagnostics.push(error_diagnostic(
+                "go.vendor_files",
+                None,
+                error.to_string(),
+                limits,
+            ));
+            return;
+        }
+    };
+    let mut snapshots = Vec::new();
+    for file in files.iter().filter(|file| {
+        brokk_bifrost_go::packages::go_vendor_root(file.rel_path()).is_some()
+            || file
+                .rel_path()
+                .file_name()
+                .is_some_and(|name| name == "go.mod")
+    }) {
+        match project.read_source_snapshot_limited(file, evidence_limits.max_file_bytes) {
+            Ok(Some(snapshot)) => snapshots.push((file.rel_path().to_path_buf(), snapshot)),
+            Ok(None) => {
+                outcome.complete = false;
+                outcome.diagnostics.push(error_diagnostic(
+                    "go.vendor_evidence_incomplete",
+                    None,
+                    format!(
+                        "{} exceeds the {}-byte evidence limit; vendored module activation may omit modules",
+                        file.rel_path().display(),
+                        evidence_limits.max_file_bytes
+                    ),
+                    limits,
+                ));
+            }
+            Err(error) => {
+                outcome.complete = false;
+                outcome.diagnostics.push(error_diagnostic(
+                    "go.vendor_files",
+                    None,
+                    format!("{}: {error}", file.rel_path().display()),
+                    limits,
+                ));
+            }
+        }
+    }
+    let snapshots = snapshots
+        .iter()
+        .map(|(path, snapshot)| super::build_evidence::GoBuildSnapshot {
+            path,
+            source: snapshot.source(),
+            oid: snapshot.oid(),
+        })
+        .collect::<Vec<_>>();
+    let evidence = super::build_evidence::collect_go_build_evidence(
+        &snapshots,
+        &evidence_limits,
+        cancellation,
+    );
+    for gap in &evidence.gaps {
+        if matches!(
+            gap.kind,
+            DependencyEvidenceGapKind::Limit | DependencyEvidenceGapKind::Cancelled
+        ) {
+            outcome.complete = false;
+            outcome.diagnostics.push(error_diagnostic(
+                "go.vendor_evidence_incomplete",
+                None,
+                format!(
+                    "{}: {}; vendored module activation may omit modules",
+                    gap.build_file.display(),
+                    gap.message
+                ),
+                limits,
+            ));
+        }
+    }
+    let named = outcome
+        .dependencies
+        .iter()
+        .filter_map(|dependency| Some(dependency.evidence.module.as_ref()?.name.clone()))
+        .collect::<std::collections::HashSet<_>>();
+    for row in evidence.rows {
+        if row.ecosystem != super::build_evidence::GO_MODULE_ECOSYSTEM
+            || row.kind != DependencyEvidenceKind::Locked
+            || !row.complete
+            || row.source.as_deref() != Some(format!("module:{}", row.package).as_str())
+            || named.contains(&row.package)
+        {
+            continue;
+        }
+        let version = row
+            .exact_version
+            .as_deref()
+            .expect("locked rows name a version");
+        let mut provenance = vec![
+            DependencyProvenance {
+                key: "module.path".to_owned(),
+                value: row.package.clone(),
+            },
+            DependencyProvenance {
+                key: "module.version".to_owned(),
+                value: version.to_owned(),
+            },
+            DependencyProvenance {
+                key: "go.vendor_listing".to_owned(),
+                value: row.build_file.to_string_lossy().replace('\\', "/"),
+            },
+        ];
+        provenance.sort_by(|left, right| left.key.cmp(&right.key));
+        outcome.dependencies.push(ResolvedDependency {
+            id: format!(
+                "go:vendored:{}:{}@{version}",
+                row.build_file.to_string_lossy().replace('\\', "/"),
+                row.package
+            ),
+            evidence: SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: super::build_evidence::GO_MODULE_ECOSYSTEM.to_owned(),
+                package: None,
+                module: Some(CatalogCoordinate {
+                    name: row.package.clone(),
+                    version: module_version(version),
+                }),
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            },
+            provenance,
+            artifacts: Vec::new(),
+            scope: DependencyScope::Unknown,
+            declared_by: row.declared_by.clone(),
+        });
+        outcome.profile.dependencies_resolved += 1;
+    }
+}
+
 fn cancelled_outcome() -> DependencyDiscoveryOutcome {
     DependencyDiscoveryOutcome::cancelled_with_message("Go dependency discovery was cancelled")
 }

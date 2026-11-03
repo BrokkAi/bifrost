@@ -10,8 +10,36 @@ use crate::analyzer::resolution::{
 };
 use crate::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION;
 use crate::analyzer::store::selected_read_memo::ExactReadMemo;
+use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;
 use rusqlite::{OptionalExtension, params};
+
+impl SelectedResolutionOperation<'_, '_> {
+    /// Import facts for one file from the content pinned by this selection.
+    #[doc(hidden)]
+    pub fn selected_rust_import_infos(
+        &self,
+        file: &ProjectFile,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<(git2::Oid, Vec<ImportInfo>)>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(mount) = self
+            .ready
+            .inventory
+            .mount_record_for_path("rust", &selected_path_key(file.rel_path()))?
+        else {
+            return Ok(None);
+        };
+        // Rust parses have one variant, so the selected blob uses the unvaried key.
+        let imports = crate::analyzer::store::read_import_infos(
+            self.ready.inventory.connection(),
+            &crate::analyzer::store::BlobKey::unvaried(mount.blob_oid(), "rust"),
+        )?;
+        Ok((!cancellation.is_cancelled()).then_some((mount.blob_oid(), imports)))
+    }
+}
 
 /// The `unmounted` column and its `+` are explained beside
 /// `rust_crate_context::MODULES`, which reads the same thing for the graph

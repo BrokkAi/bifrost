@@ -4,12 +4,26 @@
 //! supplied by the embedding and are deliberately private so neither policy
 //! decoding nor an evaluator can raise a hard cap by mutating a field directly.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
+use super::registry::PolicyRegistryLimits;
+use brokk_bifrost_flow::dataflow::SolverBudgetDimension;
 use brokk_bifrost_rql::structural::{
     CodeQueryExecutionLimits, CodeQuerySemanticLimits, CodeQuerySemanticRowLimits,
-    CodeQueryTypestateLimits,
+    CodeQueryTaintLimits, CodeQueryTypestateLimits, CodeQueryValueFlowLimits,
 };
+
+// Destructure every field, including explicitly handled nested limits, so
+// adding a new cap cannot silently omit it from persisted replay evidence.
+macro_rules! grant_caps {
+    ($out:ident, $prefix:literal, $value:expr, $type:ident {
+        $($field:ident),+ $(,)?
+    } $(; $($nested:ident),+)? ) => {
+        let $type { $($field,)+ $($($nested: _,)+)? } = $value;
+        $($out.insert(concat!($prefix, stringify!($field)).to_string(), $field as u64);)+
+    };
+}
 
 use super::relational::MAX_RETAINED_RELATIONAL_OBLIGATIONS;
 
@@ -184,6 +198,26 @@ const MAX_SERIALIZED_REPORT_BYTES_PER_BATCH: usize = 64 * 1024 * 1024;
 
 fn saturating_usize(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// Source volume of exactly the analyzer snapshot being evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PolicySourceCensus {
+    pub bytes: u64,
+    pub files: usize,
+}
+
+/// Scale original caller limits once, then apply the batch retention clamp.
+/// Replay uses the recorded snapshot's census, never the requesting head's.
+pub(crate) fn effective_grant(
+    caller: PolicyBatchBudget,
+    census: PolicySourceCensus,
+) -> PolicyBatchBudget {
+    caller.with_scaled_per_policy(
+        caller
+            .per_policy
+            .scaled_for_workspace(census.bytes, census.files),
+    )
 }
 
 /// Immutable limits for one policy evaluation and its retained report data.
@@ -523,6 +557,116 @@ impl PolicyBatchBudget {
             .min(self.max_retained_report_bytes);
         self.per_policy = budget;
         self
+    }
+
+    /// Every cap execution receives, with canonical query row capacities.
+    /// Exhaustive destructuring deliberately fails compilation when a cap is added.
+    pub(crate) fn replay_caps(self, registry: PolicyRegistryLimits) -> BTreeMap<String, u64> {
+        let mut caps = BTreeMap::new();
+        grant_caps!(caps, "batch.", self, PolicyBatchBudget {
+            max_policies,
+            max_total_findings,
+            max_retained_report_bytes,
+            max_serialized_report_bytes,
+        }; per_policy);
+        grant_caps!(caps, "policy.", self.per_policy, PolicyBudget {
+            max_selector_results,
+            max_findings,
+            max_diagnostics,
+            max_related_locations_per_finding,
+            max_evidence_refs_per_finding,
+            max_evidence_bytes_per_finding,
+            max_origins_per_finding,
+            max_witnesses_per_finding,
+            max_witness_steps,
+            max_witness_bytes,
+            max_cvss_overlays,
+            max_cvss_evidence_records_per_finding,
+            max_cvss_variants_per_finding,
+            max_cvss_reduction_steps,
+            max_projection_scenario_memberships,
+            max_organizational_risk_overlays,
+            max_obligations_per_run,
+            max_retained_report_bytes,
+            max_composition_procedures,
+            max_composition_hops,
+            max_composition_callers_per_procedure,
+        }; query);
+
+        // Execution canonicalizes the raw semantic row table here.
+        let query = self.per_policy.query_limits();
+        grant_caps!(caps, "query.", query, CodeQueryExecutionLimits {
+            max_scanned_files,
+            max_scanned_source_bytes,
+            max_fact_nodes,
+            max_pipeline_rows,
+        }; semantic, typestate, value_flow, taint);
+        grant_caps!(caps, "semantic.", query.semantic, CodeQuerySemanticLimits {
+            max_materialized_files,
+            max_source_bytes,
+            max_retained_bytes,
+        }; max_rows_per_dimension, rows_per_dimension);
+        let rows = query
+            .semantic
+            .rows_per_dimension
+            .expect("PolicyBudget::query_limits canonicalizes row limits");
+        // SourceBytes and OwnedTextBytes are unused row-table sentinels;
+        // the real semantic byte caps were recorded above.
+        for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
+            caps.insert(
+                format!("semantic.rows.{}", dimension.label()),
+                rows.get(dimension) as u64,
+            );
+        }
+        for dimension in SolverBudgetDimension::ALL {
+            caps.insert(
+                format!("typestate.solver.{}", dimension.label()),
+                query.typestate.solver_work.get(dimension) as u64,
+            );
+            caps.insert(
+                format!("value_flow.solver.{}", dimension.label()),
+                query.value_flow.solver_work.get(dimension) as u64,
+            );
+        }
+        grant_caps!(caps, "typestate.", query.typestate, CodeQueryTypestateLimits {
+            max_reached_rows,
+            max_candidates,
+            max_witness_steps,
+            max_witness_expansions,
+            max_total_witness_expansions,
+            max_witness_bytes,
+        }; solver_work);
+        grant_caps!(caps, "value_flow.", query.value_flow, CodeQueryValueFlowLimits {
+            max_retained_relations,
+            max_retained_bytes,
+            max_endpoints,
+            max_witnesses,
+            max_witness_steps,
+            max_witness_expansions,
+            max_witness_bytes,
+            max_total_witness_steps,
+            max_total_witness_expansions,
+            max_total_witness_bytes,
+        }; solver_work);
+        grant_caps!(
+            caps,
+            "taint.",
+            query.taint,
+            CodeQueryTaintLimits {
+                max_findings,
+                max_projected_bytes,
+                max_origins_per_finding,
+                max_witnesses_per_finding,
+                max_steps_per_witness,
+                max_witness_bytes,
+            }
+        );
+        caps.extend(
+            registry
+                .replay_caps()
+                .map(|(name, value)| (name.to_string(), value)),
+        );
+        caps
     }
 
     pub const fn max_policies(&self) -> usize {

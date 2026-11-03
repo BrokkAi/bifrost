@@ -194,8 +194,9 @@ pub(crate) fn go_selected_model_receiver_call(
         // the canonical declaring owner, call shape and provenance travel
         // together instead of fabricating a JVM inventory coordinate.
         // Declared owner/member identity and argument shape remain usable
-        // when import openness withholds exhaustive invocation proof.
-        if declared && !candidate.interface {
+        // when import openness or an open interface implementation family
+        // withholds exhaustive invocation proof.
+        if declared {
             result.identity = Some(ResolverOwnedExternalCalleeIdentity::new(
                 Language::Go,
                 candidate.owner.owner_fqn.to_string(),
@@ -227,7 +228,12 @@ pub(crate) fn go_selected_model_receiver_call(
         result
             .reasons
             .push("go-model-promoted-receiver-storage-unavailable".into());
-    } else if proven && !candidate.interface {
+    } else if proven && candidate.interface {
+        // Any implementation may have a pointer receiver that writes the
+        // boxed object, whichever one the open family selects. Go has no
+        // method set on a pointer to an interface.
+        result.preparation = (pointer == 0).then_some(MemberReceiverPreparation::Reference);
+    } else if proven {
         // This is the language binding kind, not a fabricated memory place.
         // Shared MemberReceiverFlow requires the descriptor's real place for
         // AddressOfPlace and withholds the storage route when it is absent.

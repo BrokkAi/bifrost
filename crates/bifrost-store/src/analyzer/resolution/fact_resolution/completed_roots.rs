@@ -9,6 +9,8 @@ pub struct SelectedDemandState {
     pub(super) identities: Arc<Mutex<crate::analyzer::resolution::CanonicalIdentityNumbers>>,
     pub(super) service_reasons: Arc<Mutex<HashMap<SemanticId, ServiceReasonDetails>>>,
     roots: Mutex<HashMap<RootMemoKey, FactResolutionAnswer>>,
+    #[cfg(test)]
+    last_hit: Mutex<Option<DemandReferenceKey>>,
     #[cfg(any(test, feature = "test-support"))]
     hits: std::sync::atomic::AtomicUsize,
 }
@@ -84,6 +86,14 @@ impl SelectedDemandState {
         self.hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(super) fn last_hit_for_test(&self) -> Option<DemandReferenceKey> {
+        *self
+            .last_hit
+            .lock()
+            .expect("memo hit observation is not poisoned")
+    }
+
     pub(super) fn lookup(
         &self,
         key: &RootMemoKey,
@@ -108,6 +118,13 @@ impl SelectedDemandState {
             )
         });
         if let Some(answer) = &answer {
+            #[cfg(test)]
+            {
+                *self
+                    .last_hit
+                    .lock()
+                    .expect("memo hit observation is not poisoned") = Some(key.reference);
+            }
             #[cfg(any(test, feature = "test-support"))]
             crate::analyzer::resolution::query_obligations::replay_observations::record(
                 crate::analyzer::resolution::query_obligations::replay_observations::Path::CompletedRoot,
@@ -171,6 +188,9 @@ impl SelectedDemandState {
             callable_candidate_applicability,
             call_target_boundary,
             application_completion,
+            external_argument_reasons,
+            external_call_binding_reasons,
+            external_constructor_hierarchy_reasons,
             member_owners,
             member_rejections,
             model_member_selection,
@@ -244,6 +264,12 @@ impl SelectedDemandState {
             && callable_candidate_applicability
                 .iter()
                 .all(|row| semantic(row.target))
+            && external_argument_reasons.iter().copied().all(semantic)
+            && external_call_binding_reasons.iter().copied().all(semantic)
+            && external_constructor_hierarchy_reasons
+                .iter()
+                .copied()
+                .all(semantic)
             && member_owners.iter().all(owner)
             && member_rejections.iter().all(|row| owner(&row.owner))
             && absent_member

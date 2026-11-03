@@ -202,11 +202,17 @@ Set `BIFROST_OPEN_PACKS_OFFLINE=1` to use only the verified cache. Set
 discover current releases; these controls cannot be combined.
 `BIFROST_LAUNCHER_AUTO_INSTALL=0` also disables pack downloads. If no
 eligible pair exists, or network access is unavailable and the cache is empty,
-the binary reports a diagnostic and continues with embedded packs. Invalid
-profiles, release metadata, and corrupt cached content fail explicitly.
+the binary continues without semantic packs: the engine embeds none. It
+reports a diagnostic when the network is unavailable or the offline cache
+misses. Invalid profiles, release metadata, and corrupt cached content fail
+explicitly.
 
-For manual installation, download, verify, and safely extract a native bundle,
-then install it with the running engine's portable command:
+To run offline, or with `BIFROST_OPEN_PACKS_DISABLE=1`, download a
+`packs/vX.Y.Z` release on a connected machine, verify the native archive against
+its `.sha256` file, and extract it. Then either set
+`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` to the extracted `bifrost-semantic-packs`
+directory, as shown below, or install it into a cache with the running engine's
+portable command:
 
 ```bash
 bifrost install-semantic-packs /path/to/bifrost-semantic-packs /path/to/cache
@@ -227,8 +233,7 @@ When both `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` and
 `BIFROST_POLICY_PACK_ROOT` are unset, the `bifrost` binary supplies its
 verified selection before the existing native and policy installers run.
 Setting either variable supplies host-owned content and disables automatic
-acquisition. The native bundle replaces embedded semantic registration; it is
-not merged with it. An empty value, malformed bundle, or bundle that installs
+acquisition. The native bundle is the only semantic registration. An empty value, malformed bundle, or bundle that installs
 no compatible pack makes activation fail. A policy report then carries
 `pack-activation-failed`, and the run exits 2. A malformed policy catalog also
 fails explicitly. Policy manifests and authored hashes are checked by the
@@ -516,13 +521,13 @@ rules failed closed, so production emitted neither rule.
 ## Version and extension rules
 
 Every source pack must contain a `schema_version` this build supports, from
-`2` through `21`. The field is mandatory: omitted, zero, and unsupported versions
+`2` through `22`. The field is mandatory: omitted, zero, and unsupported versions
 fail instead of falling back. Every object rejects unknown fields, and every
 variant is explicitly tagged. A schema addition takes a new version number and
 a new checked-in schema rather than silently widening a number that already
 shipped.
 
-The newest schema is `21`. Packs generated from pinned artifacts declare the
+The newest schema is `22`. Packs generated from pinned artifacts declare the
 lowest schema their content needs, never below `8`, so a reader that predates a
 field still accepts a pack that does not use it.
 
@@ -580,7 +585,7 @@ incomplete signature or body; none of those absences supplies an unknown type
 for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v21.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v21.schema.json).
+[`schemas/semantic-model-pack-v22.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v22.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 The version-two through version-eight schemas stay checked in as frozen

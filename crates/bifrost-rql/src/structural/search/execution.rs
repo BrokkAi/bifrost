@@ -103,18 +103,48 @@ pub(super) fn execute_plan(
     }
 
     let profiling = state.profile.is_some();
-    let mut execution = execute_plan_node(
-        plan,
-        token,
-        current_node_id,
-        state,
-        limits,
-        current_terminal_cap,
-        diagnostics,
-        profile_branch,
-        profiling.then(Instant::now),
-        None,
-    );
+    let mut execution = if let Some(operands) = state.scope.intersect_operands() {
+        assert_eq!(
+            plan.node(current_node_id).operator(),
+            PhysicalQueryOperator::SequentialIntersection,
+            "intersect continuation must replace its named physical cut"
+        );
+        assert_eq!(
+            operands.len(),
+            plan.node(current_node_id).dependencies().len()
+        );
+        let (mut rows, _) = combine_set_rows(SetOperator::Intersect, operands.to_vec(), profiling);
+        state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
+        state.step_outputs[current_node_id.index()] = rows.len() as u64;
+        let truncated = if let Some(cap) = current_terminal_cap
+            && rows.len() > cap
+        {
+            rows.truncate(cap);
+            push_truncation_diagnostic(diagnostics, &state.budget, cap);
+            true
+        } else {
+            false
+        };
+        PlanExecution {
+            rows,
+            truncated,
+            cancelled: false,
+            pipeline_halted: false,
+        }
+    } else {
+        execute_plan_node(
+            plan,
+            token,
+            current_node_id,
+            state,
+            limits,
+            current_terminal_cap,
+            diagnostics,
+            profile_branch,
+            profiling.then(Instant::now),
+            None,
+        )
+    };
     if !passes_input_rows_through(plan.logical_node(current_node_id).operator()) {
         forget_withheld_rows_paths(&mut diagnostics[chain_diagnostic_start..]);
     }
@@ -747,6 +777,7 @@ fn execute_plan_node(
                         && !child.cancelled
                         && child.rows.is_empty()
                         && (*op == SetOperator::Intersect
+                            && state.scope.intersect_prefix_capture().is_none()
                             || (*op == SetOperator::Except
                                 && index == 0
                                 && state.scope.seed_files().is_none()));
@@ -930,6 +961,18 @@ fn execute_plan_node(
                 if let Some(child) = cancelled_child {
                     disposition = QueryOperatorDisposition::Skipped;
                     child
+                } else if *op == SetOperator::Intersect
+                    && node_id == plan.node(plan.root()).dependencies()[0]
+                    && let Some(capture) = state.scope.intersect_prefix_capture()
+                {
+                    *capture.lock().expect("prefix capture lock is not poisoned") =
+                        Some(branch_rows);
+                    PlanExecution {
+                        rows: Vec::new(),
+                        truncated,
+                        cancelled: false,
+                        pipeline_halted: false,
+                    }
                 } else {
                     let merge_started = profiling.then(Instant::now);
                     let (mut rows, merge_measurement) =

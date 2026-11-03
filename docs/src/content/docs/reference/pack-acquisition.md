@@ -240,4 +240,4 @@ Omission means no catalogs, preserving existing bundles. Catalogs are registered
 for each coordinator run, including catalogs from bundles whose policies were
 not selected. Bundle policies retain their explicit-selection behavior.
 Catalog category declarations and wildcard selection are described in the
-[policy reference](./policies/#catalog).
+[policy reference](/reference/policies/#catalog).

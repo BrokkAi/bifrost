@@ -81,3 +81,68 @@ fn overwritten_property_reports_unknown_computed_keys_incomplete() {
         }
     }
 }
+
+#[test]
+fn misspelled_identifier_skips_parts_the_identifier_dictionary_accepts() {
+    use crate::structural::identifier_dictionary::IdentifierDictionary;
+    use crate::structural::search::units::{
+        CodeQueryExecutionScope, execute_code_query_unit, plan_seed_files,
+    };
+
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "main.ts",
+            "const length = 1;\nconst totalLength = length + length;\nconst lenght = 2;\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["typescript"],
+        "match": {
+            "kind": "identifier",
+            "language_rule": "js/misspelled-identifier"
+        },
+        "result_detail": "full"
+    }))
+    .expect("misspelled-identifier query");
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let flagged_lines = |scope: CodeQueryExecutionScope<'_>| {
+        let unit = execute_code_query_unit(
+            workspace.analyzer(),
+            &flow,
+            None,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            scope,
+        );
+        unit.rows
+            .iter()
+            .map(|row| row.item.range.as_ref().expect("a located match").start_line)
+            .collect::<Vec<_>>()
+    };
+
+    let unrelated = IdentifierDictionary::parse("total\n").unwrap().dictionary;
+    let accepted = IdentifierDictionary::parse("# our spelling\nLenght\n")
+        .unwrap()
+        .dictionary;
+    assert_eq!(
+        flagged_lines(CodeQueryExecutionScope::for_seed_files(&files, &files)),
+        [3]
+    );
+    assert_eq!(
+        flagged_lines(
+            CodeQueryExecutionScope::for_seed_files(&files, &files)
+                .with_identifier_dictionary(&unrelated)
+        ),
+        [3]
+    );
+    assert_eq!(
+        flagged_lines(
+            CodeQueryExecutionScope::for_seed_files(&files, &files)
+                .with_identifier_dictionary(&accepted)
+        ),
+        Vec::<usize>::new()
+    );
+}

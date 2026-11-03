@@ -17,20 +17,130 @@ mod tests;
 
 use std::fmt;
 
-pub use graph::{ComposedSourceId, Endpoint, Hop, HopQuality, PortNode};
+pub use graph::{
+    ComposedSourceId, Endpoint, ExecutionTarget, ExternalTargetIdentity, Hop, HopQuality, PortNode,
+};
+pub use labels::{ComposeLabels, LabelFunctions};
 pub use provider::{
     BlockedGap, BoundSanitizer, BoundSource, BoundTransform, CallModel, CallerLocation, Callers,
-    Completeness, CompositionProvider, Dispatch, DispatchCandidate, EndpointEvidence,
-    FallbackPorts, InteriorFlow, InteriorFlows, InteriorObservation, InteriorSeed, InteriorTarget,
-    InteriorWitnessStep, ModelTransfer, Openness, ProcedureEndpoints, ValueTypeBarrierCheck,
-    ValueTypeBarrierFindingNotes,
+    Completeness, CompositionProvider, Dispatch, DispatchCandidate, EndpointEvidence, ExecutionArm,
+    ExecutionArmContext, ExecutionDispatch, ExecutionDispatchOutcome, ExecutionEndpointStatus,
+    ExecutionEndpoints, ExecutionSource, FallbackPorts, InteriorFlow, InteriorFlows,
+    InteriorObservation, InteriorSeed, InteriorTarget, InteriorWitnessStep, InvocationSite,
+    Invocations, ModelTransfer, Openness, ProcedureEndpoints, StoreChannelLink, StoreChannelLinks,
+    StoreWriteObservation, ValueTypeBarrierCheck, ValueTypeBarrierFindingNotes, WritebackBinding,
+    bound_return_member_matches, bound_return_selector_matches,
 };
-pub use search::{BudgetLane, Incompleteness, SearchStats, SourceSinkPair};
+pub use report::ComposedStoreCrossing;
+pub use search::{
+    BudgetLane, ExecutionOutcome, ExecutionReach, Incompleteness, SearchOutcome, SearchStats,
+    SourceSinkPair,
+};
+
+/// Reachability labels for RQL's value-flow question.
+#[derive(Debug, Clone, Copy)]
+pub struct ValueFlowLabels;
+
+impl ComposeLabels for ValueFlowLabels {
+    type Fact = ();
+    type Function = ();
+
+    fn identity(&self) {}
+    fn then(&self, _: &(), _: &()) {}
+    fn apply(&self, _: &(), _: &()) {}
+    fn intersects(&self, _: &(), _: &()) -> bool {
+        true
+    }
+}
+
+/// Search one registered value-flow plan without policy labels.
+pub fn search_value_flow<Provider>(
+    plan: &crate::value_flow::ValueFlowPlan,
+    provider: &Provider,
+    budget: CompositionBudget,
+    request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+) -> Result<search::SearchOutcome<ValueFlowLabels>, ComposeError>
+where
+    Provider: CompositionProvider<Fact = (), Function = ()>,
+{
+    search::search_pairs(
+        search::ComposeQuery {
+            execution_roots: Vec::new(),
+            value_flow: Some(plan),
+            labels: ValueFlowLabels,
+            sinks: plan.sinks().map(|(id, _)| (id, ())).collect(),
+            sources: plan
+                .sources()
+                .map(|(_, source)| BoundSource {
+                    point: source.point().clone(),
+                    phase: source.phase(),
+                    carrier: source.carrier().clone(),
+                    classes: (),
+                    origin: crate::taint::SourceEventKey::new(source.key().clone()),
+                    evidence: EndpointEvidence::Known(search::evidence_quality(
+                        source.proof(),
+                        source.completeness(),
+                    )),
+                })
+                .collect(),
+            sanitizers: Vec::new(),
+            transforms: Vec::new(),
+        },
+        provider,
+        budget,
+        request,
+    )
+}
+
+/// The taint client's function for a model that removes named classes.
+pub fn taint_model_kill(
+    universe: &super::TaintUniverse,
+    removed: &[Box<str>],
+) -> super::TaintEdgeFunction {
+    super::TaintEdgeFunction::kill(&labels::label_classes(universe, removed))
+}
 
 use crate::analyzer::semantic::SemanticRequest;
-use crate::value_flow::DurableCallSiteKey;
+use crate::value_flow::{DurableCallSiteKey, DurableProcedureKey};
 
-use super::{TaintAnalysisPlan, TaintFindingError, TaintFindingReport};
+/// Search declared execution facts through body-owned invocation edges.
+pub fn search_execution<L, Provider>(
+    roots: Vec<DurableProcedureKey>,
+    labels: L,
+    provider: &Provider,
+    budget: CompositionBudget,
+    request: &mut SemanticRequest<'_>,
+) -> Result<ExecutionOutcome<L>, ComposeError>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
+    let outcome = search::search_pairs(
+        search::ComposeQuery {
+            execution_roots: roots,
+            value_flow: None,
+            labels,
+            sinks: Vec::new(),
+            sources: Vec::new(),
+            sanitizers: Vec::new(),
+            transforms: Vec::new(),
+        },
+        provider,
+        budget,
+        request,
+    )?;
+    Ok(ExecutionOutcome {
+        sources: outcome.execution_sources,
+        reaches: outcome.execution_reaches,
+        functions: outcome.functions,
+        incomplete: outcome.incomplete,
+        stats: outcome.stats,
+    })
+}
+
+use super::{
+    TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction, TaintFindingError, TaintFindingReport,
+};
 
 /// Bounds on one composition. Exhausting a lane marks the batch incomplete
 /// with the lane named.
@@ -93,6 +203,7 @@ pub struct ComposeOutcome {
     pub stats: SearchStats,
     pub barrier_notes: Vec<ValueTypeBarrierFindingNotes>,
     pub barrier_pairs: Vec<ValueTypeBarrierPairEvidence>,
+    pub store_crossings: Vec<ComposedStoreCrossing>,
 }
 
 /// Judge the evidence of every source with `Unknown` evidence that a reported
@@ -106,12 +217,15 @@ pub struct ComposeOutcome {
 /// source of every region for completion: a source the search reached that
 /// lies on no reported path keeps `Unknown` evidence, is not judged and
 /// leaves the run's completion alone.
-fn judge_reported_sources<Provider: CompositionProvider>(
+fn judge_reported_sources<Provider>(
     provider: &Provider,
-    outcome: &mut search::SearchOutcome,
+    outcome: &mut search::SearchOutcome<labels::TaintLabels<'_>>,
     labeled: &mut [labels::LabeledPath],
     request: &mut SemanticRequest<'_>,
-) -> Result<(), ComposeError> {
+) -> Result<(), ComposeError>
+where
+    Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>,
+{
     let mut judged: Vec<(ComposedSourceId, HopQuality)> = Vec::new();
     for path in labeled.iter_mut() {
         let source = &outcome.sources[path.source.index()];
@@ -145,6 +259,70 @@ fn judge_reported_sources<Provider: CompositionProvider>(
     Ok(())
 }
 
+/// The composition question of a taint plan: its bound sinks with their
+/// accepted classes, its sources with their selector evidence, and its
+/// sanitizers and in-place transforms, in the plan's labels.
+fn taint_query(plan: &TaintAnalysisPlan) -> search::ComposeQuery<'_, labels::TaintLabels<'_>> {
+    let value_flow = plan.value_flow();
+    let carrier = |id| {
+        value_flow
+            .carrier(id)
+            .expect("a bound carrier is a carrier of its plan")
+            .clone()
+    };
+    search::ComposeQuery {
+        execution_roots: Vec::new(),
+        value_flow: Some(value_flow),
+        labels: labels::TaintLabels::new(plan.universe()),
+        sinks: plan
+            .sinks()
+            .iter()
+            .map(|binding| (binding.sink(), binding.accepted().clone()))
+            .collect(),
+        sources: plan
+            .sources()
+            .iter()
+            .map(|binding| {
+                let spec = value_flow
+                    .source(binding.source())
+                    .expect("a source binding names a source of its plan");
+                BoundSource {
+                    point: spec.point().clone(),
+                    phase: spec.phase(),
+                    carrier: spec.carrier().clone(),
+                    classes: binding.classes().clone(),
+                    origin: binding.origin().clone(),
+                    evidence: EndpointEvidence::Known(search::evidence_quality(
+                        spec.proof(),
+                        spec.completeness(),
+                    )),
+                }
+            })
+            .collect(),
+        sanitizers: plan
+            .sanitizers()
+            .iter()
+            .map(|sanitizer| BoundSanitizer {
+                point: sanitizer.point().clone(),
+                input: carrier(sanitizer.carrier()),
+                output: carrier(sanitizer.output()),
+                function: TaintEdgeFunction::kill(sanitizer.removed()),
+                proven: sanitizer.is_proven(),
+                resolved: sanitizer.is_resolved(),
+            })
+            .collect(),
+        transforms: plan
+            .transforms()
+            .iter()
+            .map(|transform| search::InPlaceTransform {
+                point: transform.point().clone(),
+                carrier: carrier(transform.carrier()),
+                function: transform.function().clone(),
+            })
+            .collect(),
+    }
+}
+
 /// Compose the plan's sinks with the plan's sources and the sources the
 /// provider matches on the frontier, over the provider's port graph: stage 1
 /// finds the source-sink pairs and their paths, stage 2 evaluates labels
@@ -152,32 +330,36 @@ fn judge_reported_sources<Provider: CompositionProvider>(
 /// class.
 pub fn compose_taint_batch(
     plan: &TaintAnalysisPlan,
-    provider: &impl CompositionProvider,
+    provider: &impl CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>,
     budget: CompositionBudget,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ComposeOutcome, ComposeError> {
     provider.reset_value_type_witnesses();
     let mut outcome = {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.search");
-        search::search_pairs(plan, provider, budget, request)?
+        search::search_pairs(taint_query(plan), provider, budget, request)?
     };
     let mut labeled = {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.labels");
-        labels::evaluate_pairs(plan, &outcome.sources, &outcome.pairs)
+        labels::evaluate_pairs(plan, &outcome.functions, &outcome.sources, &outcome.pairs)
     };
     {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.source_evidence");
         judge_reported_sources(provider, &mut outcome, &mut labeled, request)?;
     }
-    let (report, mut finding_incompleteness) = {
+    let (report, mut finding_incompleteness, store_crossings) = {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.report");
         report::build_report(plan, provider, budget, &outcome, labeled, request)?
     };
     let mut barrier_pairs = Vec::new();
     if provider.has_value_type_barriers() {
         for pair in &outcome.pairs {
-            let mut labeled =
-                labels::evaluate_pairs(plan, &outcome.sources, std::slice::from_ref(pair));
+            let mut labeled = labels::evaluate_pairs(
+                plan,
+                &outcome.functions,
+                &outcome.sources,
+                std::slice::from_ref(pair),
+            );
             for path in &mut labeled {
                 if let EndpointEvidence::Known(quality) =
                     outcome.sources[path.source.index()].evidence
@@ -186,7 +368,7 @@ pub fn compose_taint_batch(
                 }
             }
             // Source judgments were already installed by the main report pass.
-            let (lenient, _) =
+            let (lenient, _, _) =
                 report::build_report(plan, provider, budget, &outcome, labeled, request)?;
             if lenient.findings().is_empty() {
                 continue;
@@ -215,6 +397,7 @@ pub fn compose_taint_batch(
                     );
                     let mut labeled = labels::evaluate_pairs(
                         plan,
+                        &outcome.functions,
                         &outcome.sources,
                         std::slice::from_ref(strict),
                     );
@@ -225,7 +408,7 @@ pub fn compose_taint_batch(
                             path.quality = path.quality.conjoin(quality);
                         }
                     }
-                    let (strict_report, reasons) =
+                    let (strict_report, reasons, _) =
                         report::build_report(plan, provider, budget, &outcome, labeled, request)?;
                     for reason in reasons {
                         if !finding_incompleteness.contains(&reason) {
@@ -248,5 +431,6 @@ pub fn compose_taint_batch(
         stats: outcome.stats,
         barrier_notes: outcome.barrier_notes,
         barrier_pairs,
+        store_crossings,
     })
 }

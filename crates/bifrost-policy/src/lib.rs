@@ -222,6 +222,8 @@ pub use units::*;
 pub use brokk_bifrost_flow::taint::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 
 #[cfg(any(test, feature = "test-support"))]
+pub use taint_policy::with_composition_taint_engine_for_test;
+#[cfg(any(test, feature = "test-support"))]
 pub use taint_policy::with_icfg_taint_engine_for_test;
 
 #[cfg(any(test, feature = "test-support"))]

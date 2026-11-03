@@ -522,7 +522,7 @@ The Claude Code manifest also registers an LSP server through `.lsp.json`. It
 runs the launcher with `--lsp`. That works only with the pinned release 0.12.0.
 Later Bifrost builds reject `--lsp`, because the language server is now the
 separate `bifrost-lsp` program. See [Claude Code](/claude-code/) and [LSP
-Server](/lsp/).
+Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md).
 
 Skills:
 

@@ -138,7 +138,7 @@ pub fn lowest_schema_version(
         "lowest_schema_version is for version-independent packs, found schema {}",
         pack.schema_version
     );
-    let (diagnostics, required) = validate_pack_internal(pack, validation_limits(options), true);
+    let (diagnostics, required, _) = validate_pack_internal(pack, validation_limits(options), true);
     if diagnostics.is_empty() {
         Ok(required)
     } else {

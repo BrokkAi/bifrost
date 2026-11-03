@@ -24,7 +24,11 @@ enum Node {
     Reach(usize),
 }
 
-impl<Provider: CompositionProvider> Search<'_, Provider> {
+impl<Provider, L> Search<'_, Provider, L>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
     /// Supports and their edges each share the existing hop ceiling. An
     /// unrecordable support stops the baseline honestly, before witness
     /// selection can depend on it. No second discovery budget is created.
@@ -52,16 +56,16 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                 let Root::Sink(sink) = reach.key.root else {
                     return None;
                 };
-                let accepted = self
-                    .plan
-                    .sink(sink)
-                    .expect("a reach names a plan sink")
-                    .accepted();
-                reach
-                    .key
-                    .function
-                    .apply(&self.sources[reach.key.source.index()].classes)
-                    .intersects(accepted)
+                let accepted = &self.accepted[&sink];
+                let labels = self.functions.labels();
+                labels
+                    .intersects(
+                        &labels.apply(
+                            self.functions.function(reach.key.function),
+                            &self.sources[reach.key.source.index()].classes,
+                        ),
+                        accepted,
+                    )
                     .then_some(id)
             })
             .collect()
@@ -172,8 +176,8 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                     .push(super::super::ValueTypeBarrierFindingNotes {
                         source: source.origin.clone(),
                         sink: self
-                            .plan
-                            .value_flow()
+                            .value_flow
+                            .expect("value refinement has a value plan")
                             .sink(pair.sink)
                             .expect("a pair sink is live")
                             .key()
@@ -247,14 +251,14 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
         let mut selected = Vec::new();
         for pair in lenient {
             if !pair.paths.iter().any(|(hops, _)| {
-                super::super::labels::hops_function(hops, self.plan.universe())
-                    .apply(&self.sources[pair.source.index()].classes)
-                    .intersects(
-                        self.plan
-                            .sink(pair.sink)
-                            .expect("a pair sink is live")
-                            .accepted(),
-                    )
+                let labels = self.functions.labels();
+                labels.intersects(
+                    &labels.apply(
+                        &self.functions.hops_value(hops),
+                        &self.sources[pair.source.index()].classes,
+                    ),
+                    &self.accepted[&pair.sink],
+                )
             }) {
                 continue;
             }
@@ -299,14 +303,14 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                 candidate.source == pair.source
                     && candidate.sink == pair.sink
                     && candidate.paths.iter().any(|(hops, _)| {
-                        super::super::labels::hops_function(hops, self.plan.universe())
-                            .apply(&self.sources[pair.source.index()].classes)
-                            .intersects(
-                                self.plan
-                                    .sink(pair.sink)
-                                    .expect("a pair sink is live")
-                                    .accepted(),
-                            )
+                        let labels = self.functions.labels();
+                        labels.intersects(
+                            &labels.apply(
+                                &self.functions.hops_value(hops),
+                                &self.sources[pair.source.index()].classes,
+                            ),
+                            &self.accepted[&pair.sink],
+                        )
                     })
             });
             if let Some(strict) = strict {
@@ -316,8 +320,8 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                 .push(super::super::ValueTypeBarrierFindingNotes {
                     source: self.sources[pair.source.index()].origin.clone(),
                     sink: self
-                        .plan
-                        .value_flow()
+                        .value_flow
+                        .expect("value refinement has a value plan")
                         .sink(pair.sink)
                         .expect("a pair sink is live")
                         .key()
@@ -373,8 +377,23 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
             let seed = super::super::report::interior_seed(&self.sources, &from)
                 .expect("a recorded seed is a source or port");
             let (observations, target) = match &to {
+                Endpoint::StoreWrite(write) => {
+                    let writes = self.provider.store_writes();
+                    let write = &writes[*write];
+                    (
+                        vec![InteriorObservation::Sink {
+                            point: write.point,
+                            phase: write.phase,
+                            carrier: write.carrier.clone(),
+                        }],
+                        InteriorTarget::Observation(0),
+                    )
+                }
                 Endpoint::Sink(sink) => (
-                    vec![super::super::report::interior_observation(self.plan, *sink)],
+                    vec![super::super::report::interior_observation(
+                        self.value_flow.expect("value refinement has a value plan"),
+                        *sink,
+                    )],
                     InteriorTarget::Observation(0),
                 ),
                 Endpoint::Location(location) => (
@@ -382,7 +401,9 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                     InteriorTarget::Observation(0),
                 ),
                 Endpoint::Port(port) => (Vec::new(), InteriorTarget::Port(port.clone())),
-                Endpoint::Source(_) => unreachable!("a recorded output is not a source"),
+                Endpoint::Source(_) | Endpoint::Execution(_) | Endpoint::Writeback { .. } => {
+                    unreachable!("a recorded output is not a source or execution")
+                }
             };
             let flows = if stored {
                 self.provider.stored_interior_flows(
@@ -546,17 +567,42 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                 procedure,
                 from,
                 to,
+                function,
                 ..
             } => {
-                let partial = self
+                let projections = self
                     .provider
-                    .partial_flows(procedure, request)
+                    .projected_partial_flows(procedure, request)
                     .map_err(provider_error)?;
+                let selected = self.functions.function(*function);
+                let partial = projections
+                    .iter()
+                    .find(|(restriction, _)| {
+                        restriction
+                            .as_ref()
+                            .map_or(*function == LabelFunctionId::IDENTITY, |restriction| {
+                                restriction == selected
+                            })
+                    })
+                    .expect("a recorded hop's label partition is stable")
+                    .1
+                    .as_ref();
                 let flow = partial.flows.iter().find(|flow| {
                     &partial.ports[flow.from.index()] == from
                         && &partial.ports[flow.to.index()] == to
                 });
                 match flow {
+                    None if partial.outcome != PartialFlowOutcome::Complete => Some(Hop::Stored {
+                        procedure: procedure.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                        function: *function,
+                        quality: HopQuality::UNCERTAIN,
+                        crossed: match &hop {
+                            Hop::Stored { crossed, .. } => crossed.clone(),
+                            _ => unreachable!(),
+                        },
+                    }),
                     None => None,
                     Some(flow) => {
                         let (quality, crossed) = self.refined_quality(
@@ -569,6 +615,7 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                             procedure: procedure.clone(),
                             from: from.clone(),
                             to: to.clone(),
+                            function: *function,
                             quality,
                             crossed,
                         })
@@ -579,6 +626,7 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                 procedure,
                 from,
                 to,
+                function,
                 ..
             } => {
                 let seed = match from {
@@ -591,13 +639,41 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                         }
                     }
                     Endpoint::Port(port) => InteriorSeed::Port(port.clone()),
+                    Endpoint::Writeback {
+                        call,
+                        heap,
+                        storage,
+                        ..
+                    } => {
+                        let PartialFlowPort::Heap {
+                            selectors, tail, ..
+                        } = heap
+                        else {
+                            unreachable!("a writeback names a heap output");
+                        };
+                        InteriorSeed::Writeback {
+                            call: *call,
+                            storage: storage.clone(),
+                            selectors: selectors.clone(),
+                            tail: *tail,
+                        }
+                    }
                     _ => unreachable!("an interior seed is a source or input port"),
                 };
                 let observations = match to {
+                    Endpoint::StoreWrite(write) => {
+                        let writes = self.provider.store_writes();
+                        let write = &writes[*write];
+                        vec![InteriorObservation::Sink {
+                            point: write.point,
+                            phase: write.phase,
+                            carrier: write.carrier.clone(),
+                        }]
+                    }
                     Endpoint::Sink(id) => {
                         let sink = self
-                            .plan
-                            .value_flow()
+                            .value_flow
+                            .expect("value refinement has a value plan")
                             .sink(*id)
                             .expect("a recorded sink is in its plan");
                         vec![InteriorObservation::Sink {
@@ -610,12 +686,24 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                         vec![InteriorObservation::Location(location.clone())]
                     }
                     Endpoint::Port(_) => Vec::new(),
-                    Endpoint::Source(_) => unreachable!("an interior output is not a source"),
+                    Endpoint::Source(_) | Endpoint::Execution(_) | Endpoint::Writeback { .. } => {
+                        unreachable!("an interior output is not a source or execution")
+                    }
                 };
-                let flows = self
+                let projections = self
                     .provider
-                    .interior_flows(procedure, &[seed], &observations, false, request)
+                    .projected_interior_flows(procedure, &[seed], &observations, false, request)
                     .map_err(provider_error)?;
+                let selected = self.functions.function(*function);
+                let flows = projections.into_iter().find_map(|(restriction, flows)| {
+                    (restriction
+                        .as_ref()
+                        .map_or(*function == LabelFunctionId::IDENTITY, |restriction| {
+                            restriction == selected
+                        }))
+                    .then_some(flows)
+                });
+                let flows = flows.expect("a recorded hop's label partition is stable");
                 let incomplete = !matches!(flows.completeness, Completeness::Complete);
                 if let Completeness::Incomplete { reason } = flows.completeness {
                     self.note(Incompleteness::Interior {
@@ -648,6 +736,7 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                             procedure: procedure.clone(),
                             from: from.clone(),
                             to: to.clone(),
+                            function: *function,
                             quality: HopQuality::UNCERTAIN,
                             crossed: crossed.clone(),
                         })
@@ -664,6 +753,7 @@ impl<Provider: CompositionProvider> Search<'_, Provider> {
                             procedure: procedure.clone(),
                             from: from.clone(),
                             to: to.clone(),
+                            function: *function,
                             quality,
                             crossed,
                         })

@@ -3336,4 +3336,153 @@ func use() {
             "the saved root-terminal path names the rebound builtin use: {error:?}"
         );
     }
+
+    #[test]
+    fn selected_go_signature_identity_matrix() {
+        use std::fmt::Write as _;
+
+        // Sources and expected output are inline: crate lib tests run in the
+        // projected public tree, which does not carry root test fixtures.
+        const SIGNATURE_GO: &str = r###"package sigid
+
+type Item struct{}
+type OtherItem struct{}
+type NamedSlice []Item
+type OtherNamedSlice []Item
+type NamedMap map[string]Item
+type OtherNamedMap map[string]Item
+type Box[T any] struct{}
+type Alias = Item
+type ErrorAlias = error
+type ErrorAlias2 = ErrorAlias
+
+type SliceNeed interface { Take([]Item) }
+type MapNeed interface { Put(map[string]Item) }
+type NestedNeed interface { Deep([]map[string]Item) }
+type DefinedSliceNeed interface { Named(NamedSlice) }
+type DefinedMapNeed interface { NamedMap(NamedMap) }
+type PointerNeed interface { Ptr(**Item) }
+type GenericNeed interface { Gen(Box[string]) }
+type AliasNeed interface { AliasTake([]Alias) }
+type ErrorNeed interface { Err(error) }
+type ErrorAliasNeed interface { AliasErr(error) }
+type ErrorSliceAliasNeed interface { AliasErrSlice([]error) }
+type ErrorMapAliasNeed interface { AliasErrMap(map[string]error) }
+
+type Good struct{}
+func (Good) Take([]Item) {}
+func (Good) Put(map[string]Item) {}
+func (Good) Deep([]map[string]Item) {}
+func (Good) Named(NamedSlice) {}
+func (Good) NamedMap(NamedMap) {}
+func (Good) Ptr(**Item) {}
+func (Good) Gen(Box[string]) {}
+func (Good) AliasTake([]Alias) {}
+func (Good) Err(error) {}
+func (Good) AliasErr(ErrorAlias) {}
+func (Good) AliasErrSlice([]ErrorAlias) {}
+func (Good) AliasErrMap(map[string]ErrorAlias2) {}
+
+type WrongElement struct{}
+func (WrongElement) Take([]OtherItem) {}
+func (WrongElement) Put(map[string]OtherItem) {}
+func (WrongElement) Deep([]map[string]OtherItem) {}
+
+type WrongDefined struct{}
+func (WrongDefined) Named(OtherNamedSlice) {}
+func (WrongDefined) NamedMap(OtherNamedMap) {}
+
+type WrongPointer struct{}
+func (WrongPointer) Ptr(*Item) {}
+
+type WrongGeneric struct{}
+func (WrongGeneric) Gen(Box[int]) {}
+"###;
+        const SHADOW_GO: &str = r###"package shadow
+
+type error interface { Shadow() }
+type Need interface { Err(error) }
+type Candidate struct{}
+func (Candidate) Err(error) {}
+"###;
+        const EXPECTED: &str = r###"Good.Take: example.test/transitive.SliceNeed.Take: Satisfies
+WrongElement.Take:
+Good.Put: example.test/transitive.MapNeed.Put: Satisfies
+WrongElement.Put:
+Good.Deep: example.test/transitive.NestedNeed.Deep: Satisfies
+WrongElement.Deep:
+Good.Named: example.test/transitive.DefinedSliceNeed.Named: Satisfies
+WrongDefined.Named:
+Good.NamedMap: example.test/transitive.DefinedMapNeed.NamedMap: Satisfies
+WrongDefined.NamedMap:
+Good.Ptr: example.test/transitive.PointerNeed.Ptr: Satisfies
+WrongPointer.Ptr:
+Good.Gen: example.test/transitive.GenericNeed.Gen: Inconclusive("unsupported structural type in the required signature")
+WrongGeneric.Gen: example.test/transitive.GenericNeed.Gen: Inconclusive("unsupported structural type in the required signature")
+Good.AliasTake: example.test/transitive.AliasNeed.AliasTake: Satisfies
+Good.Err: example.test/transitive.ErrorNeed.Err: Satisfies
+Good.AliasErr: example.test/transitive.ErrorAliasNeed.AliasErr: Satisfies
+Good.AliasErrSlice: example.test/transitive.ErrorSliceAliasNeed.AliasErrSlice: Satisfies
+Good.AliasErrMap: example.test/transitive.ErrorMapAliasNeed.AliasErrMap: Satisfies
+Candidate.Err: example.test/transitive/shadow.Need.Err: Satisfies
+"###;
+        let (_fixture, analyzer) = transitive_fixture(&[
+            ("signature.go", SIGNATURE_GO),
+            ("shadow/shadow.go", SHADOW_GO),
+        ]);
+        let cancellation = CancellationToken::new();
+        let request = match GoNativePointRequest::open(&analyzer, None, &cancellation)
+            .expect("open selected Go request")
+        {
+            GoNativePointRequestOpen::Ready(request) => request,
+            _ => panic!("selected Go request unavailable"),
+        };
+        let declarations = analyzer.get_all_declarations();
+        let mut output = String::new();
+        for (owner, method) in [
+            ("Good", "Take"),
+            ("WrongElement", "Take"),
+            ("Good", "Put"),
+            ("WrongElement", "Put"),
+            ("Good", "Deep"),
+            ("WrongElement", "Deep"),
+            ("Good", "Named"),
+            ("WrongDefined", "Named"),
+            ("Good", "NamedMap"),
+            ("WrongDefined", "NamedMap"),
+            ("Good", "Ptr"),
+            ("WrongPointer", "Ptr"),
+            ("Good", "Gen"),
+            ("WrongGeneric", "Gen"),
+            ("Good", "AliasTake"),
+            ("Good", "Err"),
+            ("Good", "AliasErr"),
+            ("Good", "AliasErrSlice"),
+            ("Good", "AliasErrMap"),
+            ("Candidate", "Err"),
+        ] {
+            let suffix = format!(".{owner}.{method}");
+            let target = declarations
+                .iter()
+                .find(|unit| unit.fq_name().to_string().ends_with(&suffix))
+                .unwrap_or_else(|| panic!("missing selected method {suffix}"));
+            let family = request
+                .method_family_for_test(target, &cancellation)
+                .expect("selected method family");
+            let mut interfaces = family
+                .interfaces
+                .iter()
+                .map(|interface| format!("{}: {:?}", interface.name, interface.outcome))
+                .collect::<Vec<_>>();
+            interfaces.sort_unstable();
+            // An empty family renders as "Owner.Method:" with no trailing space.
+            let listed = if interfaces.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", interfaces.join(", "))
+            };
+            writeln!(output, "{owner}.{method}:{listed}").expect("write golden line");
+        }
+        assert_eq!(EXPECTED, output);
+    }
 }

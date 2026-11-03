@@ -249,7 +249,7 @@ impl FactReadSession<'_> {
             }
     }
 
-    fn go_method_receiver(&self, target: SemanticId) -> Option<bool> {
+    pub(super) fn go_method_receiver(&self, target: SemanticId) -> Option<bool> {
         self.go_member_declarations
             .get(&target)
             .and_then(Option::as_ref)
@@ -632,7 +632,12 @@ struct GoReceiverInterfaceCheck {
 
 struct GoInterfaceOwnerPaths {
     paths: Vec<Vec<SemanticId>>,
+    /// Every owner on every path is an interface whose embedded frontier was
+    /// enumerated. Model gaps in that frontier are in `completion`.
     complete: bool,
+    /// A model owner was reached. Its method inventory never closes the
+    /// implementation family, but it does enumerate member selection.
+    model_family_open: bool,
     completion: ResolutionCompletion,
     source_roots: BTreeSet<SemanticId>,
 }
@@ -652,6 +657,8 @@ pub(super) struct GoSelectedMember {
     pub(super) owners: Box<[SemanticId]>,
     pub(super) fields: Vec<SemanticId>,
     pub(super) completion: ResolutionCompletion,
+    // Source placement is independent of a complete owner type frontier.
+    placement_proven: bool,
 }
 
 pub(super) enum GoMemberSearchPreparation {
@@ -667,6 +674,8 @@ pub(super) struct GoMemberSearch {
     pub(super) completion: ResolutionCompletion,
     pub(super) search_completion: ResolutionCompletion,
     pub(super) receiver_is_interface: bool,
+    // A closed, same-depth collision excludes this name from the Go method set.
+    certified_collision: bool,
 }
 
 pub(super) struct GoRejectedMember {
@@ -684,6 +693,9 @@ pub(super) enum GoSatisfactionMember<'a> {
 
 impl GoMemberSearch {
     pub(super) fn method_for_satisfaction(&self) -> GoSatisfactionMember<'_> {
+        if self.certified_collision {
+            return GoSatisfactionMember::Excluded;
+        }
         match go_member_membership(
             self.members.iter().map(|member| member.kind),
             self.rejected.iter().map(|rejection| rejection.cause),
@@ -1019,6 +1031,7 @@ impl FactEvaluation<'_, '_> {
                 rejected: Vec::new(),
                 search_completion: completion.clone(),
                 receiver_is_interface,
+                certified_collision: false,
                 completion,
             }));
         }
@@ -1234,10 +1247,12 @@ impl FactEvaluation<'_, '_> {
                                 owners: path.owners.into_boxed_slice(),
                                 fields: path.fields,
                                 completion: path.completion.clone(),
+                                placement_proven: false,
                             }],
                             rejected: Vec::new(),
                             search_completion: path.completion.clone(),
                             receiver_is_interface,
+                            certified_collision: false,
                             completion: path.completion,
                         }));
                     }
@@ -1288,6 +1303,7 @@ impl FactEvaluation<'_, '_> {
                             owners: path.owners.clone().into_boxed_slice(),
                             fields: path.fields.clone(),
                             completion: member_completion,
+                            placement_proven: false,
                         });
                     }
                 } else {
@@ -1341,7 +1357,8 @@ impl FactEvaluation<'_, '_> {
                         .iter()
                         .zip(&proofs)
                         .filter(|(_, proof)| {
-                            **proof == super::super::fact_source::DeferredMemberOwnerProof::Matches
+                            **proof
+                                != super::super::fact_source::DeferredMemberOwnerProof::DoesNotMatch
                         })
                         .map(|(candidate, _)| candidate.0)
                         .collect::<Vec<_>>();
@@ -1410,6 +1427,7 @@ impl FactEvaluation<'_, '_> {
                             owners: path.owners.clone().into_boxed_slice(),
                             fields: path.fields.clone(),
                             completion: path.completion.combine(&owner_completion),
+                            placement_proven: complete_method_packages.contains(&row.definition()),
                         });
                     }
                 }
@@ -1430,6 +1448,7 @@ impl FactEvaluation<'_, '_> {
                                 .collect(),
                             fields: path.fields.clone(),
                             completion: path.completion.combine(&origin.completion),
+                            placement_proven: false,
                         });
                     } else {
                         unavailable = true;
@@ -1449,6 +1468,7 @@ impl FactEvaluation<'_, '_> {
                                 owners: path.owners.clone().into_boxed_slice(),
                                 fields: path.fields.clone(),
                                 completion: path.completion.clone(),
+                                placement_proven: false,
                             });
                         } else {
                             unavailable = true;
@@ -1480,6 +1500,7 @@ impl FactEvaluation<'_, '_> {
                     rejected: Vec::new(),
                     search_completion: completion.clone(),
                     receiver_is_interface,
+                    certified_collision: false,
                     completion,
                 }));
             }
@@ -1514,6 +1535,15 @@ impl FactEvaluation<'_, '_> {
                 completion = completion.combine(&member.completion);
             }
             if selected.len() > 1 {
+                // Certify before adding the selector precedence reason. The
+                // accumulated completion covers shallower depths and every
+                // path and witness at this first matching depth.
+                // A complete owner frontier does not prove that its deferred
+                // member participates in the selected package. Each witness
+                // needs its own placement proof before method-set exclusion.
+                let certified_collision = !unavailable
+                    && completion == ResolutionCompletion::Complete
+                    && selected.iter().all(|member| member.placement_proven);
                 let precedence = ResolutionCompletion::incomplete([
                     ResolutionIncompleteReason::InconsistentPrecedence(reference),
                 ]);
@@ -1526,6 +1556,7 @@ impl FactEvaluation<'_, '_> {
                     rejected: Vec::new(),
                     search_completion: completion.clone(),
                     receiver_is_interface,
+                    certified_collision,
                     completion,
                 }));
             }
@@ -1548,6 +1579,7 @@ impl FactEvaluation<'_, '_> {
                         rejected: Vec::new(),
                         search_completion: completion.clone(),
                         receiver_is_interface,
+                        certified_collision: false,
                         completion,
                     }));
                 }
@@ -1572,6 +1604,7 @@ impl FactEvaluation<'_, '_> {
                         rejected: Vec::new(),
                         search_completion: completion.clone(),
                         receiver_is_interface,
+                        certified_collision: false,
                         completion,
                     }));
                 }
@@ -1599,6 +1632,7 @@ impl FactEvaluation<'_, '_> {
                         members: Vec::new(),
                         search_completion,
                         receiver_is_interface,
+                        certified_collision: false,
                         rejected: vec![GoRejectedMember {
                             cause: GoMemberRejectionCause::ReceiverNotAddressable,
                             target: member.target,
@@ -1613,6 +1647,7 @@ impl FactEvaluation<'_, '_> {
                     rejected: Vec::new(),
                     search_completion: completion.clone(),
                     receiver_is_interface,
+                    certified_collision: false,
                     completion,
                 }));
             }
@@ -1724,6 +1759,7 @@ impl FactEvaluation<'_, '_> {
             rejected: Vec::new(),
             search_completion: completion.clone(),
             receiver_is_interface,
+            certified_collision: false,
             completion,
         }))
     }
@@ -2197,9 +2233,10 @@ impl FactEvaluation<'_, '_> {
                 }
                 continue;
             }
+            let complete = paths.complete && !paths.model_family_open;
             return Ok(self
                 .go_interface_declared_methods(&paths.paths)?
-                .map(|methods| (methods, paths.complete)));
+                .map(|methods| (methods, complete)));
         }
     }
 
@@ -2362,6 +2399,7 @@ impl FactEvaluation<'_, '_> {
         let mut seen = HashSet::default();
         let mut paths = Vec::new();
         let mut complete = true;
+        let mut model_family_open = false;
         let mut completion = ResolutionCompletion::Complete;
         let mut source_roots = BTreeSet::new();
         while let Some(owners) = pending.pop() {
@@ -2396,7 +2434,10 @@ impl FactEvaluation<'_, '_> {
                 completion = completion.combine(&self.go_model_owner_completion(owner)?);
                 // Model method inventories never close the implementation
                 // family, including when all authored methods are available.
-                complete = false;
+                // Member selection needs only the declared method set, whose
+                // gaps (inexact members, malformed embeddings) are in
+                // `completion`.
+                model_family_open = true;
                 let embedded = self
                     .session
                     .go_model_owners
@@ -2475,6 +2516,7 @@ impl FactEvaluation<'_, '_> {
         Ok(Some(GoInterfaceOwnerPaths {
             paths,
             complete,
+            model_family_open,
             completion,
             source_roots,
         }))
@@ -2571,34 +2613,37 @@ impl FactEvaluation<'_, '_> {
                         && go_signature_slot_complete(b, required_signature, required_complete) =>
                 {
                     match (a.possible_values(), b.possible_values()) {
-                        ([a], [b]) if a.ty() == b.ty() => {}
-                        ([a], [b]) => {
-                            // Anonymous structural identities identify occurrences,
-                            // not nominal types. Their inequality cannot disprove
-                            // signature equality without comparing the structure.
-                            let identities = [a.ty().identity(), b.ty().identity()];
-                            let read = self
-                                .session
-                                .declaration_types_for_definitions(&identities)?;
-                            let Some(declarations) = self.accept_session_read(read) else {
-                                return Ok(Inconclusive(GO_SIGNATURE_UNKNOWN));
-                            };
-                            let mut slots = identities.to_vec();
-                            slots.extend(declarations.iter().filter_map(|declaration| {
-                                let declaration = declaration.get(self.session).row();
-                                (declaration.role() == DeclarationTypeRole::Identity)
-                                    .then_some(declaration.slot())
-                            }));
-                            let read = self.session.intrinsics_for_slots(&slots)?;
-                            let Some(seeds) = self.accept_session_read(read) else {
-                                return Ok(Inconclusive(GO_SIGNATURE_UNKNOWN));
-                            };
-                            if seeds.iter().any(|seed| {
-                                seed.get(self.session).row().kind() == IntrinsicTypeKind::Structural
-                            }) {
+                        ([_], [_]) => {
+                            let Some(shapes) =
+                                self.projected_type_shapes(&[left, right], states)?
+                            else {
                                 unknown = true;
-                            } else {
-                                return Ok(DoesNotSatisfy);
+                                continue;
+                            };
+                            let left_identity =
+                                match shapes.iter().find(|shape| shape.output_slot() == left) {
+                                    Some(shape) => self.go_signature_shape_identity(
+                                        shape,
+                                        states,
+                                        candidate_signature,
+                                        candidate_complete,
+                                    )?,
+                                    None => None,
+                                };
+                            let right_identity =
+                                match shapes.iter().find(|shape| shape.output_slot() == right) {
+                                    Some(shape) => self.go_signature_shape_identity(
+                                        shape,
+                                        states,
+                                        required_signature,
+                                        required_complete,
+                                    )?,
+                                    None => None,
+                                };
+                            match (left_identity, right_identity) {
+                                (Some(a), Some(b)) if a == b => {}
+                                (Some(_), Some(_)) => return Ok(DoesNotSatisfy),
+                                _ => unknown = true,
                             }
                         }
                         _ => unknown = true,
@@ -2612,6 +2657,160 @@ impl FactEvaluation<'_, '_> {
         } else {
             Satisfies
         })
+    }
+
+    fn go_signature_shape_identity(
+        &mut self,
+        shape: &FactProjectedTypeShape,
+        states: &StateMap,
+        signature: &LoweredCallableSignatureProperty,
+        inventory: Option<bool>,
+    ) -> StoreResult<Option<CanonicalTypeIdentity>> {
+        if !shape.supported() {
+            return Ok(None);
+        }
+        let mut shape = shape.clone();
+        let Some(root_state) = states.get(&shape.root_slot()) else {
+            return Ok(None);
+        };
+        if shape.completion() != &ResolutionCompletion::Complete {
+            if shape.completion() != root_state.completion()
+                || !go_signature_slot_complete(root_state, signature, inventory)
+            {
+                return Ok(None);
+            }
+            shape.completion = ResolutionCompletion::Complete;
+        }
+        let mut leaves = HashMap::default();
+        for node in shape.nodes() {
+            if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                return Ok(None);
+            }
+            let Some(state) = states.get(&node.slot()) else {
+                return Ok(None);
+            };
+            let [value] = state.possible_values() else {
+                return Ok(None);
+            };
+            if (node.slot() != shape.root_slot()
+                && state.completion() != &ResolutionCompletion::Complete)
+                || (node.slot() == shape.root_slot()
+                    && !go_signature_slot_complete(state, signature, inventory))
+                || value.ty().reference_indirection() != 0
+                || value.ty().identity() != node.identity()
+                || value.ty().indirection() != node.indirection()
+            {
+                return Ok(None);
+            }
+            if matches!(node.form(), FactProjectedTypeNodeForm::Alias(_)) {
+                return Ok(None);
+            }
+            let read = self.session.transfers_to_targets(&[node.slot()])?;
+            let Some(transfers) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            if transfers.iter().any(|row| {
+                let transfer = row.get(self.session).row();
+                transfer.kind() == ResolutionTypeTransferKind::TypeAlias
+                    && transfer.rule().target_slot() == node.slot()
+            }) {
+                return Ok(None);
+            }
+            if !matches!(node.form(), FactProjectedTypeNodeForm::Leaf) {
+                continue;
+            }
+            let identity = node.identity();
+            if leaves.contains_key(&identity) {
+                continue;
+            }
+            let digest = self.session.semantic_digest(self.hierarchy, identity)?;
+            // Predeclared primitives have fixed source-free identities. The
+            // selected shared name must have exactly the universe digest.
+            let universe_error = identity.shared_name_id().is_some()
+                && super::super::go_universe_identity_digest(ResolutionNamespace::Type, "error")
+                    == Some(digest);
+            let primitive = identity.shared_name_id().is_some()
+                && super::super::universe::go_types().any(|entry| {
+                    entry.identity_kind
+                        == super::super::universe::UniverseIdentityKind::Type(
+                            IntrinsicTypeKind::Primitive,
+                        )
+                        && super::super::universe::identity_digest(entry) == digest
+                });
+            if !primitive && !universe_error {
+                // A selected identity slot leads back to the declaration that
+                // owns it. An alias has no defined-type member declaration.
+                let read = self.session.declaration_types_for_slots(&[identity])?;
+                let Some(declarations) = self.accept_session_read(read) else {
+                    return Ok(None);
+                };
+                let definitions = declarations
+                    .iter()
+                    .map(|row| row.get(self.session).row())
+                    .filter(|row| {
+                        matches!(
+                            row.role(),
+                            DeclarationTypeRole::Identity | DeclarationTypeRole::NominalIdentity
+                        )
+                    })
+                    .map(|row| row.definition())
+                    .collect::<BTreeSet<_>>();
+                if definitions.len() > 1 {
+                    return Ok(None);
+                }
+                let definition = definitions.into_iter().next().unwrap_or(identity);
+                // Anonymous Go structs also publish a synthetic declaration,
+                // so a declaration row alone does not establish nominality.
+                let read = self
+                    .session
+                    .declaration_types_for_definitions(&[definition])?;
+                let Some(declaration_slots) = self.accept_session_read(read) else {
+                    return Ok(None);
+                };
+                let slots = declaration_slots
+                    .iter()
+                    .map(|row| row.get(self.session).row())
+                    .filter(|row| {
+                        matches!(
+                            row.role(),
+                            DeclarationTypeRole::Identity | DeclarationTypeRole::NominalIdentity
+                        )
+                    })
+                    .map(|row| row.slot())
+                    .collect::<Vec<_>>();
+                if !slots.is_empty() {
+                    let read = self.session.intrinsics_for_slots(&slots)?;
+                    let Some(intrinsics) = self.accept_session_read(read) else {
+                        return Ok(None);
+                    };
+                    if intrinsics.iter().any(|row| {
+                        row.get(self.session).row().kind() == IntrinsicTypeKind::Structural
+                    }) {
+                        return Ok(None);
+                    }
+                }
+                if !self.session.ensure_go_member_declarations(&[definition])?
+                    || !matches!(
+                        self.session.go_member_declarations.get(&definition),
+                        Some(Some(declaration))
+                            if matches!(
+                                declaration.kind,
+                                GoMemberDeclarationKind::Defined
+                                    | GoMemberDeclarationKind::Interface { .. }
+                                    | GoMemberDeclarationKind::Struct { .. }
+                            )
+                    )
+                {
+                    return Ok(None);
+                }
+            }
+            leaves.insert(identity, digest);
+        }
+        Ok(canonical_projected_type_identity_with_poll(
+            &shape,
+            |identity| leaves.get(&identity).copied(),
+            || !self.poll_cancelled() && self.session.charge_scope_steps(1),
+        ))
     }
 
     fn go_check_receiver_interface(

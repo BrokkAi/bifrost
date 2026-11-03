@@ -117,7 +117,7 @@ Bifrost rejects input with an error and renders nothing when:
 
 ### VS Code
 
-The VS Code extension has a **Bifrost: Show Rune IR** command. The language server runs that command, and the language server is now the separate `bifrost-lsp` program. The `bifrost` binary described here does not serve it. See [LSP Server](/lsp/) and [VS Code LSP](/vscode/) for its status.
+The VS Code extension has a **Bifrost: Show Rune IR** command. The language server runs that command, and the language server is now the separate `bifrost-lsp` program. The `bifrost` binary described here does not serve it. See [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md) and [VS Code LSP](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/vscode.md) for its status.
 
 ## Language Adapter Mappings
 

@@ -25,8 +25,8 @@ When a question begins with a known declaration, prefer symbol and usage tools. 
 | Where you work | Best first surface | What it provides |
 | --- | --- | --- |
 | Coding agent | [MCP Server](/mcp/) with `symbol\|extended` | Symbol navigation plus inline JSON `query_code` and saved `.rql` through `query_file`. |
-| VS Code | [VS Code LSP](/vscode/) | Definitions, references, hover, `.rql` editing, and execution of the current RQL buffer, including unsaved text. The published extension, version 0.11.5, downloads and runs its own Bifrost 0.11.5. Later versions run `bifrost-lsp`, which has no release yet. |
-| Another editor | [LSP Server](/lsp/) | Editor-native definitions, references, hover, and workspace indexing through the separate `bifrost-lsp` program, which has no release yet. RQL editor features belong to the VS Code extension. |
+| VS Code | [VS Code LSP](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/vscode.md) | Definitions, references, hover, `.rql` editing, and execution of the current RQL buffer, including unsaved text. The extension downloads and manages the separate `bifrost-lsp` server. |
+| Another editor | [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md) | Editor-native definitions, references, hover, and workspace indexing through the separate `bifrost-lsp` program. RQL editor features belong to the VS Code extension. |
 | Terminal exploration | [CLI](/cli/) and [Rune Query Language](/rune-query-language/) | One-shot JSON queries, saved query files, and an interactive RQL prompt. |
 | Rust application | [Rust Library](/rust-library/) | In-process analyzer APIs for a Rust integration. |
 | Python application | [Python Client](/python-client/) | Native-backed Python access to Bifrost analysis and query results. |
@@ -46,7 +46,7 @@ Start with the MCP toolsets on the [MCP Server](/mcp/) page, choose `symbol|exte
 
 ### Add Bifrost to an editor workflow
 
-Choose an [LSP integration](/lsp/) for editor navigation. The LSP server is the separate `bifrost-lsp` program; [LSP Server](/lsp/) explains what works before its first release. Add MCP separately only when an agent in that editor should call Bifrost tools. For VS Code query exploration, use the [RQL Play workflow](/rql-vscode/).
+Choose an [LSP integration](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md) for editor navigation. The LSP server is the separate `bifrost-lsp` program; its documentation lists supported versions and editor setup. Add MCP separately only when an agent in that editor should call Bifrost tools. For VS Code query exploration, use the [RQL Play workflow](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/rql-vscode.md).
 
 ### Build a static-analysis integration
 

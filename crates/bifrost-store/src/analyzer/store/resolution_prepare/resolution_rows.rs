@@ -68,8 +68,9 @@ use super::ResolutionLocalKeys;
 /// A primary-key seek over `resolution_paths(blob_id, path)`, so it needs no
 /// `INDEXED BY` and no index of its own. The keys arrive as one JSON array
 /// because the caller already holds every one of them (milestone 6's rule).
-pub(crate) const RESOLUTION_PATHS_BY_KEY_SQL: &str = "SELECT path, start_node, end_node, json(body), activation_ordinal FROM resolution_paths \
-     WHERE blob_id = ?1 AND path IN (SELECT value FROM json_each(?2))";
+pub(crate) const RESOLUTION_PATHS_BY_KEY_SQL: &str = "SELECT path.path, path.start_node, path.end_node, site.role, site.site_kind, json(path.body), path.activation_ordinal FROM resolution_paths path \
+     LEFT JOIN resolution_sites site ON site.blob_id=path.blob_id AND site.site=path.start_node \
+     WHERE path.blob_id = ?1 AND path.path IN (SELECT value FROM json_each(?2))";
 
 // Questions #11 to #14, the forward candidate match, and #15 to #18, the
 // reverse one. The two statements differ only in which end's columns they

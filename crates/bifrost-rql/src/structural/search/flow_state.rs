@@ -14,9 +14,10 @@
 
 use super::super::flow_state::{
     FLOW_STATE_AXES, FileFlowState, FlowRelationRow, FlowStateAxis, FlowStateCompleteness,
-    FlowStateDerivation, FlowStateIncompleteReason, FlowStateRequest, StateEventRow,
-    flow_state_for_file_with_snapshot, flow_state_for_materialized_artifact,
-    flow_state_for_materialized_procedure, flow_state_for_selected_property,
+    FlowStateDerivation, FlowStateIncompleteReason, FlowStateRequest, NonreturnDiscoveryCache,
+    StateEventRow, flow_state_for_file_with_snapshot,
+    flow_state_for_materialized_artifact_with_provider,
+    flow_state_for_materialized_procedure_with_provider, flow_state_for_selected_property,
 };
 use super::Incompleteness;
 use super::results::{
@@ -29,7 +30,7 @@ use super::{DerivationExecutionCause, rel_path_string};
 use crate::analyzer::semantic::SemanticGapKind;
 use crate::analyzer::semantic::{
     LengthDelimitedDigest, ProcedureHandle, ProcedureId, ProgramPointId, SemanticArtifact,
-    SemanticCapability, SemanticOutcome,
+    SemanticCapability, SemanticOutcome, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, WorkspaceAnalyzer};
@@ -45,13 +46,15 @@ const FLOW_RELATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.flow_relation.v1";
 
 /// Per-request value memo of derived flow state. Every invocation reports its
 /// own completeness evidence; policy normalization deduplicates diagnostics.
-pub(super) struct FlowStateTraversalCache {
+pub(super) struct FlowStateTraversalCache<'a> {
     /// One immutable activation snapshot for every file this request derives.
     active_semantic_model_snapshot: CaptureScopedMemo<Option<Arc<ActiveSemanticModelSnapshot>>>,
     /// The same snapshot identity carried into every memo key. `None` remains
     /// distinct from the hash of an activated but empty model set.
     active_model_set_hash: CaptureScopedMemo<Option<Arc<str>>>,
     files: CaptureScopedMemo<HashMap<FlowStateCacheKey, CachedFileFlowState>>,
+    nonreturn_provider: Option<WorkspaceIcfgProvider<'a>>,
+    nonreturn_discovery_cache: NonreturnDiscoveryCache,
 }
 
 #[derive(Clone)]
@@ -108,7 +111,7 @@ impl FlowStateOutcomeIdentity {
     }
 }
 
-impl Default for FlowStateTraversalCache {
+impl Default for FlowStateTraversalCache<'_> {
     fn default() -> Self {
         Self::new(None)
     }
@@ -137,7 +140,7 @@ fn record_flow_artifact_read(
     analyzer.record_read(crate::analyzer::ReadKey::semantic_artifact(artifact.key()));
 }
 
-impl FlowStateTraversalCache {
+impl<'a> FlowStateTraversalCache<'a> {
     /// Start one request cache from the activation snapshot its other semantic
     /// row families use.
     pub(super) fn new(
@@ -150,6 +153,8 @@ impl FlowStateTraversalCache {
             active_semantic_model_snapshot: CaptureScopedMemo::new(active_semantic_model_snapshot),
             active_model_set_hash: CaptureScopedMemo::new(active_model_set_hash),
             files: CaptureScopedMemo::default(),
+            nonreturn_provider: None,
+            nonreturn_discovery_cache: NonreturnDiscoveryCache::default(),
         }
     }
 
@@ -211,7 +216,7 @@ impl FlowStateTraversalCache {
     /// whose handles the caller will join against.
     pub(super) fn for_materialized_file(
         &mut self,
-        workspace: &WorkspaceAnalyzer,
+        workspace: &'a WorkspaceAnalyzer,
         file: &ProjectFile,
         outcome: SemanticOutcome<Arc<SemanticArtifact>>,
         cancellation: Option<&CancellationToken>,
@@ -219,13 +224,16 @@ impl FlowStateTraversalCache {
         let artifact = outcome.available_value().cloned();
         record_flow_artifact_read(workspace, artifact.as_deref());
         self.cached_materialized_scope(
+            workspace,
             workspace.analyzer(),
             file,
             outcome,
             FlowStateCacheScope::File,
             cancellation,
-            |outcome, request| {
-                flow_state_for_materialized_artifact(workspace, file, outcome, request)
+            |outcome, request, provider| {
+                flow_state_for_materialized_artifact_with_provider(
+                    workspace, file, outcome, request, provider,
+                )
             },
         )
     }
@@ -234,7 +242,7 @@ impl FlowStateTraversalCache {
     /// artifact allocation that minted its handle.
     pub(super) fn for_materialized_procedure(
         &mut self,
-        workspace: &WorkspaceAnalyzer,
+        workspace: &'a WorkspaceAnalyzer,
         file: &ProjectFile,
         outcome: SemanticOutcome<Arc<SemanticArtifact>>,
         procedure: &ProcedureHandle,
@@ -249,13 +257,16 @@ impl FlowStateTraversalCache {
             );
         }
         self.cached_materialized_scope(
+            workspace,
             workspace.analyzer(),
             file,
             outcome,
             FlowStateCacheScope::Procedure(procedure.id()),
             cancellation,
-            |outcome, request| {
-                flow_state_for_materialized_procedure(workspace, file, outcome, procedure, request)
+            |outcome, request, provider| {
+                flow_state_for_materialized_procedure_with_provider(
+                    workspace, file, outcome, procedure, request, provider,
+                )
             },
         )
     }
@@ -264,7 +275,7 @@ impl FlowStateTraversalCache {
     /// procedure artifact and this request's frozen semantic-model snapshot.
     pub(super) fn for_selected_property(
         &mut self,
-        workspace: &WorkspaceAnalyzer,
+        workspace: &'a WorkspaceAnalyzer,
         file: &ProjectFile,
         outcome: SemanticOutcome<Arc<SemanticArtifact>>,
         procedure: &ProcedureHandle,
@@ -274,10 +285,12 @@ impl FlowStateTraversalCache {
         let state =
             self.for_materialized_procedure(workspace, file, outcome, procedure, cancellation);
         let token = cancellation.cloned().unwrap_or_default();
-        let mut request = FlowStateRequest::new(&token).with_active_semantic_model_snapshot(
-            self.active_semantic_model_snapshot
-                .read(&memo_attribution(workspace.analyzer()), Clone::clone),
-        );
+        let mut request = FlowStateRequest::new(&token)
+            .with_nonreturn_discovery_cache(&self.nonreturn_discovery_cache)
+            .with_active_semantic_model_snapshot(
+                self.active_semantic_model_snapshot
+                    .read(&memo_attribution(workspace.analyzer()), Clone::clone),
+            );
         let derived = Arc::new(flow_state_for_selected_property(
             workspace,
             file,
@@ -295,6 +308,7 @@ impl FlowStateTraversalCache {
     #[allow(clippy::too_many_arguments)]
     fn cached_materialized_scope<F>(
         &mut self,
+        workspace: &'a WorkspaceAnalyzer,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         outcome: SemanticOutcome<Arc<SemanticArtifact>>,
@@ -306,6 +320,7 @@ impl FlowStateTraversalCache {
         F: FnOnce(
             SemanticOutcome<Arc<SemanticArtifact>>,
             &mut FlowStateRequest<'_>,
+            &WorkspaceIcfgProvider<'a>,
         ) -> FileFlowState,
     {
         let artifact = outcome.available_value().cloned();
@@ -330,11 +345,20 @@ impl FlowStateTraversalCache {
             return Arc::clone(&cached.state);
         }
         let token = cancellation.cloned().unwrap_or_default();
-        let mut request = FlowStateRequest::new(&token).with_active_semantic_model_snapshot(
-            self.active_semantic_model_snapshot
-                .read(&memo_attribution(analyzer), Clone::clone),
-        );
-        let derived = Arc::new(derive(outcome, &mut request));
+        let provider = self.nonreturn_provider.get_or_insert_with(|| {
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+                workspace,
+                self.active_semantic_model_snapshot
+                    .read(&memo_attribution(analyzer), Clone::clone),
+            )
+        });
+        let mut request = FlowStateRequest::new(&token)
+            .with_nonreturn_discovery_cache(&self.nonreturn_discovery_cache)
+            .with_active_semantic_model_snapshot(
+                self.active_semantic_model_snapshot
+                    .read(&memo_attribution(analyzer), Clone::clone),
+            );
+        let derived = Arc::new(derive(outcome, &mut request, provider));
         if request.refusal_count() > 0 {
             brokk_bifrost_core::profiling::note_with(|| {
                 format!(

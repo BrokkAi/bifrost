@@ -239,6 +239,11 @@ thread_local! {
     static EXTERNAL_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static EXTERNAL_INDEX_ARTIFACT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn external_index_build_count_for_test() -> usize {
@@ -1818,6 +1823,7 @@ fn merge_java_dependency_packs(
     let mut type_indexes = HashMap::<String, (usize, usize)>::default();
     let mut member_indexes = HashMap::<String, (usize, usize)>::default();
     let mut relation_ids = brokk_bifrost_core::hash::HashSet::<String>::default();
+    let mut conflicting_scopes = brokk_bifrost_core::hash::HashSet::<String>::default();
     for (shard_index, shard) in pack.shards.iter().enumerate() {
         let AuthoredPayload::DeclarationFacts {
             types,
@@ -1925,12 +1931,31 @@ fn merge_java_dependency_packs(
         for fact in secondary_types {
             if let Some((shard_index, fact_index)) = type_indexes.get(&fact.id).copied() {
                 let AuthoredPayload::DeclarationFacts { types, .. } =
-                    &pack.shards[shard_index].payload
+                    &mut pack.shards[shard_index].payload
                 else {
                     unreachable!("Java fact indexes name declaration-fact shards")
                 };
                 if !equivalent_java_type_fact(&types[fact_index], &fact) {
                     push_java_merge_conflict(diagnostics, suppressed_diagnostics, limits, &fact.id);
+                }
+                // The source declaration supplies location and documentation; the
+                // binary inventory supplies reviewed scope and absence evidence.
+                // An absent source inventory is not evidence of an empty scope.
+                if let Some(inventory) = fact.jvm_inventory {
+                    if types[fact_index]
+                        .jvm_inventory
+                        .as_ref()
+                        .is_some_and(|source| source != &inventory)
+                    {
+                        push_java_merge_conflict(
+                            diagnostics,
+                            suppressed_diagnostics,
+                            limits,
+                            &fact.id,
+                        );
+                        conflicting_scopes.insert(fact.id.clone());
+                    }
+                    types[fact_index].jvm_inventory = Some(inventory);
                 }
             } else {
                 let AuthoredPayload::DeclarationFacts { types, .. } =
@@ -1942,7 +1967,7 @@ fn merge_java_dependency_packs(
                 types.push(fact);
             }
         }
-        for fact in secondary_members {
+        for mut fact in secondary_members {
             if let Some((shard_index, fact_index)) = member_indexes.get(&fact.id).copied() {
                 let equivalent = {
                     let AuthoredPayload::DeclarationFacts { members, .. } =
@@ -1963,6 +1988,38 @@ fn merge_java_dependency_packs(
                     members[fact_index].callable_family_complete |= fact.callable_family_complete;
                 }
             } else {
+                if let Some((owner_shard, owner_index)) = type_indexes.get(&fact.owner).copied() {
+                    let AuthoredPayload::DeclarationFacts { types, .. } =
+                        &pack.shards[owner_shard].payload
+                    else {
+                        unreachable!("Java fact indexes name declaration-fact shards")
+                    };
+                    let owner = &types[owner_index];
+                    let mut scope = owner.type_parameters.clone();
+                    if let Some(inventory) = &owner.jvm_inventory {
+                        scope.extend(inventory.enclosing_type_parameters.iter().cloned());
+                    }
+                    if let Some(signature) = &fact.signature {
+                        scope.extend(signature.type_parameters.iter().cloned());
+                        let covered = java_signature_scope_covered(signature, &scope);
+                        if conflicting_scopes.contains(&fact.owner) || !covered {
+                            push_java_merge_conflict(
+                                diagnostics,
+                                suppressed_diagnostics,
+                                limits,
+                                &fact.id,
+                            );
+                            fact.signature = None;
+                            fact.callable_family_complete = false;
+                        }
+                        assert!(
+                            fact.signature.is_none() || covered,
+                            "binary-only Java member {} names a type parameter outside its owner scope {:?}",
+                            fact.id,
+                            scope
+                        );
+                    }
+                }
                 let AuthoredPayload::DeclarationFacts { members, .. } =
                     &mut pack.shards[target_shard_index].payload
                 else {
@@ -1984,6 +2041,55 @@ fn merge_java_dependency_packs(
         }
     }
     Some(pack)
+}
+
+fn java_signature_scope_covered(signature: &Signature, scope: &[String]) -> bool {
+    let mut pending: Vec<&TypeRef> = signature
+        .parameters
+        .iter()
+        .map(|parameter| &parameter.r#type)
+        .collect();
+    pending.extend(signature.returns.iter());
+    while let Some(reference) = pending.pop() {
+        match reference {
+            TypeRef::TypeParameter { name } => {
+                if !scope.contains(name) {
+                    return false;
+                }
+            }
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                pending.extend(arguments)
+            }
+            TypeRef::Projection {
+                owner,
+                trait_type,
+                arguments,
+                ..
+            } => {
+                pending.push(owner);
+                pending.extend(trait_type.iter().map(Box::as_ref));
+                pending.extend(arguments);
+            }
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element, .. }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => pending.push(element),
+            TypeRef::Map { key, value } => {
+                pending.push(key);
+                pending.push(value);
+            }
+            TypeRef::Wildcard { bound, .. } => pending.extend(bound.iter().map(Box::as_ref)),
+            TypeRef::Tuple { elements } => pending.extend(elements),
+            TypeRef::Function { parameters, result } => {
+                pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
+                pending.extend(result.iter().map(Box::as_ref));
+            }
+            TypeRef::Unknown => {}
+        }
+    }
+    true
 }
 
 fn equivalent_java_type_fact(left: &TypeFact, right: &TypeFact) -> bool {
@@ -2363,6 +2469,9 @@ impl JvmExternalDeclarationIndex {
     }
 
     fn build_from_artifacts(artifacts: Vec<ResolvedJvmArtifact>) -> Self {
+        #[cfg(test)]
+        EXTERNAL_INDEX_ARTIFACT_BUILDS.set(EXTERNAL_INDEX_ARTIFACT_BUILDS.get() + 1);
+
         let mut index = Self::default();
         let mut remaining_index_bytes = MAX_TOTAL_INDEX_BYTES;
         for artifact in artifacts.into_iter().take(MAX_INDEX_ARTIFACTS) {
@@ -8111,6 +8220,220 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#8823: the source/binary pack merge dropped an inner class's enclosing type-parameter scope, so the JDK 21 pack was rejected"
+    )]
+    fn java_dependency_pack_retains_inner_constructor_scope() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::compiler::{
+            CompilerOptions, compile_pack,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_artifact;
+
+        // Like the other class-file fixture tests, this needs `javac` and `jar`
+        // on PATH (CI installs a JDK); only their absence may skip it.
+        let (javac, jar) = (PathBuf::from("javac"), PathBuf::from("jar"));
+        if std::process::Command::new(&javac)
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping Java pack boundary test: javac is unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = b"package fixture; public class Outer<E> { public class Mid { public class Child { public Child(Outer<E> parent, int i) {} } } public static class StaticChild { public StaticChild(Outer<?> parent) {} } }";
+        let source_path = temp.path().join("Outer.java");
+        fs::write(&source_path, source).unwrap();
+        let classes = temp.path().join("classes");
+        fs::create_dir(&classes).unwrap();
+        brokk_bifrost_analysis::test_support::run_command_success(
+            std::process::Command::new(&javac)
+                .arg("-d")
+                .arg(&classes)
+                .arg(&source_path),
+        );
+        let source_jar = temp.path().join("fixture-sources.jar");
+        write_zip_entry(&source_jar, "fixture/Outer.java", source);
+        let class_jar = temp.path().join("fixture.jar");
+        brokk_bifrost_analysis::test_support::run_command_success(
+            std::process::Command::new(&jar)
+                .current_dir(&classes)
+                .arg("cf")
+                .arg(&class_jar)
+                .arg("."),
+        );
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: class_jar.clone(),
+            source_artifact_path: Some(source_jar.clone()),
+            coordinate: Some(JvmMavenCoordinate::new("fixture", "inner", "1.0.0")),
+            origin: JvmDependencyOrigin::ExplicitPath,
+        });
+        let limits = ArtifactProducerLimits::default();
+        let produce = |path: &Path, kind| {
+            let mut request = jvm_dependency_production_request(&dependency);
+            request.path = path.to_path_buf();
+            request.artifact_kind = kind;
+            let artifact = read_exact_artifact(path, &limits).unwrap();
+            let result =
+                JavaJarPackProducer.produce_loaded_artifact(&request, &limits, None, &artifact);
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.severity != ProducerDiagnosticSeverity::Error),
+                "{:?}",
+                result.diagnostics
+            );
+            result.pack.expect("Java fixture pack")
+        };
+        let source_pack = produce(&source_jar, ExternalArtifactKind::JavaSourceJar);
+        let binary_pack = produce(&class_jar, ExternalArtifactKind::JavaClassJar);
+        fn declarations(pack: &AuthoredSemanticModelPack) -> (&[TypeFact], &[MemberFact]) {
+            pack.shards
+                .iter()
+                .find_map(|shard| match &shard.payload {
+                    AuthoredPayload::DeclarationFacts { types, members, .. } => {
+                        Some((types.as_slice(), members.as_slice()))
+                    }
+                    _ => None,
+                })
+                .expect("declaration shard")
+        }
+        let (binary_types, binary_members) = declarations(&binary_pack);
+        let child = binary_types
+            .iter()
+            .find(|fact| fact.name == "fixture.Outer.Mid.Child")
+            .expect("inner child");
+        assert_eq!(
+            child
+                .jvm_inventory
+                .as_ref()
+                .unwrap()
+                .enclosing_type_parameters,
+            ["E"]
+        );
+        let constructor = binary_members
+            .iter()
+            .find(|fact| fact.owner == child.id && fact.member_kind == MemberKind::Constructor)
+            .expect("binary inner constructor");
+        let constructor_id = constructor.id.clone();
+        assert!(
+            constructor
+                .signature
+                .as_ref()
+                .is_some_and(|signature| java_signature_scope_covered(
+                    signature,
+                    &["E".to_owned()]
+                ))
+        );
+
+        let mut diagnostics = Vec::new();
+        let mut suppressed = SuppressedDiagnostics::default();
+        let merged = merge_java_dependency_packs(
+            Some(source_pack.clone()),
+            Some(binary_pack.clone()),
+            &mut diagnostics,
+            &mut suppressed,
+            &limits,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        compile_pack(&merged, &CompilerOptions::default())
+            .expect("merged non-static inner pack validates");
+        let (merged_types, merged_members) = declarations(&merged);
+        let merged_child = merged_types
+            .iter()
+            .find(|fact| fact.id == child.id)
+            .unwrap();
+        assert_eq!(
+            merged_child
+                .jvm_inventory
+                .as_ref()
+                .unwrap()
+                .enclosing_type_parameters,
+            ["E"]
+        );
+        let bound = merged_members
+            .iter()
+            .find(|fact| fact.id == constructor_id)
+            .expect("constructor binds by binary member identity");
+        assert!(
+            bound.signature.is_some(),
+            "the valid constructor signature survives"
+        );
+
+        // JLS 8.1.3: a static nested class has no enclosing E. Simulate a
+        // malformed binary-only member and prove both validation and merge
+        // refuse its generic claim.
+        let mut invalid_binary = binary_pack;
+        let (static_id, static_constructor_id) = {
+            let (types, members) = declarations(&invalid_binary);
+            let static_type = types
+                .iter()
+                .find(|fact| fact.name == "fixture.Outer.StaticChild")
+                .unwrap();
+            assert!(
+                static_type
+                    .jvm_inventory
+                    .as_ref()
+                    .unwrap()
+                    .enclosing_type_parameters
+                    .is_empty()
+            );
+            let static_constructor = members
+                .iter()
+                .find(|fact| {
+                    fact.owner == static_type.id && fact.member_kind == MemberKind::Constructor
+                })
+                .unwrap();
+            (static_type.id.clone(), static_constructor.id.clone())
+        };
+        let AuthoredPayload::DeclarationFacts { members, .. } =
+            &mut invalid_binary.shards[0].payload
+        else {
+            unreachable!()
+        };
+        let bad = members
+            .iter_mut()
+            .find(|fact| fact.id == static_constructor_id)
+            .unwrap();
+        bad.id.push_str(".out-of-scope");
+        bad.signature.as_mut().unwrap().parameters[0].r#type = TypeRef::TypeParameter {
+            name: "E".to_owned(),
+        };
+        let invalid = compile_pack(&invalid_binary, &CompilerOptions::default())
+            .expect_err("unmerged static signature must fail validation");
+        assert!(
+            invalid
+                .iter()
+                .any(|diagnostic| diagnostic.code == "type.unknown_parameter"),
+            "{invalid:?}"
+        );
+        diagnostics.clear();
+        let merged_static = merge_java_dependency_packs(
+            Some(source_pack),
+            Some(invalid_binary),
+            &mut diagnostics,
+            &mut suppressed,
+            &limits,
+        )
+        .unwrap();
+        assert!(
+            !diagnostics.is_empty(),
+            "out-of-scope signature must be reported"
+        );
+        let (_, members) = declarations(&merged_static);
+        let erased = members
+            .iter()
+            .find(|fact| fact.owner == static_id && fact.id.ends_with(".out-of-scope"))
+            .unwrap();
+        assert!(erased.signature.is_none());
+        assert!(!erased.callable_family_complete);
+        compile_pack(&merged_static, &CompilerOptions::default())
+            .expect("erased static signature validates");
+    }
+
+    #[test]
     fn java_dependency_pack_retains_coordinate_and_reuses_merged_artifacts() {
         use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
 
@@ -8212,6 +8535,10 @@ mod tests {
             .iter()
             .find(|fact| fact.name == "com.example.dep.ExternalService")
             .expect("merged service declaration");
+        assert!(
+            owner.jvm_inventory.is_some(),
+            "binary scope and inventory must survive the source declaration merge"
+        );
         let echo = members
             .iter()
             .find(|fact| fact.owner == owner.id && fact.name == "echo")
@@ -8952,6 +9279,144 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "content-determined diagnostics must permit memo retention"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#8951: Scala repeated-parameter-list gaps are deterministic and must not rebuild an unchanged external index"
+    )]
+    fn scala_repeated_parameter_list_gap_keeps_external_index_memoized() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo_dir = root.join("m2").join("org/scala-lang/scala-library/2.13.16");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::create_dir_all(root.join("workspace")).unwrap();
+
+        let binary_jar = repo_dir.join("scala-library-2.13.16.jar");
+        let source_jar = repo_dir.join("scala-library-2.13.16-sources.jar");
+        probe_class_jar(&binary_jar);
+
+        let initial_source = r#"
+package scala.example
+trait RepeatedLists {
+  def repeatedThenList(values: String*)(suffix: String): String = suffix
+  def finalVararg(values: String*): String = ""
+  def ordinary(value: String, suffix: String): String = value
+}
+trait Neighbor {
+  def retained: String
+}
+"#;
+        write_zip_entry(
+            &source_jar,
+            "scala/example/LibraryApi.scala",
+            initial_source.as_bytes(),
+        );
+
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate::new(
+                    "org.scala-lang",
+                    "scala-library",
+                    "2.13.16",
+                )],
+                repository_roots: vec![root.join("m2")],
+                ..JvmExternalDependencies::default()
+            },
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..Default::default()
+                },
+            standard_library_discovery:
+                brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
+                },
+        };
+        let project = TestProject::new(root.join("workspace"), Language::Scala);
+
+        let builds_before_first = super::EXTERNAL_INDEX_ARTIFACT_BUILDS.get();
+        let first = JvmExternalDeclarationIndex::build_for_project(&config, &project);
+        assert_eq!(
+            super::EXTERNAL_INDEX_ARTIFACT_BUILDS.get() - builds_before_first,
+            1,
+            "the first dependency universe must build its artifact index once"
+        );
+        let assert_repeated_list_gap = |index: &JvmExternalDeclarationIndex| {
+            let diagnostic = index
+                .production_diagnostics()
+                .iter()
+                .find(|diagnostic| diagnostic.code == "scala.signature.repeated_parameter_list")
+                .expect("Scala producer diagnostic is retained by the external index");
+            assert_eq!(
+                diagnostic.declaration.as_deref(),
+                Some("scala.example.RepeatedLists.repeatedThenList")
+            );
+            assert!(matches!(
+                crate::analyzer::jvm::producer_codes::classify(diagnostic),
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceGap(_)
+            ));
+        };
+        assert_repeated_list_gap(&first);
+        for name in ["scala.example.RepeatedLists", "scala.example.Neighbor"] {
+            assert!(
+                first.get(name).is_some(),
+                "valid Scala type {name} remains indexed"
+            );
+        }
+
+        let builds_before_second = super::EXTERNAL_INDEX_ARTIFACT_BUILDS.get();
+        let second = JvmExternalDeclarationIndex::build_for_project(&config, &project);
+        assert_eq!(
+            super::EXTERNAL_INDEX_ARTIFACT_BUILDS.get() - builds_before_second,
+            0,
+            "unchanged dependency evidence must skip artifact indexing"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a deterministic Scala evidence gap must permit memo retention"
+        );
+        assert_repeated_list_gap(&second);
+
+        let refreshed_source = r#"
+package scala.example
+trait RepeatedLists {
+  def repeatedThenList(values: String*)(suffix: String): String = suffix
+  def finalVararg(values: String*): String = ""
+  def ordinary(value: String, suffix: String): String = value
+}
+trait Neighbor {
+  def retained: String
+}
+trait RefreshedNeighbor {
+  def newlyAvailable: String
+}
+"#;
+        write_zip_entry(
+            &source_jar,
+            "scala/example/LibraryApi.scala",
+            refreshed_source.as_bytes(),
+        );
+        let builds_before_refresh = super::EXTERNAL_INDEX_ARTIFACT_BUILDS.get();
+        let refreshed = JvmExternalDeclarationIndex::build_for_project(&config, &project);
+        assert_eq!(
+            super::EXTERNAL_INDEX_ARTIFACT_BUILDS.get() - builds_before_refresh,
+            1,
+            "changed source artifact evidence must build one refreshed index"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &refreshed),
+            "changed source artifact evidence must rebuild the external index"
+        );
+        assert!(
+            first.get("scala.example.RefreshedNeighbor").is_none(),
+            "the original index must not expose a declaration added later"
+        );
+        assert!(
+            refreshed.get("scala.example.RefreshedNeighbor").is_some(),
+            "the rebuilt index must expose the changed source artifact"
         );
     }
 

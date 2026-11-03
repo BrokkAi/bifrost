@@ -235,6 +235,7 @@ pub trait ResolutionFragmentSource {
 pub(super) struct StoredPartialPath {
     pub(super) identity: CandidatePathIdentity,
     path: PartialPath,
+    origin: super::CandidatePathOrigin,
 }
 
 /// The first fixed cell of an endpoint stack, as the candidate index keys it.
@@ -408,6 +409,7 @@ pub struct PreloadedFragment {
     nodes: Vec<(BindingNodeId, BindingNodeKind)>,
     paths: Vec<(PartialPathId, PartialPath)>,
     reference_metadata: Vec<(SemanticId, FactReferenceSiteMetadata)>,
+    path_origins: Vec<(BindingNodeId, super::CandidatePathOrigin)>,
     go_definition_namespaces: Vec<(SemanticId, GoDefinitionNamespaces)>,
 }
 
@@ -422,8 +424,17 @@ impl PreloadedFragment {
             nodes: nodes.into_iter().collect(),
             paths: paths.into_iter().collect(),
             reference_metadata: Vec::new(),
+            path_origins: Vec::new(),
             go_definition_namespaces: Vec::new(),
         }
+    }
+
+    pub(super) fn with_path_origins(
+        mut self,
+        origins: Vec<(BindingNodeId, super::CandidatePathOrigin)>,
+    ) -> Self {
+        self.path_origins = origins;
+        self
     }
 
     pub(super) fn with_reference_metadata(
@@ -577,7 +588,7 @@ impl PreloadedCoverage {
 
 /// The heap one stored candidate path owns beyond its own inline size.
 fn stored_partial_path_owned_bytes(stored: &StoredPartialPath) -> usize {
-    let StoredPartialPath { identity: _, path } = stored;
+    let StoredPartialPath { path, .. } = stored;
     [path.start(), path.end()]
         .into_iter()
         .map(|endpoint| {
@@ -1326,6 +1337,7 @@ impl PreloadedFragmentSource {
 
         let mut path_ids = HashSet::default();
         for fragment in fragments {
+            let origins = fragment.path_origins.into_iter().collect::<HashMap<_, _>>();
             for (id, path) in fragment.paths {
                 assert!(path_ids.insert(id), "duplicate partial path {id}");
                 for (label, endpoint) in [("start", path.start()), ("end", path.end())] {
@@ -1391,7 +1403,15 @@ impl PreloadedFragmentSource {
                     .entry(path.end().node())
                     .or_default()
                     .push(CandidateLeadCell::of(path.end()), index);
-                source.paths.push(StoredPartialPath { identity, path });
+                let origin = origins
+                    .get(&path.start().node())
+                    .copied()
+                    .unwrap_or_default();
+                source.paths.push(StoredPartialPath {
+                    identity,
+                    path,
+                    origin,
+                });
             }
         }
         let paths = &source.paths;
@@ -1801,6 +1821,13 @@ impl ResolutionFragmentSource for PreloadedFragmentSource {
 }
 
 impl BatchResolutionFragmentSource for PreloadedFragmentSource {
+    fn jvm_selected_root_presence(
+        &self,
+        _root_fqn: &str,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<super::batch::JvmSelectedRootPresence> {
+        Ok(super::batch::JvmSelectedRootPresence::NotReady)
+    }
     /// A preload has no selection behind it: it answers from the fragments it
     /// was handed, so it names no authority and is memoized for nothing.
     fn selection_authority(&self) -> Option<super::batch::SeedReadAuthority> {
@@ -2335,6 +2362,21 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
             }
         }
         Ok(hydrated)
+    }
+
+    fn hydrate_candidate_paths_with_origin(
+        &self,
+        candidates: &[CandidatePathIdentity],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<(CandidatePathIdentity, super::HydratedCandidatePath)>> {
+        Ok(self
+            .hydrate_candidate_paths(candidates, cancellation)?
+            .into_iter()
+            .map(|(identity, path)| {
+                let origin = self.paths[self.path_positions[&identity]].origin;
+                (identity, super::HydratedCandidatePath { path, origin })
+            })
+            .collect())
     }
 
     fn visit_type_transfer_rules(

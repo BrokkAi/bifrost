@@ -1155,6 +1155,11 @@ mod value_domain {
         crate::analyzer::topology::TopologyCompleteness::LABELS;
     pub(super) const DEPENDENCY_SCOPE: &[&str] = crate::analyzer::topology::DependencyScope::LABELS;
 
+    /// The build-configuration vocabularies (#9048), declared beside the row.
+    pub(super) const BUILD_SETTING_SOURCE: &[&str] = super::BUILD_SETTING_SOURCE_LABELS;
+    pub(super) const BUILD_FILE_STATUS: &[&str] = super::BUILD_FILE_STATUS_LABELS;
+    pub(super) const BUILD_TARGET_SCOPE: &[&str] = super::BUILD_TARGET_SCOPE_LABELS;
+
     pub(super) const REWRITE_DOMAIN: &[&str] = RewriteDomainKind::LABELS;
     pub(super) const REWRITE_OUTCOME: &[&str] = RewriteOutcomeKind::LABELS;
     pub(super) const REWRITE_PATH_COMPLETENESS: &[&str] =
@@ -3504,6 +3509,45 @@ detailed_row_domains! {
                         "completeness",
                         value_domain::TOPOLOGY_COMPLETENESS
                     ),
+        ],
+    },
+    // A file's standing under its selected build configuration (#9048). The
+    // claim is about the whole file, so it anchors at the file's first line
+    // like the topology rows anchor at their build file's.
+    BuildConfiguration => "build_configuration" {
+        display_range: |_value| Some(BUILD_FILE_ANCHOR_RANGE),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("configuration_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::optional("target", Scalar::String),
+                    CodeQueryRowField::optional("os", Scalar::String),
+                    CodeQueryRowField::optional_enum(
+                        "os_source",
+                        value_domain::BUILD_SETTING_SOURCE
+                    ),
+                    CodeQueryRowField::optional("arch", Scalar::String),
+                    CodeQueryRowField::optional_enum(
+                        "arch_source",
+                        value_domain::BUILD_SETTING_SOURCE
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "file_status",
+                        value_domain::BUILD_FILE_STATUS
+                    ),
+                    CodeQueryRowField::optional("constraint", Scalar::String),
+                    CodeQueryRowField::required_enum(
+                        "os_scope",
+                        value_domain::BUILD_TARGET_SCOPE
+                    ),
+                    CodeQueryRowField::optional("os_values", Scalar::String),
+                    CodeQueryRowField::required_enum(
+                        "arch_scope",
+                        value_domain::BUILD_TARGET_SCOPE
+                    ),
+                    CodeQueryRowField::optional("arch_values", Scalar::String),
         ],
     },
 }
@@ -6898,6 +6942,51 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::BuildTarget { value }, "completeness") => {
             Some(Scalar::ConstrainedEnum(value.completeness))
         }
+        (CodeQueryResultValue::BuildConfiguration { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "configuration_id") => {
+            Some(Scalar::StableId(&value.configuration_id))
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "target") => {
+            value.target.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "os") => {
+            value.os.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "os_source") => {
+            value.os_source.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "arch") => {
+            value.arch.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "arch_source") => {
+            value.arch_source.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "file_status") => {
+            Some(Scalar::ConstrainedEnum(value.file_status))
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "constraint") => {
+            value.constraint.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "os_scope") => {
+            Some(Scalar::ConstrainedEnum(value.os_scope))
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "os_values") => {
+            value.os_values.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "arch_scope") => {
+            Some(Scalar::ConstrainedEnum(value.arch_scope))
+        }
+        (CodeQueryResultValue::BuildConfiguration { value }, "arch_values") => {
+            value.arch_values.as_deref().map(Scalar::String)
+        }
         (CodeQueryResultValue::TopologyEdge { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::TopologyEdge { value }, "from_id") => {
             Some(Scalar::StableId(&value.from_id))
@@ -7450,6 +7539,10 @@ pub enum DetailedCodeQueryKey {
         to_name: String,
         scope: String,
     },
+    BuildConfiguration {
+        id: String,
+        configuration_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7913,6 +8006,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::SourceSet { .. }
         | CodeQueryResultValue::BuildTarget { .. }
         | CodeQueryResultValue::TopologyEdge { .. }
+        | CodeQueryResultValue::BuildConfiguration { .. }
         | CodeQueryResultValue::RewritePath { .. } => None,
         CodeQueryResultValue::QualifiedPath { .. } | CodeQueryResultValue::PathSegment { .. } => {
             None
@@ -8039,6 +8133,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::SourceSet { .. }
         | DetailedCodeQueryKey::BuildTarget { .. }
         | DetailedCodeQueryKey::TopologyEdge { .. }
+        | DetailedCodeQueryKey::BuildConfiguration { .. }
         | DetailedCodeQueryKey::RewritePath { .. } => None,
         DetailedCodeQueryKey::QualifiedPath { .. } | DetailedCodeQueryKey::PathSegment { .. } => {
             None

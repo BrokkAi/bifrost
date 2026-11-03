@@ -1,7 +1,9 @@
 //! Bounded, files-only Cargo evidence using the #2442 discovery envelope.
 //!
-//! This producer is deliberately separate from artifact-backed pack activation.
-//! Its rows have no artifacts or selected target/configuration. Consumers must
+//! This producer is separate from artifact-backed pack production. Its rows
+//! have no artifacts or selected target/configuration; only exact crates.io
+//! lock associations become package activation evidence
+//! ([`cargo_lock_activation_rows`]). Consumers must
 //! preserve `evidence.kind` and association uncertainty when projecting them into
 //! the shared durable dependency/query contract. Nothing is retained on an
 //! analyzer, and queries must consume persisted rows rather than call acquisition.
@@ -19,6 +21,10 @@ use toml_edit::ImDocument;
 
 use crate::analyzer::rust::dependency_discovery::CargoLockPackage;
 
+use crate::analyzer::rust::toolchain_evidence::{
+    push_rust_toolchain_evidence, rust_toolchain_input,
+};
+
 use crate::analyzer::rust::dependency_discovery::CargoLockfile;
 
 use crate::analyzer::rust::dependency_discovery::cargo_lock_reference;
@@ -35,8 +41,8 @@ use crate::analyzer::semantic_model::{
     BoundedDependencyDiagnostics, CatalogCoordinate, DependencyCondition,
     DependencyDiscoveryOutcome, DependencyEvidence, DependencyEvidenceGap,
     DependencyEvidenceGapKind, DependencyEvidenceKind, DependencyFileEvidence,
-    DependencyFileEvidenceLimits, DependencyPackLimits, DependencyProvenance, ResolvedDependency,
-    SemanticModelActivationEvidence,
+    DependencyFileEvidenceLimits, DependencyPackDiagnostic, DependencyPackLimits,
+    DependencyProvenance, ResolvedDependency, SemanticModelActivationEvidence,
 };
 use brokk_bifrost_analysis::analyzer::dependency_support::{
     dependency_diagnostic as diagnostic, dependency_provenance_entry as entry,
@@ -75,7 +81,11 @@ fn acquire_cargo_discovery_rows(
     project: &dyn Project,
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
-) -> (DependencyDiscoveryOutcome, usize) {
+) -> (
+    DependencyDiscoveryOutcome,
+    usize,
+    Vec<(ProjectFile, ProjectSourceSnapshot)>,
+) {
     let mut selected = Vec::new();
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
     let mut bytes = 0_u64;
@@ -87,10 +97,13 @@ fn acquire_cargo_discovery_rows(
             let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
             (outcome.diagnostics, outcome.suppressed_diagnostics) = diagnostics.finish();
             outcome.complete = false;
-            return (outcome, 0);
+            return (outcome, 0, Vec::new());
         }
     };
-    for file in files.iter().filter(|file| cargo_input(file.rel_path())) {
+    for file in files
+        .iter()
+        .filter(|file| cargo_input(file.rel_path()) || rust_toolchain_input(file.rel_path()))
+    {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             cancelled = true;
             diagnostics.push(diagnostic(
@@ -149,7 +162,7 @@ fn acquire_cargo_discovery_rows(
     outcome.complete &= outcome.diagnostics.is_empty()
         && outcome.suppressed_diagnostics.errors == 0
         && !outcome.cancelled;
-    (outcome, bytes as usize)
+    (outcome, bytes as usize, selected)
 }
 pub(super) fn cargo_input(path: &Path) -> bool {
     matches!(
@@ -506,6 +519,23 @@ fn cargo_file_discovery_rows(
                         ));
                     }
                 }
+                // A member feature value `alias/feature` or `alias?/feature`
+                // requests the dependency's feature only while that member
+                // feature is enabled (#9051). `dep:alias` requests none.
+                for value in manifest
+                    .get("features")
+                    .and_then(toml::Value::as_table)
+                    .into_iter()
+                    .flat_map(|table| table.values())
+                    .flat_map(|values| values.as_array().expect("validated member features"))
+                {
+                    let value = value.as_str().expect("validated member feature");
+                    if let Some((dependency, feature)) = value.split_once('/')
+                        && dependency.trim_end_matches('?') == alias
+                    {
+                        provenance.push(entry("cargo.conditional_requested_feature", feature));
+                    }
+                }
                 let mut row = ResolvedDependency {
                     id: identity(
                         "declared",
@@ -669,7 +699,7 @@ fn cargo_file_discovery_rows(
         }
     }
     for path in configs {
-        diagnostics.push(diagnostic("rust.configuration.unresolved", Some(&path), "Cargo configuration overrides are owned by #3768; no effective target, rustflags, or patch selection is inferred"));
+        diagnostics.push(diagnostic("rust.configuration.unresolved", Some(&path), "Cargo configuration overrides are owned by #3768; dependency rows apply no rustflags or patch selection (build targets are rust-toolchain rows)"));
     }
     if cancelled {
         diagnostics.push(diagnostic(
@@ -1397,9 +1427,117 @@ pub fn acquire_rust_file_dependency_evidence(
     limits: &DependencyFileEvidenceLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyFileEvidence {
-    let (outcome, bytes) =
+    let (outcome, bytes, selected) =
         acquire_cargo_discovery_rows(project, &discovery_limits(limits), cancellation);
-    shared_file_evidence(outcome, bytes, limits)
+    let mut evidence = shared_file_evidence(outcome, bytes, limits);
+    push_rust_toolchain_evidence(project.root(), &selected, limits, &mut evidence);
+    evidence
+}
+
+/// Package activation rows for the lock instances member declarations name
+/// exactly (#9056).
+///
+/// A lock instance is activation evidence only when a member declaration
+/// associates with it exactly and its source is crates.io, so the coordinate
+/// names one published package version and the declaring member owns it. Raw
+/// lock rows, declared-only rows, unresolved or ambiguous associations, and
+/// git, path, or alternate-registry sources activate nothing; the files-only
+/// evidence surface keeps their association state. When the exact rows of one
+/// package lock more than one version, none of them activates: activation is
+/// workspace-wide, so selecting one version would apply its models to members
+/// that compile against another. That ambiguity is reported, not dropped, as
+/// is an acquisition limit that may have omitted rows.
+///
+/// Returns the rows, those diagnostics, and whether acquisition was cancelled.
+pub(crate) fn cargo_lock_activation_rows(
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> (Vec<ResolvedDependency>, Vec<DependencyPackDiagnostic>, bool) {
+    let (outcome, _, _) = acquire_cargo_discovery_rows(project, limits, cancellation);
+    fn value<'a>(row: &'a ResolvedDependency, key: &str) -> Option<&'a str> {
+        row.provenance
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.value.as_str())
+    }
+    let locks = outcome
+        .dependencies
+        .iter()
+        .filter(|row| value(row, "evidence.kind") == Some("locked"))
+        .map(|row| (row.id.as_str(), row))
+        .collect::<HashMap<_, _>>();
+    let mut by_package = std::collections::BTreeMap::<&str, Vec<ResolvedDependency>>::new();
+    for declaration in &outcome.dependencies {
+        if value(declaration, "cargo.lock_association") != Some("exact") {
+            continue;
+        }
+        let candidate =
+            value(declaration, "cargo.lock_candidate").expect("exact association has a candidate");
+        // An acquisition limit can omit the associated lock row; nothing then
+        // proves the version, so nothing activates.
+        let Some(locked) = locks.get(candidate) else {
+            continue;
+        };
+        if value(locked, "cargo.source") != Some(CRATES_IO) {
+            continue;
+        }
+        let mut provenance = locked
+            .provenance
+            .iter()
+            .filter(|entry| entry.key != "cargo.activation")
+            .cloned()
+            .collect::<Vec<_>>();
+        provenance.push(entry("cargo.activation", "exact_lock_association"));
+        provenance.push(entry("cargo.declaration", &declaration.id));
+        provenance.sort_by(|left, right| (&left.key, &left.value).cmp(&(&right.key, &right.value)));
+        let package = locked
+            .evidence
+            .package
+            .as_ref()
+            .expect("lock rows name their package");
+        by_package
+            .entry(package.name.as_str())
+            .or_default()
+            .push(ResolvedDependency {
+                id: identity("lock_activation", &[&declaration.id, &locked.id]),
+                evidence: locked.evidence.clone(),
+                provenance,
+                artifacts: Vec::new(),
+                scope: declaration.scope,
+                declared_by: declaration.declared_by.clone(),
+            });
+    }
+    let mut rows = Vec::new();
+    // Other acquisition diagnostics stay on the files-only evidence surface:
+    // an unresolved association there already activates nothing here.
+    let mut diagnostics = outcome
+        .diagnostics
+        .iter()
+        .filter(|entry| entry.code.starts_with("limit."))
+        .cloned()
+        .collect::<Vec<_>>();
+    for (package, mut candidates) in by_package {
+        let mut versions = candidates
+            .iter()
+            .filter_map(|row| row.evidence.package.as_ref()?.version.as_ref())
+            .collect::<Vec<_>>();
+        versions.sort();
+        versions.dedup();
+        if versions.len() > 1 {
+            let versions = versions.iter().map(ToString::to_string).collect::<Vec<_>>();
+            diagnostics.push(diagnostic(
+                "rust.lockfile.ambiguous_activation",
+                None,
+                format!(
+                    "members lock package {package} at versions {versions:?}; no version activates package-scoped semantic models"
+                ),
+            ));
+            continue;
+        }
+        rows.append(&mut candidates);
+    }
+    (rows, diagnostics, outcome.cancelled)
 }
 
 /// Interpret explicitly selected snapshots, including immutable revision or
@@ -1419,7 +1557,73 @@ pub fn rust_file_dependency_evidence(
         .fold(0_usize, |total, (_, snapshot)| {
             total.saturating_add(snapshot.source().len())
         });
-    shared_file_evidence(outcome, bytes, limits)
+    let mut evidence = shared_file_evidence(outcome, bytes, limits);
+    push_rust_toolchain_evidence(root, selected, limits, &mut evidence);
+    evidence
+}
+
+/// One lock instance owned by the member a declaration belongs to: the
+/// declaration's own instance when `via` is `None`, otherwise an instance that
+/// `via`, the declaration's own instance, reaches through lock dependencies.
+fn owned_lock_row(
+    locked: &DependencyEvidence,
+    declaration: &DependencyEvidence,
+    via: Option<&DependencyEvidence>,
+) -> DependencyEvidence {
+    let mut associated = locked.clone();
+    associated.declared_by = declaration.declared_by.clone();
+    associated.scope = declaration.scope;
+    associated.conditions.extend(
+        declaration
+            .conditions
+            .iter()
+            .filter(|condition| {
+                via.is_none()
+                    || !matches!(
+                        condition.kind.as_str(),
+                        "cargo.lock_association" | "cargo.lock_candidate"
+                    )
+            })
+            .cloned(),
+    );
+    if let Some(via) = via {
+        associated.conditions.push(DependencyCondition {
+            kind: "cargo.lock_association".to_owned(),
+            value: "transitive".to_owned(),
+        });
+        associated.conditions.push(DependencyCondition {
+            kind: "cargo.lock_via".to_owned(),
+            value: via
+                .locator
+                .clone()
+                .expect("Cargo lock rows carry a locator"),
+        });
+    }
+    for (kind, value) in [
+        ("cargo.declaration_file", display(&declaration.build_file)),
+        (
+            "cargo.declaration_snapshot",
+            declaration.source_digest.clone(),
+        ),
+        (
+            "cargo.declaration_start_byte",
+            declaration.byte_range.start.to_string(),
+        ),
+        (
+            "cargo.declaration_end_byte",
+            declaration.byte_range.end.to_string(),
+        ),
+    ] {
+        associated.conditions.push(DependencyCondition {
+            kind: kind.to_owned(),
+            value,
+        });
+    }
+    associated
+        .conditions
+        .sort_by(|left, right| (&left.kind, &left.value).cmp(&(&right.kind, &right.value)));
+    associated.conditions.dedup();
+    associated
 }
 
 fn discovery_limits(limits: &DependencyFileEvidenceLimits) -> DependencyPackLimits {
@@ -1543,6 +1747,13 @@ fn shared_file_evidence(
         }
         result.rows.push(fact);
     }
+    // Owned rows: each exact declaration's own lock instance, then the lock
+    // instances that instance reaches through the lockfile's `dependencies`
+    // edges (#9055). A transitive row names the direct instance it came
+    // through; a member that reaches one instance twice in one scope owns it
+    // once, and a direct association wins over a transitive one.
+    let mut owned = HashSet::default();
+    let mut direct = Vec::new();
     for (candidate, declaration) in associations {
         if result.rows.len() >= limits.max_rows {
             result.gaps.push(DependencyEvidenceGap {
@@ -1562,31 +1773,93 @@ fn shared_file_evidence(
             });
             continue;
         };
-        let mut associated = locked.clone();
-        associated.declared_by = declaration.declared_by;
-        associated.scope = declaration.scope;
-        associated.conditions.extend(declaration.conditions);
-        associated.conditions.push(DependencyCondition {
-            kind: "cargo.declaration_file".to_owned(),
-            value: display(&declaration.build_file),
-        });
-        associated.conditions.push(DependencyCondition {
-            kind: "cargo.declaration_snapshot".to_owned(),
-            value: declaration.source_digest,
-        });
-        associated.conditions.push(DependencyCondition {
-            kind: "cargo.declaration_start_byte".to_owned(),
-            value: declaration.byte_range.start.to_string(),
-        });
-        associated.conditions.push(DependencyCondition {
-            kind: "cargo.declaration_end_byte".to_owned(),
-            value: declaration.byte_range.end.to_string(),
-        });
-        associated
-            .conditions
-            .sort_by(|left, right| (&left.kind, &left.value).cmp(&(&right.kind, &right.value)));
-        associated.conditions.dedup();
-        result.rows.push(associated);
+        owned.insert((
+            declaration.declared_by.clone(),
+            locked.locator.clone(),
+            declaration.scope,
+        ));
+        result.rows.push(owned_lock_row(locked, &declaration, None));
+        direct.push((locked, declaration));
+    }
+    let mut lockfiles = HashMap::<&Path, Vec<&DependencyEvidence>>::default();
+    for locked in locks.values() {
+        lockfiles
+            .entry(locked.build_file.as_path())
+            .or_default()
+            .push(locked);
+    }
+    let mut unresolved_references = HashSet::default();
+    'closure: for (root, declaration) in &direct {
+        let mut visited = HashSet::default();
+        visited.insert(root.locator.as_deref());
+        let mut pending = vec![*root];
+        while let Some(parent) = pending.pop() {
+            for reference in parent
+                .conditions
+                .iter()
+                .filter(|condition| condition.kind == "cargo.lock_dependency")
+                .map(|condition| condition.value.as_str())
+            {
+                let targets = cargo_lock_reference(reference).map(|(name, version, source)| {
+                    lockfiles[parent.build_file.as_path()]
+                        .iter()
+                        .copied()
+                        .filter(|candidate| {
+                            candidate.package == name
+                                && version.is_none_or(|version| {
+                                    candidate.exact_version.as_deref() == Some(version)
+                                })
+                                && source.is_none_or(|source| {
+                                    candidate.source.as_deref() == Some(source)
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let target = match targets.as_deref() {
+                    Ok([target]) => *target,
+                    resolved => {
+                        if unresolved_references.insert((parent.locator.as_deref(), reference)) {
+                            result.gaps.push(DependencyEvidenceGap {
+                                kind: DependencyEvidenceGapKind::Unresolved,
+                                build_file: parent.build_file.clone(),
+                                byte_range: parent.byte_range.clone(),
+                                message: format!(
+                                    "lock dependency {reference:?} of {} {:?} names {} lock instances ({:?}); the owning members' lock closure is unresolved",
+                                    parent.package,
+                                    parent.exact_version,
+                                    resolved.as_ref().map_or(0, |targets| targets.len()),
+                                    resolved.as_ref().err()
+                                ),
+                            });
+                        }
+                        continue;
+                    }
+                };
+                if !visited.insert(target.locator.as_deref()) {
+                    continue;
+                }
+                pending.push(target);
+                if !owned.insert((
+                    declaration.declared_by.clone(),
+                    target.locator.clone(),
+                    declaration.scope,
+                )) {
+                    continue;
+                }
+                if result.rows.len() >= limits.max_rows {
+                    result.gaps.push(DependencyEvidenceGap {
+                        kind: DependencyEvidenceGapKind::Limit,
+                        build_file: declaration.build_file.clone(),
+                        byte_range: declaration.byte_range.clone(),
+                        message: "Cargo transitive lock row limit exceeded".to_owned(),
+                    });
+                    break 'closure;
+                }
+                result
+                    .rows
+                    .push(owned_lock_row(target, declaration, Some(*root)));
+            }
+        }
     }
     for entry in outcome.diagnostics {
         let kind = if entry.code == "rust.evidence.cancelled" {

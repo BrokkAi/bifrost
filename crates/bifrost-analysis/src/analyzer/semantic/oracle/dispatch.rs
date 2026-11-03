@@ -420,6 +420,25 @@ impl DispatchResult {
         }
     }
 
+    /// A Go interface call passes the value its interface boxes to whichever
+    /// method the dynamic type selects. A pointer dynamic type lets that
+    /// method write the object the caller's interface refers to, so the
+    /// receiver is a reference. This does not depend on the selected
+    /// implementation, so it holds while the family is still open.
+    pub(crate) fn mark_go_interface_receiver_preparation(
+        &mut self,
+        preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
+    ) {
+        debug_assert!(matches!(
+            preparation,
+            None | Some(crate::analyzer::semantic::MemberReceiverPreparation::Reference)
+        ));
+        self.member_receiver_preparation = preparation;
+        if let (Some(preparation), [candidate]) = (preparation, self.candidates.as_mut()) {
+            candidate.mark_member_receiver_preparation(preparation);
+        }
+    }
+
     pub const fn member_receiver_preparation(
         &self,
     ) -> Option<crate::analyzer::semantic::MemberReceiverPreparation> {

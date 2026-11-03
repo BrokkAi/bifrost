@@ -10249,7 +10249,7 @@ fn rust_runtime_value_producer<'tree>(
 /// remove, so the evaluator reports the adjustment as unrepresentable and the
 /// binding stays incomplete rather than taking a wrong type. Separating the two
 /// needs the receiver's resolved type, which the producer does not have.
-fn rust_unwrap_operand<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+pub fn rust_unwrap_operand<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     if node.kind() == "try_expression" {
         // `try_expression` wraps a single unnamed-field expression child.
         return node.named_child(0);

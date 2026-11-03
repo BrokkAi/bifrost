@@ -17,6 +17,14 @@ const socialCardUrl = new URL(`/${socialCardPath}`, site).href;
 export default defineConfig({
   site,
   base: isDev ? '/' : productionBase,
+  redirects: {
+    '/lsp/': 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md',
+    '/vscode/': 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/vscode.md',
+    '/rql-vscode/': 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/rql-vscode.md',
+    '/zed-lsp/': 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/zed.md',
+    '/neovim/': 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/neovim.md',
+    '/helix/': 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/helix.md',
+  },
   markdown: {
     processor: unified({
       rehypePlugins: [[rehypeBasePathLinks, { base: isDev ? '/' : productionBase }]],
@@ -111,12 +119,12 @@ export default defineConfig({
         {
           label: 'Use Bifrost via LSP',
           items: [
-            { label: 'LSP Server', slug: 'lsp' },
-            { label: 'VS Code', slug: 'vscode' },
-            { label: 'Cursor', slug: 'cursor' },
-            { label: 'Zed', slug: 'zed-lsp' },
-            { label: 'Neovim / Vim', slug: 'neovim' },
-            { label: 'Helix', slug: 'helix' },
+            { label: 'LSP Server', link: 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md' },
+            { label: 'VS Code', link: 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/vscode.md' },
+            { label: 'Cursor', link: 'https://github.com/BrokkAi/bifrost-lsp/blob/c3e7caaed7c3e8db54521edc985a7ff1fc51cdf2/docs/cursor.md' },
+            { label: 'Zed', link: 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/zed.md' },
+            { label: 'Neovim / Vim', link: 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/neovim.md' },
+            { label: 'Helix', link: 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/helix.md' },
           ],
         },
         {
@@ -136,7 +144,7 @@ export default defineConfig({
               items: [
                 { label: 'Overview', slug: 'rune-query-language' },
                 { label: 'Rune IR', slug: 'rune-ir' },
-                { label: 'VS Code', slug: 'rql-vscode' },
+                { label: 'VS Code', link: 'https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/rql-vscode.md' },
                 {
                   label: 'Language Tutorials',
                   items: [

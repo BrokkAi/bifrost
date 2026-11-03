@@ -74,6 +74,7 @@ pub mod multi_analyzer;
 // Shared bounded native point-resolution machinery used by production language routes.
 #[doc(hidden)]
 pub mod native_points;
+pub mod root_presence;
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::NativeAssignmentValueProbe;
 #[cfg(any(test, feature = "test-support"))]

@@ -19,7 +19,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.15.0"
+brokk-bifrost = "0.15.1"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -134,12 +134,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`install_bifrost_semantic_model_packs()` registers the shipped semantic-model
-packs for the process. Call it once before you build an analyzer or a
-`SearchToolsService`. Without it, no shipped packs activate. If the environment
-variable `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` names a pack bundle directory,
-Bifrost installs that bundle instead of the shipped packs each time it opens a
-catalog for activation. An empty value or a bundle with no compatible pack
+`install_bifrost_semantic_model_packs()` connects semantic-pack registration
+for the process. Call it once before you build an analyzer or a
+`SearchToolsService`. The engine embeds no packs: if the environment variable
+`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` names an extracted packs release, Bifrost
+installs that bundle each time it opens a catalog for activation; otherwise no
+semantic pack activates. An empty value or a bundle with no compatible pack
 makes that activation fail; the call to
 `install_bifrost_semantic_model_packs()` itself still succeeds.
 
@@ -167,7 +167,7 @@ reference](/reference/rust-api/).
 | `execute_request`, `execute_request_with_limits`, `execute_request_with_cancellation` | Run a `CodeQuery` against an analyzer. |
 | `CancellationToken` | Cancel long-running calls. |
 | `extension` | The stable, versioned extension API. |
-| `install_bifrost_semantic_model_packs`, `open_pack_engine_profile` | Register the shipped semantic packs; report the pack-consumer profile. |
+| `install_bifrost_semantic_model_packs`, `open_pack_engine_profile` | Connect semantic-pack registration; report the pack-consumer profile. |
 | `BIFROST_VERSION`, `BIFROST_BUILD_IDENTITY` | The package version and the exact source revision of this build. |
 
 The facade also exports passive dependency-evidence types for Rust, Ruby, PHP,

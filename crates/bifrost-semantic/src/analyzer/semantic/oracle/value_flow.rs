@@ -114,6 +114,12 @@ pub enum ValueFlowRelationKind {
     LanguageDefined,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CollapseRead {
+    Root,
+    Load(Box<[AccessSelector]>),
+}
+
 impl ValueFlowRelationKind {
     /// When the target of a relation of this kind is evaluated, relative to
     /// its source (#2446).
@@ -845,6 +851,7 @@ pub struct ValueFlowRelationPayload {
     pub transfer: Option<ValueTransfer>,
     pub source: ValueFlowEndpoint,
     pub target: ValueFlowEndpoint,
+    pub collapse_read: Option<CollapseRead>,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
     pub strong_update: bool,
@@ -860,6 +867,7 @@ struct ValueFlowPayloadRef<'a> {
     transfer: &'a Option<ValueTransfer>,
     source: &'a ValueFlowEndpoint,
     target: &'a ValueFlowEndpoint,
+    collapse_read: &'a Option<CollapseRead>,
     proof: &'a ProofStatus,
     completeness: &'a EvidenceCompleteness,
     strong_update: bool,
@@ -887,6 +895,7 @@ impl ValueFlowRelationPayload {
             transfer: &self.transfer,
             source: &self.source,
             target: &self.target,
+            collapse_read: &self.collapse_read,
             proof: &self.proof,
             completeness: &self.completeness,
             strong_update: self.strong_update,
@@ -923,6 +932,7 @@ pub struct ValueFlowRelation {
     pub transfer: Option<ValueTransfer>,
     pub source: ValueFlowEndpoint,
     pub target: ValueFlowEndpoint,
+    pub collapse_read: Option<CollapseRead>,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
     /// Whether this store holds a [`StrongUpdateCertificate`] at its own site
@@ -967,6 +977,7 @@ impl ValueFlowRelation {
             transfer: payload.transfer,
             source: payload.source,
             target: payload.target,
+            collapse_read: payload.collapse_read,
             proof: payload.proof,
             completeness: payload.completeness,
             strong_update: payload.strong_update,
@@ -993,6 +1004,7 @@ impl ValueFlowRelation {
             transfer: &self.transfer,
             source: &self.source,
             target: &self.target,
+            collapse_read: &self.collapse_read,
             proof: &self.proof,
             completeness: &self.completeness,
             strong_update: self.strong_update,
@@ -1364,6 +1376,8 @@ pub struct ValueFlowSnapshot {
     /// and without needing the query-time analyzer access that judgment
     /// required.
     discharged_gaps: Box<[SemanticGapId]>,
+    /// The workspace proof could not discharge a lowered Go builtin assumption.
+    unproven_go_builtin_assumptions: bool,
     member_receivers: Box<[MemberReceiverFlow]>,
 }
 
@@ -1420,6 +1434,10 @@ impl ValueFlowSnapshot {
             relations: Box::default(),
             coverage,
             discharged_gaps: Box::default(),
+            unproven_go_builtin_assumptions: !procedure
+                .artifact()
+                .go_predeclared_builtin_assumptions()
+                .is_empty(),
             member_receivers: Box::default(),
         }
         .with_member_receivers(receivers, limits)?;
@@ -1536,8 +1554,20 @@ impl ValueFlowSnapshot {
             relations: relations.into_boxed_slice(),
             coverage: metadata.coverage,
             discharged_gaps: discharged_gaps.into_boxed_slice(),
+            unproven_go_builtin_assumptions: metadata.unproven_go_builtin_assumptions,
             member_receivers: metadata.member_receivers,
         })
+    }
+
+    /// Carry the workspace host's bounded package-declaration proof to the
+    /// pure plan classifier without repeating a workspace read there.
+    pub fn with_unproven_go_builtin_assumptions(mut self, open: bool) -> Self {
+        self.unproven_go_builtin_assumptions = open;
+        self
+    }
+
+    pub fn has_unproven_go_builtin_assumptions(&self) -> bool {
+        self.unproven_go_builtin_assumptions
     }
 
     pub fn with_member_receivers(

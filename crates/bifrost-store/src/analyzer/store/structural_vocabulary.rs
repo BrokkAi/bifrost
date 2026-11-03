@@ -108,8 +108,9 @@ use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
 /// Version 50 stores declaration modifier words and declaration type kinds as
 /// trailing structural node-array positions 24 and 25, and adds general
 /// expression/statement facts (#4365).
+/// Version 51 adds the Rust assignment-operator role (#9050).
 #[doc(hidden)]
-pub const STRUCTURAL_FACTS_VERSION: i64 = 50;
+pub const STRUCTURAL_FACTS_VERSION: i64 = 51;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]

@@ -50,7 +50,7 @@ use crate::value_flow::{
     ValueFlowSinkSpec, ValueFlowSourceSpec, discover_closure, solve_value_flow_with_summaries,
 };
 
-const INPUT_IDENTITY_DOMAIN: &[u8] = b"bifrost-source-summary-input-v1";
+const INPUT_IDENTITY_DOMAIN: &[u8] = b"bifrost-source-summary-input-v2";
 const NORMAL_RESULT_ORDINAL: u32 = 0;
 
 /// One immutable caller-owned source file, addressed by a workspace-relative
@@ -365,12 +365,6 @@ pub fn derive_source_normal_result(
     identity.push(entrypoint_path.as_bytes());
     identity.push(&(input.entrypoint.range.start_byte as u64).to_le_bytes());
     identity.push(&(input.entrypoint.range.end_byte as u64).to_le_bytes());
-    identity.push(&(limits.max_source_files as u64).to_le_bytes());
-    identity.push(&(limits.max_source_bytes as u64).to_le_bytes());
-    identity.push(&(limits.max_entrypoint_lookup_examined as u64).to_le_bytes());
-    identity.push(&(limits.max_closure_procedures as u64).to_le_bytes());
-    identity.push(format!("{:?}", semantic_budget.limits()).as_bytes());
-    identity.push(format!("{:?}", solver_budget.limits()).as_bytes());
     let dependencies = files
         .iter()
         .map(|(path, file)| {
@@ -1082,6 +1076,19 @@ mod tests {
             .input_digest
         };
         let initial = fingerprint(&input);
+        let under_tighter_source_limits = derive_source_normal_result(
+            &input,
+            SourceDerivationLimits {
+                max_source_files: 1,
+                max_source_bytes: 1,
+                ..SourceDerivationLimits::default()
+            },
+            &mut SemanticBudget::default(),
+            &mut SolverBudget::default(),
+            &CancellationToken::default(),
+        )
+        .expect("bounded request yields a digest");
+        assert_eq!(under_tighter_source_limits.input_digest, initial);
         let initial_dependencies = derive_source_normal_result(
             &input,
             SourceDerivationLimits {

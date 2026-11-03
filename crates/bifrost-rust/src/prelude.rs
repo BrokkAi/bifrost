@@ -274,9 +274,10 @@ pub struct RustStdTypeFact {
 /// The reviewed standard prelude types whose destructors run no user code of
 /// their own.
 ///
-/// This table is the interim home of these facts. The follow-up is a
-/// drop-glue fact in the semantic-model declaration schema, carried by a
-/// regenerated std pack. A type that is not listed here stays unproven.
+/// This table is the interim home of these facts. The declaration schema
+/// carries the same fact as `value_semantics.drop_glue` (#9057); the follow-up
+/// is a regenerated std pack that states it. A type that is not listed here
+/// stays unproven.
 pub const RUST_STD_TYPE_FACTS: &[RustStdTypeFact] = &[
     RustStdTypeFact {
         name: "String",

@@ -289,3 +289,8 @@ Migration `0222-field-slot-exact-result-sources.sql` rebuilds the field-slot ato
 table while preserving its rows, primary key, foreign key and checks. It admits
 exact call and access result sources so complete factory-backed inventories
 can be published and replayed instead of failing schema validation.
+
+Migration `0231-policy-evaluation-replay-evidence.sql` records nullable
+per-policy and aggregate effective grants and certified source censuses.
+The aggregate also records whether its evidence was complete. Legacy rows
+remain readable but have no replay evidence.

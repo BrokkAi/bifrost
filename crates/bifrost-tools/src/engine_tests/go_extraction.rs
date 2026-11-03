@@ -6496,9 +6496,14 @@ type Item struct{ Decoy bool }
                 // RESOLUTION_PATHS_BY_KEY_SQL hydration within one point
                 // operation; only that statement moves: cold search -5
                 // executions/-13 rows, warm search -3/-3, for both kinds.
+                // #9015: the Go publication recheck reads PRAGMA main.data_version
+                // before the recheck and again after revalidation (+2 statements
+                // and rows), and the operation-local caller-role memo serves one
+                // repeated CALLER_SOURCE_ROLE read (-1/-1): cold and warm searches
+                // gain one statement and one row for both kinds.
                 let (cold_search, warm_open, warm_search) = match kind {
-                    ProductionGoPointKind::Definition => ((155, 143), (5, 4), (122, 93)),
-                    ProductionGoPointKind::Type => ((173, 140), (5, 4), (141, 91)),
+                    ProductionGoPointKind::Definition => ((156, 144), (5, 4), (123, 94)),
+                    ProductionGoPointKind::Type => ((174, 141), (5, 4), (142, 92)),
                 };
                 let production_schema = cold
                     .open
@@ -8070,11 +8075,19 @@ type Item struct{ Decoy bool }
                             "{case}.{selector}: {:?}",
                             answer.answer
                         );
+                        // Member lookup reads only the declared method set
+                        // (#9101). The open model implementation family stays
+                        // with interface satisfaction and method inventories, so
+                        // an exact model interface selects and proves absence
+                        // completely. A cyclic embedding is a gap in the
+                        // declared set and stays incomplete.
                         if case != "promoted-field" {
-                            assert_ne!(
-                                answer.answer.binding().completion(),
-                                &ResolutionCompletion::Complete,
-                                "{case}.{selector}: a boundary terminal never proves complete empty inventory or implementation family"
+                            assert_eq!(
+                                answer.answer.binding().completion()
+                                    == &ResolutionCompletion::Complete,
+                                case != "interface-cycle",
+                                "{case}.{selector}: {:?}",
+                                answer.answer.binding().completion()
                             );
                         }
                         if case == "promoted-field" && selector == "Missing" {
@@ -14466,7 +14479,7 @@ func caller(value ResizerAlias) { value.Resize(1) }
                 result.boundaries().iter().any(|boundary| {
                     matches!(boundary.kind, DispatchBoundaryKind::Unresolved)
                         && format!("{:?}", boundary.completeness)
-                            .contains("Go interface implementations are not closed")
+                            .contains("selector callee may be a function-valued field")
                 }),
                 "{result:#?}"
             );

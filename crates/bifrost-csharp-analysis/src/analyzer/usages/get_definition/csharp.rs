@@ -121,14 +121,16 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason,
 };
+use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind;
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_csharp::graph::resolver::{
     CSharpCallArgumentOwners, call_argument_node, call_argument_parameter_index,
     canonical_builtin_type_identity as csharp_canonical_builtin_type_identity,
     csharp_invocation_member, filter_call_argument_method_candidates_with_metadata,
-    resolve_call_argument_owners, with_callable_parameter_type_nodes,
+    resolve_call_argument_owners, with_callable_parameter_type_nodes, with_declaration_node,
 };
 use brokk_bifrost_csharp::graph_support::CSharpSource;
+use brokk_bifrost_csharp::syntax::csharp_has_modifier;
 use brokk_bifrost_csharp::syntax::csharp_source_identifier;
 use brokk_bifrost_csharp::syntax::{
     CSharpNamedArgumentLabel, csharp_arity_preserving_full_name,
@@ -378,9 +380,22 @@ impl<'a> CSharpDefinitionProvider<'a> {
         else {
             return Vec::new();
         };
+        self.visible_type_declarations_in(file, name, &context)
+            .map(|types| self.admit_visible_types(types))
+            .unwrap_or_default()
+    }
+
+    /// The types `name` denotes in `context`, with the tier that decided them.
+    /// `None` when a bounded lookup ran out.
+    fn visible_type_declarations_in(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        context: &graph_support::CSharpLookupContext,
+    ) -> Option<graph_support::VisibleTypes> {
         graph_support::visible_type_declarations_at_with_lookups(
             name,
-            &context,
+            context,
             &mut |name| self.global_alias_target_at(name),
             &mut || self.global_using_namespaces_at(),
             &mut |namespace| self.query(|| self.csharp.workspace_namespace_exists(namespace)),
@@ -390,8 +405,6 @@ impl<'a> CSharpDefinitionProvider<'a> {
             },
             &mut || self.scope_step(),
         )
-        .map(|types| self.admit_visible_types(types))
-        .unwrap_or_default()
     }
 
     fn global_alias_target_at(&self, name: &str) -> Option<Option<String>> {
@@ -1109,6 +1122,7 @@ fn csharp_external_member_evidence(
         ExactExternalCallProof::csharp_bound_external_member(&owner, &member, parameter_count)
     };
     CallEvidence {
+        source_member_evidence: None,
         native_resolution: None,
         model_member_selection: None,
         call_application: proof.call_application(),
@@ -1173,7 +1187,8 @@ fn resolve_csharp_in_session(
         site,
         preserve_using_alias,
     );
-    hold_to_compilation_membership(analyzer, definitions, file, outcome)
+    let outcome = hold_to_compilation_membership(analyzer, definitions, file, outcome);
+    hold_to_compilation_inventory(analyzer, definitions, file, source, tree, site, outcome)
 }
 
 /// Hold an answer to compilation membership.
@@ -1193,25 +1208,6 @@ fn hold_to_compilation_membership(
     file: &ProjectFile,
     mut outcome: DefinitionLookupOutcome,
 ) -> DefinitionLookupOutcome {
-    let inventory = definitions
-        .csharp
-        .compilation_inventory_obligations(file)
-        .unwrap_or_else(|| vec!["C# compilation inventory could not be read".into()]);
-    if !inventory.is_empty() {
-        if matches!(
-            outcome.status,
-            DefinitionLookupStatus::Resolved
-                | DefinitionLookupStatus::NoDefinition
-                | DefinitionLookupStatus::NotFound
-        ) {
-            outcome.status = DefinitionLookupStatus::Incomplete;
-        }
-        outcome.diagnostics.push(DefinitionLookupDiagnostic {
-            claim: None,
-            kind: "csharp_compilation_usings_incomplete".into(),
-            message: inventory.join("; "),
-        });
-    }
     let mut doubt = Vec::new();
     let root = analyzer.project().root();
     let mut removed = Vec::new();
@@ -1295,6 +1291,336 @@ fn hold_to_compilation_membership(
         });
     }
     outcome
+}
+
+/// Hold an answer to an open compilation inventory (#8822).
+///
+/// An unacquired package or restore-generated import leaves the compilation's
+/// inventory open. It can add a type in any namespace, a member of a `partial`
+/// type, an extension method or a global using. A negative answer stays
+/// `Incomplete`, because an addition can supply the missing declaration. A
+/// resolved answer stays `Resolved` only when
+/// [`csharp_unqualified_call_closed_under_additions`] proves that no addition
+/// can change it. The proof is positive: every other answer is `Incomplete`.
+fn hold_to_compilation_inventory(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    mut outcome: DefinitionLookupOutcome,
+) -> DefinitionLookupOutcome {
+    let inventory = definitions.csharp.compilation_inventory_obligations(file);
+    if inventory.as_ref().is_some_and(Vec::is_empty) {
+        return outcome;
+    }
+    // A failed inventory read proves nothing about additions, so only a read
+    // that names the open obligations can be overcome by the closure proof.
+    let closed = inventory.is_some()
+        && outcome.status == DefinitionLookupStatus::Resolved
+        && tree.is_some_and(|tree| {
+            csharp_unqualified_call_closed_under_additions(
+                analyzer,
+                definitions,
+                file,
+                source,
+                tree,
+                site,
+                &outcome,
+            )
+        });
+    if closed {
+        return outcome;
+    }
+    if matches!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved
+            | DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::NotFound
+    ) {
+        outcome.status = DefinitionLookupStatus::Incomplete;
+    }
+    outcome.diagnostics.push(DefinitionLookupDiagnostic {
+        claim: None,
+        kind: "csharp_compilation_usings_incomplete".into(),
+        message: inventory
+            .map(|obligations| obligations.join("; "))
+            .unwrap_or_else(|| "C# compilation inventory could not be read".into()),
+    });
+    outcome
+}
+
+/// Whether a resolved unqualified invocation keeps its target under every
+/// addition an open compilation inventory can make (#8822).
+///
+/// The one proven shape is `M(args)`, with no explicit type arguments, whose
+/// single target is a method of `E0`, the innermost enclosing class or struct,
+/// or of a class in its base-class chain. C# simple-name lookup stops at the
+/// first type with a member named `M` and never considers extension methods.
+/// When `E0` and its base-class chain are closed ([`csharp_closed_class_chain`])
+/// and declare exactly one member named `M`, an addition cannot add a
+/// candidate, so the target is fixed whatever the argument types: an
+/// inapplicable singleton is a compile error, not a different target. Every
+/// other shape is not proven here and stays open.
+fn csharp_unqualified_call_closed_under_additions(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    outcome: &DefinitionLookupOutcome,
+) -> bool {
+    let [target] = outcome.definitions.as_slice() else {
+        return false;
+    };
+    let Some(node) = csharp_smallest_named_node_covering(
+        definitions,
+        tree.root_node(),
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) else {
+        return false;
+    };
+    let Some(CSharpReferenceNode::UnqualifiedMember(name)) =
+        csharp_reference_node(node, definitions)
+    else {
+        return false;
+    };
+    let Some((member, None)) = csharp_member_name_parts(name, source) else {
+        return false;
+    };
+    // `System.Object`, and `System.ValueType` with a subset of its names, ends
+    // every base-class chain, and its members are not indexed.
+    if csharp_invocation_arity(name, source, definitions).is_none()
+        || csharp_object_declares_member(member)
+    {
+        return false;
+    }
+    let Some(owner) = csharp_enclosing_class(analyzer, definitions, file, name.start_byte()) else {
+        return false;
+    };
+    let Some(chain) = csharp_closed_class_chain(analyzer, definitions, file, &owner) else {
+        return false;
+    };
+    let mut members = Vec::new();
+    for class in &chain {
+        if csharp_declares_unindexed_member(definitions, class, member) != Some(false) {
+            return false;
+        }
+        members.extend(definitions.members_for_owner_name(&class.fq_name(), member));
+        if members.len() > 1 {
+            return false;
+        }
+    }
+    // A bounded read that ran out returns no rows and stops the session, so a
+    // stopped session proves nothing even when one member was read.
+    definitions.observe_cancellation()
+        && matches!(members.as_slice(), [only] if only.is_function() && only == target)
+}
+
+/// Whether `owner`'s declaration has a member named `member` that the C#
+/// declaration index does not publish as a code unit: an event, an event field
+/// or a nested delegate type. Methods, constructors, properties, fields and
+/// nested classes, structs, interfaces, enums and records are published.
+/// `None` when the declaration cannot be read.
+fn csharp_declares_unindexed_member(
+    definitions: &CSharpDefinitionProvider<'_>,
+    owner: &CodeUnit,
+    member: &str,
+) -> Option<bool> {
+    with_declaration_node(definitions.csharp, owner, |source, declaration| {
+        let Some(body) = declaration.child_by_field_name("body") else {
+            return false;
+        };
+        let mut cursor = body.walk();
+        body.named_children(&mut cursor).any(|child| {
+            let names: Vec<Node<'_>> = match child.kind() {
+                "event_declaration" | "delegate_declaration" => {
+                    child.child_by_field_name("name").into_iter().collect()
+                }
+                "event_field_declaration" => {
+                    first_named_child_of_kind(child, "variable_declaration")
+                        .map(|variables| {
+                            let mut cursor = variables.walk();
+                            variables
+                                .named_children(&mut cursor)
+                                .filter(|declarator| declarator.kind() == "variable_declarator")
+                                .filter_map(|declarator| declarator.child_by_field_name("name"))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            names
+                .into_iter()
+                .any(|name| csharp_node_text(name, source) == member)
+        })
+    })
+}
+
+/// `owner` and the classes it inherits from, when no addition an open
+/// compilation inventory can make changes them (#8822). Each link is a
+/// non-partial workspace class or struct whose compilation membership is
+/// Visible from `file`. C# puts the base class, if any, first in a base list,
+/// so only the first entry can name one, and an added class can shadow that
+/// name unless a closed tier decides it ([`csharp_closed_base_name`]). A
+/// struct's base list names interfaces only, and an interface as the first
+/// entry leaves `object` as the base class, so either ends the chain. `None`
+/// when any link is open.
+fn csharp_closed_class_chain(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+) -> Option<Vec<CodeUnit>> {
+    let mut chain: Vec<CodeUnit> = Vec::new();
+    let mut current = owner.clone();
+    loop {
+        if !definitions.scope_step()
+            || chain.contains(&current)
+            || !csharp_type_is_closed_part(analyzer, definitions, file, &current)
+        {
+            return None;
+        }
+        let base = with_declaration_node(definitions.csharp, &current, |source, declaration| {
+            if csharp_has_modifier(source, declaration, "partial") {
+                return None;
+            }
+            match declaration.kind() {
+                "struct_declaration" => Some(None),
+                "class_declaration" => {
+                    let Some(first) = first_named_child_of_kind(declaration, "base_list")
+                        .and_then(|bases| bases.named_child(0))
+                    else {
+                        return Some(None);
+                    };
+                    let base = csharp_closed_base_name(
+                        analyzer,
+                        definitions,
+                        &current,
+                        source,
+                        declaration,
+                        first,
+                    )?;
+                    with_declaration_node(definitions.csharp, &base, |_, base_declaration| {
+                        match base_declaration.kind() {
+                            "interface_declaration" => Some(None),
+                            "class_declaration" => Some(Some(base.clone())),
+                            _ => None,
+                        }
+                    })
+                    .flatten()
+                }
+                _ => None,
+            }
+        })
+        .flatten()?;
+        chain.push(current);
+        match base {
+            Some(base) => current = base,
+            None => return Some(chain),
+        }
+    }
+}
+
+/// Whether `unit` is a workspace type with one declaration part whose
+/// compilation membership is Visible from `file`, so that no addition can give
+/// it another part or hide it.
+fn csharp_type_is_closed_part(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    unit: &CodeUnit,
+) -> bool {
+    unit.source().root() == analyzer.project().root()
+        && definitions.partial_type_parts(unit).len() == 1
+        && definitions
+            .csharp
+            .compilation_visibility(file, unit.source())
+            == Some(graph_support::CSharpCompilationVisibility::Visible)
+}
+
+/// The type named by `first`, the first base-list entry of `owner`'s
+/// `declaration`, when a closed tier decides it (#8822). C# looks a base name
+/// up through the type parameters in scope, then each enclosing type's nested
+/// types and those of its base classes, then the namespaces from the innermost
+/// outward with their using directives. The name is closed when no type
+/// parameter has it, every enclosing type is a closed part with no base list
+/// (so it inherits no nested types) and declares no type of that name, and the
+/// innermost namespace itself declares it. A name decided by a using
+/// directive, an outer namespace or the global namespace can be shadowed by an
+/// added type, so it is `None`, as is a qualified or aliased name.
+fn csharp_closed_base_name(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    owner: &CodeUnit,
+    source: &str,
+    declaration: Node<'_>,
+    first: Node<'_>,
+) -> Option<CodeUnit> {
+    let type_node = if first.kind() == "primary_constructor_base_type" {
+        first.child_by_field_name("type")?
+    } else {
+        first
+    };
+    let simple_name = match type_node.kind() {
+        "identifier" => type_node,
+        "generic_name" => type_node.child_by_field_name("name")?,
+        _ => return None,
+    };
+    let reference = csharp_reference_type_text(type_node, source);
+    if csharp_type_parameter_shadows_reference(type_node, source, &reference) {
+        return None;
+    }
+    let simple_name = csharp_node_text(simple_name, source);
+    let mut enclosing_unit = definitions
+        .parent_of(analyzer, owner)
+        .filter(CodeUnit::is_class);
+    let mut ancestor = declaration.parent();
+    while let Some(node) = ancestor {
+        ancestor = node.parent();
+        if !matches!(
+            node.kind(),
+            "class_declaration"
+                | "struct_declaration"
+                | "interface_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) {
+            continue;
+        }
+        let unit = enclosing_unit.take()?;
+        if !matches!(node.kind(), "class_declaration" | "struct_declaration")
+            || csharp_has_modifier(source, node, "partial")
+            || first_named_child_of_kind(node, "base_list").is_some()
+            || !csharp_type_is_closed_part(analyzer, definitions, owner.source(), &unit)
+            || definitions
+                .arity_free_types_by_fqn(&format!("{}.{}", unit.fq_name(), simple_name))
+                .iter()
+                .any(CodeUnit::is_class)
+        {
+            return None;
+        }
+        enclosing_unit = definitions
+            .parent_of(analyzer, &unit)
+            .filter(CodeUnit::is_class);
+    }
+    let context =
+        graph_support::CSharpLookupContext::at(source, type_node, || definitions.scope_step())?
+            .with_closed_enclosing_types();
+    let types = definitions.visible_type_declarations_in(owner.source(), &reference, &context)?;
+    if types.tier != graph_support::CSharpLookupTier::InnermostNamespace
+        || !types.unproven.is_empty()
+    {
+        return None;
+    }
+    let [base] = types.declarations.as_slice() else {
+        return None;
+    };
+    Some(base.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3615,6 +3941,7 @@ fn csharp_external_constructor_evidence(
     let proof =
         ExactExternalCallProof::csharp_external_constructor(&owner, &member, parameter_count);
     CallEvidence {
+        source_member_evidence: None,
         native_resolution: None,
         model_member_selection: None,
         call_application: proof.call_application(),
@@ -4351,6 +4678,17 @@ fn csharp_hierarchy_crosses_unindexed_supertype(
     false
 }
 
+/// `System.Object`'s declared members, with the parameter counts each name
+/// offers. `Finalize` is omitted: C# forbids calling it by name.
+const CSHARP_OBJECT_MEMBERS: &[(&str, &[usize])] = &[
+    ("Equals", &[1, 2]),
+    ("GetHashCode", &[0]),
+    ("GetType", &[0]),
+    ("MemberwiseClone", &[0]),
+    ("ReferenceEquals", &[2]),
+    ("ToString", &[0]),
+];
+
 /// Whether `System.Object` itself declares a `member` overload this call's
 /// argument count could reach.
 ///
@@ -4374,22 +4712,18 @@ fn csharp_hierarchy_crosses_unindexed_supertype(
 /// `object` has no three-argument `Equals`, so an `Equals(a, b, c)` call is not
 /// reaching across this boundary either.
 fn csharp_object_declares_overload(member: &str, arity: Option<usize>) -> bool {
-    /// `System.Object`'s declared members, with the parameter counts each name
-    /// offers. `Finalize` is omitted: C# forbids calling it by name.
-    const OBJECT_MEMBERS: &[(&str, &[usize])] = &[
-        ("Equals", &[1, 2]),
-        ("GetHashCode", &[0]),
-        ("GetType", &[0]),
-        ("MemberwiseClone", &[0]),
-        ("ReferenceEquals", &[2]),
-        ("ToString", &[0]),
-    ];
     let Some(arity) = arity else {
         return false;
     };
-    OBJECT_MEMBERS
+    CSHARP_OBJECT_MEMBERS
         .iter()
         .any(|(name, arities)| *name == member && arities.contains(&arity))
+}
+
+fn csharp_object_declares_member(member: &str) -> bool {
+    CSHARP_OBJECT_MEMBERS
+        .iter()
+        .any(|(name, _)| *name == member)
 }
 
 /// Where the C# member walk found one candidate: the exact type it read the
@@ -6851,7 +7185,11 @@ pub(crate) fn resolve_definition_dispatch<'a>(
             resolution.outcome
         },
     );
-    std::ops::ControlFlow::Continue(DefinitionResolution { outcome, evidence })
+    std::ops::ControlFlow::Continue(DefinitionResolution {
+        outcome,
+        evidence,
+        call_binding_discharge_digests: Vec::new(),
+    })
 }
 
 #[cfg(test)]

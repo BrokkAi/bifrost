@@ -725,6 +725,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryTopologyEdge>,
     },
+    BuildConfiguration {
+        #[serde(flatten)]
+        value: Box<CodeQueryBuildConfiguration>,
+    },
     CrossDomain {
         #[serde(flatten)]
         value: Box<CodeQueryCrossDomain>,

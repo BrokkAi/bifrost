@@ -202,7 +202,7 @@ pub(super) fn query_memo_value<K: Clone + Eq + std::hash::Hash, V>(
 /// A shared replay wrapper for the inputs of mutable request state. These
 /// requests can be restored by successive captures, so capture scoping alone
 /// cannot certify their hits.
-pub(crate) type QueryMemoReads = crate::analyzer::workspace_authority::ReplayingMemo<
+pub type QueryMemoReads = crate::analyzer::workspace_authority::ReplayingMemo<
     Option<
         std::sync::Arc<
             crate::analyzer::workspace_authority::ReplayingMemoEntry<(), crate::analyzer::ReadKey>,
@@ -210,7 +210,7 @@ pub(crate) type QueryMemoReads = crate::analyzer::workspace_authority::Replaying
     >,
 >;
 
-pub(crate) fn capture_memo_reads<T>(
+pub fn capture_memo_reads<T>(
     analyzer: &dyn crate::analyzer::IAnalyzer,
     build: impl FnOnce() -> T,
 ) -> (T, QueryMemoReads) {
@@ -231,7 +231,7 @@ pub(crate) fn capture_memo_reads<T>(
     (value.expect("request builder ran"), reads)
 }
 
-pub(crate) fn replay_memo_reads(reads: &QueryMemoReads, analyzer: &dyn crate::analyzer::IAnalyzer) {
+pub fn replay_memo_reads(reads: &QueryMemoReads, analyzer: &dyn crate::analyzer::IAnalyzer) {
     reads
         .read(
             &crate::analyzer::workspace_authority::memo_attribution(analyzer),

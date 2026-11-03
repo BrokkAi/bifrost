@@ -123,10 +123,10 @@ fn report_open(
     diagnostics.push(diagnostic);
 }
 
-pub(super) fn loop_relation_expansions(
-    workspace: &WorkspaceAnalyzer,
+pub(super) fn loop_relation_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut semantic::SemanticQueryContext<'_>,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,

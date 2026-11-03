@@ -153,6 +153,7 @@ pub enum GoOuterTypeShape {
         syntax_kind: String,
         syntax: GoSourceTypeNode,
         declaration_chain: Vec<GoSourceAnchor>,
+        generic: bool,
     },
     Unknown {
         reason: GoDeclaredTypeUnknown,
@@ -166,6 +167,9 @@ pub enum GoDeclaredTypeShape {
     Struct {
         fields: Vec<GoStructFieldIdentity>,
         declaration_chain: Vec<GoSourceAnchor>,
+        /// The exact declaration or its resolved package-local chain has
+        /// formal type parameters or an applied generic type.
+        generic: bool,
     },
     Function(GoFunctionTypeShape),
     Other {
@@ -1174,6 +1178,7 @@ fn resolve_outer_type_shape(
     let mut file = file;
     let mut chain = chain;
     let mut visited = HashSet::new();
+    let mut generic = false;
     loop {
         if let Err(reason) = shape_step(remaining, cancellation) {
             return GoOuterTypeShape::Unknown {
@@ -1182,7 +1187,11 @@ fn resolve_outer_type_shape(
                 declaration_chain: chain,
             };
         }
+        generic |= node
+            .parent()
+            .is_some_and(|parent| parent.child_by_field_name("type_parameters").is_some());
         if node.kind() == "generic_type" {
+            generic = true;
             let Some(base) = node.child_by_field_name("type") else {
                 return GoOuterTypeShape::Unknown {
                     reason: GoDeclaredTypeUnknown::InvalidAstShape,
@@ -1206,6 +1215,7 @@ fn resolve_outer_type_shape(
                     syntax_kind: "type_parameter".to_owned(),
                     syntax: type_node_location(file, node),
                     declaration_chain: chain,
+                    generic: true,
                 };
             }
             if !visited.insert(name.clone()) {
@@ -1254,6 +1264,7 @@ fn resolve_outer_type_shape(
             syntax_kind: node.kind().to_owned(),
             syntax: type_node_location(file, node),
             declaration_chain: chain,
+            generic,
         };
     }
 }
@@ -1459,6 +1470,7 @@ fn resolve_declared_type_shape(
             syntax_kind,
             syntax,
             declaration_chain,
+            generic,
         } if syntax_kind == "struct_type" => {
             let final_owner = declaration_chain
                 .last()
@@ -1499,6 +1511,7 @@ fn resolve_declared_type_shape(
                 Ok(fields) => GoDeclaredTypeShape::Struct {
                     fields,
                     declaration_chain,
+                    generic,
                 },
                 Err(reason) => GoDeclaredTypeShape::Unknown {
                     reason,
@@ -1511,6 +1524,7 @@ fn resolve_declared_type_shape(
             syntax_kind,
             syntax,
             declaration_chain,
+            generic: _,
         } => GoDeclaredTypeShape::Other {
             syntax_kind,
             syntax,
@@ -1801,7 +1815,7 @@ mod tests {
 
     #[test]
     fn generic_declaration_shape_and_receiver_owner_are_exact() {
-        let source = "package pkg\ntype Cache[K comparable, V any] struct { Key K; Value V }\ntype Contract[T any] interface { Accept(value T) }\ntype Handler[T any] struct { Contract[T] }\nfunc (c *Cache[Key, Value]) Get() Value { return c.Value }\n";
+        let source = "package pkg\ntype Cache[K comparable, V any] struct { Key K; Value V }\ntype Alias = Cache[int, string]\ntype AliasChain = Alias\ntype Unapplied = Cache\ntype Contract[T any] interface { Accept(value T) }\ntype Handler[T any] struct { Contract[T] }\nfunc (c *Cache[Key, Value]) Get() Value { return c.Value }\n";
         let (_directory, artifact, package) = fixture(source);
         let result = analyze_go_package_source_identities(&artifact, &package, 10_000, None);
         let declaration = result
@@ -1809,13 +1823,35 @@ mod tests {
             .iter()
             .find(|identity| identity.anchor.kind == GoSourceDeclarationKind::Type)
             .expect("generic type declaration");
-        let GoDeclaredTypeShape::Struct { fields, .. } = declaration
+        let GoDeclaredTypeShape::Struct {
+            fields, generic, ..
+        } = declaration
             .declared_type_shape
             .as_ref()
             .expect("generic struct shape")
         else {
             panic!("generic struct remains structured: {declaration:#?}");
         };
+        assert!(*generic);
+        for name in ["Alias", "AliasChain", "Unapplied"] {
+            let alias = result
+                .identities
+                .iter()
+                .find(|identity| {
+                    identity
+                        .name
+                        .as_ref()
+                        .is_some_and(|candidate| candidate.text == name)
+                })
+                .expect("alias declaration");
+            assert!(
+                matches!(
+                    alias.declared_type_shape,
+                    Some(GoDeclaredTypeShape::Struct { generic: true, .. })
+                ),
+                "{name}: {alias:#?}"
+            );
+        }
         assert_eq!(fields.len(), 2);
         assert!(fields.iter().all(|field| matches!(
             field.outer_type_shape,
@@ -1832,13 +1868,16 @@ mod tests {
                         .is_some_and(|name| name.text == "Handler")
             })
             .expect("generic embedding owner");
-        let GoDeclaredTypeShape::Struct { fields, .. } = handler
+        let GoDeclaredTypeShape::Struct {
+            fields, generic, ..
+        } = handler
             .declared_type_shape
             .as_ref()
             .expect("generic embedding struct shape")
         else {
             panic!("generic embedding owner remains structured: {handler:#?}");
         };
+        assert!(*generic);
         assert_eq!(fields.len(), 1);
         assert!(matches!(
             fields[0].outer_type_shape,

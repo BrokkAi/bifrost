@@ -181,6 +181,7 @@ use crate::analyzer::semantic::ValueFlowRelation;
 use crate::analyzer::semantic::ValueFlowRelationKind;
 
 use crate::analyzer::semantic::ValueFlowRelationPayload;
+use crate::analyzer::semantic::oracle::value_flow::CollapseRead;
 
 use crate::analyzer::semantic::ValueFlowSnapshot;
 
@@ -377,6 +378,8 @@ pub struct LocalStoreBases {
     /// Exact backing-store aliases, as (source, target) pairs in source order.
     backing_aliases: Box<[(ValueId, ValueId)]>,
     allocation_results: HashSet<ValueId>,
+    object_allocation_results: HashSet<ValueId>,
+    aggregate_copy_bindings: HashSet<ValueId>,
     array_allocation_results: HashSet<ValueId>,
     slice_allocation_results: HashSet<ValueId>,
     /// Values that own a language binding rather than naming one temporary
@@ -397,8 +400,37 @@ impl LocalStoreBases {
         let mut backing_aliases = Vec::new();
         let mut foreign = HashSet::new();
         let mut escaped = HashSet::new();
+        let mut aggregate_copy_bindings = HashSet::new();
         for point in semantics.points() {
             for (event_index, event) in point.events.iter().enumerate() {
+                let copied_target = match event.effect {
+                    SemanticEffect::Assignment { target, value }
+                        if assignment_transfer(&point.events, event_index, value, target)
+                            .is_some_and(|transfer| {
+                                transfer.kind
+                                    == crate::analyzer::semantic::TransferKind::AggregateCopy
+                            }) =>
+                    {
+                        Some(target)
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Transfer(transfer),
+                        target,
+                        ..
+                    } if transfer.kind
+                        == crate::analyzer::semantic::TransferKind::AggregateCopy =>
+                    {
+                        Some(target)
+                    }
+                    _ => None,
+                };
+                if let Some(target) = copied_target
+                    && semantics
+                        .value(target)
+                        .is_some_and(|row| row.kind == SemanticValueKind::Local)
+                {
+                    aggregate_copy_bindings.insert(target);
+                }
                 if let SemanticEffect::Assignment { target, value } = event.effect
                     && semantics
                         .value(target)
@@ -459,6 +491,14 @@ impl LocalStoreBases {
                     .then_some(allocation.result)
             })
             .collect();
+        let object_allocation_results = semantics
+            .allocations()
+            .iter()
+            .filter_map(|allocation| {
+                (allocation.kind == crate::analyzer::semantic::AllocationKind::Object)
+                    .then_some(allocation.result)
+            })
+            .collect();
         let slice_allocation_results = semantics
             .allocations()
             .iter()
@@ -505,6 +545,8 @@ impl LocalStoreBases {
             forward_copies: forward_copies.into_boxed_slice(),
             backing_aliases: backing_aliases.into_boxed_slice(),
             allocation_results,
+            object_allocation_results,
+            aggregate_copy_bindings,
             array_allocation_results,
             slice_allocation_results,
             binding_values,
@@ -663,6 +705,75 @@ impl LocalStoreBases {
     /// check so a by-value copy is never promoted into alias identity.
     #[doc(hidden)]
     pub fn is_closed_local_array(&self, base: ValueId) -> bool {
+        self.is_closed_local_allocation(base, &self.array_allocation_results)
+    }
+
+    /// A fresh object that remains in one local binding and has no address or
+    /// capture escape. Languages with value aggregate semantics can strongly
+    /// replace one exact field of this object without a workspace heap read.
+    #[doc(hidden)]
+    pub fn is_closed_local_object(&self, base: ValueId) -> bool {
+        self.is_closed_local_allocation(base, &self.object_allocation_results)
+    }
+
+    /// An aggregate-copy transfer gives a local binding its own member
+    /// storage. It remains private only while no address or capture of that
+    /// binding (or an identity-preserving local copy) escapes.
+    #[doc(hidden)]
+    pub fn is_closed_local_aggregate_copy_binding(&self, base: ValueId) -> bool {
+        let mut sources = vec![base];
+        let mut visited = HashSet::new();
+        let mut roots = HashSet::new();
+        while let Some(value) = sources.pop() {
+            if !visited.insert(value) || self.foreign.contains(&value) {
+                return false;
+            }
+            if self.aggregate_copy_bindings.contains(&value) {
+                roots.insert(value);
+                continue;
+            }
+            if self.binding_values.contains(&value) {
+                return false;
+            }
+            let start = self.copies.partition_point(|(target, _)| *target < value);
+            let copied = self.copies[start..]
+                .iter()
+                .take_while(|(target, _)| *target == value);
+            let mut any = false;
+            for (_, source) in copied {
+                any = true;
+                sources.push(*source);
+            }
+            if !any {
+                return false;
+            }
+        }
+        if roots.len() != 1 {
+            return false;
+        }
+        let mut pending = roots.into_iter().collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        while let Some(value) = pending.pop() {
+            if !seen.insert(value) {
+                continue;
+            }
+            if self.escaped.contains(&value) {
+                return false;
+            }
+            let start = self
+                .forward_copies
+                .partition_point(|(source, _)| *source < value);
+            pending.extend(
+                self.forward_copies[start..]
+                    .iter()
+                    .take_while(|(source, _)| *source == value)
+                    .map(|(_, target)| *target),
+            );
+        }
+        true
+    }
+
+    fn is_closed_local_allocation(&self, base: ValueId, allowed: &HashSet<ValueId>) -> bool {
         let mut pending = vec![base];
         let mut seen = HashSet::new();
         let mut roots = HashSet::new();
@@ -674,7 +785,7 @@ impl LocalStoreBases {
                 return false;
             }
             if self.allocation_results.contains(&value) {
-                if !self.array_allocation_results.contains(&value) {
+                if !allowed.contains(&value) {
                     return false;
                 }
                 roots.insert(value);
@@ -3442,6 +3553,7 @@ pub enum StrongUpdateStop {
     Provider(SemanticProviderError),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_flow_snapshot(
     procedure: &ProcedureHandle,
     context: &OracleCallContext,
@@ -3449,6 +3561,7 @@ fn materialize_flow_snapshot(
     coverage: CandidateCoverage,
     limits: crate::analyzer::semantic::OracleLimits,
     discharged_gaps: Vec<crate::analyzer::semantic::SemanticGapId>,
+    unproven_go_builtin_assumptions: bool,
     member_receivers: Vec<crate::analyzer::semantic::MemberReceiverFlow>,
 ) -> Result<ValueFlowSnapshot, SemanticProviderError> {
     let records = drafts
@@ -3509,6 +3622,7 @@ fn materialize_flow_snapshot(
         discharged_gaps,
         member_receivers,
     )
+    .map(|snapshot| snapshot.with_unproven_go_builtin_assumptions(unproven_go_builtin_assumptions))
     .map_err(|error| internal_contract("invalid value-flow snapshot", error))
 }
 
@@ -4017,6 +4131,8 @@ pub trait RelationProjectionHost {
 pub struct GapSweep {
     #[doc(hidden)]
     pub open: bool,
+    /// Whether a recorded Go builtin assumption survived the package proof.
+    pub unproven_go_builtin_assumptions: bool,
     #[doc(hidden)]
     pub relevant_gaps: Vec<SemanticGapId>,
     pub(crate) gap_quality: Option<GapOutcomeQuality>,
@@ -4025,6 +4141,30 @@ pub struct GapSweep {
     pub interrupted: Option<Interruption>,
     /// The per-procedure store bases the sweep derived, if any store asked.
     pub(crate) store_bases: Option<LocalStoreBases>,
+}
+
+/// The query-time proof shared by snapshot projection and openness sweeps.
+/// The host owns the workspace read; its bounded lookup charges work and
+/// observes cancellation through the supplied stager and token.
+fn unproven_go_builtin_assumptions(
+    host: &dyn RelationProjectionHost,
+    procedure: &ProcedureHandle,
+    limit: usize,
+    staged: &mut WorkStager,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<bool, Interruption> {
+    let mut open = false;
+    for builtin in procedure
+        .artifact()
+        .go_predeclared_builtin_assumptions()
+        .iter()
+        .copied()
+    {
+        if !host.go_builtin_scope_absent(procedure, builtin, limit, staged, cancellation)? {
+            open = true;
+        }
+    }
+    Ok(open)
 }
 
 /// The gap sweep of the relation projection. Every gap that
@@ -4047,29 +4187,22 @@ pub fn sweep_procedure_gaps(
     let mut gap_quality = None;
     let mut discharged_gaps = Vec::new();
     let mut interrupted = None;
-    for builtin in procedure
-        .artifact()
-        .go_predeclared_builtin_assumptions()
-        .iter()
-        .copied()
-    {
-        match host.go_builtin_scope_absent(
-            procedure,
-            builtin,
-            limits.dispatch_targets(),
-            staged,
-            request.cancellation,
-        ) {
-            Ok(false) => {
-                open = true;
-                gap_quality = Some(GapOutcomeQuality::Unknown);
-            }
-            Ok(true) => {}
-            Err(stop) => {
-                interrupted = Some(stop);
-                break;
-            }
+    let unproven_go_builtin_assumptions = match unproven_go_builtin_assumptions(
+        host,
+        procedure,
+        limits.dispatch_targets(),
+        staged,
+        request.cancellation,
+    ) {
+        Ok(open) => open,
+        Err(stop) => {
+            interrupted = Some(stop);
+            true
         }
+    };
+    if unproven_go_builtin_assumptions {
+        open = true;
+        gap_quality = Some(GapOutcomeQuality::Unknown);
     }
     if interrupted.is_none() {
         let abort_user_code = abort_paths_run_user_code(procedure.semantics());
@@ -4147,6 +4280,7 @@ pub fn sweep_procedure_gaps(
     }
     Ok(GapSweep {
         open,
+        unproven_go_builtin_assumptions,
         relevant_gaps,
         gap_quality,
         discharged_gaps,
@@ -4231,6 +4365,10 @@ pub fn project_procedure_relations(
     // can see this sweep's own judgment instead of re-deriving (or
     // failing to re-derive) it. See `ValueFlowSnapshot::gap_is_discharged`.
     let mut discharged_gaps = Vec::new();
+    let mut unproven_go_builtin_assumptions = !procedure
+        .artifact()
+        .go_predeclared_builtin_assumptions()
+        .is_empty();
     if interrupted.is_none() {
         let sweep = sweep_procedure_gaps(
             host,
@@ -4245,6 +4383,7 @@ pub fn project_procedure_relations(
         open |= sweep.open;
         gap_quality = sweep.gap_quality;
         discharged_gaps = sweep.discharged_gaps;
+        unproven_go_builtin_assumptions = sweep.unproven_go_builtin_assumptions;
         interrupted = sweep.interrupted;
     }
 
@@ -5151,6 +5290,7 @@ pub fn project_procedure_relations(
                     transfer,
                     source,
                     target,
+                    collapse_read: None,
                     proof: proof.clone(),
                     completeness: completeness.clone(),
                     strong_update,
@@ -5189,6 +5329,7 @@ pub fn project_procedure_relations(
                         transfer: None,
                         source: derived.source,
                         target: derived.target,
+                        collapse_read: None,
                         proof: derived_proof,
                         completeness: derived_completeness,
                         // Supplemental summaries and alternative candidates join;
@@ -5226,7 +5367,7 @@ pub fn project_procedure_relations(
             }
             let mut visited_values = HashSet::new();
             let mut choice_index = 0usize;
-            let (root, prefix, summarized) = match walk_value_origin(
+            let (root, prefix, summarized, collapse_read) = match walk_value_origin(
                 &load_origins,
                 read.value,
                 &mut visited_values,
@@ -5242,6 +5383,7 @@ pub fn project_procedure_relations(
                     AccessPathRoot::Value(value_handle(procedure, value)?),
                     Vec::new(),
                     summarized || offset != Some(0),
+                    Some(CollapseRead::Root),
                 ),
                 ValueOriginWalk::Port {
                     kind,
@@ -5255,6 +5397,7 @@ pub fn project_procedure_relations(
                     ),
                     Vec::new(),
                     summarized || offset != Some(0),
+                    None,
                 ),
                 ValueOriginWalk::Allocation {
                     allocation,
@@ -5268,6 +5411,7 @@ pub fn project_procedure_relations(
                     ),
                     Vec::new(),
                     summarized || offset != Some(0),
+                    None,
                 ),
                 ValueOriginWalk::Load { location, .. } => {
                     // The whole value was loaded out of memory, so the
@@ -5296,6 +5440,9 @@ pub fn project_procedure_relations(
                                 location.path().root().clone(),
                                 location.path().selectors().to_vec(),
                                 summary,
+                                Some(CollapseRead::Load(
+                                    location.path().selectors().to_vec().into_boxed_slice(),
+                                )),
                             )
                         }
                         AccessPathResolution::Interrupted(stop) => {
@@ -5417,6 +5564,9 @@ pub fn project_procedure_relations(
                         transfer: None,
                         source: ValueFlowEndpoint::Location(Box::new(element.location.clone())),
                         target,
+                        collapse_read: (kind == ValueFlowRelationKind::ContainerCollapse)
+                            .then(|| collapse_read.clone())
+                            .flatten(),
                         proof,
                         completeness,
                         // Reading a member never overwrites it.
@@ -5575,6 +5725,7 @@ pub fn project_procedure_relations(
                     transfer: None,
                     source: transfer.source,
                     target: transfer.target,
+                    collapse_read: None,
                     proof: transfer.proof,
                     completeness: transfer.completeness,
                     strong_update: false,
@@ -5607,6 +5758,7 @@ pub fn project_procedure_relations(
         coverage,
         limits,
         discharged_gaps,
+        unproven_go_builtin_assumptions,
         member_receivers,
     )?;
     if interrupted.is_none() && request.cancellation.is_cancelled() {

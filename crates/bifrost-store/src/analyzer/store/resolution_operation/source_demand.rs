@@ -323,7 +323,10 @@ fn root_source_sets_in_mounts(
                         })
                         .push(request);
                 }
-                for (identity, path) in base.hydrate_candidate_paths(&identities, cancellation)? {
+                for (identity, row) in
+                    base.hydrate_candidate_paths_with_origin(&identities, cancellation)?
+                {
+                    let path = row.path;
                     let request_owners = owners
                         .get(&identity)
                         .expect("hydrated candidate came from this reverse page");
@@ -341,6 +344,7 @@ fn root_source_sets_in_mounts(
                         else {
                             continue;
                         };
+                        let half = half.with_source_origin(row.origin);
                         let candidate = match &half {
                             SelectedRootPathHalf::Import { token, demand, .. }
                             | SelectedRootPathHalf::Reference { token, demand, .. } => {

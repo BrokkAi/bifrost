@@ -8,6 +8,7 @@ pub use brokk_bifrost_analysis::analyzer;
 pub use brokk_bifrost_analysis::path_utils;
 pub use brokk_bifrost_core::{cancellation, hash, text_utils};
 
+pub mod composition;
 pub mod dataflow;
 pub mod detached_task;
 pub mod flow_state;

@@ -567,7 +567,8 @@ unless the summary states no transfer at all.
 | Receivers | Trait objects, generic receivers, user `Deref` wrappers, unannotated bindings of an external call's result | Incomplete: no exact receiver type |
 | Value construction | `+` on `String` and `&str`; a source bound to a `&mut local` argument reaches the local; `let` bindings and wildcard `let` temporaries | Complete |
 | Value construction | `format!` and other macros, `String::push_str` and builders, closures, `async` blocks, `?`, `match`/`if let` destructuring that may drop owned values | Incomplete: macros and closures are not lowered, and these drops are outside the inert-drop proof |
-| Drops of external values | `let _ = client.execute(..)` where the result's type comes from an external crate | Incomplete: needs a drop-glue fact in the declaration schema (follow-up to the in-code std table) |
+| Drops of external values | An owned parameter or `let` binding, including `let _ = client.execute(..)`, whose type is declared by an activated model with `value_semantics.drop_glue: inert` and whose type arguments are covered | Complete |
+| Drops of external values | The same positions when the model declares no `drop_glue` for the type, or the type has no model | Incomplete: the scope exit may run user drop code |
 | Framework sources | Axum and Actix extractors (`Query<T>`, `Path<T>`, `Json<T>`), handler parameters as entry points, `http::HeaderMap::get` | Incomplete: no reviewed model |
 | Shipped policy | A general Rust request-to-SQL policy | Not shipped: author sources and sinks with `resolved-call` selectors that name the reviewed identity, such as `(call-argument :formal-index 0 (resolved-call :resolves-to "postgres.Client.execute" :proof declared ...))` |
 
@@ -1153,7 +1154,7 @@ bifrost --root . \
 MCP `run_policy` accepts the same policy file in `policy_files` and resolves
 the imported path relative to the workspace root. Editors run policies through
 the separate `bifrost-lsp` program, which sends a `bifrost/runPolicy` request;
-see [LSP Server](/lsp/). A second policy can import the same document;
+see [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md). A second policy can import the same document;
 each policy retains its own finding identity while the report records the
 shared document's source, entry identities, and semantic hash; the resolved
 entries retain their analysis projection hashes and endpoint-set provenance.
@@ -4296,7 +4297,7 @@ artifacts to preserve.
 The Bifrost VS Code extension associates `.rqlp` files with the **Bifrost RQL
 Policy** language. Diagnostics, hover, and the **Run RQL Policy** action need a
 running language server. The language server is the separate `bifrost-lsp`
-program, not the `bifrost` binary. See [LSP Server](/lsp/) for the versions
+program, not the `bifrost` binary. See [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md) for the versions
 that serve it.
 
 **Run RQL Policy** sends the current text, including unsaved edits, and
@@ -4304,4 +4305,4 @@ today's UTC date as the evaluation date. It does not name a suppression file.
 Active findings appear under **Bifrost Policy Results**. Suppressed findings
 move to its suppression audit. Policy findings never appear in **Bifrost Query
 Results**. When the date or the suppression file must be fixed, run the policy
-from the CLI. See [RQL in VS Code](/rql-vscode/).
+from the CLI. See [RQL in VS Code](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/rql-vscode.md).

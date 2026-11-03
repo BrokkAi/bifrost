@@ -197,6 +197,20 @@ LEFT JOIN main.rust_resolution_unit_summary_file_naming AS naming
  AND naming.member_ordinal = members.member_ordinal
 "#;
 
+/// Which Cargo manifest's targets compile each selected Rust source file
+/// (#9055). A detached unit, for a file no Cargo target reaches, has no
+/// manifest, so its row carries NULL. A Cargo target the inventory cannot
+/// enumerate has no unit, so its files appear only in detached units. One row
+/// per (member, unit); the reader groups them by file.
+pub(crate) const CARGO_FILE_OWNER_ROWS_SQL: &str = r#"
+SELECT members.rel_path, manifest.rel_path
+FROM selected_rust_unit_members AS members
+CROSS JOIN temp.selected_rust_unit_summaries AS units
+  ON units.summary_id = members.summary_id
+LEFT JOIN main.workspace_file_versions AS manifest
+  ON manifest.file_version_id = units.manifest_file_version_id
+"#;
+
 pub(crate) const CARGO_ROUTE_ROWS_SQL: &str = r#"
 WITH selected_units AS (
   SELECT versions.workspace_id, versions.generation, selected.revision,
@@ -660,6 +674,17 @@ pub struct RustSummaryPackageRow {
     pub blob_oid: String,
     #[doc(hidden)]
     pub is_root_member: bool,
+}
+
+/// One selected Rust source file in one unit, and the manifest of that unit's
+/// Cargo target; `None` for a detached unit.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct RustCargoFileOwnerRow {
+    #[doc(hidden)]
+    pub rel_path: String,
+    #[doc(hidden)]
+    pub manifest_rel_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -4452,6 +4477,30 @@ impl AnalyzerStore {
             });
         }
         drop(statement);
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    #[doc(hidden)]
+    pub fn rust_cargo_file_owner_rows(
+        &self,
+        snapshots: &WorkspaceSnapshots,
+    ) -> Result<Vec<RustCargoFileOwnerRow>> {
+        let Some(snapshot) = snapshots.get("rust") else {
+            return Ok(Vec::new());
+        };
+        let mut conn = self.read_conn_for_workspace(snapshots)?;
+        let tx = conn.transaction()?;
+        super::require_current_generation(&tx, "rust", snapshot.generation)?;
+        let rows = tx
+            .prepare_cached(CARGO_FILE_OWNER_ROWS_SQL)?
+            .query_map([], |row| {
+                Ok(RustCargoFileOwnerRow {
+                    rel_path: row.get(0)?,
+                    manifest_rel_path: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         tx.commit()?;
         Ok(rows)
     }

@@ -1603,7 +1603,10 @@ impl SelectedResolutionOperation<'_, '_> {
         candidates: JvmReverseCandidateSet,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
-    ) -> Result<SelectedResolutionOperationOutcome<JvmReverseConfirmed>> {
+    ) -> Result<(
+        SelectedResolutionOperationOutcome<JvmReverseConfirmed>,
+        ConsumedJvmRootPresence,
+    )> {
         // Preserve the JVM public predicate: candidate-stage access and
         // hierarchy gaps also make its legacy inventory projection incomplete.
         let candidate_inventory_complete = candidates.completion == ResolutionCompletion::Complete;
@@ -1633,13 +1636,15 @@ impl SelectedResolutionOperation<'_, '_> {
             cancellation,
             context_metrics,
         )? {
-            return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                cancelled_completion(),
+            return Ok((
+                SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
+                self.drain_consumed_root_presence(),
             ));
         }
         let completion = jvm_reverse_completion(&evidence, cancellation);
         let references = reducer.references;
-        self.ready.finish(
+        let root_reads = self.drain_consumed_root_presence();
+        let result = self.ready.finish(
             JvmReverseConfirmed {
                 equivalent_targets: candidates.equivalent_targets,
                 target: target_semantic,
@@ -1653,7 +1658,12 @@ impl SelectedResolutionOperation<'_, '_> {
             },
             &completion,
             cancellation,
-        )
+        )?;
+        assert!(
+            self.consumed_root_presence().is_empty(),
+            "JVM reverse finish must not read root presence after export"
+        );
+        Ok((result, root_reads))
     }
 }
 

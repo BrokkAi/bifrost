@@ -162,6 +162,11 @@ impl SolverBudget {
         self.ledger.check(work).map_err(Into::into)
     }
 
+    /// Check a prospective replay without recording a refused charge.
+    pub fn replay_fits(&self, work: SolverWork) -> bool {
+        self.ledger.check_without_recording(work).is_ok()
+    }
+
     /// Atomically charge work; a failed charge leaves the budget unchanged.
     pub fn charge(&mut self, work: SolverWork) -> Result<(), SolverBudgetExceeded> {
         self.ledger.charge(work).map_err(Into::into)
@@ -279,6 +284,20 @@ impl<'request> DataflowRequest<'request> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#8389: solver replay preflight recorded refused work")]
+    fn replay_fit_does_not_record_a_refusal() {
+        let budget = SolverBudget::uniform(1);
+        let work = SolverWork {
+            interned_facts: 2,
+            ..SolverWork::default()
+        };
+        assert!(!budget.replay_fits(work));
+        assert_eq!(budget.refusal_count(), 0);
+        assert!(budget.check(work).is_err());
+        assert_eq!(budget.refusal_count(), 1);
+    }
 
     #[test]
     fn failed_budget_charge_is_atomic_and_identifies_dimension() {

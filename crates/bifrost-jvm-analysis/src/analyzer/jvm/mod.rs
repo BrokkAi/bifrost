@@ -24,6 +24,7 @@ pub(crate) mod producer_codes;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
 pub(crate) mod scala_collection_contracts;
+pub(crate) mod selected_operation;
 pub(crate) mod toolchains_document;
 pub(crate) mod topology;
 

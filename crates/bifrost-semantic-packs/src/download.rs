@@ -195,7 +195,7 @@ impl Display for OpenPackFallbackKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenPackRuntimeOutcome {
     Selected(Box<OpenPackSelection>),
-    EmbeddedFallback {
+    Unselected {
         kind: OpenPackFallbackKind,
         message: String,
     },
@@ -1434,13 +1434,13 @@ impl PackRequestRun {
 
 /// Select verified open packs for scan and server bootstrap. Public discovery
 /// may use stale verified inventory when the network is unavailable; soft
-/// selection outcomes leave activation on the embedded packs. Explicit-source
+/// selection outcomes leave activation without open packs. Explicit-source
 /// errors remain hard failures.
 pub fn prepare_open_packs_for_runtime(
     engine_profile: &Value,
 ) -> Result<OpenPackRuntimeOutcome, OpenPackError> {
     if env_flag("BIFROST_OPEN_PACKS_DISABLE") {
-        return Ok(OpenPackRuntimeOutcome::EmbeddedFallback {
+        return Ok(OpenPackRuntimeOutcome::Unselected {
             kind: OpenPackFallbackKind::Disabled,
             message: "open-pack acquisition is disabled".to_owned(),
         });
@@ -1856,7 +1856,7 @@ fn runtime_fallback(
         }
         error => return Err(error),
     };
-    Ok(OpenPackRuntimeOutcome::EmbeddedFallback { kind, message })
+    Ok(OpenPackRuntimeOutcome::Unselected { kind, message })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5303,7 +5303,7 @@ mod tests {
         .expect("public network unavailability falls back");
         assert!(matches!(
             cold,
-            OpenPackRuntimeOutcome::EmbeddedFallback {
+            OpenPackRuntimeOutcome::Unselected {
                 kind: OpenPackFallbackKind::NetworkUnavailable,
                 ..
             }
@@ -5322,7 +5322,7 @@ mod tests {
         .expect("offline cache miss falls back");
         assert!(matches!(
             offline,
-            OpenPackRuntimeOutcome::EmbeddedFallback {
+            OpenPackRuntimeOutcome::Unselected {
                 kind: OpenPackFallbackKind::OfflineCacheMiss,
                 ..
             }
@@ -5364,7 +5364,7 @@ mod tests {
                     .expect("inapplicable offline index must not fail startup");
             assert!(matches!(
                 offline,
-                OpenPackRuntimeOutcome::EmbeddedFallback {
+                OpenPackRuntimeOutcome::Unselected {
                     kind: OpenPackFallbackKind::OfflineCacheMiss,
                     ..
                 }
@@ -5377,7 +5377,7 @@ mod tests {
                     .expect("inapplicable online index must rediscover");
             assert!(matches!(
                 online,
-                OpenPackRuntimeOutcome::EmbeddedFallback {
+                OpenPackRuntimeOutcome::Unselected {
                     kind: OpenPackFallbackKind::NoCompatibleRelease,
                     ..
                 }
@@ -5418,7 +5418,7 @@ mod tests {
         .expect("fresh cached absence falls back");
         assert!(matches!(
             fresh,
-            OpenPackRuntimeOutcome::EmbeddedFallback {
+            OpenPackRuntimeOutcome::Unselected {
                 kind: OpenPackFallbackKind::NoCompatibleRelease,
                 ..
             }
@@ -5441,7 +5441,7 @@ mod tests {
         .expect("offline cached absence falls back at any age");
         assert!(matches!(
             offline,
-            OpenPackRuntimeOutcome::EmbeddedFallback {
+            OpenPackRuntimeOutcome::Unselected {
                 kind: OpenPackFallbackKind::NoCompatibleRelease,
                 ..
             }
@@ -5468,7 +5468,7 @@ mod tests {
         .expect("stale inventory is used after discovery outage");
         assert!(matches!(
             outcome,
-            OpenPackRuntimeOutcome::EmbeddedFallback {
+            OpenPackRuntimeOutcome::Unselected {
                 kind: OpenPackFallbackKind::NoCompatibleRelease,
                 ..
             }
@@ -5503,7 +5503,7 @@ mod tests {
                 .expect("default runtime selection falls back");
             assert!(matches!(
                 fallback,
-                OpenPackRuntimeOutcome::EmbeddedFallback { kind, .. } if kind == expected
+                OpenPackRuntimeOutcome::Unselected { kind, .. } if kind == expected
             ));
             let explicit = runtime_fallback(error.clone(), Some(&source))
                 .expect_err("explicit source errors must remain hard");
@@ -6079,9 +6079,9 @@ mod tests {
             false,
             &runtime_transport,
         )
-        .expect("public 403 rate limiting falls back to embedded packs");
-        let OpenPackRuntimeOutcome::EmbeddedFallback { kind, message } = runtime else {
-            panic!("expected embedded fallback, got {runtime:?}");
+        .expect("public 403 rate limiting is a soft runtime outcome");
+        let OpenPackRuntimeOutcome::Unselected { kind, message } = runtime else {
+            panic!("expected an unselected outcome, got {runtime:?}");
         };
         assert_eq!(kind, OpenPackFallbackKind::NetworkUnavailable);
         assert!(message.contains("rate limit"));

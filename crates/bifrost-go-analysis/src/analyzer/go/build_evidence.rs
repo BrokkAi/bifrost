@@ -14,13 +14,11 @@ use brokk_bifrost_go::build_files::{
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
-use brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string;
-
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     DependencyCondition, DependencyEvidence, DependencyEvidenceGap, DependencyEvidenceGapKind,
     DependencyEvidenceKind, DependencyFileEvidence, DependencyFileEvidenceLimits,
+    VersionComparator, parse_version_comparators, version_bounds_admit,
 };
-use brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes;
 
 use brokk_bifrost_analysis::analyzer::topology::DependencyScope;
 
@@ -45,6 +43,10 @@ use brokk_bifrost_analysis::workspace_document::validate_workspace_relative_path
 pub struct GoBuildSnapshot<'a> {
     pub path: &'a Path,
     pub source: &'a str,
+    /// Blob identity of the selected snapshot's original bytes. Rows record
+    /// it as their source digest, which the store checks against the
+    /// retained input it presents.
+    pub oid: git2::Oid,
 }
 
 /// Shared topology identity convention for a Go module's build project.
@@ -209,7 +211,7 @@ pub fn collect_go_build_evidence(
                     snapshot: *snapshot,
                     document,
                     owner,
-                    digest: lower_hex_string(&sha256_bytes(snapshot.source.as_bytes())),
+                    digest: snapshot.oid.to_string(),
                 },
             );
         } else {
@@ -299,7 +301,7 @@ pub fn collect_go_build_evidence(
     integrity.sort_by(|left, right| left.path.cmp(right.path));
     for snapshot in integrity {
         let path = snapshot.path;
-        let digest = lower_hex_string(&sha256_bytes(snapshot.source.as_bytes()));
+        let digest = snapshot.oid.to_string();
         let parent = path.parent().expect("build file has parent");
         let declaration_path = if path.file_name().is_some_and(|name| name == "go.work.sum") {
             parent.join("go.work")
@@ -383,7 +385,7 @@ pub fn collect_go_build_evidence(
                     }
                 }
                 let row = DependencyEvidence {
-                    ecosystem: "go-module".to_owned(),
+                    ecosystem: GO_MODULE_ECOSYSTEM.to_owned(),
                     package,
                     // Until reconciliation, this is a constraint/observation,
                     // not a locked selected graph or installed instance.
@@ -427,7 +429,7 @@ pub fn collect_go_build_evidence(
             }
             for entry in document.entries {
                 let row = DependencyEvidence {
-                    ecosystem: "go-module".to_owned(),
+                    ecosystem: GO_MODULE_ECOSYSTEM.to_owned(),
                     package: entry.module.value.clone(),
                     kind: DependencyEvidenceKind::Checksum,
                     version_requirement: None,
@@ -551,9 +553,9 @@ fn declaration_row(
     };
     Some(DependencyEvidence {
         ecosystem: if package == "go" && source.is_none() {
-            "go-toolchain"
+            GO_TOOLCHAIN_ECOSYSTEM
         } else {
-            "go-module"
+            GO_MODULE_ECOSYSTEM
         }
         .to_owned(),
         package,
@@ -859,30 +861,185 @@ fn select_replacement<'a>(
         .max_by_key(|entry| matches!(&entry.directive, GoDirective::Replace { version: Some(_), .. }))
 }
 
-/// Compare supported exact Go module evidence against a canonical Go version.
-/// Declared minimums, excluded versions, checksums, local replacements and
-/// unvalidated snapshots deliberately return unknown. Use ordering bounds in
-/// the shared policy engine rather than semver VersionReq, whose implicit
-/// prerelease exclusion would lose Go pseudo-versions inside an affected range.
-pub fn go_evidence_version_cmp(
-    evidence: &DependencyEvidence,
-    version: &str,
-) -> Option<std::cmp::Ordering> {
-    if evidence.ecosystem != "go-module"
-        || !evidence.complete
+/// Module dependency rows: `require`, `replace`, `exclude`, `go.sum` and
+/// `vendor/modules.txt` entries.
+pub const GO_MODULE_ECOSYSTEM: &str = "go-module";
+/// Toolchain rows: the `go` and `toolchain` directives of go.mod and go.work.
+pub const GO_TOOLCHAIN_ECOSYSTEM: &str = "go-toolchain";
+
+/// A version in one Go ecosystem's own ordering. A range only ever compares
+/// versions of the ecosystem it was parsed for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoVersion {
+    /// Semantic version precedence; build metadata (`+incompatible`) is
+    /// ignored and pseudo-versions order as the prereleases they are.
+    Module(semver::Version),
+    Toolchain(GoToolchainVersion),
+}
+
+/// A Go release version in `go/version` order: `1.21` (the language
+/// version) < `1.21rc1` < `1.21.0` < `1.21.1`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GoToolchainVersion {
+    major: u64,
+    minor: Option<u64>,
+    patch: Option<u64>,
+    prerelease: Option<(GoPrereleaseKind, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GoPrereleaseKind {
+    Alpha,
+    Beta,
+    Rc,
+}
+
+impl GoVersion {
+    pub fn parse(ecosystem: &str, text: &str) -> Result<Self, String> {
+        match ecosystem {
+            GO_MODULE_ECOSYSTEM => semver::Version::parse(text.strip_prefix('v').unwrap_or(text))
+                .map(Self::Module)
+                .map_err(|error| format!("{text:?} is not a Go module version: {error}")),
+            GO_TOOLCHAIN_ECOSYSTEM => GoToolchainVersion::parse(text).map(Self::Toolchain),
+            _ => unreachable!("{ecosystem} is not a Go version ecosystem"),
+        }
+    }
+}
+
+impl GoToolchainVersion {
+    /// Accepts the `go1.21.0` spelling of a toolchain name as well.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let invalid = || format!("{text:?} is not a Go release version");
+        let number = |part: &str| {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            part.parse::<u64>().map_err(|_| invalid())
+        };
+        let version = text.strip_prefix("go").unwrap_or(text);
+        let mut parts = version.split('.');
+        let major = number(parts.next().expect("split yields one part"))?;
+        let Some(minor) = parts.next() else {
+            return Ok(Self {
+                major,
+                minor: None,
+                patch: None,
+                prerelease: None,
+            });
+        };
+        let patch = parts.next().map(number).transpose()?;
+        if parts.next().is_some() {
+            return Err(invalid());
+        }
+        let prerelease = [
+            ("alpha", GoPrereleaseKind::Alpha),
+            ("beta", GoPrereleaseKind::Beta),
+            ("rc", GoPrereleaseKind::Rc),
+        ]
+        .into_iter()
+        .find_map(|(label, kind)| {
+            minor
+                .split_once(label)
+                .map(|(minor, number)| (minor, kind, number))
+        });
+        let (minor, prerelease) = match prerelease {
+            // Go publishes prereleases only before the first patch release.
+            Some(_) if patch.is_some() => return Err(invalid()),
+            Some((minor, kind, ordinal)) => (minor, Some((kind, number(ordinal)?))),
+            None => (minor, None),
+        };
+        Ok(Self {
+            major,
+            minor: Some(number(minor)?),
+            patch,
+            prerelease,
+        })
+    }
+}
+
+impl Ord for GoVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Module(left), Self::Module(right)) => left.cmp_precedence(right),
+            (Self::Toolchain(left), Self::Toolchain(right)) => left.cmp(right),
+            _ => unreachable!("Go versions of different ecosystems are never compared"),
+        }
+    }
+}
+
+impl PartialOrd for GoVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// An authored affected-version range for one Go ecosystem: `||`-joined
+/// alternatives of whitespace-joined comparators (`>=1.24.0 <1.24.4`).
+/// Semver's VersionReq is deliberately not used: its implicit prerelease
+/// exclusion would lose Go pseudo-versions inside an affected range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoVersionRange {
+    ecosystem: &'static str,
+    alternatives: Vec<Vec<(VersionComparator, GoVersion)>>,
+}
+
+impl GoVersionRange {
+    pub fn parse(ecosystem: &str, text: &str) -> Result<Self, String> {
+        let ecosystem = match ecosystem {
+            GO_MODULE_ECOSYSTEM => GO_MODULE_ECOSYSTEM,
+            GO_TOOLCHAIN_ECOSYSTEM => GO_TOOLCHAIN_ECOSYSTEM,
+            _ => unreachable!("{ecosystem} is not a Go version ecosystem"),
+        };
+        let alternatives = text
+            .split("||")
+            .map(|alternative| {
+                let bounds = parse_version_comparators(alternative, |version| {
+                    GoVersion::parse(ecosystem, version)
+                })?;
+                if bounds.is_empty() {
+                    return Err("an empty Go version range alternative".to_owned());
+                }
+                Ok(bounds)
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Self {
+            ecosystem,
+            alternatives,
+        })
+    }
+}
+
+/// Whether one complete locked or installed row of the range's ecosystem has
+/// an exact version in `range`. Declared minimums (`go`, `toolchain`,
+/// `require`), constraints, checksums, replaced or excluded sources and
+/// unvalidated vendor snapshots have no exact selected version and stay
+/// unknown, so a minimum is never mistaken for the toolchain that builds.
+pub fn go_dependency_version_matches(
+    row: &DependencyEvidence,
+    range: &GoVersionRange,
+) -> Result<Option<bool>, String> {
+    if row.ecosystem != range.ecosystem
+        || !row.complete
         || !matches!(
-            evidence.kind,
+            row.kind,
             DependencyEvidenceKind::Locked | DependencyEvidenceKind::Installed
         )
-        || evidence.source.as_deref()?.strip_prefix("module:")? != evidence.package
+        || (row.ecosystem == GO_MODULE_ECOSYSTEM
+            && row
+                .source
+                .as_deref()
+                .and_then(|source| source.strip_prefix("module:"))
+                != Some(row.package.as_str()))
     {
-        return None;
+        return Ok(None);
     }
-    let exact =
-        semver::Version::parse(evidence.exact_version.as_deref()?.strip_prefix('v')?).ok()?;
-    let bound = semver::Version::parse(version.strip_prefix('v')?).ok()?;
-    // Build metadata (+incompatible) does not alter Go version precedence.
-    Some(exact.cmp_precedence(&bound))
+    row.exact_version
+        .as_deref()
+        .map(|version| {
+            GoVersion::parse(range.ecosystem, version)
+                .map(|version| version_bounds_admit(&range.alternatives, &version))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -896,6 +1053,7 @@ mod tests {
             .map(|(path, source)| GoBuildSnapshot {
                 path: Path::new(path),
                 source,
+                oid: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap(),
             })
             .collect();
         collect_go_build_evidence(&snapshots, &DependencyFileEvidenceLimits::default(), None)

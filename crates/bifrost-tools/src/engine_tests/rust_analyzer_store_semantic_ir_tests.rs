@@ -796,8 +796,17 @@ pub(crate) mod rust_departing_root_tests {
     /// equal to the computed value.
     #[test]
     pub(crate) fn partial_flows_round_trip_through_rows() {
-        let source = "pub struct Holder {\n    field: u32,\n}\n\nimpl Holder {\n    pub fn store(&mut self, value: u32) {\n        self.field = value;\n    }\n}\n\npub fn identity(value: u32) -> u32 {\n    value\n}\n\npub fn forward(value: u32) {\n    sink(value);\n}\n\nfn sink(_value: u32) {}\n\npub fn capture(value: u32) -> impl Fn() -> u32 {\n    move || value\n}\n\npub fn around(value: u32) -> u32 {\n    sink(0);\n    value\n}\n\npub fn dynamic_index(values: &[u32], index: usize) -> u32 {\n    values[index]\n}\n";
+        let source = "pub struct Holder {\n    field: u32,\n}\n\nimpl Holder {\n    pub fn store(&mut self, value: u32) {\n        self.field = value;\n    }\n}\n\npub fn identity(value: u32) -> u32 {\n    value\n}\n\npub fn forward(value: u32) {\n    sink(value);\n}\n\nfn sink(_value: u32) {}\n\npub fn capture(value: u32) -> impl Fn() -> u32 {\n    move || value\n}\n\npub fn around(value: u32) -> u32 {\n    sink(0);\n    value\n}\n\npub fn dynamic_index(values: &[u32], index: usize) -> u32 {\n    values[index]\n}\n\npub struct Pair { value: u32 }\npub fn mixed(flag: bool, value: u32, original: Pair) -> Pair {\n    if flag { return Pair { value }; }\n    original\n}\n";
         let (file, parts, flows) = partial_flows_of(source);
+        let mixed = parts
+            .iter()
+            .position(|part| part.locator.declaration().last_segment_name() == Some("mixed"))
+            .expect("mixed return procedure");
+        assert!(
+            !flows[mixed].relations_complete && !flows[mixed].flows.is_empty(),
+            "a positive member relation in one return arm cannot close another: {:#?}",
+            flows[mixed]
+        );
         assert!(
             flows.iter().any(|procedure| !procedure.flows.is_empty()),
             "the fixture has at least one partial flow to round-trip"

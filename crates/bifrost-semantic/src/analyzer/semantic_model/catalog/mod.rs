@@ -88,8 +88,6 @@ use crate::analyzer::semantic_model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS;
 
 use crate::analyzer::semantic_model::decode_manifest;
 
-use crate::analyzer::semantic_model::decode_validated_shard_for_manifest;
-
 use crate::analyzer::semantic_model::validate_manifest_inventory;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -248,7 +246,7 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 // #8523: brokk-tree-sitter-kotlin 0.4.7 parses empty collection literals, so
 // Kotlin source-jar productions change for unchanged artifacts.
 // #8591: re-produce Kotlin source jars with context-parameter function types.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 76;
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 78;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -1092,7 +1090,8 @@ pub struct DecodedManifestMemo {
 pub const DECODED_MANIFEST_MEMO_BYTES: usize = 32 * 1024 * 1024;
 
 // Increment when artifact semantic validation or normalization changes. A
-// certificate proves those checks for exact bytes under exact decode limits;
+// certificate proves those checks for exact bytes when measured admission
+// thresholds fit the reader's limits;
 // it never replaces the stored/content digest checks on each load.
 // 7: callable families may be complete when their final declaration formal is
 // variadic, and schema-14 summary formal shapes receive directional validation.
@@ -1129,10 +1128,10 @@ pub const SHARED_PRODUCTION_PRESENT_SQL: &str = "SELECT EXISTS(
     SELECT 1 FROM catalog_verified_generated_productions WHERE production_digest = ?1)";
 
 #[doc(hidden)]
-pub const CERTIFIED_SHARD_SQL: &str = "SELECT EXISTS(
-    SELECT 1 FROM catalog_shard_validations
+pub const CERTIFIED_SHARD_SQL: &str = "SELECT max_text_bytes, max_depth
+    FROM catalog_shard_validations
     WHERE manifest_digest = ?1 AND shard_id = ?2
-      AND validation_version = ?3 AND limits_sha256 = ?4)";
+      AND validation_version = ?3";
 
 #[doc(hidden)]
 pub const CALLABLE_VALUES_RETURNED_SQL: &str = "SELECT fact.fact_ordinal,
@@ -1199,14 +1198,19 @@ pub fn record_shard_validation(
     connection: &Connection,
     manifest: &str,
     shard: &str,
-    limits: &str,
+    census: crate::analyzer::semantic_model::validate::ValidationCensus,
 ) -> Result<(), CatalogError> {
+    let text = i64::try_from(census.max_text_bytes).map_err(|_| {
+        CatalogError::Integrity("validated text length exceeds SQLite INTEGER".into())
+    })?;
+    let depth = i64::try_from(census.max_depth)
+        .map_err(|_| CatalogError::Integrity("validated depth exceeds SQLite INTEGER".into()))?;
     connection
         .execute(
             "INSERT OR IGNORE INTO catalog_shard_validations
-         (manifest_digest, shard_id, validation_version, limits_sha256)
-         VALUES (?1, ?2, ?3, ?4)",
-            params![manifest, shard, SHARD_VALIDATION_VERSION, limits],
+         (manifest_digest, shard_id, validation_version, max_text_bytes, max_depth)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![manifest, shard, SHARD_VALIDATION_VERSION, text, depth],
         )
         .map_err(|error| CatalogError::sqlite("record shard validation", error))?;
     Ok(())
@@ -1244,6 +1248,8 @@ pub struct ValidatedShard {
     #[doc(hidden)]
     /// Decoded facts live through publication, never in the session registry.
     pub decoded: CompiledShard,
+    #[doc(hidden)]
+    pub census: crate::analyzer::semantic_model::validate::ValidationCensus,
 }
 
 #[doc(hidden)]
@@ -1479,8 +1485,24 @@ pub fn validate_pack(
     pack: &CompiledSemanticModelPack,
     limits: &DecodeLimits,
 ) -> Result<ValidatedPack, CatalogError> {
-    let manifest = decode_manifest(&pack.manifest_bytes, limits)
-        .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+    validate_pack_with_census(pack, limits).map(|(validated, _)| validated)
+}
+
+pub fn validate_pack_with_census(
+    pack: &CompiledSemanticModelPack,
+    limits: &DecodeLimits,
+) -> Result<
+    (
+        ValidatedPack,
+        crate::analyzer::semantic_model::validate::ValidationCensus,
+    ),
+    CatalogError,
+> {
+    let (manifest, _) = crate::analyzer::semantic_model::artifact::decode_manifest_with_census(
+        &pack.manifest_bytes,
+        limits,
+    )
+    .map_err(|error| CatalogError::Artifact(error.to_string()))?;
     if manifest != pack.manifest {
         return Err(CatalogError::Integrity(
             "compiled pack manifest value does not match its bytes".to_owned(),
@@ -1496,6 +1518,7 @@ pub fn validate_pack(
     validate_manifest_inventory(&manifest)
         .map_err(|error| CatalogError::Artifact(error.to_string()))?;
 
+    let mut census = crate::analyzer::semantic_model::validate::ValidationCensus::default();
     let mut shards = Vec::with_capacity(pack.shards.len());
     let mut matched = HashSet::with_capacity(pack.shards.len());
     for descriptor in &manifest.shards {
@@ -1515,9 +1538,10 @@ pub fn validate_pack(
                 descriptor.shard_id
             )));
         }
-        let decoded =
-            decode_validated_shard_for_manifest(&manifest, descriptor, &artifact.bytes, limits)
+        let (decoded, shard_census) =
+            crate::analyzer::semantic_model::artifact::decode_validated_shard_for_manifest_with_census(&manifest, descriptor, &artifact.bytes, limits)
                 .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        census.merge(shard_census);
         let selectors = decoded.activation.clone();
         let mut diagnostics = Vec::new();
         if let Some(summaries) = decoded.payload().procedure_summaries() {
@@ -1552,6 +1576,7 @@ pub fn validate_pack(
             bytes: artifact.bytes.clone(),
             selectors,
             decoded,
+            census: shard_census,
         });
     }
     if manifest.language == "python" {
@@ -1567,7 +1592,7 @@ pub fn validate_pack(
             )));
         }
     }
-    Ok(ValidatedPack { manifest, shards })
+    Ok((ValidatedPack { manifest, shards }, census))
 }
 
 #[doc(hidden)]
@@ -3660,6 +3685,89 @@ mod extraction_storage_tests {
         ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
         compile_pack, decode_manifest,
     };
+
+    #[test]
+    fn shard_validation_census_matches_independent_cap_refusals() {
+        let source = include_bytes!("../../../../tests/fixtures/extraction-contract.json");
+        let mut pack: AuthoredSemanticModelPack = serde_json::from_slice(source).unwrap();
+        pack.schema_version = 19;
+        pack.compatibility.bifrost = None;
+        let plain = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let (_, plain_census) =
+            crate::analyzer::semantic_model::artifact::decode_shard_with_census(
+                &plain.shards[0].descriptor,
+                &plain.shards[0].bytes,
+                &DecodeLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(plain_census.max_depth, 0);
+        crate::analyzer::semantic_model::artifact::decode_shard(
+            &plain.shards[0].descriptor,
+            &plain.shards[0].bytes,
+            &DecodeLimits {
+                max_depth: 0,
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap();
+        let crate::analyzer::semantic_model::model::AuthoredPayload::DeclarationFacts {
+            types, ..
+        } = &mut pack.shards[0].payload
+        else {
+            panic!("fixture has declaration facts");
+        };
+        types[0]
+            .hierarchy
+            .push(crate::analyzer::semantic_model::model::HierarchyFact {
+                hierarchy_kind: crate::analyzer::semantic_model::model::HierarchyKind::Extends,
+                target: crate::analyzer::semantic_model::model::TypeRef::Named {
+                    name: "java.lang.Object".into(),
+                    arguments: vec![],
+                    nullable: false,
+                },
+                declaration_ordinal: None,
+            });
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        assert!(!compiled.shards.is_empty());
+        let limits = DecodeLimits::default();
+        let descriptor = &compiled.shards[0].descriptor;
+        let bytes = &compiled.shards[0].bytes;
+        let (_, census) = crate::analyzer::semantic_model::artifact::decode_shard_with_census(
+            descriptor, bytes, &limits,
+        )
+        .unwrap();
+        assert!(census.max_text_bytes > 0);
+        assert!(census.max_depth > 0);
+
+        let exact = DecodeLimits {
+            max_text_bytes: census.max_text_bytes,
+            max_depth: census.max_depth,
+            ..limits
+        };
+        crate::analyzer::semantic_model::artifact::decode_shard(descriptor, bytes, &exact).unwrap();
+        assert!(
+            crate::analyzer::semantic_model::artifact::decode_shard(
+                descriptor,
+                bytes,
+                &DecodeLimits {
+                    max_text_bytes: census.max_text_bytes - 1,
+                    ..exact
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            crate::analyzer::semantic_model::artifact::decode_shard(
+                descriptor,
+                bytes,
+                &DecodeLimits {
+                    max_depth: census.max_depth - 1,
+                    ..exact
+                }
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn extraction_claim_survives_catalog_rows_and_certified_hydration() {

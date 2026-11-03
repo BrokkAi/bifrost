@@ -64,10 +64,10 @@ fn plain_c_candidate(candidate: CAssignmentCandidate) -> PlainAssignmentCandidat
     }
 }
 
-pub(super) fn assignment_relation_expansions(
-    workspace: &WorkspaceAnalyzer,
+pub(super) fn assignment_relation_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut semantic::SemanticQueryContext<'_>,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,
@@ -163,10 +163,10 @@ pub(super) fn supports_relation(
     }
 }
 
-fn ordinary_assignment_relation_expansions(
-    workspace: &WorkspaceAnalyzer,
+fn ordinary_assignment_relation_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut semantic::SemanticQueryContext<'_>,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,
@@ -546,10 +546,10 @@ fn ordinary_assignment_relation_expansions(
     expansions
 }
 
-fn overwritten_unread_expansions(
-    workspace: &WorkspaceAnalyzer,
+fn overwritten_unread_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut semantic::SemanticQueryContext<'_>,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,

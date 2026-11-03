@@ -25,8 +25,9 @@ pub mod analyzer {
 
     pub use go::GoArtifactCallableTarget;
     pub use go::build_evidence::{
-        GoBuildSnapshot, collect_go_build_evidence, go_build_project, go_build_workspace,
-        go_evidence_version_cmp,
+        GO_MODULE_ECOSYSTEM, GO_TOOLCHAIN_ECOSYSTEM, GoBuildSnapshot, GoToolchainVersion,
+        GoVersion, GoVersionRange, collect_go_build_evidence, go_build_project, go_build_workspace,
+        go_dependency_version_matches,
     };
     #[cfg(any(test, feature = "test-support"))]
     pub use go::native_call_relations::{GoNativeCallRelations, go_native_incoming_calls};

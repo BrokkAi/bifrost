@@ -297,7 +297,7 @@ pub fn implicit_root_type_alias(
 /// Whether this language can use an inventory as an absence-only provider.
 pub fn language_has_member_inventory(language: Language, owner: &str) -> bool {
     language_root_member_inventory(language, owner).is_some()
-        || (language == Language::Kotlin && closed_owner_member_inventory(owner).is_some())
+        || language_closed_owner_member_inventory(language, owner).is_some()
 }
 
 pub const KOTLIN_STDLIB_VERSION: &str = "2.1.20";
@@ -324,6 +324,23 @@ pub struct ClosedOwnerMember {
     pub name: &'static str,
     pub kind: ClosedMemberKind,
     pub visibility: &'static str,
+}
+
+/// Language opt-in for names-only certificates; no signatures or parent facts.
+pub fn language_closed_owner_member_inventory(
+    language: Language,
+    owner: &str,
+) -> Option<&'static [ClosedOwnerMember]> {
+    let java_compiler_owner = JVM_ROOTS.iter().any(|root| {
+        root.source_language == Some(Language::Java)
+            && root.fqn == owner
+            && root.names_only_member_certificate
+    });
+    match language {
+        Language::Java if java_compiler_owner => closed_owner_member_inventory(owner),
+        Language::Kotlin if !java_compiler_owner => closed_owner_member_inventory(owner),
+        _ => None,
+    }
 }
 
 /// A flattened, complete name inventory: it already includes inherited and mapped names,
@@ -391,62 +408,152 @@ pub fn root_member_inventory(owner: &str) -> Option<&'static [IntrinsicMember]> 
 /// Compiler and language-defined roots whose member names are complete.
 /// Java Object retains its separate JLS method authority.
 pub fn source_language_root_member_inventory(owner: &str) -> Option<&'static [IntrinsicMember]> {
-    SOURCE_LANGUAGE_ROOTS
+    JVM_ROOTS
         .iter()
-        .any(|(_, root)| *root == owner)
+        .any(|root| {
+            root.source_language.is_some() && root.fqn == owner && root.root_member_certificate
+        })
         .then(|| root_member_inventory(owner))
         .flatten()
 }
 
-// These source-language roots have closed hierarchies as well as closed member
-// inventories. Java Object retains its existing producer obligation and ordinals.
-const JVM_OBJECT_ROOT: &str = "java.lang.Object";
+// Each entry records independent compiler type, member and hierarchy facts.
+// Java Object retains its existing producer obligation and ordinals.
+struct JvmRootEntry {
+    fqn: &'static str,
+    package: &'static str,
+    simple: &'static str,
+    source_language: Option<Language>,
+    compiler_type_identity: bool,
+    root_member_certificate: bool,
+    names_only_member_certificate: bool,
+    closed_hierarchy_root: bool,
+    implicit_superclass_language: Option<Language>,
+}
 
-const SOURCE_LANGUAGE_ROOTS: &[(Language, &str)] = &[
-    (Language::Kotlin, "kotlin.Any"),
-    (Language::Kotlin, "kotlin.Annotation"),
-    (Language::Scala, "scala.Any"),
-    (Language::Scala, "scala.AnyRef"),
-];
-
-const IMPLICIT_SUPERCLASS_ROOTS: &[(Language, &str)] = &[
-    (Language::Java, JVM_OBJECT_ROOT),
-    (Language::Kotlin, "kotlin.Any"),
-    (Language::Scala, "scala.AnyRef"),
+// Each fact is independent. In particular, positive compiler Type identity
+// does not certify a complete member inventory or a closed hierarchy.
+const JVM_ROOTS: &[JvmRootEntry] = &[
+    JvmRootEntry {
+        fqn: "java.lang.Object",
+        package: "java.lang",
+        simple: "Object",
+        source_language: None,
+        compiler_type_identity: false,
+        root_member_certificate: true,
+        names_only_member_certificate: false,
+        closed_hierarchy_root: true,
+        implicit_superclass_language: Some(Language::Java),
+    },
+    JvmRootEntry {
+        fqn: "kotlin.Any",
+        package: "kotlin",
+        simple: "Any",
+        source_language: Some(Language::Kotlin),
+        compiler_type_identity: false,
+        root_member_certificate: true,
+        names_only_member_certificate: false,
+        closed_hierarchy_root: true,
+        implicit_superclass_language: Some(Language::Kotlin),
+    },
+    JvmRootEntry {
+        fqn: "kotlin.Annotation",
+        package: "kotlin",
+        simple: "Annotation",
+        source_language: Some(Language::Kotlin),
+        compiler_type_identity: false,
+        root_member_certificate: true,
+        names_only_member_certificate: false,
+        closed_hierarchy_root: true,
+        implicit_superclass_language: None,
+    },
+    JvmRootEntry {
+        fqn: "scala.Any",
+        package: "scala",
+        simple: "Any",
+        source_language: Some(Language::Scala),
+        compiler_type_identity: true,
+        root_member_certificate: true,
+        names_only_member_certificate: false,
+        closed_hierarchy_root: true,
+        implicit_superclass_language: None,
+    },
+    JvmRootEntry {
+        fqn: "scala.AnyRef",
+        package: "scala",
+        simple: "AnyRef",
+        source_language: Some(Language::Scala),
+        compiler_type_identity: true,
+        root_member_certificate: true,
+        names_only_member_certificate: false,
+        closed_hierarchy_root: true,
+        implicit_superclass_language: Some(Language::Scala),
+    },
+    JvmRootEntry {
+        fqn: "java.lang.Enum",
+        package: "java.lang",
+        simple: "Enum",
+        source_language: Some(Language::Java),
+        compiler_type_identity: true,
+        root_member_certificate: false,
+        names_only_member_certificate: false,
+        closed_hierarchy_root: false,
+        implicit_superclass_language: None,
+    },
+    JvmRootEntry {
+        fqn: "java.lang.Record",
+        package: "java.lang",
+        simple: "Record",
+        source_language: Some(Language::Java),
+        compiler_type_identity: true,
+        root_member_certificate: false,
+        names_only_member_certificate: true,
+        closed_hierarchy_root: false,
+        implicit_superclass_language: None,
+    },
+    JvmRootEntry {
+        fqn: "java.lang.annotation.Annotation",
+        package: "java.lang.annotation",
+        simple: "Annotation",
+        source_language: Some(Language::Java),
+        compiler_type_identity: true,
+        root_member_certificate: false,
+        names_only_member_certificate: true,
+        closed_hierarchy_root: false,
+        implicit_superclass_language: None,
+    },
 ];
 
 /// The closed parent named by each JVM producer's ImplicitSuperclass fact.
 pub fn implicit_superclass_root(language: Language) -> Option<&'static str> {
-    IMPLICIT_SUPERCLASS_ROOTS
+    JVM_ROOTS
         .iter()
-        .find_map(|&(candidate, root)| (candidate == language).then_some(root))
+        .find_map(|root| {
+            (root.implicit_superclass_language == Some(language) && root.closed_hierarchy_root)
+                .then_some(root.fqn)
+        })
         .inspect(|root| assert_eq!(intrinsic_root_owner(root), Some(*root)))
 }
 
 /// Canonical owner for a closed source-language root or the shared JVM Object.
 /// Hierarchy projections use this same set as the language-root inventories.
 pub fn intrinsic_root_owner(owner: &str) -> Option<&'static str> {
-    SOURCE_LANGUAGE_ROOTS
+    JVM_ROOTS
         .iter()
-        .map(|(_, name)| *name)
-        .chain(std::iter::once(JVM_OBJECT_ROOT))
-        .find(|name| *name == owner)
+        .find_map(|root| (root.fqn == owner && root.closed_hierarchy_root).then_some(root.fqn))
 }
 
 // Compiler declarations are positive Type authority, separate from inventories
 // that merely certify name absence in an implicit provider.
-const COMPILER_ROOT_OWNERS: &[(Language, &str, &str, &str)] = &[
-    (Language::Scala, "scala", "Any", "scala.Any"),
-    (Language::Scala, "scala", "AnyRef", "scala.AnyRef"),
-];
-
 /// Return the intrinsic owner FQN of a compiler-synthesized Type declaration.
 pub fn compiler_root_owner(language: Language, package: &str, name: &str) -> Option<&'static str> {
-    COMPILER_ROOT_OWNERS
-        .iter()
-        .find_map(|&(lang, pkg, member, owner)| {
-            (language == lang && package == pkg && name == member).then_some(owner)
-        })
+    JVM_ROOTS.iter().find_map(|root| {
+        (root.compiler_type_identity
+            && root.source_language == Some(language)
+            && package == root.package
+            && name == root.simple)
+            .then_some(root.fqn)
+    })
 }
 
 /// A synthetic absolute route to one of these roots needs no open hierarchy
@@ -454,10 +561,15 @@ pub fn compiler_root_owner(language: Language, package: &str, name: &str) -> Opt
 pub(crate) fn source_root_hierarchy_is_intrinsic<'a>(
     segments: impl Iterator<Item = &'a str> + Clone,
 ) -> bool {
-    SOURCE_LANGUAGE_ROOTS.iter().any(|(_, owner)| {
-        debug_assert!(root_member_inventory(owner).is_some());
-        joined_segments(owner, ".").eq(segments.clone())
-    })
+    JVM_ROOTS
+        .iter()
+        .filter(|root| root.source_language.is_some() && root.closed_hierarchy_root)
+        .any(|root| {
+            debug_assert!(
+                root.root_member_certificate && root_member_inventory(root.fqn).is_some()
+            );
+            joined_segments(root.fqn, ".").eq(segments.clone())
+        })
 }
 
 /// Roots introduced by this source language, plus the JVM's shared Object root.
@@ -465,12 +577,16 @@ pub fn language_root_member_inventory(
     language: Language,
     owner: &str,
 ) -> Option<&'static [IntrinsicMember]> {
-    let defined = SOURCE_LANGUAGE_ROOTS.contains(&(language, owner))
-        || (owner == JVM_OBJECT_ROOT
-            && matches!(
-                language,
-                Language::Java | Language::Kotlin | Language::Scala
-            ));
+    let defined = JVM_ROOTS.iter().any(|root| {
+        root.fqn == owner
+            && root.root_member_certificate
+            && (root.source_language == Some(language)
+                || (root.fqn == "java.lang.Object"
+                    && matches!(
+                        language,
+                        Language::Java | Language::Kotlin | Language::Scala
+                    )))
+    });
     if defined {
         root_member_inventory(owner)
     } else {

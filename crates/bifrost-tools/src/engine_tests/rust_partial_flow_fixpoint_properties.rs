@@ -279,6 +279,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8896: a DerefMut field store falsely killed the returned member content"
+    )]
+    fn deref_mut_field_store_does_not_claim_a_direct_cell_kill() {
+        let source = "use core::ops::{Deref, DerefMut};\nstruct Inner { value: i32 }\nstruct Wrapper { inner: Inner }\nimpl Deref for Wrapper { type Target = Inner; fn deref(&self) -> &Inner { &self.inner } }\nimpl DerefMut for Wrapper { fn deref_mut(&mut self) -> &mut Inner { &mut self.inner } }\npub fn make(value: i32) -> Wrapper { let mut w = Wrapper { inner: Inner { value } }; w.value = 0; w }\n";
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticCapability;
+        use brokk_bifrost_analysis::analyzer::semantic::oracle::value_flow::ValueFlowRelationKind;
+        use brokk_bifrost_analysis::analyzer::semantic::partial_flow::file_local_procedure_relations;
+
+        let (procedure, _) = procedure_and_snapshot(source, "make");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let snapshot = file_local_procedure_relations(
+            &procedure,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("file-local relation projection")
+        .available_value()
+        .cloned()
+        .expect("DerefMut store retains a relation snapshot");
+        let deref_stores = snapshot
+            .relations()
+            .iter()
+            .filter(|relation| {
+                relation.kind == ValueFlowRelationKind::MemoryStore
+                    && procedure.semantics().gaps().iter().any(|gap| {
+                        gap.point == relation.point.id()
+                            && gap.capability == SemanticCapability::Calls
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !deref_stores.is_empty(),
+            "the DerefMut store is represented"
+        );
+        assert!(
+            deref_stores.iter().all(|relation| !relation.strong_update),
+            "a user-defined DerefMut store cannot certify a direct-cell kill: {deref_stores:#?}"
+        );
+    }
+
+    #[test]
     fn unresolved_call_projection_keeps_its_flows_and_is_open() {
         // An unresolved dispatch gap makes the projection `Unknown`, with the
         // snapshot attached: the arm that writes flows with outcome 0 and open = 1.
@@ -611,5 +654,71 @@ pub(crate) mod tests {
         assert!(limited.replay_charge(&before, &charge));
         assert_eq!(limited.work().traversal_steps, visits - 1);
         assert!(limited.work().exhausted);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8896: extra-seed and filtered derivations closed a mixed return's member boundary"
+    )]
+    fn mixed_return_member_coverage_survives_recomputation_and_filtering() {
+        use brokk_bifrost_analysis::analyzer::semantic::ids::ProgramPointId;
+        use brokk_bifrost_analysis::analyzer::semantic::oracle::model::ObservationPhase;
+        use brokk_bifrost_analysis::analyzer::semantic::partial_flow::fixpoint::{
+            ObservationFilter, compute_partial_flows_filtered,
+        };
+
+        struct AllowAll;
+        impl ObservationFilter for AllowAll {
+            type Error = std::convert::Infallible;
+
+            fn permits(
+                &mut self,
+                _point: ProgramPointId,
+                _phase: ObservationPhase,
+                _endpoint: &ValueFlowEndpoint,
+                _request: &mut SemanticRequest<'_>,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let source = "pub struct Pair { value: u32 }\npub fn mixed(flag: bool, value: u32, original: Pair) -> Pair { if flag { return Pair { value }; } original }\n";
+        let (_, parts, stored) = crate::engine_tests::rust_analyzer_store_semantic_ir_tests::rust_departing_root_tests::partial_flows_of(source);
+        let index = parts
+            .iter()
+            .position(|part| part.locator.declaration().last_segment_name() == Some("mixed"))
+            .expect("mixed procedure");
+        assert!(!stored[index].relations_complete);
+
+        let (procedure, snapshot) = procedure_and_snapshot(source, "mixed");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let recomputed =
+            compute_partial_flows_with(&procedure, &snapshot, &[], &[], false, &mut request);
+        let seed = input_port_seed(
+            &procedure,
+            &snapshot,
+            &PartialFlowPort::Parameter { ordinal: 1 },
+        )
+        .expect("the parameter has an entry seed");
+        let mut filter = AllowAll;
+        let filtered = compute_partial_flows_filtered(
+            &procedure,
+            &snapshot,
+            &[seed],
+            &[],
+            false,
+            &[],
+            &mut filter,
+            &mut request,
+        )
+        .unwrap();
+        assert!(!recomputed.partial.relations_complete);
+        assert!(!filtered.partial.relations_complete);
+        // The two inline projects have distinct mount IDs in their field
+        // locators. Compare the row shape and the coverage bit across them.
+        assert_eq!(recomputed.partial.ports.len(), stored[index].ports.len());
+        assert_eq!(recomputed.partial.flows, stored[index].flows);
     }
 }

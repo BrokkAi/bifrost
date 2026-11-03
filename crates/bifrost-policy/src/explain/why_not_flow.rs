@@ -240,6 +240,10 @@ pub fn explain_flow_candidate(
         );
         stages.extend(source_stage);
         stages.extend(observation_stage);
+        // A reached path through the retained selector rows is not a complete
+        // finding when another origin, observation or kill row was withheld.
+        // In particular, a missing kill could invalidate the reached path.
+        stages.extend(authored.selection_gaps.iter().map(boundary_node));
         let bound = matches!(authored.origin, CandidateBinding::Bound(_))
             && matches!(authored.observation, CandidateBinding::Bound(_));
         if bound {
@@ -510,6 +514,46 @@ fn propagation_stage(
                 })
         });
         let Some(finding) = finding else {
+            let store_write_observation = policy.resolved_taint().is_some_and(|spec| {
+                observation_sites.iter().any(|site| {
+                    spec.store_writes
+                        .iter()
+                        .any(|write| write.identity == site.endpoint)
+                })
+            });
+            if store_write_observation {
+                let complete = pass.selection_gaps.is_empty() && solve.boundaries.is_empty();
+                let mut node = RawNode::new(
+                    ExplanationNodeKind::Derivation,
+                    if complete {
+                        ExplanationOutcome::Satisfied
+                    } else {
+                        ExplanationOutcome::Unknown
+                    },
+                    "propagation",
+                )
+                .with_expected(expected)
+                .with_actual(format!(
+                    "the solver reaches the declared store write from the {}; the write is the selected observation",
+                    vocabulary.source
+                ));
+                for (index, witness) in solve.witnesses.iter().enumerate() {
+                    if let Some(projected) = project_candidate_witness(
+                        context
+                            .workspace
+                            .expect("candidate evaluation has a workspace"),
+                        solve,
+                        witness,
+                        index,
+                        budget,
+                    )
+                    .map_err(|message| ExplainError::PolicyUnavailable { message })?
+                    {
+                        node.push_child(witness_node(&projected));
+                    }
+                }
+                return Ok(node);
+            }
             let complete = matches!(run.completion(), PolicyRunCompletion::Complete);
             let mut node = RawNode::new(
                 ExplanationNodeKind::Derivation,
@@ -677,16 +721,26 @@ fn attribution_stage(
     }
     let mut relaxed_spec = spec.clone();
     relaxed_spec.sanitizers.clear();
-    let relaxed = solve_flow_candidate(
-        policy,
-        context.flow_resources(),
-        &relaxed_spec,
-        workspace,
-        snapshot,
-        context.cancellation,
-        budget,
-        candidate,
-    );
+    // The second pass asks a different policy question. Shadow any enclosing
+    // read ledger so its selector, artifact and absence reads cannot certify
+    // the authored pass. Each solve also builds its own composition memo and
+    // the candidate plan's compatibility includes its effective kill bindings.
+    let (relaxed, _counterfactual_reads) =
+        brokk_bifrost_analysis::analyzer::i_analyzer::capture_nested_reads(
+            context.analyzer,
+            || {
+                solve_flow_candidate(
+                    policy,
+                    context.flow_resources(),
+                    &relaxed_spec,
+                    workspace,
+                    snapshot,
+                    context.cancellation,
+                    budget,
+                    candidate,
+                )
+            },
+        );
     let Some(relaxed_solve) = relaxed.solve.as_ref().filter(|solve| solve.reached) else {
         let boundaries = relaxed
             .selection_gaps
@@ -745,8 +799,9 @@ fn attribution_stage(
         }
         // Several solver findings at one observation can retain the same
         // path; it is published once.
-        if let Some(projected) = project_candidate_witness(workspace, witness, index, budget)
-            .map_err(|message| ExplainError::PolicyUnavailable { message })?
+        if let Some(projected) =
+            project_candidate_witness(workspace, relaxed_solve, witness, index, budget)
+                .map_err(|message| ExplainError::PolicyUnavailable { message })?
             && !paths
                 .iter()
                 .any(|path: &crate::finding::BoundedWitness| path.steps() == projected.steps())

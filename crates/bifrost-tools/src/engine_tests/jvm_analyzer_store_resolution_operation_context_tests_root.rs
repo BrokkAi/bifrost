@@ -815,6 +815,142 @@ mod context_path_tests {
         }
     }
     #[test]
+    fn java_compiler_parent_names_are_not_declarations_or_closed_hierarchy() {
+        use brokk_bifrost_analysis::native_resolution_test_support::{
+            ExternalOwnerIdentity, TypedFactRequest,
+        };
+        use brokk_bifrost_core::analyzer::model::Language;
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+        for owner in ["java.lang.Record", "java.lang.annotation.Annotation"] {
+            let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
+            fixture.store.conn.execute(move |connection| {
+                for provider in ["left", "right"] {
+                    connection
+                        .execute(
+                            "INSERT INTO jvm_external_owners VALUES (?1, ?2, 1, 1, 1, 1)",
+                            rusqlite::params![provider, owner],
+                        )
+                        .unwrap();
+                }
+            });
+            let selection = fixture.open_ready(&[]);
+            let live = CancellationToken::new();
+            for providers in [
+                Vec::new(),
+                vec!["left".to_owned()],
+                vec!["left".to_owned(), "right".to_owned()],
+            ] {
+                let selected = !providers.is_empty();
+                let identities =
+                    ["jvm-intrinsic", "left", "right"].map(|provider| ExternalOwnerIdentity {
+                        provider_id: provider.into(),
+                        owner_fqn: owner.into(),
+                    });
+                let (source, definitions) =
+                    SelectedResolutionTypedSource::new_on_demand(&selection)
+                        .with_external_owner_test_inventory(providers, &identities);
+                assert_eq!(
+                    source
+                        .jvm_intrinsic_owner_is_unshadowed(owner, &live)
+                        .unwrap(),
+                    !selected
+                );
+                let mut scopes = Vec::new();
+                source
+                    .visit_member_scope_pages_for_definitions(
+                        TypedFactRequest::new(&definitions[..1]),
+                        &live,
+                        &mut FactPageVisitor::new(&mut |page| {
+                            scopes.extend_from_slice(page);
+                            Ok(true)
+                        }),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    scopes.len(),
+                    usize::from(!selected),
+                    "selected or ambiguous provider must block intrinsic certificate: {scopes:?}"
+                );
+                if !selected {
+                    let coverage = scopes[0].row().external_coverage().unwrap();
+                    assert!(
+                        coverage.member_names_only && !coverage.supertypes_complete,
+                        "{coverage:?}"
+                    );
+                    assert!(
+                        coverage.covers(ResolutionNamespace::Callable)
+                            && coverage.covers(ResolutionNamespace::Value)
+                            && coverage.covers(ResolutionNamespace::Type)
+                    );
+                    assert!(!coverage.covers(ResolutionNamespace::Constructor));
+                } else {
+                    let mut acquired = Vec::new();
+                    source
+                        .visit_member_scope_pages_for_definitions(
+                            TypedFactRequest::new(&definitions[1..2]),
+                            &live,
+                            &mut FactPageVisitor::new(&mut |page| {
+                                acquired.extend_from_slice(page);
+                                Ok(true)
+                            }),
+                        )
+                        .unwrap();
+                    assert_eq!(acquired.len(), 1);
+                    let coverage = acquired[0].row().external_coverage().unwrap();
+                    assert!(
+                        coverage.supertypes_complete && !coverage.member_names_only,
+                        "{coverage:?}"
+                    );
+                }
+                let mut members = Vec::new();
+                source
+                    .visit_member_owner_pages_for_owners(
+                        TypedFactRequest::new(&definitions[..1]),
+                        &live,
+                        &mut FactPageVisitor::new(&mut |page| {
+                            members.extend_from_slice(page);
+                            Ok(true)
+                        }),
+                    )
+                    .unwrap();
+                assert!(
+                    members.is_empty(),
+                    "names-only certificate invents no declarations: {members:?}"
+                );
+                let mut parents = Vec::new();
+                source
+                    .visit_supertype_pages_for_definitions(
+                        TypedFactRequest::new(&definitions[..1]),
+                        &live,
+                        &mut FactPageVisitor::new(&mut |page| {
+                            parents.extend_from_slice(page);
+                            Ok(true)
+                        }),
+                    )
+                    .unwrap();
+                assert!(
+                    parents.is_empty(),
+                    "names-only certificate invents no parent edges: {parents:?}"
+                );
+            }
+            assert!(
+                brokk_bifrost_jvm::intrinsics::language_closed_owner_member_inventory(
+                    Language::Java,
+                    owner
+                )
+                .is_some()
+            );
+            assert!(
+                brokk_bifrost_jvm::intrinsics::language_closed_owner_member_inventory(
+                    Language::Kotlin,
+                    owner
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#6141: a closed String inventory hid a selected declaration provider's member"
     )]

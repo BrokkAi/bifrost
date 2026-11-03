@@ -46,7 +46,7 @@ define_dense_id! {
 }
 
 /// One port of a procedure. A `Heap` port is an access path rooted at an
-/// input port (receiver, parameter or capture slot) of the same procedure.
+/// formal input or normal-return output of the same procedure.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PartialFlowPort {
     Receiver,
@@ -103,11 +103,18 @@ pub enum HeapSelector {
 }
 
 impl PartialFlowPort {
-    /// Whether this port can be the root of a `Heap` port (kinds 0, 1 and 9).
+    /// Whether this port can be the root of a `Heap` port.
     pub(crate) fn is_heap_root(&self) -> bool {
         matches!(
             self,
-            Self::Receiver | Self::Parameter { .. } | Self::Capture { .. }
+            Self::Receiver
+                | Self::Parameter { .. }
+                | Self::Capture { .. }
+                | Self::CallReceiver { .. }
+                | Self::CallArgument { .. }
+                | Self::NormalReturn
+                | Self::IndexedNormalReturn { .. }
+                | Self::CallResult { .. }
         )
     }
 }
@@ -162,6 +169,58 @@ pub fn port_of_endpoint(endpoint: &ValueFlowEndpoint) -> Option<PartialFlowPort>
             let root = match location.path().root() {
                 AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
                     port_of_handle(port)
+                }
+                AccessPathRoot::Value(value) => {
+                    port_of_endpoint(&ValueFlowEndpoint::Value(value.clone())).or_else(|| {
+                        value
+                            .procedure()
+                            .semantics()
+                            .call_sites()
+                            .iter()
+                            .find_map(|call| {
+                                if call.result == Some(value.id()) {
+                                    Some(PartialFlowPort::CallResult {
+                                        call: call.id,
+                                        ordinal: None,
+                                    })
+                                } else {
+                                    call.normal_results
+                                        .iter()
+                                        .position(|result| *result == value.id())
+                                        .map(|ordinal| PartialFlowPort::CallResult {
+                                            call: call.id,
+                                            ordinal: Some(
+                                                u32::try_from(ordinal)
+                                                    .expect("a call's result count fits u32"),
+                                            ),
+                                        })
+                                }
+                            })
+                    })?
+                }
+                AccessPathRoot::CallResult(result) => {
+                    let call = result
+                        .call()
+                        .procedure()
+                        .semantics()
+                        .call_site(result.call().id())?;
+                    if call.result == Some(result.result().id()) {
+                        PartialFlowPort::CallResult {
+                            call: call.id,
+                            ordinal: None,
+                        }
+                    } else {
+                        let ordinal = call
+                            .normal_results
+                            .iter()
+                            .position(|value| *value == result.result().id())?;
+                        PartialFlowPort::CallResult {
+                            call: call.id,
+                            ordinal: Some(
+                                u32::try_from(ordinal).expect("a call's result count fits u32"),
+                            ),
+                        }
+                    }
                 }
                 _ => return None,
             };

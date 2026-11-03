@@ -1073,6 +1073,13 @@ fn answer_workspace_fact(
             }
         }
         WorkspaceFactFamily::FieldSlots => summaries.workspace_fact(family, language, subject),
+        WorkspaceFactFamily::JvmSelectedRootPresence => {
+            if language != Language::None || !matches!(subject, FactSubject::Named { .. }) {
+                return None;
+            }
+            crate::analyzer::languages::language_support(Language::Java)?
+                .workspace_fact_answer(analyzer, family, language, subject)
+        }
         WorkspaceFactFamily::RuntimeRootWriteFootprint => {
             let FactSubject::File { rel_path } = subject else {
                 return None;

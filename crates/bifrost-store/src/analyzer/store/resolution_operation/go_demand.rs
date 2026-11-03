@@ -836,6 +836,7 @@ impl GoRules<'_, '_, '_, '_> {
             RootFrame {
                 query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
                 endpoint: endpoint.clone(),
+                relation: crate::analyzer::resolution::DemandRelationKey::caller(endpoint.clone()),
                 sources: Box::new([RootSource::Context(
                     context.expect("a remote context has a certified role"),
                 )]),
@@ -956,8 +957,12 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
         Ok(Read::ready(policy))
     }
 
-    fn raw_prefix_completion(&self, answer: &FactResolutionAnswer) -> ResolutionCompletion {
-        answer.binding().completion().clone()
+    fn raw_prefix_completion(
+        &self,
+        _: &EndpointSignature,
+        prefix: super::demand_closure::PrefixAnswer<'_>,
+    ) -> ResolutionCompletion {
+        prefix.answer.binding().completion().clone()
     }
 
     fn derive_context(

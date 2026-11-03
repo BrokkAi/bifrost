@@ -598,6 +598,56 @@ pub mod neutral_fixture {
         }
     }
 
+    #[cfg(test)]
+    struct DischargingCallApplicabilityAdapter;
+    #[cfg(test)]
+    impl crate::analyzer::resolution::CallApplicabilityAdapter for DischargingCallApplicabilityAdapter {
+        fn discharges_known_head_external_arguments(&self) -> bool {
+            true
+        }
+
+        fn map_arguments(
+            &self,
+            call: &crate::analyzer::resolution::typed_fact_lowering::LoweredCallApplicabilityObligation,
+            signature: &crate::analyzer::resolution::typed_fact_lowering::LoweredCallableSignatureProperty,
+        ) -> crate::analyzer::resolution::fact_resolution::call_applicability::MappingAssessment
+        {
+            crate::analyzer::resolution::CallApplicabilityAdapter::map_arguments(
+                &NeutralFakeCallApplicabilityAdapter,
+                call,
+                signature,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    struct DischargingJavaFixtureSupport;
+    #[cfg(test)]
+    impl StoreLanguageSupport for DischargingJavaFixtureSupport {
+        fn precedence_rules(
+            &self,
+        ) -> &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules {
+            crate::analyzer::resolution::precedence::JAVA_PRECEDENCE_RULES
+        }
+
+        fn call_applicability_adapter(
+            &self,
+        ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
+            Some(&DischargingCallApplicabilityAdapter)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discharging_java_rules_fixture() -> NeutralRulesFixture {
+        let fixture = neutral_rules_fixture(&[Language::Java]);
+        static SUPPORT: DischargingJavaFixtureSupport = DischargingJavaFixtureSupport;
+        OVERLAYS.with(|overlays| {
+            overlays.borrow_mut().last_mut().unwrap()[language_index(Language::Java).unwrap()] =
+                Some(&SUPPORT);
+        });
+        fixture
+    }
+
     /// Drops on the creating thread and restores the enclosing fixture's overlay.
     pub struct NeutralRulesFixture {
         depth: usize,

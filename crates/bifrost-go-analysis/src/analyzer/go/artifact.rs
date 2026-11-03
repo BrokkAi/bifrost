@@ -282,7 +282,8 @@ pub struct GoModulePackProducer;
 
 /// Bump when generated Go pack content changes for unchanged inputs.
 // #8264: package-local types take precedence over predeclared spellings.
-const GO_PACK_PRODUCER_VERSION: u32 = 2;
+// #7509: an exported package type retains its package Module record.
+const GO_PACK_PRODUCER_VERSION: u32 = 3;
 
 fn go_pack_producer_version() -> &'static str {
     static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -957,6 +958,7 @@ fn top_level_type_specs(root: Node<'_>) -> Vec<Node<'_>> {
 #[derive(Clone)]
 struct TypeDraft {
     fact: TypeFact,
+    import_path: String,
     exported: bool,
     scaffold: bool,
     referenced_type_ids: Vec<String>,
@@ -992,6 +994,7 @@ fn module_type_drafts(
                     .into_iter()
                     .collect();
                 TypeDraft {
+                    import_path: package.import_path.clone(),
                     fact: TypeFact {
                         implemented_traits_complete: false,
                         generic_trait_impls_complete: false,
@@ -1248,6 +1251,7 @@ fn collect_type_draft(
         return;
     }
     types.push(TypeDraft {
+        import_path: parsed.import_path.clone(),
         fact: TypeFact {
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
@@ -2497,6 +2501,27 @@ fn finish_facts(
             retained.insert(member.fact.owner.clone());
         }
     }
+    // An exported top-level type is part of its package's own surface even
+    // when that package publishes no package-level functions or variables.
+    // Only the package's own Module record counts; the synthetic module-scope
+    // record shares this import path but has a different identity.
+    let modules = type_drafts
+        .iter()
+        .filter(|draft| {
+            draft.scaffold
+                && draft.fact.type_kind == TypeKind::Module
+                && draft.fact.name == draft.import_path
+        })
+        .map(|draft| (draft.import_path.as_str(), draft.fact.id.as_str()))
+        .collect::<HashMap<_, _>>();
+    for draft in type_drafts
+        .iter()
+        .filter(|draft| draft.exported && !draft.scaffold)
+    {
+        if let Some(module) = modules.get(draft.import_path.as_str()) {
+            retained.insert((*module).to_owned());
+        }
+    }
     let member_references_by_owner = member_drafts.iter().filter(|member| member.surface).fold(
         HashMap::<String, Vec<String>>::default(),
         |mut grouped, member| {
@@ -2609,6 +2634,26 @@ mod tests {
         let (diagnostics, suppressed) = diagnostics.finish();
         assert_eq!(suppressed, SuppressedDiagnostics::default());
         (facts.0, facts.1, diagnostics)
+    }
+
+    #[test]
+    fn exported_type_retains_own_package_module_without_package_members() {
+        let (types, members, diagnostics) =
+            facts("package api\ntype Public struct{}\ntype private struct{}\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(members.is_empty());
+        assert!(types.iter().any(|ty| {
+            ty.name == "example.com/dep/api"
+                && ty.type_kind == TypeKind::Module
+                && ty.aliases == ["api"]
+        }));
+        let (private_only, _, diagnostics) = facts("package api\ntype private struct{}\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            !private_only
+                .iter()
+                .any(|ty| ty.name == "example.com/dep/api")
+        );
     }
 
     #[test]
@@ -3131,6 +3176,7 @@ func (Unknown) Read() int { return 0 }
             .map(|fact| {
                 let exported = fact.visibility == Visibility::Public;
                 TypeDraft {
+                    import_path: "example.com/dep/api".to_owned(),
                     fact,
                     exported,
                     scaffold: false,

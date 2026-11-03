@@ -23,6 +23,7 @@ use brokk_bifrost_analysis::analyzer::semantic::topology::DependencyScope;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     DependencyCondition, DependencyEvidence, DependencyEvidenceGap, DependencyEvidenceGapKind,
     DependencyEvidenceKind, DependencyFileEvidence, DependencyFileEvidenceLimits,
+    VersionComparator, parse_version_comparators, version_bounds_admit,
 };
 use brokk_bifrost_analysis::analyzer::topology::{
     TopologyCompleteness, TopologyEntity, TopologyEntityKind, TopologyProvenance,
@@ -873,22 +874,13 @@ impl PartialOrd for NugetVersion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Comparator {
-    Less,
-    LessOrEqual,
-    Greater,
-    GreaterOrEqual,
-    Equal,
-}
-
 /// An authored affected-version range over NuGet versions. Alternatives are
 /// joined by `||`; each is NuGet interval notation (`[1.0,2.0)`, `[1.2.3]`,
 /// `(,1.0]`), a bare NuGet minimum (`1.0`), or whitespace-joined comparators
 /// (`>=1.0 <1.11.0`). Floating versions name a restore policy, not a set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NugetVersionRange {
-    alternatives: Vec<Vec<(Comparator, NugetVersion)>>,
+    alternatives: Vec<Vec<(VersionComparator, NugetVersion)>>,
 }
 
 impl NugetVersionRange {
@@ -917,22 +909,11 @@ impl NugetVersionRange {
     }
 
     pub fn matches(&self, version: &NugetVersion) -> bool {
-        self.alternatives.iter().any(|bounds| {
-            bounds.iter().all(|(comparator, bound)| {
-                let ordering = version.cmp(bound);
-                match comparator {
-                    Comparator::Less => ordering == Ordering::Less,
-                    Comparator::LessOrEqual => ordering != Ordering::Greater,
-                    Comparator::Greater => ordering == Ordering::Greater,
-                    Comparator::GreaterOrEqual => ordering != Ordering::Less,
-                    Comparator::Equal => ordering == Ordering::Equal,
-                }
-            })
-        })
+        version_bounds_admit(&self.alternatives, version)
     }
 }
 
-fn interval(text: &str) -> Result<Vec<(Comparator, NugetVersion)>, String> {
+fn interval(text: &str) -> Result<Vec<(VersionComparator, NugetVersion)>, String> {
     let invalid = || format!("{text:?} is not NuGet interval notation");
     let inclusive_lower = text.starts_with('[');
     let inclusive_upper = text.ends_with(']');
@@ -945,7 +926,10 @@ fn interval(text: &str) -> Result<Vec<(Comparator, NugetVersion)>, String> {
         if !(inclusive_lower && inclusive_upper) {
             return Err(invalid());
         }
-        return Ok(vec![(Comparator::Equal, NugetVersion::parse(inner)?)]);
+        return Ok(vec![(
+            VersionComparator::Equal,
+            NugetVersion::parse(inner)?,
+        )]);
     };
     let (lower, upper) = (lower.trim(), upper.trim());
     if (lower.is_empty() && upper.is_empty()) || upper.contains(',') {
@@ -954,17 +938,17 @@ fn interval(text: &str) -> Result<Vec<(Comparator, NugetVersion)>, String> {
     let mut bounds = Vec::new();
     if !lower.is_empty() {
         let comparator = if inclusive_lower {
-            Comparator::GreaterOrEqual
+            VersionComparator::GreaterOrEqual
         } else {
-            Comparator::Greater
+            VersionComparator::Greater
         };
         bounds.push((comparator, NugetVersion::parse(lower)?));
     }
     if !upper.is_empty() {
         let comparator = if inclusive_upper {
-            Comparator::LessOrEqual
+            VersionComparator::LessOrEqual
         } else {
-            Comparator::Less
+            VersionComparator::Less
         };
         bounds.push((comparator, NugetVersion::parse(upper)?));
     }
@@ -976,44 +960,18 @@ fn interval(text: &str) -> Result<Vec<(Comparator, NugetVersion)>, String> {
     Ok(bounds)
 }
 
-fn comparators(text: &str) -> Result<Vec<(Comparator, NugetVersion)>, String> {
+fn comparators(text: &str) -> Result<Vec<(VersionComparator, NugetVersion)>, String> {
     let tokens = text.split_whitespace().collect::<Vec<_>>();
     if let [token] = tokens.as_slice()
         && token.starts_with(|first: char| first.is_ascii_digit())
     {
         // NuGet reads a bare version as an inclusive minimum.
         return Ok(vec![(
-            Comparator::GreaterOrEqual,
+            VersionComparator::GreaterOrEqual,
             NugetVersion::parse(token)?,
         )]);
     }
-    let mut bounds = Vec::new();
-    let mut index = 0;
-    while index < tokens.len() {
-        let token = tokens[index];
-        let (comparator, rest) = [
-            (">=", Comparator::GreaterOrEqual),
-            ("<=", Comparator::LessOrEqual),
-            (">", Comparator::Greater),
-            ("<", Comparator::Less),
-            ("=", Comparator::Equal),
-        ]
-        .into_iter()
-        .find_map(|(prefix, comparator)| token.strip_prefix(prefix).map(|rest| (comparator, rest)))
-        .ok_or_else(|| format!("{token:?} needs a comparator (<, <=, >, >=, =)"))?;
-        // Accept `>= 1.0` as well as `>=1.0`.
-        let version = if rest.is_empty() {
-            index += 1;
-            *tokens
-                .get(index)
-                .ok_or_else(|| format!("{token:?} has no version"))?
-        } else {
-            rest
-        };
-        bounds.push((comparator, NugetVersion::parse(version)?));
-        index += 1;
-    }
-    Ok(bounds)
+    parse_version_comparators(text, NugetVersion::parse)
 }
 
 /// Whether one complete locked or installed NuGet row's exact version is in

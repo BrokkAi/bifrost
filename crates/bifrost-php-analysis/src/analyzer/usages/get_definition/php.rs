@@ -3543,7 +3543,11 @@ pub(crate) fn resolve_definition_dispatch<'a>(
         evidence.external_callee_identity = resolution.external_callee_identity;
         resolution.outcome
     };
-    std::ops::ControlFlow::Continue(DefinitionResolution { outcome, evidence })
+    std::ops::ControlFlow::Continue(DefinitionResolution {
+        outcome,
+        evidence,
+        call_binding_discharge_digests: Vec::new(),
+    })
 }
 
 #[cfg(test)]

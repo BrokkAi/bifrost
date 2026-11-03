@@ -41,8 +41,8 @@ policy loader validate them during activation. A policy-only selection omits
 `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`. Explicit host configuration for either
 root suppresses acquisition and takes precedence. The binary honors
 `BIFROST_OPEN_PACKS_OFFLINE` and `BIFROST_OPEN_PACKS_REFRESH`, reuses its
-verified one-hour manifest inventory and hash-addressed artifacts, and falls
-back to embedded packs when no eligible release or unavailable network prevents
+verified one-hour manifest inventory and hash-addressed artifacts, and runs
+without semantic packs when no eligible release or unavailable network prevents
 runtime selection. Invalid release metadata and corrupt cached content fail
 explicitly. The analysis facade itself never accesses the network.
 

@@ -15,11 +15,12 @@ use crate::analyzer::{
     static_member_property, static_property_name,
 };
 use crate::query::JsRule;
+use crate::structural::identifier_dictionary::IdentifierDictionary;
 use brokk_bifrost_js_ts::syntax::{
     js_ts_string_literal_code_units, object_literal_property_key_node,
     object_literal_property_key_value,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use strsim::damerau_levenshtein;
 use tree_sitter::{Node, Tree};
 
@@ -48,6 +49,7 @@ pub(super) fn matches_for_file(
     file: &ProjectFile,
     source: &str,
     rule: JsRule,
+    dictionary: &IdentifierDictionary,
 ) -> LanguageRuleMatches {
     let language = language_for_file(file);
     if !matches!(language, Language::JavaScript | Language::TypeScript) {
@@ -72,7 +74,7 @@ pub(super) fn matches_for_file(
         JsRule::OverwrittenProperty => {
             overwritten_properties(&tree, source, &mut unknown_property_keys)
         }
-        JsRule::MisspelledIdentifier => misspelled_identifiers(&tree, source),
+        JsRule::MisspelledIdentifier => misspelled_identifiers(&tree, source, dictionary),
     };
     ranges.sort_unstable();
     ranges.dedup();
@@ -888,7 +890,11 @@ fn structurally_same(left: Node<'_>, right: Node<'_>, source: &str) -> bool {
     true
 }
 
-fn misspelled_identifiers(tree: &Tree, source: &str) -> Vec<Range> {
+fn misspelled_identifiers(
+    tree: &Tree,
+    source: &str,
+    dictionary: &IdentifierDictionary,
+) -> Vec<Range> {
     // The generated CodeQL typo database is not an engine asset. This closed
     // relation keeps the same normalized-part/co-occurrence shape with a
     // bounded one-edit Damerau candidate relation.
@@ -905,17 +911,38 @@ fn misspelled_identifiers(tree: &Tree, source: &str) -> Vec<Range> {
     for (_, part) in &identifiers {
         increment_count(&mut counts, &part.normalized);
     }
+    let names = descendants(tree.root_node())
+        .into_iter()
+        .filter(|node| is_identifier_node(*node))
+        .filter_map(|node| class_node_text(node, source).map(str::to_ascii_lowercase))
+        .collect::<HashSet<_>>();
 
     let mut ranges = Vec::new();
-    for (_, wrong) in &identifiers {
-        if wrong.normalized.chars().count() <= 3 {
+    for (node, wrong) in &identifiers {
+        // A part the project's dictionary accepts is a word it uses on
+        // purpose, however close it is to a more frequent one.
+        if wrong.normalized.chars().count() <= 3 || dictionary.accepts(&wrong.normalized) {
             continue;
         }
+        // ASCII lower-casing keeps the parts' byte offsets valid in the name.
+        let Some(name) = class_node_text(*node, source).map(str::to_ascii_lowercase) else {
+            continue;
+        };
         let wrong_count = count_for(&counts, &wrong.normalized);
+        // A slip one letter-swap from a commoner part is often another word
+        // (`from`/`form`, `trial`/`trail`). It is reported only when the
+        // corrected whole name is also in the file, the binding or API the
+        // slip may wrongly stand for: `fromLink` needs a `formLink` (#7800).
         let has_correction = identifiers.iter().any(|(_, right)| {
             right.normalized != wrong.normalized
                 && count_for(&counts, &right.normalized) > wrong_count
                 && likely_typo(&wrong.normalized, &right.normalized)
+                && names.contains(&format!(
+                    "{}{}{}",
+                    &name[..wrong.start_offset],
+                    right.normalized,
+                    &name[wrong.end_offset..]
+                ))
         });
         if !has_correction {
             continue;

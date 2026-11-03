@@ -1751,6 +1751,9 @@ mod authored_override_residual_tests {
             exceeded_limit: None,
             arms: Vec::new(),
             call_contexts: vec![super::super::dispatch::DispatchCallContext {
+                call: None,
+                proven_non_callable: false,
+                residuals: Vec::new(),
                 member_receiver_preparation: None,
                 procedure_id: "test-procedure".to_owned(),
                 caller: None,
@@ -1763,6 +1766,8 @@ mod authored_override_residual_tests {
             let mut answer = answer(outcome);
             answer.arms.push(super::super::dispatch::DispatchArm {
                 call_context: 0,
+                target_procedure: None,
+                boundary: None,
                 execution_timing: crate::analyzer::semantic::ExecutionTiming::Unknown,
                 target_id: "target".to_owned(),
                 target_path: "target".to_owned(),

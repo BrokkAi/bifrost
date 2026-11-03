@@ -347,7 +347,8 @@ impl CodeQueryResultValue {
             | Self::PathSegment { .. }
             | Self::SourceSet { .. }
             | Self::BuildTarget { .. }
-            | Self::TopologyEdge { .. } => None,
+            | Self::TopologyEdge { .. }
+            | Self::BuildConfiguration { .. } => None,
         }
     }
 }

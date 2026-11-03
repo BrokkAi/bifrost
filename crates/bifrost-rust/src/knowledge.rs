@@ -3,18 +3,44 @@
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
 use brokk_bifrost_core::analyzer::language_knowledge::ParserFlavor;
+use brokk_bifrost_core::analyzer::language_knowledge::ScalarObjectFieldKind;
 use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 
 /// Rust syntax and static language rules.
 pub struct RustKnowledge;
 
 impl LanguageKnowledge for RustKnowledge {
+    fn scalar_object_field_is_copy(&self, kind: ScalarObjectFieldKind) -> bool {
+        matches!(
+            kind,
+            ScalarObjectFieldKind::Boolean | ScalarObjectFieldKind::Number
+        )
+    }
     fn models_compose_from_catalog_rows(&self) -> bool {
         true
     }
 
-    fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
-        false
+    fn declared_type_is_referent_immutable(&self, canonical_type: &str) -> bool {
+        matches!(
+            canonical_type,
+            "bool"
+                | "char"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "f32"
+                | "f64"
+                | "&str"
+        )
     }
 
     fn unbound_call_passes_receiver_as_argument(&self) -> bool {

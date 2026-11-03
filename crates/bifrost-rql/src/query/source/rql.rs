@@ -1017,6 +1017,7 @@ fn validate_wrapper(
         | RqlForm::FlowTarget
         | RqlForm::TargetOf
         | RqlForm::SourceSetOf
+        | RqlForm::BuildConfigurationOf
         | RqlForm::TopologyEdgesOf
         | RqlForm::GuardsOf
         | RqlForm::FailureHandlerState

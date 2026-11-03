@@ -121,10 +121,18 @@ where
     }
 
     pub fn check(&self, work: Work) -> Result<(), WorkBudgetExceeded<Work::Dimension>> {
+        self.check_without_recording(work)
+            .inspect_err(|_| self.record_refusal())
+    }
+
+    /// Check a prospective charge without recording a refusal on this ledger.
+    pub fn check_without_recording(
+        &self,
+        work: Work,
+    ) -> Result<(), WorkBudgetExceeded<Work::Dimension>> {
         for &dimension in Work::DIMENSIONS {
             let limit = self.limits.get(dimension);
             let Some(attempted) = self.used.get(dimension).checked_add(work.get(dimension)) else {
-                self.record_refusal();
                 return Err(WorkBudgetExceeded {
                     dimension,
                     limit,
@@ -132,7 +140,6 @@ where
                 });
             };
             if attempted > limit {
-                self.record_refusal();
                 return Err(WorkBudgetExceeded {
                     dimension,
                     limit,

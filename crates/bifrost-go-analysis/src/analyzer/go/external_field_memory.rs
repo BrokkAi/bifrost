@@ -538,9 +538,32 @@ pub enum GoAggregateSourceBinding {
         type_syntax: crate::analyzer::go::GoSourceByteRange,
         member: String,
         /// Structured resolver candidate; exact overlay/artifact binding is still required.
-        owner: Option<String>,
+        owner: Option<GoAggregateOwner>,
+        model_set_hash: Option<String>,
     },
     Incomplete(GoExternalFieldGap),
+}
+
+use super::native_points::GoAggregateOwner;
+
+impl GoAggregateOwner {
+    fn fqn(&self) -> String {
+        match self {
+            Self::Source(unit) => unit.fq_name().to_string(),
+            Self::ExternalModel(owner) => owner.owner_fqn.to_string(),
+        }
+    }
+
+    fn matches_layout(&self, layout: &BoundGoExternalFieldLayout<'_>) -> bool {
+        layout.owner == self.fqn()
+            && match self {
+                Self::Source(_) => false,
+                Self::ExternalModel(owner) => {
+                    layout.fields[0].field.owner.provenance.pack_digest
+                        == owner.provider_id.as_ref()
+                }
+            }
+    }
 }
 
 /// Validate against the exact current source snapshot of the owning procedure.
@@ -756,16 +779,60 @@ pub fn bind_go_aggregate_operand_source(
         }
         allocation_node = parent;
     }
-    let owner = match crate::analyzer::usages::get_definition::go::go_type_owner_at_node_bounded(
-        workspace.analyzer(),
+    use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+    use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+    use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+    let Some(go) = resolve_analyzer::<super::GoAnalyzer>(workspace.analyzer()) else {
+        return Ok(incomplete(GoExternalFieldGap::SourceStateUnknown));
+    };
+    let selected_overlay = workspace.analyzer().semantic_model_overlay();
+    let model_set_hash = selected_overlay
+        .as_ref()
+        .map(|overlay| overlay.active_model_set_hash().to_owned());
+    let mut request = match super::native_points::GoNativePointRequest::open_for_file(
+        go,
         &file,
-        &source,
-        type_node,
-        brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-            max_scope_nodes: remaining,
-            ..Default::default()
-        },
+        selected_overlay,
         cancellation,
+    ) {
+        Ok(super::native_points::GoNativePointRequestOpen::Ready(request)) => request,
+        Ok(super::native_points::GoNativePointRequestOpen::Cancelled) => {
+            return Ok(incomplete(GoExternalFieldGap::Cancelled));
+        }
+        Ok(super::native_points::GoNativePointRequestOpen::Unavailable { .. }) => {
+            return Ok(incomplete(GoExternalFieldGap::SourceStateUnknown));
+        }
+        Err(error) => {
+            go.record_query_failure(error);
+            return Ok(incomplete(GoExternalFieldGap::SourceStateUnknown));
+        }
+    };
+    let site = ResolvedReferenceSite {
+        path: brokk_bifrost_core::path_utils::rel_path_string(&file),
+        text: source[literal.start_byte()..literal.end_byte()].to_owned(),
+        range: brokk_bifrost_core::analyzer::model::Range {
+            start_byte: literal.start_byte(),
+            end_byte: literal.end_byte(),
+            start_line: literal.start_position().row,
+            end_line: literal.end_position().row,
+        },
+        focus_start_byte: literal.start_byte(),
+        focus_end_byte: literal.end_byte(),
+    };
+    let owner = match request.composite_literal_nominal_owner(
+        BoundedReceiverQuery {
+            analyzer: workspace.analyzer(),
+            file: &file,
+            source: &source,
+            tree: Some(&tree),
+            site: &site,
+            budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+                max_scope_nodes: remaining,
+                ..Default::default()
+            },
+            cancellation: Some(cancellation),
+        },
     ) {
         brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete { value, .. } => value,
         brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Exceeded { .. } => {
@@ -788,6 +855,7 @@ pub fn bind_go_aggregate_operand_source(
         },
         member: source[key.start_byte()..key.end_byte()].to_owned(),
         owner,
+        model_set_hash,
     })
 }
 
@@ -898,10 +966,11 @@ pub fn bind_go_external_field_source(
 /// aggregate are modeled.
 fn bind_go_external_field_layout<'a>(
     query: &GoExternalFieldQuery<'a>,
-    owner_fqn: &str,
+    selected_owner: &GoAggregateOwner,
     member: &str,
     max_nodes: usize,
 ) -> Result<BoundGoExternalFieldLayout<'a>, GoExternalFieldGap> {
+    let owner_fqn = selected_owner.fqn();
     let overlay = query.overlay;
     let selection = &query.selection;
     let artifact = query.artifact;
@@ -909,7 +978,16 @@ fn bind_go_external_field_layout<'a>(
     let cancellation = query.cancellation;
     let mut remaining = max_nodes;
     charge_route_work(&mut remaining, cancellation)?;
-    let owner = selected_go_struct_owner(overlay, selection, owner_fqn, cancellation)?;
+    if matches!(selected_owner, GoAggregateOwner::Source(_)) {
+        return Err(GoExternalFieldGap::EffectiveStateIncomplete);
+    }
+    let owner = selected_go_struct_owner(overlay, selection, &owner_fqn, cancellation)?;
+    if let GoAggregateOwner::ExternalModel(identity) = selected_owner
+        && (owner.provenance.pack_digest != identity.provider_id.as_ref()
+            || owner.qualified_name != identity.owner_fqn.as_ref())
+    {
+        return Err(GoExternalFieldGap::FieldLayoutIncomplete);
+    }
     if owner.provenance.completeness != SemanticModelCompleteness::Complete {
         return Err(GoExternalFieldGap::FieldLayoutIncomplete);
     }
@@ -943,8 +1021,9 @@ fn bind_go_external_field_layout<'a>(
         let Some(name) = declaration.name.as_ref() else {
             continue;
         };
-        let Some(crate::analyzer::go::GoDeclaredTypeShape::Struct { fields, .. }) =
-            declaration.declared_type_shape.as_ref()
+        let Some(crate::analyzer::go::GoDeclaredTypeShape::Struct {
+            fields, generic, ..
+        }) = declaration.declared_type_shape.as_ref()
         else {
             continue;
         };
@@ -954,6 +1033,9 @@ fn bind_go_external_field_layout<'a>(
             && owner.qualified_name == format!("{}.{}", declaration.package_import_path, name.text)
             && owner.has_exact_artifact_locator(&declaration.anchor.file, &owner.qualified_name)
         {
+            if *generic {
+                return Err(GoExternalFieldGap::FieldLayoutIncomplete);
+            }
             declarations.push((declaration.anchor.clone(), fields));
         }
     }
@@ -1000,7 +1082,7 @@ fn bind_go_external_field_layout<'a>(
     let field = resolve_go_external_field(
         overlay,
         selection,
-        owner_fqn,
+        &owner_fqn,
         member,
         artifact,
         cancellation,
@@ -2071,6 +2153,7 @@ impl<'a> GoExternalFieldQuery<'a> {
                 let GoAggregateSourceBinding::Bound {
                     member: source_member,
                     owner: Some(owner),
+                    model_set_hash,
                     ..
                 } = binding
                 else {
@@ -2079,8 +2162,11 @@ impl<'a> GoExternalFieldQuery<'a> {
                 if source_member != member {
                     continue;
                 }
+                if model_set_hash.as_deref() != Some(self.overlay.active_model_set_hash()) {
+                    return Err(GoExternalFieldGap::EffectiveStateIncomplete);
+                }
                 if let Some(existing) = layout.as_ref()
-                    && existing.owner != owner
+                    && !owner.matches_layout(existing)
                 {
                     return Err(GoExternalFieldGap::EffectiveStateIncomplete);
                 }
@@ -2275,6 +2361,7 @@ impl<'a> GoExternalFieldQuery<'a> {
                         let GoAggregateSourceBinding::Bound {
                             member: source_member,
                             owner: Some(owner),
+                            model_set_hash,
                             ..
                         } = binding
                         else {
@@ -2283,13 +2370,16 @@ impl<'a> GoExternalFieldQuery<'a> {
                         if source_member != layout.fields[0].field.symbol().name {
                             continue;
                         }
-                        if owner != layout.owner {
+                        if model_set_hash.as_deref() != Some(overlay.active_model_set_hash()) {
+                            return Err(GoExternalFieldGap::EffectiveStateIncomplete);
+                        }
+                        if !owner.matches_layout(&layout) {
                             return Err(GoExternalFieldGap::EffectiveStateIncomplete);
                         }
                         let field = resolve_go_external_field(
                             overlay,
                             &self.selection,
-                            &owner,
+                            &owner.fqn(),
                             &source_member,
                             artifact,
                             cancellation,
@@ -2590,9 +2680,11 @@ impl<'a> GoExternalFieldQuery<'a> {
                     if let GoAggregateSourceBinding::Bound {
                         owner: Some(owner),
                         member,
+                        model_set_hash,
                         ..
                     } = binding
-                        && owner == layout.owner
+                        && model_set_hash.as_deref() == Some(self.overlay.active_model_set_hash())
+                        && owner.matches_layout(layout)
                         && layout.field_named(&member).is_some()
                     {
                         return Ok(true);
@@ -3079,6 +3171,7 @@ mod tests {
             type_syntax,
             member,
             owner,
+            ..
         } = binding
         else {
             panic!("exact event/AST/value/allocation correspondence expected: {binding:?}");
@@ -3090,7 +3183,9 @@ mod tests {
             "ext.Config{Callback: func() {}}"
         );
         assert_eq!(member, "Callback");
-        assert_eq!(owner.as_deref(), Some("example.test/dep.Config"));
+        // The import has no selected declaration in this workspace, so its
+        // spelling cannot establish a replayable external layout owner.
+        assert_eq!(owner, None);
         assert!(matches!(
             bind_go_aggregate_operand_source(&workspace, &operand, 1024 * 1024, 0, &cancellation)
                 .unwrap(),

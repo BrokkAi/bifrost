@@ -25,7 +25,7 @@ Network access happens only in these places:
 - The VS Code extension, which is not part of the `bifrost` binary, downloads
   its language server. The published version 0.11.5 downloads Bifrost 0.11.5.
   Later versions download the separate `bifrost-lsp` program. See
-  [VS Code LSP](/vscode/) and [LSP Server](/lsp/).
+  [VS Code LSP](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/vscode.md) and [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md).
 
 ## Boundary Map
 
@@ -175,7 +175,7 @@ minor release, and skills that require a newer tool raise the declared minimum.
 All Portable Agent Plugins v1/Codex, Claude Code, Cursor, Pi, and Amp adapters
 use the same launcher for MCP. The Claude Code plugin also starts its LSP entry
 through the launcher; that works only with Bifrost releases that still serve
-LSP (see [LSP Server](/lsp/)). The launcher resolves the binary in this order:
+LSP (see [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md)). The launcher resolves the binary in this order:
 
 1. `BIFROST_BINARY_PATH`, when it is set and the binary is compatible;
 2. the exact preferred binary in the launcher cache;

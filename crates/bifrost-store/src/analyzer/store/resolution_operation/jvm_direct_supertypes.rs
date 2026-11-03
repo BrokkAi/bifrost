@@ -9,10 +9,7 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 };
 use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason;
 
-/// Each JVM producer publishes ImplicitSuperclass only for its language-defined
-/// root. That kind certifies a closed intrinsic parent independently
-/// of lexical binding or of whether the synthetic reference has provider paths.
-/// Both hierarchy directions apply this rule before demanding a reference.
+/// Each JVM producer publishes ImplicitSuperclass only for its language-defined root.
 pub fn jvm_intrinsic_parent(
     language: brokk_bifrost_core::analyzer::model::Language,
     kind: Option<ResolutionSupertypeKind>,
@@ -20,12 +17,82 @@ pub fn jvm_intrinsic_parent(
     if kind != Some(ResolutionSupertypeKind::ImplicitSuperclass) {
         return None;
     }
-    brokk_bifrost_jvm::intrinsics::implicit_superclass_root(language).map(|root| {
-        crate::analyzer::resolution::ExternalOwnerIdentity {
-            provider_id: std::sync::Arc::from("jvm-intrinsic"),
-            owner_fqn: std::sync::Arc::from(root),
-        }
+    let root = brokk_bifrost_jvm::intrinsics::implicit_superclass_root(language)
+        .expect("every implicit superclass edge has a language root in the intrinsic table");
+    Some(crate::analyzer::resolution::ExternalOwnerIdentity {
+        provider_id: std::sync::Arc::from("jvm-intrinsic"),
+        owner_fqn: std::sync::Arc::from(root),
     })
+}
+
+/// A selected source root keeps ordinary resolution authority. An exhausted
+/// negative selected-source read proves the intrinsic root owns this edge.
+pub(crate) fn selected_implicit_root_presence(
+    source: &dyn crate::analyzer::resolution::BatchResolutionFragmentSource,
+    root: &crate::analyzer::resolution::ExternalOwnerIdentity,
+    cancellation: &CancellationToken,
+) -> Result<crate::analyzer::resolution::JvmSelectedRootPresence> {
+    source.jvm_selected_root_presence(&root.owner_fqn, cancellation)
+}
+
+/// Complete an implicit root only after ordinary reference resolution has had
+/// the chance to select a source declaration. The model boundary is derived
+/// from the root coordinate, never read from a mutable provider claim.
+pub(crate) fn combine_implicit_root_reference(
+    root: Option<&crate::analyzer::resolution::ExternalOwnerIdentity>,
+    presence: crate::analyzer::resolution::JvmSelectedRootPresence,
+    targets: &mut Vec<SemanticId>,
+    completion: &mut ResolutionCompletion,
+    identities: &SelectedContextIdentities,
+    mut intrinsic_identity: impl FnMut(
+        &crate::analyzer::resolution::ExternalOwnerIdentity,
+    ) -> Result<Option<SemanticId>>,
+) -> Result<bool> {
+    let Some(root) = root else {
+        return Ok(true);
+    };
+    if !targets.is_empty() {
+        return Ok(true);
+    }
+    let replace = match completion {
+        ResolutionCompletion::Complete => true,
+        ResolutionCompletion::Incomplete(reasons) if reasons.len() == 1 => {
+            let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                b"bifrost-jvm-model-declared-type-boundary:v1",
+            );
+            hash.field("declared-type-fqn", root.owner_fqn.as_bytes());
+            let boundary = identities.named_semantic(
+                hash.finish(),
+                "jvm-intrinsic-root",
+                &format!(
+                    "language-defined root `{}` has a fixed complete member inventory",
+                    root.owner_fqn
+                ),
+            );
+            reasons.iter().all(|reason| {
+                matches!(reason,
+                    ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+                    | ResolutionIncompleteReason::OpenBoundary { semantic, .. }
+                        if *semantic == boundary
+                )
+            })
+        }
+        ResolutionCompletion::Incomplete(_) => false,
+    };
+    if !replace || presence != crate::analyzer::resolution::JvmSelectedRootPresence::Ready(false) {
+        return Ok(true);
+    }
+    assert_eq!(
+        presence,
+        crate::analyzer::resolution::JvmSelectedRootPresence::Ready(false),
+        "an intrinsic edge requires exhausted selected-source absence"
+    );
+    let Some(identity) = intrinsic_identity(root)? else {
+        return Ok(false);
+    };
+    targets.push(identity);
+    *completion = ResolutionCompletion::Complete;
+    Ok(true)
 }
 
 /// One authored or implicit parent, with all binding alternatives preserved.
@@ -113,18 +180,32 @@ struct ReferenceAnswer {
 /// Borrowed inside `with_jvm_hierarchy_query`; never retained across requests.
 pub struct JvmHierarchyQuery<'query, 'source, R: JvmHierarchyReadReceipts = ()> {
     forward: &'query mut FactResolutionOperation<'source>,
+    source: &'query dyn crate::analyzer::resolution::BatchResolutionFragmentSource,
     typed: &'query dyn SelectedTypedFactSource,
     identities: &'query SelectedContextIdentities,
     cancellation: &'query CancellationToken,
     receipts: &'query mut R,
     references: HashMap<SemanticId, (Result<ReferenceAnswer>, R::Receipt)>,
+    #[cfg(any(test, feature = "test-support"))]
+    resolved_references: std::cell::Cell<usize>,
     // Selected language/kind facts certify the intrinsic coordinate. This
     // query-scoped callback retains no answer; its reads join the receipt.
-    intrinsic_parent:
-        &'query dyn Fn(SemanticId, Option<ResolutionSupertypeKind>) -> Result<Option<SemanticId>>,
+    intrinsic_parent: &'query dyn Fn(
+        SemanticId,
+        Option<ResolutionSupertypeKind>,
+    ) -> Result<
+        Option<(
+            crate::analyzer::resolution::ExternalOwnerIdentity,
+            SemanticId,
+        )>,
+    >,
 }
 
 impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resolved_reference_count_for_test(&self) -> usize {
+        self.resolved_references.get()
+    }
     /// Bypass query result reuse only to witness the shared engine's #8290 bug.
     #[cfg(any(test, feature = "test-support"))]
     pub fn resolve_reference_uncached_for_test(
@@ -152,15 +233,25 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
             self.receipts.replay(receipt);
         } else {
             let forward = &mut self.forward;
+            let source = self.source;
+            let cancellation = self.cancellation;
+            #[cfg(any(test, feature = "test-support"))]
+            let resolved_references = &self.resolved_references;
             let identities = self.identities;
             let intrinsic_parent = self.intrinsic_parent;
             let (answer, receipt) = self.receipts.capture(|| {
-                if let Some(target) = intrinsic_parent(reference, kind)? {
+                let root = intrinsic_parent(reference, kind)?;
+                if let Some((owner, target)) = &root
+                    && selected_implicit_root_presence(source, owner, cancellation)?
+                        == crate::analyzer::resolution::JvmSelectedRootPresence::Ready(false)
+                {
                     return Ok(ReferenceAnswer {
-                        targets: vec![target],
+                        targets: vec![*target],
                         completion: ResolutionCompletion::Complete,
                     });
                 }
+                #[cfg(any(test, feature = "test-support"))]
+                resolved_references.set(resolved_references.get() + 1);
                 let answer = forward.resolve_reference_with_metrics(
                     reference,
                     &mut ResolutionBatchMetrics::default(),
@@ -194,9 +285,10 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
                         targets.push(ty.identity());
                     }
                 }
+                let completion = answer.binding().completion().clone();
                 Ok(ReferenceAnswer {
                     targets,
-                    completion: answer.binding().completion().clone(),
+                    completion,
                 })
             });
             self.references.insert(reference, (answer, receipt));
@@ -355,7 +447,14 @@ impl SelectedResolutionOperation<'_, '_> {
         let typed = self.ready.typed_source();
         let lexical = SeamProfiled::observing(&lexical);
         let typed = SeamProfiled::observing(&typed);
-        let intrinsic_parent = |reference: SemanticId, kind| -> Result<Option<SemanticId>> {
+        let intrinsic_parent = |reference: SemanticId,
+                                kind|
+         -> Result<
+            Option<(
+                crate::analyzer::resolution::ExternalOwnerIdentity,
+                SemanticId,
+            )>,
+        > {
             if kind != Some(ResolutionSupertypeKind::ImplicitSuperclass) {
                 return Ok(None);
             }
@@ -385,9 +484,11 @@ impl SelectedResolutionOperation<'_, '_> {
                 .mount_record_by_ordinal(mount.ordinal())?
                 .semantic_language();
             Ok(jvm_intrinsic_parent(language, kind).map(|owner| {
-                self.ready
+                let identity = self
+                    .ready
                     .context_identities
-                    .external_owner_semantic(&owner, &self.ready.shared_names())
+                    .external_owner_semantic(&owner, &self.ready.shared_names());
+                (owner, identity)
             }))
         };
         self.with_jvm_forward_operation(
@@ -403,11 +504,14 @@ impl SelectedResolutionOperation<'_, '_> {
             |forward| {
                 run(&mut JvmHierarchyQuery {
                     forward,
+                    source: &lexical,
                     typed: &typed,
                     identities: &self.ready.context_identities,
                     cancellation: context.cancellation,
                     receipts,
                     references: HashMap::default(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    resolved_references: std::cell::Cell::new(0),
                     intrinsic_parent: &intrinsic_parent,
                 })
             },

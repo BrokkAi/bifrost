@@ -11,7 +11,7 @@ variables, see [Environment Variables](/reference/environment/).
 
 The `bifrost` command does not serve the Language Server Protocol. The
 language server is the separate `bifrost-lsp` program; see
-[LSP Server](/lsp/).
+[LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md).
 
 ## Run One Tool
 

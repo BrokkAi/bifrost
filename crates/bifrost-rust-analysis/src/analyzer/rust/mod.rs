@@ -43,6 +43,7 @@ pub mod native_points;
 pub mod native_rename;
 #[doc(hidden)]
 pub mod native_usages;
+mod toolchain_evidence;
 mod trait_applicability;
 mod value_type_barriers;
 
@@ -57,6 +58,7 @@ pub mod selected_shadow;
 #[doc(hidden)]
 pub mod semantic;
 mod site_activation;
+mod topology;
 
 pub(crate) use crate::analyzer::rust::semantic::RustReceiverTypeFacts;
 
@@ -131,6 +133,20 @@ fn read_selected_type_head(
     }))
 }
 
+pub(crate) fn standard_unwrap_payload_name(name: &str) -> bool {
+    matches!(
+        name,
+        "std.option.Option"
+            | "core.option.Option"
+            | "alloc.option.Option"
+            | "std.result.Result"
+            | "core.result.Result"
+            | "alloc.result.Result"
+            | "std.io.Result"
+            | "std.thread.Result"
+    )
+}
+
 fn standard_wrapper_payload(
     evidence: &SelectedTypeHeadEvidence<'_>,
 ) -> Option<brokk_bifrost_analysis::analyzer::store::language_support::WrapperPayloadProjection> {
@@ -141,7 +157,15 @@ fn standard_wrapper_payload(
         }
         match name {
             "Box" | "Arc" | "Rc" => 0,
-            "Option" | "Result" => 1,
+            "Option" | "Result"
+                if standard_unwrap_payload_name(&format!(
+                    "{root}.{}.{}",
+                    if name == "Option" { "option" } else { "result" },
+                    name
+                )) =>
+            {
+                1
+            }
             _ => return None,
         }
     } else {
@@ -153,8 +177,7 @@ fn standard_wrapper_payload(
         }
         match (module.as_str(), name.as_str()) {
             ("boxed", "Box") | ("sync", "Arc") | ("rc", "Rc") => 0,
-            ("option", "Option") | ("result", "Result") => 1,
-            ("io" | "thread", "Result") if root == "std" => 1,
+            _ if standard_unwrap_payload_name(&format!("{root}.{module}.{name}")) => 1,
             _ => return None,
         }
     };
@@ -476,6 +499,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RustSuppo
 
     fn is_configuration_input_path(&self, path: &Path) -> bool {
         file_dependency_evidence::cargo_input(path)
+            || toolchain_evidence::rust_toolchain_input(path)
     }
     fn selected_macro_source_rows(
         &self,
@@ -722,6 +746,7 @@ use brokk_bifrost_rust::cargo_routes::{
 };
 use brokk_bifrost_rust::crate_naming;
 
+pub use brokk_bifrost_rust::cargo_config::{builtin_target_platform, host_target_triple};
 pub(crate) use brokk_bifrost_rust::declarations::rust_type_identifiers;
 pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
 pub use brokk_bifrost_rust::graph_support::{rust_path_segments, rust_reference_namespace};
@@ -737,6 +762,8 @@ pub use crate::analyzer::rust::external::RustDependencyPackAdapter;
 pub use crate::analyzer::rust::file_dependency_evidence::acquire_rust_file_dependency_evidence;
 
 pub use crate::analyzer::rust::file_dependency_evidence::rust_file_dependency_evidence;
+
+pub use crate::analyzer::rust::toolchain_evidence::RUST_TOOLCHAIN_ECOSYSTEM;
 
 pub use crate::analyzer::rust::rustdoc_artifact::RustdocJsonPackProducer;
 
@@ -2988,8 +3015,14 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
                 brokk_bifrost_rust::declarations::rust_node_text(*written_member, site.source);
             if let Some(provider) = analyzer.import_analysis_provider_for_file(file) {
                 let scope = AnalyzerQueryScope::new(analyzer);
-                for import in provider.import_info_of(scope.token(), file) {
-                    let binding_name = rust_import_binding_name(&import);
+                let imports = if let Some(selected) = operation.as_deref_mut() {
+                    let cancellation = analyzer.active_query_cancellation().unwrap_or_default();
+                    std_types::selected_import_infos(analyzer, selected, file, &cancellation)?
+                } else {
+                    provider.import_info_of(scope.token(), file)
+                };
+                for import in &imports {
+                    let binding_name = rust_import_binding_name(import);
                     if binding_name.is_glob() || binding_name.named() != Some(binding) {
                         continue;
                     }
@@ -3034,7 +3067,8 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
                         scope.token(),
                         file,
                         site,
-                        &import,
+                        import,
+                        &imports,
                         member,
                         &owner_components,
                         operation_factory,
@@ -3077,6 +3111,12 @@ fn rust_import_binder_visible_at_byte(path: &StructuredImportPath, call_start_by
 }
 
 impl LanguageSupport for RustSupport {
+    fn build_model_provider(
+        &self,
+    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::languages::BuildModelProvider> {
+        Some(&topology::CARGO_BUILD_MODEL)
+    }
+
     fn intrinsic_call(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
@@ -3947,6 +3987,16 @@ mod dependency_packs {
     use crate::analyzer::RustDependencyPackAdapter;
 
     use crate::analyzer::resolve_rust_semantic_pack_dependencies;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationOutcome;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependency;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_compatible_installed_semantic_packs;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
     pub(crate) struct CargoDependencyResolver;
 
     impl DependencyResolver for CargoDependencyResolver {
@@ -3960,6 +4010,46 @@ mod dependency_packs {
 
         fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
             READS_FILES_ONLY
+        }
+
+        /// Exact Cargo lock coordinates carry no artifact to produce from, so
+        /// they select only compatible installed or reviewed workspace packs,
+        /// as curated Go module evidence does. A crate without such a pack is
+        /// not a failure: most locked crates have no model. Rustdoc evidence
+        /// and the toolchain row keep the producing and acquiring route.
+        fn prepare(
+            &self,
+            _config: &AnalyzerConfig,
+            catalog: &SemanticPackCatalog,
+            dependencies: &[ResolvedDependency],
+            limits: &DependencyPackLimits,
+            cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        ) -> DependencyPackPreparationOutcome {
+            let (locked, produced): (Vec<_>, Vec<_>) =
+                dependencies.iter().cloned().partition(|dependency| {
+                    dependency.artifacts.is_empty() && dependency.evidence.package.is_some()
+                });
+            let mut outcome = prepare_dependency_semantic_packs(
+                catalog,
+                self.adapter(),
+                &produced,
+                limits,
+                cancellation,
+            );
+            if outcome.cancelled || locked.is_empty() {
+                return outcome;
+            }
+            let installed =
+                prepare_compatible_installed_semantic_packs(catalog, &locked, limits, cancellation);
+            outcome.installed_packs.extend(installed.installed_packs);
+            outcome.evidence.extend(installed.evidence);
+            outcome.diagnostics.extend(installed.diagnostics);
+            outcome.suppressed_diagnostics += installed.suppressed_diagnostics;
+            outcome.complete &= installed.complete;
+            outcome.cancelled = installed.cancelled;
+            outcome.profile.dependencies_considered += installed.profile.dependencies_considered;
+            outcome.profile.installed_packs += installed.profile.installed_packs;
+            outcome
         }
 
         fn resolve(

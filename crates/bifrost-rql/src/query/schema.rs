@@ -997,6 +997,7 @@ query_step_ops! {
     GuardsOf { shape: RowLocal, label: "guards_of", signature: "procedure -> guard", description: "Return the normalized branch conditions the language adapter recorded for each procedure: which decision point each guard sits on, what its condition was normalized to -- a compile-time constant, a null comparison, a comparison against a constant, or an explicitly opaque condition -- and the stable ids of the true and false successor edges and target points. A constant condition is published even when lowering folded its dead arm away, which is the only place that evidence survives. An empty answer means the adapter records no guard facts for this language, which its own guard_facts capability states.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     TargetOf { shape: DerivedValue, label: "target_of", signature: "file -> build_target", description: "Return the build target each file compiles into, as the workspace's own build files declare it. Ownership comes from build evidence alone: a file no read build file claims produces no row, and a build model this workspace cannot read produces an explicit incomplete diagnostic rather than an empty answer that reads as \"no target\"." }
     SourceSetOf { shape: DerivedValue, label: "source_set_of", signature: "file -> source_set", description: "Return the declared compilation input set each file belongs to, with the build file that fixes the layout. A file two declared source sets both claim is reported ambiguous rather than assigned to whichever was read first." }
+    BuildConfigurationOf { shape: RowLocal, label: "build_configuration_of", signature: "file -> build_configuration", description: "Return the build configuration each file is analyzed under and the file's standing in it: the selected target OS and architecture with where each came from (Bifrost configuration, the language toolchain, or the analysis host), whether that configuration compiles the file, the file's own build constraint, and the target OS and architecture values the constraint admits at all, independent of the host. An admitted-target scope of `any` is a platform-neutral file, never evidence that it is built for one target; an invalid constraint leaves both scopes `unknown`. A file in a language without a build-configuration provider produces no row and an explicit unsupported diagnostic." }
     TopologyEdgesOf { shape: DerivedValue, label: "topology_edges_of", signature: "build_target -> topology_edge", description: "Return the dependencies each build target declares on other targets of the same workspace, each carrying its build-declared scope and the build file that declares it. The absence of an edge is only publishable when the topology it was read from is complete, which the row's own completeness column states." }
     RewritePathsOf { shape: RowLocal, label: "rewrite_paths_of", signature: "file -> rewrite_path", description: "Enumerate the bounded rewrite chases each file engages in a declared finite rewrite domain: the ordered steps a production analysis took, the bound the domain declared for itself, and the terminal outcome -- converged with its fixed point, cycle with the ordered repeated-state witness, or exceeded-budget with the work performed. Budget exhaustion is absence of evidence, never a proven cycle and never a clean convergence." }
     SegmentsOf { shape: RowLocal, label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution." }
@@ -1339,6 +1340,7 @@ macro_rules! rql_forms {
                     | Self::TargetOf
                     | Self::SourceSetOf
                     | Self::TopologyEdgesOf
+                    | Self::BuildConfigurationOf
                     | Self::GuardsOf
                     | Self::RewritePathsOf
                     | Self::StatementFacts => None,
@@ -2946,6 +2948,14 @@ rql_forms! {
         signature: "(topology-edges-of query)",
         description: (QueryStepOp::TopologyEdgesOf),
         step: TopologyEdgesOf,
+    }
+    BuildConfigurationOf {
+        labels: ["build-configuration-of", "build_configuration_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(build-configuration-of query)",
+        description: (QueryStepOp::BuildConfigurationOf),
+        step: BuildConfigurationOf,
     }
     RewritePathsOf {
         labels: ["rewrite-paths-of", "rewrite_paths_of"],
@@ -5013,6 +5023,7 @@ json_fields! {
  Sources { label: "sources", shape: StringList, signature: "\"sources\": [\"...\"]", description: "Exact source identities, including registry URL or git revision." }
  DeclaredBy { label: "declared_by", shape: StringList, signature: "\"declared_by\": [\"...\"]", description: "Established owning BuildProject IDs; lock co-occurrence never creates ownership." }
  Scopes { label: "scopes", shape: StringList, signature: "\"scopes\": [\"...\"]", description: "Recorded compile, test, unknown or other dependency scope, without enabled configuration inference." }
+ Features { label: "features", shape: StringList, signature: "\"features\": [\"...\"]", description: "Features the owning manifest requests of the package; requires exactly the cargo ecosystem axis. A match proves a request, not an enabled build feature; defaults, member feature tables and the package's own feature implications leave other rows unknown." }
 }
 pub fn dependency_evidence_field_for_rql_label(
     label: &str,
@@ -5026,6 +5037,7 @@ pub fn dependency_evidence_field_for_rql_label(
         ":source" | ":sources" => Some(DependencyEvidenceFilterField::Sources),
         ":declared-by" | ":declared_by" => Some(DependencyEvidenceFilterField::DeclaredBy),
         ":scope" | ":scopes" => Some(DependencyEvidenceFilterField::Scopes),
+        ":feature" | ":features" => Some(DependencyEvidenceFilterField::Features),
         _ => None,
     }
 }

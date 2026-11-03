@@ -17,7 +17,6 @@ use brokk_bifrost_core::analyzer::usages::resolution_session::{
     BoundedResolution, ResolutionSession,
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use tree_sitter::Node;
 
@@ -33,9 +32,6 @@ use crate::analyzer::go::package_identity::GoModeledPackageCallResolution;
 use crate::analyzer::go::package_identity::GoOverlayPackages;
 
 use brokk_bifrost_analysis::analyzer::languages::package_fq_name;
-use brokk_bifrost_analysis::analyzer::semantic::{
-    PropertyReachingLimits, SourceSpan, ValueFlowRelationKind,
-};
 
 use brokk_bifrost_analysis::analyzer::store::StoreError;
 
@@ -67,9 +63,7 @@ use brokk_bifrost_core::analyzer::common::node_source_text_trimmed as go_node_te
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{parent_if_field, root_node};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
-use brokk_bifrost_core::analyzer::{
-    PackageRelationKind, PackageRelationValue, RelationalName, model::StructuredTypeNodeView,
-};
+use brokk_bifrost_core::analyzer::{PackageRelationKind, PackageRelationValue, RelationalName};
 use brokk_bifrost_go::packages::go_internal_import_allowed;
 use brokk_bifrost_go::references::go_name_shadowed_at_with_scope;
 use tree_sitter::Tree;
@@ -84,16 +78,10 @@ pub(crate) enum GoWorkspacePackageStatus {
 
 pub(crate) trait GoDefinitionProvider {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn fqn_exists(&self, fqn: &str) -> bool {
-        !self.fqn(fqn).is_empty()
-    }
     fn workspace_package_status(&self, import_path: &str) -> GoWorkspacePackageStatus;
     fn workspace_declaration_identities_authoritative(&self) -> bool;
     fn workspace_package_inventory_complete(&self) -> bool {
         false
-    }
-    fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
-        self.fqn(&format!("{owner_fqn}.{name}"))
     }
     fn import_infos(
         &self,
@@ -115,9 +103,6 @@ pub(crate) trait GoDefinitionProvider {
         analyzer.signature_metadata(unit)
     }
     fn scope_step(&self) -> bool {
-        true
-    }
-    fn summary_step(&self) -> bool {
         true
     }
     fn session(&self) -> Option<&ResolutionSession> {
@@ -144,7 +129,7 @@ pub(crate) trait GoDefinitionProvider {
         None
     }
 
-    fn selected_modeled_call_result_count(
+    fn selected_call_result_count(
         &self,
         _token: QueryToken<'_>,
         _file: &ProjectFile,
@@ -431,20 +416,6 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         self.analyzer.workspace_package_inventory_complete()
     }
 
-    fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
-        match self.session {
-            Some(session) => brokk_bifrost_analysis::analyzer::usages::get_definition::query_limited_definition_units(session, |limit| {
-                self.analyzer
-                    .member_candidates_for_owner_limited(owner_fqn, name, limit, || {
-                        session.observe_cancellation()
-                    })
-            }),
-            None => brokk_bifrost_core::analyzer::definition_lookup::sort_dedup_units(
-                self.fqn(&format!("{owner_fqn}.{name}")),
-            ),
-        }
-    }
-
     fn signature_metadata(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -459,10 +430,6 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
 
     fn scope_step(&self) -> bool {
         brokk_bifrost_analysis::analyzer::usages::get_definition::session_scope_step(self.session())
-    }
-
-    fn summary_step(&self) -> bool {
-        brokk_bifrost_analysis::analyzer::usages::get_definition::summary_step(self.session)
     }
 
     fn session(&self) -> Option<&ResolutionSession> {
@@ -498,7 +465,7 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         .package_call_resolution(import_path, member, parameter_count)
     }
 
-    fn selected_modeled_call_result_count(
+    fn selected_call_result_count(
         &self,
         token: QueryToken<'_>,
         file: &ProjectFile,
@@ -506,8 +473,6 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         callee: Node<'_>,
         argument_count: usize,
     ) -> Option<usize> {
-        // A modeled count needs an overlay; without one, native work cannot supply it.
-        self.semantic_model_overlay.as_ref()?;
         let cancellation = go_request_cancellation(self, self.analyzer);
         if cancellation.is_cancelled() {
             return None;
@@ -598,12 +563,14 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
             }
             return None;
         }
-        let result = self.selected_model_result_count_from_resolution(
-            file,
-            &value,
-            &cancellation,
-            argument_count,
-        );
+        let result = value.selected_callable_result_count.or_else(|| {
+            self.selected_model_result_count_from_resolution(
+                file,
+                &value,
+                &cancellation,
+                argument_count,
+            )
+        });
         if !cancellation.is_cancelled() {
             self.nested_counts
                 .read(&memo_attribution(self.analyzer), |memo| {
@@ -676,19 +643,21 @@ pub(crate) fn parse_go_tree_for_proof(analyzer: &dyn IAnalyzer, source: &str) ->
     tree
 }
 
-/// Recover the result type of a known function-valued call expression from
-/// the same structured local-value inference used by Go navigation.
+/// Recover the type of result `result_ordinal` of a call through a function
+/// value whose callee is a plain identifier bound to an explicit function type.
 ///
 /// The call resolver may leave a function-valued binding without dispatch
 /// arms because its value flow is local rather than declaration-target based.
-/// This narrow adapter still has a positive proof when the callee's selected
-/// expression has one indexed result type. Unknown bindings and modeled-only
-/// values deliberately abstain.
+/// This adapter has a positive proof only when the identifier's nearest visible
+/// binding declares an anonymous `func(...)` type or names a function type
+/// declaration, and the requested result is the unshadowed predeclared `error`.
+/// Every other callee abstains.
 pub(crate) fn go_function_value_result_type_identity(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     range: Range,
     result_ordinal: usize,
+    cancellation: &CancellationToken,
 ) -> Option<StructuredTypeIdentity> {
     if file.declaration_language() != Language::Go || range.start_byte >= range.end_byte {
         return None;
@@ -706,7 +675,6 @@ pub(crate) fn go_function_value_result_type_identity(
     let function = node.child_by_field_name("function")?;
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
     let support = AnalyzerGoDefinitionProvider::new(go, analyzer.semantic_model_overlay());
-    let scope = AnalyzerQueryScope::new(analyzer);
     if function.kind() == "identifier"
         && let Some(GoLocalBinding::Type(type_node)) = go_nearest_visible_binding_with_evaluation(
             &support,
@@ -718,21 +686,53 @@ pub(crate) fn go_function_value_result_type_identity(
         )
     {
         if type_node.kind() != "function_type" {
-            let token = scope.token();
-            let type_fqn =
-                go_resolve_type_fqn(analyzer, token, &support, file, &source, type_node)?;
-            let units = support.fqn(&type_fqn);
-            let [unit] = units.as_slice() else {
+            let declaration = type_node.parent()?;
+            let mut cursor = declaration.walk();
+            let mut names = declaration.named_children(&mut cursor).filter(|child| {
+                child.kind() == "identifier"
+                    && child.end_byte() <= type_node.start_byte()
+                    && go_node_text(*child, &source) == go_node_text(function, &source)
+            });
+            let binding = names.next()?;
+            if names.next().is_some() {
                 return None;
-            };
+            }
+            let selected =
+                match crate::analyzer::go::type_identity_proof::go_explicit_binding_declared_type(
+                    analyzer,
+                    file,
+                    &source,
+                    Range {
+                        start_byte: binding.start_byte(),
+                        end_byte: binding.end_byte(),
+                        start_line: binding.start_position().row,
+                        end_line: binding.end_position().row,
+                    },
+                    cancellation,
+                ) {
+                    BoundedResolution::Complete { value, .. } => value.nominal?,
+                    BoundedResolution::Exceeded { limit, .. } => {
+                        analyzer.record_query_incomplete(
+                            QueryReadIncomplete::SemanticEvidenceUnavailable(
+                                format!(
+                                    "Go explicit binding type resolution budget exceeded: {limit:?}"
+                                )
+                                .into(),
+                            ),
+                        );
+                        return None;
+                    }
+                    BoundedResolution::Cancelled { .. } => {
+                        analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+                        return None;
+                    }
+                };
+            let unit = &selected;
             let type_source = analyzer.indexed_source(unit.source())?;
             let type_tree = parse_go_tree_for_proof(analyzer, &type_source)?;
             let type_root = type_tree.root_node();
-            let function_type = go_named_function_type_node(
-                type_root,
-                &type_source,
-                go_node_text(type_node, &source).trim(),
-            )?;
+            let function_type =
+                go_named_function_type_node(type_root, &type_source, unit.terminal_name())?;
             if function_type.has_error() {
                 return None;
             }
@@ -772,18 +772,7 @@ pub(crate) fn go_function_value_result_type_identity(
         }
         return None;
     }
-    let inferred = go_expression_inferred_type(
-        analyzer,
-        scope.token(),
-        &support,
-        file,
-        &source,
-        root,
-        function,
-        function.start_byte(),
-        0,
-    )?;
-    inferred.indexed_identity().cloned()
+    None
 }
 
 fn go_named_function_type_node<'tree>(
@@ -792,6 +781,7 @@ fn go_named_function_type_node<'tree>(
     name: &str,
 ) -> Option<Node<'tree>> {
     let mut stack = vec![root];
+    let mut found = None;
     while let Some(node) = stack.pop() {
         if node.kind() == "type_spec"
             && node
@@ -799,14 +789,14 @@ fn go_named_function_type_node<'tree>(
                 .is_some_and(|candidate| go_node_text(candidate, source).trim() == name)
         {
             let type_node = node.child_by_field_name("type")?;
-            if type_node.kind() == "function_type" {
-                return Some(type_node);
+            if found.replace(type_node).is_some() {
+                return None;
             }
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    None
+    found.filter(|type_node| type_node.kind() == "function_type")
 }
 
 struct GoCallEvidence {
@@ -895,233 +885,7 @@ fn go_workspace_package_status_unknown(import_path: &str) -> DefinitionLookupOut
     )
 }
 
-/// A selector target recovered from the receiver's structured Go type fact.
-/// Workspace methods retain the declaration selected by Go's method set;
-/// external methods retain only their canonical model key and call-shape
-/// proof, never an invented body.
-#[derive(Debug, Clone)]
-pub(crate) struct GoTypedSelectorTarget {
-    pub(crate) member: String,
-    pub(crate) receiver_is_interface: bool,
-    pub(crate) field_anchor: Option<brokk_bifrost_analysis::analyzer::semantic::SourceAnchor>,
-    pub(crate) receiver_preparation:
-        Option<brokk_bifrost_analysis::analyzer::semantic::MemberReceiverPreparation>,
-    pub(crate) external_concrete_owner_fqn: Option<String>,
-    pub(crate) workspace_methods: Vec<CodeUnit>,
-    pub(crate) external_callee: Option<String>,
-    pub(crate) external_call: Option<ExactExternalCallProof>,
-}
-
-/// Resolve one exact Go selector call using the same structured expression
-/// inference and method-set rules as ordinary Go definition lookup. The
-/// caller supplies nodes from the call site's already-paid parse tree.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn go_typed_selector_target(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    receiver: Node<'_>,
-    callable: Node<'_>,
-    member: &str,
-    byte: usize,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
-) -> BoundedResolution<Option<GoTypedSelectorTarget>> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return session.finish(None);
-    };
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
-    // A package-qualified function such as `time.NewTicker` is also a Go
-    // selector expression, but its left identifier names an import namespace
-    // rather than a receiver value. Keep it on the package-function resolver
-    // path so its reviewed call proof is not replaced with a receiver proof.
-    if matches!(receiver.kind(), "identifier" | "package_identifier")
-        && go_nearest_visible_binding(
-            &support,
-            root,
-            source,
-            go_node_text(receiver, source),
-            receiver.start_byte(),
-        )
-        .is_none()
-        && go_import_paths(&support, token, go, file).contains_key(go_node_text(receiver, source))
-    {
-        return session.finish(None);
-    }
-    let Some(inferred) = go_expression_inferred_type(
-        analyzer, token, &support, file, source, root, receiver, byte, 0,
-    ) else {
-        return session.finish(None);
-    };
-    let Some((owner_fqn, owner_is_external)) =
-        go_selector_owner_fqn(&support, token, go, &inferred)
-    else {
-        return session.finish(None);
-    };
-    let field_target = || {
-        let field = callable.child_by_field_name("field")?;
-        let anchor =
-            brokk_bifrost_analysis::analyzer::semantic::lowering::source_anchor(field, 0).ok()?;
-        Some(GoTypedSelectorTarget {
-            member: member.to_owned(),
-            receiver_is_interface: false,
-            field_anchor: Some(anchor),
-            receiver_preparation: None,
-            external_concrete_owner_fqn: None,
-            workspace_methods: Vec::new(),
-            external_callee: None,
-            external_call: None,
-        })
-    };
-    if owner_is_external {
-        // Native model selection (including an open result) is handled before
-        // this source-only bridge. Never retry the legacy model walk here.
-        return session.finish(None);
-    }
-
-    let Some(owner_fqn) = go_resolve_selector_alias_owner(go, &owner_fqn) else {
-        return session.finish(None);
-    };
-    let methods = match go_indexed_field_lookup_with_method_set(
-        analyzer,
-        token,
-        &support,
-        &owner_fqn,
-        member,
-        Some(&inferred),
-    ) {
-        GoDefinitionMemberLookup::Missing => return session.finish(None),
-        GoDefinitionMemberLookup::Unique(method) => vec![method],
-        GoDefinitionMemberLookup::Ambiguous(methods) => methods,
-    };
-    if matches!(methods.as_slice(), [field] if field.is_field()) {
-        return session.finish(field_target());
-    }
-    let Some(receiver_is_interface) = methods.iter().try_fold(false, |is_interface, method| {
-        go_method_is_interface_method(analyzer, &support, method)
-            .map(|candidate_is_interface| is_interface || candidate_is_interface)
-    }) else {
-        return session.finish(None);
-    };
-    let receiver_preparation = if !receiver_is_interface {
-        match methods.as_slice() {
-            // A promoted method needs the embedded field path, not the outer
-            // receiver's address/copy preparation. Keep that selection open.
-            [method]
-                if support
-                    .members_for_owner_name(&owner_fqn, member)
-                    .contains(method) =>
-            {
-                match go_member_in_method_set(
-                    analyzer,
-                    &support,
-                    method,
-                    inferred.admits_pointer_receivers(),
-                ) {
-                    GoMethodSetVerdict::InMethodSet {
-                        pointer_receiver: Some(pointer),
-                        ..
-                    } => crate::analyzer::go::go_method_receiver_preparation(
-                        pointer,
-                        inferred.is_pointer(),
-                        inferred.addressable,
-                    ),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    session.finish(Some(GoTypedSelectorTarget {
-        member: member.to_owned(),
-        receiver_is_interface,
-        field_anchor: None,
-        receiver_preparation,
-        external_concrete_owner_fqn: None,
-        workspace_methods: methods,
-        external_callee: None,
-        external_call: None,
-    }))
-}
-
-/// Resolve the concrete method represented by one exhaustive heap allocation.
-/// A value allocated as `T` has T's value method set even when the allocation
-/// expression itself is addressable; only a pointer allocation admits pointer
-/// receiver methods here.
-#[allow(clippy::too_many_arguments)]
-pub fn go_allocation_selector_method(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    allocation: Node<'_>,
-    member: &str,
-    byte: usize,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
-) -> BoundedResolution<Option<CodeUnit>> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return session.finish(None);
-    };
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
-    let Some(mut inferred) = go_expression_inferred_type(
-        analyzer, token, &support, file, source, root, allocation, byte, 0,
-    ) else {
-        return session.finish(None);
-    };
-    inferred.addressable = false;
-    let Some((owner_fqn, owner_is_external)) =
-        go_selector_owner_fqn(&support, token, go, &inferred)
-    else {
-        return session.finish(None);
-    };
-    if owner_is_external {
-        return session.finish(None);
-    }
-    let Some(owner_fqn) = go_resolve_selector_alias_owner(go, &owner_fqn) else {
-        return session.finish(None);
-    };
-    let method = match go_indexed_field_lookup_with_method_set(
-        analyzer,
-        token,
-        &support,
-        &owner_fqn,
-        member,
-        Some(&inferred),
-    ) {
-        GoDefinitionMemberLookup::Unique(method) => Some(method),
-        GoDefinitionMemberLookup::Missing | GoDefinitionMemberLookup::Ambiguous(_) => None,
-    };
-    if method.as_ref().is_some_and(|method| {
-        go_method_is_interface_method(analyzer, &support, method) != Some(false)
-    }) {
-        return session.finish(None);
-    }
-    session.finish(method)
-}
-
-fn go_resolve_selector_alias_owner(go: &GoAnalyzer, owner_fqn: &str) -> Option<String> {
-    let edge_index = go.usage_edge_index().ok()?;
-    let resolved = edge_index.resolve_type_alias(owner_fqn);
-    if resolved != owner_fqn {
-        Some(resolved)
-    } else {
-        edge_index
-            .is_known_non_alias_type(owner_fqn)
-            .then(|| owner_fqn.to_owned())
-    }
-}
-
-fn go_method_is_interface_method(
+pub(crate) fn go_method_is_interface_method(
     analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
     method: &CodeUnit,
@@ -1609,86 +1373,6 @@ fn go_unqualified_package_member_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn go_native_call_application(
-    query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-    overlay: Option<
-        Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
-    >,
-    selected_imports: &[GoSelectedExternalImport],
-) -> CallApplicationKind {
-    let Some(tree) = query.tree else {
-        return CallApplicationKind::Unknown;
-    };
-    let support = AnalyzerGoDefinitionProvider::bounded(go, session, overlay);
-    let scope = AnalyzerQueryScope::new(query.analyzer);
-    let token = scope.token();
-    let root = tree.root_node();
-    if let Some(selector) = brokk_bifrost_go::references::go_selector_descriptor(root, query.site)
-        && go_selector_is_call_target(&support, &selector)
-    {
-        if selector.focus_segment > 1 {
-            return CallApplicationKind::ReceiverBindingUnknown;
-        }
-        let base = selector.base;
-        if matches!(base.kind(), "identifier" | "package_identifier") {
-            let name = go_node_text(base, query.source);
-            if let Some(binding) = go_nearest_visible_binding(
-                &support,
-                root,
-                query.source,
-                name,
-                query.site.focus_start_byte,
-            ) {
-                return match binding {
-                    GoLocalBinding::Value { .. } | GoLocalBinding::SwitchInput(_) => {
-                        CallApplicationKind::BoundReceiver
-                    }
-                    GoLocalBinding::Type(_)
-                    | GoLocalBinding::Variadic(_)
-                    | GoLocalBinding::OpaqueType => CallApplicationKind::ReceiverBindingUnknown,
-                    GoLocalBinding::Unmodeled => CallApplicationKind::Unknown,
-                    GoLocalBinding::RangeElement(_) | GoLocalBinding::Opaque => {
-                        CallApplicationKind::BoundReceiver
-                    }
-                };
-            }
-            // The binding walk reports local type declarations and generic
-            // parameters as opaque types. Keep the shared lexical check for
-            // any remaining type-only shadow before claiming a package.
-            match go_name_shadowed_at_with_scope(
-                root,
-                query.source,
-                query.site.focus_start_byte,
-                name,
-                || support.scope_step(),
-            ) {
-                Some(true) => return CallApplicationKind::ReceiverBindingUnknown,
-                Some(false) => {}
-                None => return CallApplicationKind::Unknown,
-            }
-            let imports = go_import_paths(&support, token, go, query.file);
-            if imports.contains_key(name)
-                || selected_imports.iter().any(|selected| {
-                    go_selected_external_import_spec(query, &support, token, selected, root, base)
-                        .is_some()
-                })
-            {
-                return CallApplicationKind::PackageFunction;
-            }
-            return CallApplicationKind::Unknown;
-        }
-        return CallApplicationKind::BoundReceiver;
-    }
-    if go_identifier_is_call_target(&support, root, query.site) {
-        CallApplicationKind::PackageFunction
-    } else {
-        CallApplicationKind::Unknown
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2279,58 +1963,6 @@ fn go_external_model_member_outcome(target: &str) -> DefinitionLookupOutcome {
     )
 }
 
-/// One request-local promotion route; pointer admission remains caller-typed.
-struct PromotionPath<M> {
-    owner: String,
-    pointer_receivers: M,
-    parent: Option<usize>,
-}
-
-impl<M> PromotionPath<M> {
-    fn root(owner: &str, pointer_receivers: M) -> Self {
-        Self {
-            owner: owner.to_string(),
-            pointer_receivers,
-            parent: None,
-        }
-    }
-
-    /// Check only this route's ancestors, charging before each comparison.
-    /// A budget stop exits lookup, while a cycle only rejects this child.
-    #[track_caller]
-    fn prepare_child(
-        paths: &[Self],
-        parent: usize,
-        owner: String,
-        pointer_receivers: M,
-        support: &dyn GoDefinitionProvider,
-    ) -> ControlFlow<(), Option<Self>> {
-        let mut ancestor = Some(parent);
-        while let Some(ancestor_index) = ancestor {
-            if !support.scope_step() {
-                return ControlFlow::Break(());
-            }
-            let ancestor_path = &paths[ancestor_index];
-            if ancestor_path.owner == owner {
-                return ControlFlow::Continue(None);
-            }
-            ancestor = ancestor_path.parent;
-        }
-        ControlFlow::Continue(Some(Self {
-            owner,
-            pointer_receivers,
-            parent: Some(parent),
-        }))
-    }
-
-    /// Append after caller-owned tracing and return the stable arena index.
-    fn append_to(self, paths: &mut Vec<Self>) -> usize {
-        let index = paths.len();
-        paths.push(self);
-        index
-    }
-}
-
 fn go_dot_import_paths(
     go: &crate::analyzer::GoAnalyzer,
     support: &dyn GoDefinitionProvider,
@@ -2366,15 +1998,11 @@ fn go_dot_import_path(support: &dyn GoDefinitionProvider, import: &ImportInfo) -
 /// when this resolver has no useful type to infer for its value.
 enum GoLocalBinding<'tree> {
     Type(Node<'tree>),
-    /// The variadic declaration's implicit slice-type spelling, not its element.
-    Variadic(Node<'tree>),
+    Variadic,
     /// Multi-type, nil and default clauses retain the switch input's type.
     SwitchInput(Node<'tree>),
-    Value {
-        expression: Node<'tree>,
-        result_ordinal: usize,
-    },
-    RangeElement(Node<'tree>),
+    Value,
+    RangeElement,
     Opaque,
     /// A local type/type-parameter shadows the name without becoming a value.
     OpaqueType,
@@ -2382,194 +2010,16 @@ enum GoLocalBinding<'tree> {
     Unmodeled,
 }
 
-/// Structured lexical context for an expression evaluation.
-///
-/// A range expression evaluates before its `:=` binder is established.  The
-/// source-order resolver cannot express that fact by moving the lookup byte,
-/// because the moved byte is only a fabricated proxy for the evaluation.  A
-/// range evaluation instead carries the exact clause identity that must be
-/// excluded while resolving its RHS.  The source span is retained alongside
-/// the tree-sitter identity so a future semantic evidence join can validate
-/// the barrier against the corresponding source mapping.
 #[derive(Clone, Copy, Default)]
-struct GoLexicalEvaluation {
-    range_barrier: Option<GoRangeEvaluationEvidence>,
-}
-
-#[derive(Clone, Copy)]
-struct GoRangeEvaluationEvidence {
-    /// The semantic provider must establish this relation before the barrier
-    /// can be installed.  Keeping the source identity here lets the provider
-    /// join its event mapping without handing flow-internal IDs to this
-    /// resolver.
-    barrier: GoRangeEvaluationBarrier,
-}
-
-#[derive(Clone, Copy)]
-struct GoRangeEvaluationBarrier {
-    node_id: usize,
-    start_byte: usize,
-    end_byte: usize,
-}
-
-#[derive(Clone, Copy)]
-struct GoSourceNodeIdentity {
-    start_byte: usize,
-    end_byte: usize,
-}
-
-impl GoSourceNodeIdentity {
-    fn of(node: Node<'_>) -> Self {
-        Self {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-        }
-    }
-
-    fn is_contained_by(self, span: SourceSpan) -> bool {
-        Range {
-            start_byte: span.start_byte() as usize,
-            end_byte: span.end_byte() as usize,
-            start_line: 0,
-            end_line: 0,
-        }
-        .contains(&Range {
-            start_byte: self.start_byte,
-            end_byte: self.end_byte,
-            start_line: 0,
-            end_line: 0,
-        })
-    }
-}
+struct GoLexicalEvaluation;
 
 impl GoLexicalEvaluation {
     fn ordinary() -> Self {
-        Self::default()
+        Self
     }
-
-    fn with_range_evidence(evidence: GoRangeEvaluationEvidence) -> Self {
-        Self {
-            range_barrier: Some(evidence),
-        }
+    fn excludes_range_node(self, _node: Node<'_>) -> bool {
+        false
     }
-
-    fn excludes_range_node(self, node: Node<'_>) -> bool {
-        self.range_barrier.is_some_and(|evidence| {
-            let barrier = evidence.barrier;
-            barrier.node_id == node.id()
-                && barrier.start_byte == node.start_byte()
-                && barrier.end_byte == node.end_byte()
-        })
-    }
-}
-
-/// Ask the analysis-owned source relation for permission to suppress this
-/// range binder while resolving its RHS.
-///
-/// Returning `None` is conservative: no lexical barrier is installed and the
-/// caller reports incomplete semantic evidence rather than claiming that
-/// syntax alone proved the evaluation order.
-#[allow(clippy::too_many_arguments)]
-fn go_range_evaluation(
-    analyzer: &dyn IAnalyzer,
-    _token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    _root: Node<'_>,
-    range_node: Node<'_>,
-    right: Node<'_>,
-    binding_name: &str,
-) -> Option<GoLexicalEvaluation> {
-    let references = go_expression_binding_references(support, right, source, binding_name)?;
-    if references.is_empty() {
-        return Some(GoLexicalEvaluation::ordinary());
-    }
-    let left = range_node.child_by_field_name("left")?;
-    let binding_index = go_expression_list_index(support, left, source, binding_name)?;
-    debug_assert_eq!(binding_index, 1, "the range-element route owns binder one");
-    let binding = left.named_child(binding_index)?;
-    if binding.kind() != "identifier" {
-        return None;
-    }
-    let binding = GoSourceNodeIdentity::of(binding);
-    let local_cancellation = CancellationToken::new();
-    let active_cancellation = analyzer.active_query_cancellation();
-    let cancellation = active_cancellation.as_ref().unwrap_or(&local_cancellation);
-    if cancellation.is_cancelled() {
-        analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
-        return None;
-    }
-    if analyzer.property_reaching_provider().is_none() {
-        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-            "Go range evaluation provider unavailable".into(),
-        ));
-        return None;
-    }
-    let right_range = Range {
-        start_byte: right.start_byte(),
-        end_byte: right.end_byte(),
-        start_line: right.start_position().row,
-        end_line: right.end_position().row,
-    };
-    let result = analyzer.property_reaching_for_source_range(
-        file,
-        &right_range,
-        PropertyReachingLimits::default(),
-        cancellation,
-    );
-    let proven = result.evaluations().iter().any(|relation| {
-        relation.is_proven_complete()
-            && relation.establishment.kind == ValueFlowRelationKind::Assignment
-            && relation.establishment.procedure == relation.read.procedure
-            && references.iter().any(|reference| {
-                reference.is_contained_by(relation.read.source_locator.anchor().span())
-            })
-            && binding.is_contained_by(relation.establishment.source_locator.anchor().span())
-    });
-    if !result.evaluations_complete() || !proven {
-        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-            "Go range RHS and binder lack complete same-evaluation evidence".into(),
-        ));
-        return None;
-    }
-    Some(GoLexicalEvaluation::with_range_evidence(
-        GoRangeEvaluationEvidence {
-            barrier: GoRangeEvaluationBarrier {
-                node_id: range_node.id(),
-                start_byte: range_node.start_byte(),
-                end_byte: range_node.end_byte(),
-            },
-        },
-    ))
-}
-
-fn go_expression_binding_references(
-    support: &dyn GoDefinitionProvider,
-    expression: Node<'_>,
-    source: &str,
-    binding_name: &str,
-) -> Option<Vec<GoSourceNodeIdentity>> {
-    let mut stack = vec![expression];
-    let mut references = Vec::new();
-    while let Some(node) = stack.pop() {
-        if !support.scope_step() {
-            return None;
-        }
-        if node.kind() == "identifier" && go_node_text(node, source) == binding_name {
-            references.push(GoSourceNodeIdentity::of(node));
-            continue;
-        }
-        if node.id() != expression.id() && node.kind() == "func_literal" {
-            continue;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    Some(references)
 }
 
 fn go_nearest_binding_in_scope_with_evaluation<'tree>(
@@ -2814,7 +2264,7 @@ fn go_parameter_list_binding<'tree>(
         return Some(
             match (parameter.kind(), parameter.child_by_field_name("type")) {
                 ("parameter_declaration", Some(type_node)) => GoLocalBinding::Type(type_node),
-                ("variadic_parameter_declaration", Some(_)) => GoLocalBinding::Variadic(parameter),
+                ("variadic_parameter_declaration", Some(_)) => GoLocalBinding::Variadic,
                 ("type_parameter_declaration", _) => GoLocalBinding::OpaqueType,
                 _ => GoLocalBinding::Opaque,
             },
@@ -2888,7 +2338,7 @@ fn go_range_binding<'tree>(
     let left = node.child_by_field_name("left")?;
     let index = go_expression_list_index(support, left, source, name)?;
     Some(if index == 1 {
-        GoLocalBinding::RangeElement(node)
+        GoLocalBinding::RangeElement
     } else {
         // The key/index type is not inferred here, but its declaration is exact.
         GoLocalBinding::Opaque
@@ -4004,26 +3454,9 @@ fn go_expression_list_binding<'tree>(
             }
             expressions.push(child);
         }
-        // `a, b := f()` selects two result ordinals from one expression;
-        // `a, b := f(), g()` selects result zero from each expression.
-        if let [expression] = expressions.as_slice() {
-            return Some(GoLocalBinding::Value {
-                expression: *expression,
-                result_ordinal: index,
-            });
-        }
-        expressions
-            .get(index)
-            .copied()
-            .map(|expression| GoLocalBinding::Value {
-                expression,
-                result_ordinal: 0,
-            })
+        expressions.get(index).map(|_| GoLocalBinding::Value)
     } else {
-        Some(GoLocalBinding::Value {
-            expression: list,
-            result_ordinal: index,
-        })
+        Some(GoLocalBinding::Value)
     }
 }
 
@@ -4330,44 +3763,11 @@ fn go_resolved_call_result_count<'tree>(
                         return None;
                     }
                     return support
-                        .selected_modeled_call_result_count(token, file, source, function, count);
+                        .selected_call_result_count(token, file, source, function, count);
                 }
                 candidates
             } else {
-                let inferred = go_expression_inferred_type_with_argument_counts(
-                    go,
-                    token,
-                    support,
-                    file,
-                    source,
-                    root,
-                    receiver,
-                    call.start_byte(),
-                    0,
-                    GoLexicalEvaluation::ordinary(),
-                    argument_count,
-                );
-                let Some(inferred) = inferred else {
-                    return support
-                        .selected_modeled_call_result_count(token, file, source, function, count);
-                };
-                let (owner, _) = go_selector_owner_fqn(support, token, go, &inferred)?;
-                match go_indexed_field_lookup_with_method_set(
-                    go,
-                    token,
-                    support,
-                    &owner,
-                    member,
-                    Some(&inferred),
-                ) {
-                    GoDefinitionMemberLookup::Unique(candidate) => vec![candidate],
-                    GoDefinitionMemberLookup::Ambiguous(_) => return None,
-                    GoDefinitionMemberLookup::Missing => {
-                        return support.selected_modeled_call_result_count(
-                            token, file, source, function, count,
-                        );
-                    }
-                }
+                return support.selected_call_result_count(token, file, source, function, count);
             }
         }
         _ => return None,
@@ -4583,674 +3983,6 @@ fn go_identifier_modeled_call_argument_count(
         })
 }
 
-struct GoInferredType {
-    identity: StructuredTypeIdentity,
-    file: ProjectFile,
-    package: String,
-    addressable: bool,
-}
-
-impl GoInferredType {
-    fn indexed_identity(&self) -> Option<&StructuredTypeIdentity> {
-        Some(&self.identity)
-    }
-
-    fn is_pointer(&self) -> bool {
-        self.identity.is_pointer()
-    }
-
-    fn admits_pointer_receivers(&self) -> bool {
-        self.addressable || self.identity.is_pointer()
-    }
-}
-
-enum GoTypeInferenceFrame<'tree> {
-    Expression {
-        node: Node<'tree>,
-        reference_byte: usize,
-        result_ordinal: usize,
-        evaluation: GoLexicalEvaluation,
-    },
-    Field(String),
-    Method {
-        name: String,
-        result_ordinal: usize,
-    },
-    Element,
-    MakeAddressable,
-    AddressOf,
-    Dereference,
-    MakeNonAddressable,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn go_expression_inferred_type(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    expression: Node<'_>,
-    byte: usize,
-    result_ordinal: usize,
-) -> Option<GoInferredType> {
-    go_expression_inferred_type_with_evaluation(
-        analyzer,
-        token,
-        support,
-        file,
-        source,
-        root,
-        expression,
-        byte,
-        result_ordinal,
-        GoLexicalEvaluation::ordinary(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn go_expression_inferred_type_with_evaluation(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    expression: Node<'_>,
-    byte: usize,
-    result_ordinal: usize,
-    evaluation: GoLexicalEvaluation,
-) -> Option<GoInferredType> {
-    go_expression_inferred_type_with_argument_counts(
-        analyzer,
-        token,
-        support,
-        file,
-        source,
-        root,
-        expression,
-        byte,
-        result_ordinal,
-        evaluation,
-        &|function| {
-            let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-            go_callable_modeled_argument_count(support, token, go, file, source, function)
-        },
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn go_expression_inferred_type_with_argument_counts<'tree>(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'tree>,
-    expression: Node<'tree>,
-    byte: usize,
-    result_ordinal: usize,
-    evaluation: GoLexicalEvaluation,
-    argument_count: &dyn Fn(Node<'tree>) -> Option<usize>,
-) -> Option<GoInferredType> {
-    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-    let package = go_package_name(support, file, source, Some(root))?;
-    let mut frames = vec![GoTypeInferenceFrame::Expression {
-        node: expression,
-        reference_byte: byte,
-        result_ordinal,
-        evaluation,
-    }];
-    let mut values = Vec::new();
-    let mut active_expressions = HashSet::default();
-
-    while let Some(frame) = frames.pop() {
-        if !support.scope_step() {
-            return None;
-        }
-        match frame {
-            GoTypeInferenceFrame::Expression {
-                node,
-                reference_byte,
-                result_ordinal,
-                evaluation,
-            } => {
-                if !active_expressions.insert((node.id(), reference_byte, result_ordinal)) {
-                    return None;
-                }
-                if result_ordinal != 0
-                    && !matches!(node.kind(), "call_expression" | "parenthesized_expression")
-                {
-                    return None;
-                }
-                match node.kind() {
-                    "identifier" => {
-                        let name = go_node_text(node, source);
-                        let binding = go_nearest_visible_binding_with_evaluation(
-                            support,
-                            root,
-                            source,
-                            name,
-                            reference_byte,
-                            evaluation,
-                        )?;
-                        match binding {
-                            GoLocalBinding::Type(type_node) => {
-                                let mut inferred = go_inferred_type_from_node(
-                                    support, type_node, file, source, &package,
-                                )?;
-                                inferred.addressable = true;
-                                values.push(inferred);
-                            }
-                            GoLocalBinding::Value {
-                                expression,
-                                result_ordinal,
-                            } => {
-                                frames.push(GoTypeInferenceFrame::MakeAddressable);
-                                frames.push(GoTypeInferenceFrame::Expression {
-                                    node: expression,
-                                    reference_byte: expression.start_byte(),
-                                    result_ordinal,
-                                    evaluation,
-                                });
-                            }
-                            GoLocalBinding::Variadic(type_node) => {
-                                let mut inferred = go_variadic_binding_inferred_type(
-                                    support, type_node, file, source, &package,
-                                )?;
-                                inferred.addressable = true;
-                                values.push(inferred);
-                            }
-                            GoLocalBinding::SwitchInput(input) => {
-                                frames.push(GoTypeInferenceFrame::MakeAddressable);
-                                frames.push(GoTypeInferenceFrame::Expression {
-                                    node: input,
-                                    reference_byte: input.start_byte(),
-                                    result_ordinal: 0,
-                                    evaluation,
-                                });
-                            }
-                            GoLocalBinding::RangeElement(range_node) => {
-                                let iterable = range_node
-                                    .child_by_field_name("right")
-                                    .or_else(|| go_last_named_child(support, range_node))?;
-                                let range_evaluation = go_range_evaluation(
-                                    analyzer, token, support, file, source, root, range_node,
-                                    iterable, name,
-                                )?;
-                                frames.push(GoTypeInferenceFrame::MakeAddressable);
-                                frames.push(GoTypeInferenceFrame::Element);
-                                frames.push(GoTypeInferenceFrame::Expression {
-                                    node: iterable,
-                                    reference_byte,
-                                    result_ordinal: 0,
-                                    evaluation: range_evaluation,
-                                });
-                            }
-                            GoLocalBinding::Opaque
-                            | GoLocalBinding::OpaqueType
-                            | GoLocalBinding::Unmodeled => return None,
-                        }
-                    }
-                    "selector_expression" => {
-                        let qualifier = go_first_named_child(support, node)?;
-                        let field = go_last_named_child(support, node)?;
-                        frames.push(GoTypeInferenceFrame::Field(
-                            go_node_text(field, source).to_string(),
-                        ));
-                        frames.push(GoTypeInferenceFrame::Expression {
-                            node: qualifier,
-                            reference_byte: reference_byte.min(node.start_byte()),
-                            result_ordinal: 0,
-                            evaluation,
-                        });
-                    }
-                    "call_expression" => {
-                        let function = node
-                            .child_by_field_name("function")
-                            .or_else(|| go_first_named_child(support, node))?;
-                        match function.kind() {
-                            "identifier" => {
-                                let name = go_node_text(function, source);
-                                if result_ordinal == 0
-                                    && name == "new"
-                                    && let Some(inferred) = go_builtin_new_inferred_type(
-                                        support,
-                                        file,
-                                        source,
-                                        root,
-                                        node,
-                                        reference_byte,
-                                        evaluation,
-                                        &package,
-                                    )
-                                {
-                                    values.push(inferred);
-                                } else {
-                                    values.push(go_callable_return_inferred_type(
-                                        analyzer,
-                                        support,
-                                        go_unqualified_package_member_candidates(
-                                            support, token, go, file, &package, name,
-                                        ),
-                                        result_ordinal,
-                                    )?);
-                                }
-                            }
-                            "selector_expression" => {
-                                let qualifier = go_first_named_child(support, function)?;
-                                let method = go_last_named_child(support, function)?;
-                                let method_name = go_node_text(method, source);
-                                // A spread or pending nested-call dependency keeps argument shape unknown and inference open.
-                                argument_count(function)?;
-                                let qualifier_name = go_node_text(qualifier, source);
-                                let qualifier_is_unshadowed = if qualifier.kind() == "identifier" {
-                                    let binding = go_nearest_visible_binding_with_evaluation(
-                                        support,
-                                        root,
-                                        source,
-                                        qualifier_name,
-                                        node.start_byte(),
-                                        evaluation,
-                                    );
-                                    if !support.scope_step() {
-                                        return None;
-                                    }
-                                    binding.is_none()
-                                } else {
-                                    false
-                                };
-                                let imported = qualifier_is_unshadowed
-                                    .then(|| {
-                                        go_import_paths(support, token, go, file)
-                                            .remove(qualifier_name)
-                                    })
-                                    .flatten()
-                                    .and_then(|import_path| {
-                                        let candidates = go_package_member_candidates(
-                                            support,
-                                            &import_path,
-                                            method_name,
-                                        );
-                                        if candidates.is_empty() {
-                                            None
-                                        } else {
-                                            go_callable_return_inferred_type(
-                                                analyzer,
-                                                support,
-                                                candidates,
-                                                result_ordinal,
-                                            )
-                                        }
-                                    });
-                                if let Some(imported) = imported {
-                                    values.push(imported);
-                                } else {
-                                    frames.push(GoTypeInferenceFrame::Method {
-                                        name: method_name.to_string(),
-                                        result_ordinal,
-                                    });
-                                    frames.push(GoTypeInferenceFrame::Expression {
-                                        node: qualifier,
-                                        reference_byte: reference_byte.min(node.start_byte()),
-                                        result_ordinal: 0,
-                                        evaluation,
-                                    });
-                                }
-                            }
-                            _ => return None,
-                        }
-                    }
-                    "composite_literal" => {
-                        let type_node = node.child_by_field_name("type")?;
-                        values.push(go_inferred_type_from_node(
-                            support, type_node, file, source, &package,
-                        )?);
-                    }
-                    "index_expression" => {
-                        let operand = node
-                            .child_by_field_name("operand")
-                            .or_else(|| go_first_named_child(support, node))?;
-                        frames.push(GoTypeInferenceFrame::Element);
-                        frames.push(GoTypeInferenceFrame::Expression {
-                            node: operand,
-                            reference_byte,
-                            result_ordinal: 0,
-                            evaluation,
-                        });
-                    }
-                    "parenthesized_expression" => {
-                        frames.push(GoTypeInferenceFrame::Expression {
-                            node: go_first_named_child(support, node)?,
-                            reference_byte,
-                            result_ordinal,
-                            evaluation,
-                        });
-                    }
-                    "unary_expression" => {
-                        let operator = node.child_by_field_name("operator")?.kind();
-                        let operand = node
-                            .child_by_field_name("operand")
-                            .or_else(|| go_first_named_child(support, node))?;
-                        frames.push(match operator {
-                            "&" => GoTypeInferenceFrame::AddressOf,
-                            "*" => GoTypeInferenceFrame::Dereference,
-                            _ => GoTypeInferenceFrame::MakeNonAddressable,
-                        });
-                        frames.push(GoTypeInferenceFrame::Expression {
-                            node: operand,
-                            reference_byte,
-                            result_ordinal: 0,
-                            evaluation,
-                        });
-                    }
-                    _ => return None,
-                }
-            }
-            GoTypeInferenceFrame::Field(field) => {
-                let owner = values.pop()?;
-                let owner_fqn = go_resolve_inferred_type_fqn(support, token, go, &owner)?;
-                values.push(go_field_inferred_type_for_receiver(
-                    analyzer, token, support, &owner, &owner_fqn, &field,
-                )?);
-            }
-            GoTypeInferenceFrame::Method {
-                name: method,
-                result_ordinal,
-            } => {
-                let owner = values.pop()?;
-                let (owner_fqn, _) = go_selector_owner_fqn(support, token, go, &owner)?;
-                let inferred = match go_indexed_field_lookup_with_method_set(
-                    analyzer,
-                    token,
-                    support,
-                    &owner_fqn,
-                    &method,
-                    Some(&owner),
-                ) {
-                    GoDefinitionMemberLookup::Unique(candidate) => {
-                        go_callable_return_inferred_type(
-                            analyzer,
-                            support,
-                            vec![candidate],
-                            result_ordinal,
-                        )
-                    }
-                    GoDefinitionMemberLookup::Missing => None,
-                    GoDefinitionMemberLookup::Ambiguous(_) => None,
-                }?;
-                values.push(inferred);
-            }
-            GoTypeInferenceFrame::Element => {
-                let mut iterable = values.pop()?;
-                let identity = iterable.indexed_identity()?;
-                let addressable =
-                    identity.is_slice() || (identity.is_array() && iterable.addressable);
-                let identity = iterable.identity;
-                iterable.identity =
-                    identity.into_container_element_with(|| support.scope_step())?;
-                iterable.addressable = addressable;
-                values.push(iterable);
-            }
-            GoTypeInferenceFrame::MakeAddressable => {
-                let mut inferred = values.pop()?;
-                inferred.addressable = true;
-                values.push(inferred);
-            }
-            GoTypeInferenceFrame::AddressOf => {
-                let mut inferred = values.pop()?;
-                let identity = inferred.identity;
-                inferred.identity = identity.wrap_pointer()?;
-                inferred.addressable = false;
-                values.push(inferred);
-            }
-            GoTypeInferenceFrame::Dereference => {
-                let mut inferred = values.pop()?;
-                let identity = &inferred.identity;
-                if !identity.is_pointer() {
-                    return None;
-                }
-                // A dereferenced pointer expression is addressable. Keeping
-                // the pointer wrapper is sufficient for nominal-owner and
-                // method-set selection; both resolve through the same named
-                // type and admit the pointer receiver's method set.
-                inferred.addressable = true;
-                values.push(inferred);
-            }
-            GoTypeInferenceFrame::MakeNonAddressable => {
-                let mut inferred = values.pop()?;
-                inferred.addressable = false;
-                values.push(inferred);
-            }
-        }
-    }
-
-    (values.len() == 1).then(|| values.pop()).flatten()
-}
-
-fn go_variadic_binding_inferred_type(
-    support: &dyn GoDefinitionProvider,
-    parameter: Node<'_>,
-    file: &ProjectFile,
-    source: &str,
-    package: &str,
-) -> Option<GoInferredType> {
-    let element = parameter.child_by_field_name("type")?;
-    let mut inferred = go_inferred_type_from_node(support, element, file, source, package)?;
-    let identity = inferred.identity;
-    inferred.identity = identity.wrap_slice()?;
-    Some(inferred)
-}
-
-fn go_inferred_type_from_node(
-    support: &dyn GoDefinitionProvider,
-    node: Node<'_>,
-    file: &ProjectFile,
-    source: &str,
-    package: &str,
-) -> Option<GoInferredType> {
-    Some(GoInferredType {
-        identity: brokk_bifrost_go::declarations::go_structured_type_identity_bounded(
-            node,
-            source,
-            || support.scope_step(),
-        )?,
-        file: file.clone(),
-        package: package.to_string(),
-        addressable: false,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn go_builtin_new_inferred_type(
-    support: &dyn GoDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    call: Node<'_>,
-    reference_byte: usize,
-    evaluation: GoLexicalEvaluation,
-    package: &str,
-) -> Option<GoInferredType> {
-    if go_nearest_visible_binding_with_evaluation(
-        support,
-        root,
-        source,
-        "new",
-        reference_byte,
-        evaluation,
-    )
-    .is_some()
-        || !go_package_member_candidates(support, package, "new").is_empty()
-    {
-        return None;
-    }
-    if !support.scope_step() {
-        return None;
-    }
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let mut argument = None;
-    for child in arguments.named_children(&mut cursor) {
-        if !support.scope_step() || argument.replace(child).is_some() {
-            return None;
-        }
-    }
-    let type_node = argument?;
-    let mut inferred = go_inferred_type_from_node(support, type_node, file, source, package)?;
-    let identity = inferred.identity;
-    inferred.identity = identity.wrap_pointer()?;
-    inferred.addressable = false;
-    Some(inferred)
-}
-
-fn go_callable_return_inferred_type(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn GoDefinitionProvider,
-    candidates: Vec<CodeUnit>,
-    result_ordinal: usize,
-) -> Option<GoInferredType> {
-    let mut inferred = Vec::new();
-    for candidate in candidates {
-        if !support.scope_step() {
-            return None;
-        }
-        for metadata in support.signature_metadata(analyzer, &candidate) {
-            if !support.scope_step() {
-                return None;
-            }
-            // A multi-result callable answers by position; a single-result one
-            // has no positional list and answers ordinal zero from its one
-            // return identity.
-            let Some(identity) = metadata.result_type_identity(result_ordinal).cloned() else {
-                continue;
-            };
-            let candidate_type = GoInferredType {
-                identity,
-                file: candidate.source().clone(),
-                package: candidate.package_name().to_string(),
-                addressable: false,
-            };
-            let mut duplicate = false;
-            for existing in &inferred {
-                if go_inferred_types_equal(support, existing, &candidate_type)? {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if !duplicate {
-                inferred.push(candidate_type);
-            }
-        }
-    }
-    (inferred.len() == 1).then(|| inferred.pop()).flatten()
-}
-
-fn go_inferred_types_equal(
-    support: &dyn GoDefinitionProvider,
-    left: &GoInferredType,
-    right: &GoInferredType,
-) -> Option<bool> {
-    if left.file != right.file || left.package != right.package {
-        return Some(false);
-    }
-    left.identity
-        .structurally_eq_with(&right.identity, || support.scope_step())
-}
-
-fn go_field_inferred_type_for_receiver(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    owner: &GoInferredType,
-    owner_fqn: &str,
-    field: &str,
-) -> Option<GoInferredType> {
-    let candidate = go_indexed_member_candidate_for_receiver(
-        analyzer, token, support, owner_fqn, field, owner,
-    )?;
-    let identity = go_field_unit_type_identity(analyzer, support, &candidate)?;
-    Some(GoInferredType {
-        identity,
-        file: candidate.source().clone(),
-        package: candidate.package_name().to_string(),
-        addressable: !candidate.is_function() && owner.admits_pointer_receivers(),
-    })
-}
-
-/// Name the owner an inferred type denotes for selector resolution, and report
-/// whether that name came from outside the workspace.
-///
-/// A selector chain needs this at its base and at every later step, and the
-/// three routes are the same everywhere: a reviewed modeled nominal, a
-/// workspace declaration, or an imported nominal whose package the workspace
-/// does not contain. Only the first and third name a type the workspace cannot
-/// index, and both report `true`, because a reviewed external slice proves a
-/// direct method on the concrete receiver and carries no field surface for a
-/// longer chain.
-fn go_selector_owner_fqn(
-    support: &dyn GoDefinitionProvider,
-    token: QueryToken<'_>,
-    go: &GoAnalyzer,
-    owner: &GoInferredType,
-) -> Option<(String, bool)> {
-    if let Some(owner_fqn) = go_resolve_inferred_type_fqn(support, token, go, owner) {
-        return Some((owner_fqn, false));
-    }
-    let identity = owner.indexed_identity()?;
-    let (owner_fqn, _) =
-        go_imported_nominal_receiver_candidate_fqn(support, token, go, &owner.file, identity)?;
-    Some((owner_fqn, true))
-}
-
-fn go_resolve_inferred_type_fqn(
-    support: &dyn GoDefinitionProvider,
-    token: QueryToken<'_>,
-    go: &GoAnalyzer,
-    inferred: &GoInferredType,
-) -> Option<String> {
-    go_resolve_structured_type_fqn(
-        support,
-        token,
-        go,
-        &inferred.file,
-        &inferred.package,
-        &inferred.identity,
-    )
-}
-
-/// The imported nominal owner a reviewed concrete-receiver fact may prove.
-///
-/// This is deliberately narrower than ordinary Go type resolution: only a
-/// qualified named type or a pointer to one is admitted. Local aliases,
-/// generic instantiations, wrappers, containers, and reconstructed source text
-/// never enter this route. The import binder supplies the package identity;
-/// the declaration overlay still has to prove the concrete method before a
-/// boundary can carry the returned name.
-fn go_imported_nominal_receiver_candidate_fqn(
-    support: &dyn GoDefinitionProvider,
-    token: QueryToken<'_>,
-    go: &GoAnalyzer,
-    file: &ProjectFile,
-    identity: &StructuredTypeIdentity,
-) -> Option<(String, String)> {
-    let name = match identity.view(identity.root_id())? {
-        StructuredTypeNodeView::Named(name) => name,
-        StructuredTypeNodeView::Pointer(inner) => match identity.view(inner)? {
-            StructuredTypeNodeView::Named(name) => name,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    let [qualifier, name] = name.path() else {
-        return None;
-    };
-    let import_path = go_import_paths(support, token, go, file).remove(qualifier)?;
-    (go_workspace_package_status(support, &import_path) == GoWorkspacePackageStatus::Absent)
-        .then(|| (format!("{import_path}.{name}"), import_path))
-}
-
 fn go_nearest_visible_binding<'tree>(
     support: &dyn GoDefinitionProvider,
     root: Node<'tree>,
@@ -5310,630 +4042,6 @@ fn go_nearest_visible_binding_with_evaluation<'tree>(
     }
 }
 
-enum GoDefinitionMemberLookup {
-    Missing,
-    Unique(CodeUnit),
-    Ambiguous(Vec<CodeUnit>),
-}
-
-fn go_indexed_member_candidate_for_receiver(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    owner_fqn: &str,
-    member: &str,
-    receiver: &GoInferredType,
-) -> Option<CodeUnit> {
-    let GoDefinitionMemberLookup::Unique(candidate) = go_indexed_field_lookup_with_method_set(
-        analyzer,
-        token,
-        support,
-        owner_fqn,
-        member,
-        Some(receiver),
-    ) else {
-        return None;
-    };
-    Some(candidate)
-}
-
-fn go_indexed_field_lookup_with_method_set(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    owner_fqn: &str,
-    field: &str,
-    receiver: Option<&GoInferredType>,
-) -> GoDefinitionMemberLookup {
-    let root_pointer_receivers = receiver.map(GoInferredType::admits_pointer_receivers);
-    let mut paths = vec![PromotionPath::root(owner_fqn, root_pointer_receivers)];
-    // Built only while a trace records (#1477): it mirrors the promotion paths
-    // this walk expands and the path each candidate is found on, and decides
-    // nothing.
-    let mut member_trace = trace::recording().then(GoPromotionTrace::default);
-    if let Some(state) = member_trace.as_mut() {
-        state.push_path(owner_fqn, None);
-    }
-    let mut frontier = vec![0];
-    while !frontier.is_empty() {
-        let mut candidates = Vec::new();
-        for &path_index in &frontier {
-            if !support.scope_step() {
-                return GoDefinitionMemberLookup::Missing;
-            }
-            let path = &paths[path_index];
-            for candidate in support.members_for_owner_name(&path.owner, field) {
-                let verdict = match path.pointer_receivers {
-                    Some(pointer_receivers) => {
-                        go_member_in_method_set(analyzer, support, &candidate, pointer_receivers)
-                    }
-                    None => GoMethodSetVerdict::UNCHECKED,
-                };
-                if let Some(state) = member_trace.as_mut() {
-                    state.record(&candidate, path_index, verdict.interface_method());
-                }
-                if verdict.admits() {
-                    candidates.push(candidate);
-                } else if let (GoMethodSetVerdict::OutsideMethodSet, Some(state)) =
-                    (verdict, member_trace.as_ref())
-                {
-                    // The method-set filter computed this candidate and threw
-                    // it away; the row states that, with the same owner and
-                    // route an admitted candidate gets. An `Undecided` verdict
-                    // records nothing: the filter never reached a reason.
-                    state.record_rejection(analyzer, &candidate);
-                }
-            }
-        }
-        sort_units(&mut candidates);
-        match candidates.len() {
-            0 => {}
-            1 => {
-                let candidate = candidates
-                    .pop()
-                    .expect("single Go member candidate was checked");
-                if let Some(state) = member_trace.as_ref() {
-                    state.stage_selection(analyzer, std::slice::from_ref(&candidate));
-                }
-                return GoDefinitionMemberLookup::Unique(candidate);
-            }
-            _ => {
-                if let Some(state) = member_trace.as_ref() {
-                    state.stage_selection(analyzer, &candidates);
-                }
-                return GoDefinitionMemberLookup::Ambiguous(candidates);
-            }
-        }
-        let mut next = Vec::new();
-        for path_index in frontier {
-            if !support.summary_step() {
-                return GoDefinitionMemberLookup::Missing;
-            }
-            let owner = paths[path_index].owner.clone();
-            let pointer_receivers = paths[path_index].pointer_receivers;
-            let embedded: Vec<(String, Option<bool>)> = if let Some(pointer_receivers) =
-                pointer_receivers
-            {
-                go_embedded_method_set_types(analyzer, token, support, &owner, pointer_receivers)
-                    .into_iter()
-                    .map(|(owner, pointer_receivers)| (owner, Some(pointer_receivers)))
-                    .collect()
-            } else {
-                go_embedded_field_types(analyzer, token, support, &owner)
-                    .into_iter()
-                    .map(|owner| (owner, None))
-                    .collect()
-            };
-            for (embedded_owner, embedded_pointer_receivers) in embedded {
-                let path = match PromotionPath::prepare_child(
-                    &paths,
-                    path_index,
-                    embedded_owner,
-                    embedded_pointer_receivers,
-                    support,
-                ) {
-                    ControlFlow::Break(()) => return GoDefinitionMemberLookup::Missing,
-                    ControlFlow::Continue(None) => continue,
-                    ControlFlow::Continue(Some(path)) => path,
-                };
-                if let Some(state) = member_trace.as_mut() {
-                    state.push_path(&path.owner, path.parent);
-                }
-                let embedded_index = path.append_to(&mut paths);
-                next.push(embedded_index);
-            }
-        }
-        frontier = next;
-    }
-    GoDefinitionMemberLookup::Missing
-}
-
-/// What the Go method-set filter decided about one candidate.
-///
-/// A function candidate that declares no receiver is exactly an interface
-/// method element. The filter computes that to keep open dispatch visible, so
-/// `interface_method` is a fact it already holds rather than a second structure
-/// asked what kind of type the owner is.
-#[derive(Clone, Copy)]
-enum GoMethodSetVerdict {
-    /// The candidate is in the receiver's method set.
-    InMethodSet {
-        interface_method: bool,
-        pointer_receiver: Option<bool>,
-    },
-    /// The candidate declares a pointer receiver, and the receiver this lookup
-    /// has is neither a pointer nor addressable, so the method is not in its
-    /// method set.
-    OutsideMethodSet,
-    /// The filter ran out of scope budget before it could decide. The candidate
-    /// is not admitted, and nothing may be claimed about why.
-    Undecided,
-}
-
-impl GoMethodSetVerdict {
-    /// The verdict for a lookup with no inferred receiver. The production walk
-    /// applies no method-set filter there, so it admits the candidate and
-    /// observes nothing about the candidate's receiver declaration.
-    const UNCHECKED: Self = Self::InMethodSet {
-        interface_method: false,
-        pointer_receiver: None,
-    };
-
-    const fn admits(self) -> bool {
-        matches!(self, Self::InMethodSet { .. })
-    }
-
-    const fn interface_method(self) -> bool {
-        matches!(
-            self,
-            Self::InMethodSet {
-                interface_method: true,
-                ..
-            }
-        )
-    }
-}
-
-fn go_member_in_method_set(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn GoDefinitionProvider,
-    candidate: &CodeUnit,
-    pointer_receivers: bool,
-) -> GoMethodSetVerdict {
-    if !candidate.is_function() {
-        return GoMethodSetVerdict::UNCHECKED;
-    }
-    let mut saw_receiver = false;
-    for metadata in support.signature_metadata(analyzer, candidate) {
-        if !support.scope_step() {
-            return GoMethodSetVerdict::Undecided;
-        }
-        let Some(receiver) = metadata.extension_receiver_type_identity() else {
-            continue;
-        };
-        saw_receiver = true;
-        if !receiver.is_pointer() || pointer_receivers {
-            return GoMethodSetVerdict::InMethodSet {
-                interface_method: false,
-                pointer_receiver: Some(receiver.is_pointer()),
-            };
-        }
-    }
-    // Interface methods have no concrete receiver declaration. Their open
-    // dispatch remains visible rather than being mistaken for a pointer-only
-    // concrete method.
-    if saw_receiver {
-        GoMethodSetVerdict::OutsideMethodSet
-    } else {
-        GoMethodSetVerdict::InMethodSet {
-            interface_method: true,
-            pointer_receiver: None,
-        }
-    }
-}
-
-/// The member attribution the Go promotion walk records while it runs (#1477).
-///
-/// [`go_indexed_field_lookup_with_method_set`] is a breadth-first walk over
-/// promotion paths, and every path already names the owner it searches and the
-/// path whose embedded field introduced it. This mirrors those two facts in the
-/// walk's own index order, plus the path each candidate was found on, so owner,
-/// depth and route are read off the walk instead of being rediscovered from its
-/// flattened result. It decides nothing.
-///
-/// Applicability stays `Unknown`: the walk selects by owner, name and method
-/// set and never inspects the call shape, so claiming anything else would
-/// invent a check the resolver did not perform (#1478).
-#[derive(Default)]
-struct GoPromotionTrace {
-    /// One entry per promotion path, in the walk's index order: the owner
-    /// fully-qualified name the path searches, and the path it was embedded in.
-    paths: Vec<(String, Option<usize>)>,
-    /// Candidate declaration -> the promotion path it was found on, and whether
-    /// the method-set filter proved it declares no receiver.
-    found: Vec<(CodeUnit, usize, bool)>,
-}
-
-impl GoPromotionTrace {
-    fn push_path(&mut self, owner_fqn: &str, parent: Option<usize>) {
-        self.paths.push((owner_fqn.to_owned(), parent));
-    }
-
-    /// First discovery wins, exactly as the breadth-first walk does: a name
-    /// reached at two depths is the shallower one's.
-    fn record(&mut self, candidate: &CodeUnit, path_index: usize, interface_method: bool) {
-        if self.found.iter().any(|(unit, ..)| unit == candidate) {
-            return;
-        }
-        self.found
-            .push((candidate.clone(), path_index, interface_method));
-    }
-
-    /// The promotion paths from the root owner to `path_index`, root first.
-    fn chain(&self, path_index: usize) -> Vec<usize> {
-        let mut chain = vec![path_index];
-        while let Some(parent) = self.paths[*chain.last().expect("a chain is never empty")].1 {
-            chain.push(parent);
-        }
-        chain.reverse();
-        chain
-    }
-
-    /// The declaration `owner_fqn` names, read straight from the Go store.
-    ///
-    /// The read deliberately bypasses [`GoDefinitionProvider`]: a provider
-    /// lookup is charged against the resolution session's scope budget, so a
-    /// recording run would spend budget the untraced run does not and a request
-    /// near its limit could answer differently while recording. An owner name
-    /// that does not name exactly one declaration leaves the candidate
-    /// unattributed rather than attributed to a guess.
-    fn owner_unit(analyzer: &dyn IAnalyzer, owner_fqn: &str) -> Option<CodeUnit> {
-        let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-        let mut units: Vec<CodeUnit> = go.definitions(owner_fqn).collect();
-        sort_units(&mut units);
-        units.dedup();
-        (units.len() == 1).then(|| units.pop()).flatten()
-    }
-
-    /// The attribution for `candidate`, or `None` when an owner on its route
-    /// does not name exactly one declaration.
-    fn enrichment(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        candidate: &CodeUnit,
-    ) -> Option<trace::MemberEnrichment> {
-        use brokk_bifrost_core::analyzer::structural::resolution::HierarchyRelation;
-
-        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
-        use brokk_bifrost_core::analyzer::structural::resolution::MemberDispatchTier;
-
-        let (_, path_index, interface_method) =
-            self.found.iter().find(|(unit, ..)| unit == candidate)?;
-        let owners = self
-            .chain(*path_index)
-            .into_iter()
-            .map(|index| Self::owner_unit(analyzer, &self.paths[index].0))
-            .collect::<Option<Vec<CodeUnit>>>()?;
-        let depth = owners.len() - 1;
-        // Every hop this walk takes is a Go embedded field or embedded
-        // interface, which is the one relation the walk expands.
-        let route = owners
-            .windows(2)
-            .enumerate()
-            .map(|(hop, pair)| trace::HierarchyHopRecord {
-                hop,
-                from: pair[0].clone(),
-                to: pair[1].clone(),
-                relation: HierarchyRelation::Embedded,
-            })
-            .collect();
-        let dispatch_tier = if *interface_method {
-            MemberDispatchTier::TraitOrInterface
-        } else if depth == 0 {
-            MemberDispatchTier::InherentOrDirect
-        } else {
-            MemberDispatchTier::InheritedOrPromoted
-        };
-        Some(trace::MemberEnrichment {
-            owner: owners[depth].clone(),
-            hierarchy_depth: depth,
-            dispatch_tier,
-            applicability: ApplicabilityVerdict::Unknown,
-            route,
-        })
-    }
-
-    /// Stage attribution for the candidates the walk is about to return, for
-    /// the outcome constructor the caller reaches next.
-    fn stage_selection(&self, analyzer: &dyn IAnalyzer, winners: &[CodeUnit]) {
-        let by_fq_name: Vec<(String, trace::MemberEnrichment)> = winners
-            .iter()
-            .filter_map(|unit| {
-                self.enrichment(analyzer, unit)
-                    .map(|enrichment| (unit.fq_name(), enrichment))
-            })
-            .collect();
-        trace::stage_winner_tier(
-            winners,
-            by_fq_name.iter().map(|(_, enrichment)| {
-                brokk_bifrost_analysis::analyzer::usages::get_definition::member_precedence_tier(
-                    enrichment.hierarchy_depth,
-                )
-            }),
-        );
-        trace::stage_member_context(by_fq_name);
-    }
-
-    /// Record a candidate the method-set filter computed and discarded.
-    ///
-    /// Go's method set is a declaration space: a method declared on `*T` is not
-    /// in `T`'s method set at all, which is what
-    /// [`RejectionReason::WrongDeclarationSpace`] names. It is not a visibility
-    /// rule and not a call-shape rule, so neither of those reasons applies.
-    fn record_rejection(&self, analyzer: &dyn IAnalyzer, candidate: &CodeUnit) {
-        use brokk_bifrost_core::analyzer::structural::resolution::RejectionReason;
-
-        let enrichment = self.enrichment(analyzer, candidate);
-        let tier = enrichment.as_ref().map(|enrichment| {
-            brokk_bifrost_analysis::analyzer::usages::get_definition::member_precedence_tier(
-                enrichment.hierarchy_depth,
-            )
-        });
-        trace::record_rejected_unit(
-            candidate,
-            tier,
-            RejectionReason::WrongDeclarationSpace,
-            None,
-            enrichment,
-        );
-    }
-}
-
-fn go_embedded_method_set_types(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    owner_fqn: &str,
-    inherited_pointer_receivers: bool,
-) -> Vec<(String, bool)> {
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return Vec::new();
-    };
-    let mut embedded = Vec::new();
-    for owner in support.fqn(owner_fqn) {
-        if !support.scope_step() {
-            return Vec::new();
-        }
-        for metadata in support.signature_metadata(analyzer, &owner) {
-            if !support.scope_step() {
-                return Vec::new();
-            }
-            let Some(identity) = metadata.into_return_type_identity() else {
-                continue;
-            };
-            let pointer_receivers = inherited_pointer_receivers || identity.is_pointer();
-            if let Some(fqn) = go_resolve_structured_type_fqn(
-                support,
-                token,
-                go,
-                owner.source(),
-                owner.package_name(),
-                &identity,
-            )
-            .or_else(|| {
-                go_imported_nominal_receiver_candidate_fqn(
-                    support,
-                    token,
-                    go,
-                    owner.source(),
-                    &identity,
-                )
-                .map(|(fqn, _)| fqn)
-            }) {
-                embedded.push((fqn, pointer_receivers));
-            }
-        }
-    }
-    embedded.sort();
-    embedded.dedup();
-    embedded
-}
-
-fn go_embedded_field_types(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    owner_fqn: &str,
-) -> Vec<String> {
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return Vec::new();
-    };
-    let mut embedded = Vec::new();
-    for owner in support.fqn(owner_fqn) {
-        if !support.scope_step() {
-            return Vec::new();
-        }
-        for metadata in support.signature_metadata(analyzer, &owner) {
-            if !support.scope_step() {
-                return Vec::new();
-            }
-            let Some(identity) = metadata.into_return_type_identity() else {
-                continue;
-            };
-            if let Some(fqn) = go_resolve_structured_type_fqn(
-                support,
-                token,
-                go,
-                owner.source(),
-                owner.package_name(),
-                &identity,
-            ) {
-                embedded.push(fqn);
-            }
-        }
-    }
-    embedded.sort();
-    embedded.dedup();
-    embedded
-}
-
-fn go_field_unit_type_identity(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn GoDefinitionProvider,
-    field_unit: &CodeUnit,
-) -> Option<StructuredTypeIdentity> {
-    let metadata = support.signature_metadata(analyzer, field_unit);
-    let mut identities: Vec<StructuredTypeIdentity> = Vec::new();
-    for metadata in metadata {
-        let identity = metadata.into_return_type_identity()?;
-        let mut duplicate = false;
-        for existing in &identities {
-            if existing.structurally_eq_with(&identity, || support.scope_step())? {
-                duplicate = true;
-                break;
-            }
-        }
-        if !duplicate {
-            identities.push(identity);
-        }
-    }
-    (identities.len() == 1).then(|| identities.pop()).flatten()
-}
-
-fn go_resolve_structured_type_fqn(
-    support: &dyn GoDefinitionProvider,
-    token: QueryToken<'_>,
-    go: &GoAnalyzer,
-    file: &ProjectFile,
-    default_package: &str,
-    identity: &StructuredTypeIdentity,
-) -> Option<String> {
-    let name = identity.nominal_name_with(|| support.scope_step())?;
-    match name.path() {
-        [name] => {
-            let mut candidates = Vec::new();
-            if let Some(fqn) =
-                go_resolve_exact_type_name_in_package(support, go, default_package, name)
-            {
-                candidates.push(fqn);
-            }
-            for import_path in go_dot_import_paths(go, support, token, file) {
-                if !support.scope_step() {
-                    return None;
-                }
-                if let Some(fqn) =
-                    go_resolve_exact_type_name_in_package(support, go, &import_path, name)
-                {
-                    candidates.push(fqn);
-                }
-            }
-            candidates.sort();
-            candidates.dedup();
-            (candidates.len() == 1).then(|| candidates.pop()).flatten()
-        }
-        [qualifier, name] => {
-            let import_path = go_import_paths(support, token, go, file).remove(qualifier)?;
-            go_resolve_exact_type_name_in_package(support, go, &import_path, name)
-        }
-        _ => None,
-    }
-}
-
-/// Resolve one exact AST type through the same bounded import and nominal
-/// binder used by ordinary definition queries. Imported names remain candidates
-/// until the caller joins their exact activated declaration and artifact.
-pub(crate) fn go_type_owner_at_node_bounded(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    type_node: Node<'_>,
-    budget: ReceiverAnalysisBudget,
-    cancellation: &CancellationToken,
-) -> BoundedResolution<Option<String>> {
-    let session = ResolutionSession::bounded(budget, Some(cancellation));
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return session.finish(None);
-    };
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let owner = (|| {
-        let root = go_syntax_root(&support, type_node)?;
-        let identity = brokk_bifrost_go::declarations::go_structured_type_identity_bounded(
-            type_node,
-            source,
-            || support.scope_step(),
-        )?;
-        let name = identity.nominal_name_with(|| support.scope_step())?;
-        let [qualifier, _] = name.path() else {
-            // Local aliases require their own declaration-to-artifact proof.
-            return go_resolve_type_fqn(analyzer, scope.token(), &support, file, source, type_node);
-        };
-        if go_name_shadowed_at_with_scope(root, source, type_node.start_byte(), qualifier, || {
-            support.scope_step()
-        }) != Some(false)
-        {
-            return None;
-        }
-        go_imported_nominal_receiver_candidate_fqn(&support, scope.token(), go, file, &identity)
-            .map(|(fqn, _)| fqn)
-    })();
-    session.finish(owner)
-}
-
-fn go_resolve_type_fqn(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn GoDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    type_node: Node<'_>,
-) -> Option<String> {
-    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-    let root = go_syntax_root(support, type_node)?;
-    let package = go_package_name(support, file, source, Some(root))?;
-    let identity = brokk_bifrost_go::declarations::go_structured_type_identity_bounded(
-        type_node,
-        source,
-        || support.scope_step(),
-    )?;
-    go_resolve_structured_type_fqn(support, token, go, file, &package, &identity)
-}
-
-fn go_syntax_root<'tree>(
-    support: &dyn GoDefinitionProvider,
-    mut node: Node<'tree>,
-) -> Option<Node<'tree>> {
-    loop {
-        if !support.scope_step() {
-            return None;
-        }
-        let Some(parent) = node.parent() else {
-            return Some(node);
-        };
-        node = parent;
-    }
-}
-
-fn go_resolve_exact_type_name_in_package(
-    support: &dyn GoDefinitionProvider,
-    go: &GoAnalyzer,
-    package: &str,
-    name: &str,
-) -> Option<String> {
-    if name.is_empty() {
-        return None;
-    }
-    let fqn = format!("{package}.{name}");
-    if let Ok(edge_index) = go.usage_edge_index() {
-        let resolved = edge_index.resolve_type_alias(&fqn);
-        if resolved != fqn {
-            return Some(resolved);
-        }
-    }
-    support.fqn_exists(&fqn).then_some(fqn)
-}
-
 pub(crate) fn go_call_reference_candidate(node: Node<'_>) -> bool {
     match node.parent() {
         Some(parent)
@@ -5972,6 +4080,7 @@ pub(crate) fn resolve_definition_dispatch<'a>(
     go_session: Option<
         &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
     >,
+    mut definition_batch: Option<&mut GoDefinitionBatchOperation<'a>>,
 ) -> std::ops::ControlFlow<
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
@@ -5992,11 +4101,18 @@ pub(crate) fn resolve_definition_dispatch<'a>(
             cancellation,
         };
         evidence.authority = DefinitionResolutionAuthority::NativeGoSelected;
-        match crate::analyzer::go::native_points::resolve_go_definition_with_evidence_bounded(
-            query,
-            || {},
-        ) {
+        let native = definition_batch
+            .as_mut()
+            .and_then(|batch| batch.resolve(query))
+            .unwrap_or_else(|| {
+                crate::analyzer::go::native_points::resolve_go_definition_with_evidence_bounded(
+                    query,
+                    || {},
+                )
+            });
+        match native {
             BoundedResolution::Complete { value, .. } => {
+                evidence.source_member_evidence = value.source_member_evidence;
                 evidence.native_resolution = value.native_resolution;
                 evidence.model_member_selection = value.model_member_selection;
                 evidence.call_application = value.call_application;
@@ -6020,7 +4136,173 @@ pub(crate) fn resolve_definition_dispatch<'a>(
             }
         }
     };
-    std::ops::ControlFlow::Continue(DefinitionResolution { outcome, evidence })
+    std::ops::ControlFlow::Continue(DefinitionResolution {
+        outcome,
+        evidence,
+        call_binding_discharge_digests: Vec::new(),
+    })
+}
+
+pub(crate) struct GoDefinitionBatchOperation<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    request: Option<Box<crate::analyzer::go::native_points::GoNativePointRequest<'a>>>,
+    file: Option<ProjectFile>,
+    open_reads: Option<brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads>,
+    disabled: bool,
+    #[cfg(test)]
+    opened_operations: usize,
+}
+
+pub(crate) fn definition_batch_resolver<'a>(
+    analyzer: &'a dyn IAnalyzer,
+) -> Box<dyn DefinitionBatchResolver<'a> + 'a> {
+    Box::new(GoDefinitionBatchOperation {
+        analyzer,
+        request: None,
+        file: None,
+        open_reads: None,
+        disabled: false,
+        #[cfg(test)]
+        opened_operations: 0,
+    })
+}
+
+impl<'a> GoDefinitionBatchOperation<'a> {
+    fn resolve(
+        &mut self,
+        query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+    ) -> Option<BoundedResolution<crate::analyzer::go::native_points::GoNativeDefinitionResolution>>
+    {
+        if self.disabled {
+            return None;
+        }
+        if self.file.as_ref().is_some_and(|file| file != query.file) {
+            self.request = None;
+            self.open_reads = None;
+        }
+        if self.request.is_none() {
+            let go = resolve_analyzer::<GoAnalyzer>(self.analyzer)?;
+            let cancellation = query.cancellation.cloned().unwrap_or_default();
+            let (opened, reads) =
+                brokk_bifrost_analysis::analyzer::usages::common::capture_memo_reads(
+                    self.analyzer,
+                    || {
+                        crate::analyzer::go::native_points::GoNativePointRequest::open_for_file(
+                            go,
+                            query.file,
+                            self.analyzer.semantic_model_overlay(),
+                            &cancellation,
+                        )
+                    },
+                );
+            match opened {
+                Ok(crate::analyzer::go::native_points::GoNativePointRequestOpen::Ready(
+                    request,
+                )) => {
+                    #[cfg(test)]
+                    {
+                        self.opened_operations += 1;
+                    }
+                    self.request = Some(request);
+                    self.file = Some(query.file.clone());
+                    self.open_reads = Some(reads);
+                }
+                Ok(crate::analyzer::go::native_points::GoNativePointRequestOpen::Unavailable {
+                    kind,
+                    message,
+                }) => {
+                    self.disabled = true;
+                    return Some(
+                        crate::analyzer::go::native_points::unavailable_go_definition_open(
+                            query, kind, message,
+                        ),
+                    );
+                }
+                Ok(crate::analyzer::go::native_points::GoNativePointRequestOpen::Cancelled) => {
+                    return Some(BoundedResolution::Cancelled {
+                        work: Default::default(),
+                    });
+                }
+                Err(error) => {
+                    self.disabled = true;
+                    return Some(
+                        crate::analyzer::go::native_points::unavailable_go_definition_open(
+                            query,
+                            "native_store_error",
+                            error.to_string(),
+                        ),
+                    );
+                }
+            }
+        } else if let Some(reads) = self.open_reads.as_ref() {
+            brokk_bifrost_analysis::analyzer::usages::common::replay_memo_reads(
+                reads,
+                self.analyzer,
+            );
+        }
+        let request = self.request.as_mut().expect("Go batch request opened");
+        // Only completed candidate artifacts survive across sites. The owner
+        // frontier charge belongs to this site's independent budget.
+        request.begin_receiver_query(query.file);
+        let result = request.resolve_definition_with_evidence(query);
+        let release = request.reader_excludes_store_access()
+            || !matches!(&result, BoundedResolution::Complete { value, .. } if !value.outcome.diagnostics.iter().any(|diagnostic| matches!(diagnostic.kind.as_str(), "native_stale" | "native_store_error" | "native_unavailable")));
+        if release {
+            self.request = None;
+            self.open_reads = None;
+        }
+        Some(result)
+    }
+}
+
+impl<'a> DefinitionBatchResolver<'a> for GoDefinitionBatchOperation<'a> {
+    fn release_before_store_read(&mut self) {
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|request| request.reader_excludes_store_access())
+        {
+            self.request = None;
+            self.open_reads = None;
+        }
+    }
+
+    fn precompute(
+        &mut self,
+        _analyzer: &dyn IAnalyzer,
+        _context: &mut DefinitionBatchContext<'_, '_>,
+        _requests: &[DefinitionLookupRequest],
+        _cancellation: Option<&CancellationToken>,
+    ) {
+    }
+
+    fn resolve_definition_dispatch(
+        &mut self,
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'_>,
+        context: &mut DefinitionBatchContext<'a, '_>,
+        request: &DefinitionLookupRequest,
+        source: &Arc<str>,
+        tree: &Option<Tree>,
+        site: &ResolvedReferenceSite,
+        operation: Option<brokk_bifrost_analysis::navigation::NavigationOperation>,
+        cancellation: Option<&CancellationToken>,
+        go_session: Option<&ResolutionSession>,
+    ) -> std::ops::ControlFlow<DefinitionResolution, DefinitionResolution> {
+        resolve_definition_dispatch(
+            analyzer,
+            token,
+            context,
+            request,
+            source,
+            tree,
+            site,
+            operation,
+            cancellation,
+            go_session,
+            Some(self),
+        )
+    }
 }
 
 pub(crate) fn resolve_definition_call_target_batch(
@@ -6039,6 +4321,7 @@ pub(crate) fn resolve_definition_call_target_batch(
         "one call-target source batch must contain requests for that source file"
     );
     record_definition_batch_probe_reads(analyzer, &mut context, &requests);
+    let mut definition_batch = definition_batch_resolver(analyzer);
 
     requests
         .into_iter()
@@ -6053,7 +4336,7 @@ pub(crate) fn resolve_definition_call_target_batch(
                 None,
                 cancellation,
                 Some(&session),
-                None,
+                Some(definition_batch.as_mut()),
             );
             let (resolution, truncated) = match session.finish(resolution) {
                 BoundedResolution::Complete { value, .. } => (value, false),
@@ -6095,6 +4378,144 @@ mod bounded_tests {
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
     use brokk_bifrost_test_macros::hardwon;
 
+    #[test]
+    #[hardwon("#9015: a Go file batch reopened native selection and context for every call")]
+    fn go_many_call_batch_profile() {
+        let source = "package main\nimport \"example.com/app/helper\"\nfunc use() {\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n}\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("helper/helper.go", "package helper\nfunc Target() {}\n"),
+                ("main.go", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let requests: Vec<_> = source
+            .match_indices("Target()")
+            .map(|(start_byte, _)| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + "Target".len()),
+            })
+            .collect();
+        assert_eq!(requests.len(), 8);
+        let analyzer = fixture.analyzer.analyzer();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let outcomes = {
+            let _profile =
+                brokk_bifrost_core::cache_db::sql_profile::request_scope("go_many_call_batch");
+            resolve_definition_call_target_batch(
+                analyzer,
+                scope.token(),
+                requests.clone(),
+                file.clone(),
+                Arc::from(source),
+                None,
+            )
+        };
+        assert_eq!(outcomes.len(), 8);
+        assert!(outcomes.iter().all(|result| {
+            result.outcome.status == DefinitionLookupStatus::Resolved
+                && result.outcome.definitions.len() == 1
+        }));
+
+        let mut batch = GoDefinitionBatchOperation {
+            analyzer,
+            request: None,
+            file: None,
+            open_reads: None,
+            disabled: false,
+            opened_operations: 0,
+        };
+        let mut batch_context = DefinitionBatchContext::new(analyzer, scope.token());
+        let mut scalar_context = DefinitionBatchContext::new(analyzer, scope.token());
+        batch_context
+            .sources
+            .insert(file.clone(), Ok(Arc::from(source)));
+        scalar_context.sources.insert(file, Ok(Arc::from(source)));
+        for request in requests {
+            let ((batched, batched_reads), (scalar, scalar_reads)) = (
+                brokk_bifrost_analysis::analyzer::capture_query_reads(analyzer, || {
+                    resolve_one_with_evidence(
+                        analyzer,
+                        scope.token(),
+                        &mut batch_context,
+                        request.clone(),
+                        None,
+                        None,
+                        None,
+                        Some(&mut batch),
+                    )
+                }),
+                brokk_bifrost_analysis::analyzer::capture_query_reads(analyzer, || {
+                    resolve_one_with_evidence(
+                        analyzer,
+                        scope.token(),
+                        &mut scalar_context,
+                        request,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }),
+            );
+            assert_eq!(batched.outcome.status, scalar.outcome.status);
+            assert_eq!(batched.outcome.definitions, scalar.outcome.definitions);
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    batched
+                        .evidence
+                        .native_resolution
+                        .as_ref()
+                        .map(|evidence| &evidence.completion)
+                ),
+                format!(
+                    "{:?}",
+                    scalar
+                        .evidence
+                        .native_resolution
+                        .as_ref()
+                        .map(|evidence| &evidence.completion)
+                )
+            );
+            assert_eq!(
+                format!("{:?}", batched.evidence.source_member_evidence),
+                format!("{:?}", scalar.evidence.source_member_evidence)
+            );
+            assert_eq!(
+                format!("{:?}", batched.evidence.model_member_selection),
+                format!("{:?}", scalar.evidence.model_member_selection)
+            );
+            assert_eq!(
+                format!("{:?}", batched.outcome.diagnostics),
+                format!("{:?}", scalar.outcome.diagnostics)
+            );
+            assert_eq!(batched_reads.keys(), scalar_reads.keys());
+            assert_eq!(
+                batched_reads.unattributed_reads(),
+                scalar_reads.unattributed_reads()
+            );
+            assert_eq!(
+                batched_reads.execution_dependences(),
+                scalar_reads.execution_dependences()
+            );
+        }
+        assert_eq!(batch.opened_operations, 1);
+        assert_eq!(
+            batch
+                .request
+                .as_ref()
+                .expect("retained Go operation")
+                .prepared_file_contexts_for_test(),
+            1
+        );
+    }
+
     fn site_for(
         file: &ProjectFile,
         source: &str,
@@ -6122,51 +4543,6 @@ mod bounded_tests {
             focus_start_byte: start_byte,
             focus_end_byte: end_byte,
         }
-    }
-
-    use brokk_bifrost_core::analyzer::model::StructuredTypeName;
-
-    use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
-
-    use crate::inline_project::InlineTestProject;
-
-    struct MetadataOverrideProvider<'a> {
-        inner: AnalyzerGoDefinitionProvider<'a>,
-        unit: CodeUnit,
-        metadata: Vec<SignatureMetadata>,
-    }
-
-    impl GoDefinitionProvider for MetadataOverrideProvider<'_> {
-        fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-            self.inner.fqn(fqn)
-        }
-
-        fn workspace_package_status(&self, import_path: &str) -> GoWorkspacePackageStatus {
-            self.inner.workspace_package_status(import_path)
-        }
-
-        fn workspace_declaration_identities_authoritative(&self) -> bool {
-            self.inner.workspace_declaration_identities_authoritative()
-        }
-
-        fn signature_metadata(
-            &self,
-            analyzer: &dyn IAnalyzer,
-            unit: &CodeUnit,
-        ) -> Vec<SignatureMetadata> {
-            if unit == &self.unit {
-                self.metadata.clone()
-            } else {
-                self.inner.signature_metadata(analyzer, unit)
-            }
-        }
-    }
-
-    fn named_type_identity(name: &str) -> StructuredTypeIdentity {
-        let mut builder = StructuredTypeIdentityBuilder::default();
-        let name = StructuredTypeName::new(vec![name.to_owned()], Vec::new(), false).unwrap();
-        let root = builder.named(name).unwrap();
-        builder.finish(root).unwrap()
     }
 
     fn indexed_go_function_at_start(
@@ -7249,61 +5625,6 @@ func (Right) Build() struct{} { return struct{}{} }
     }
 
     #[hardwon(
-        "ec40fea7cc91: incomplete embedding metadata preserves known components without reparsing source headers"
-    )]
-    #[test]
-    fn unbounded_go_embedding_keeps_components_but_does_not_reparse_header() {
-        let project = InlineTestProject::with_language(Language::Go)
-            .file(
-                "main.go",
-                "package main\n\ntype Embedded struct{}\ntype Other struct{}\ntype Outer struct {\n    Embedded\n    Other\n}\n",
-            )
-            .build();
-        let analyzer = GoAnalyzer::new(project.project_dyn());
-        let owner = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.identifier() == "Outer")
-            .expect("Outer declaration");
-        let embedded = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.identifier() == "Embedded")
-            .expect("Embedded declaration");
-        let other = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.identifier() == "Other")
-            .expect("Other declaration");
-        let provider = MetadataOverrideProvider {
-            inner: AnalyzerGoDefinitionProvider::new(&analyzer, None),
-            unit: owner.clone(),
-            metadata: vec![SignatureMetadata::new(
-                "type Outer struct { Embedded; Other }",
-                Vec::new(),
-            )],
-        };
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let owner_fqn = owner.fq_name();
-        let embedded_fqn = embedded.fq_name();
-        let other_fqn = other.fq_name();
-
-        assert!(
-            go_embedded_field_types(&analyzer, scope.token(), &provider, &owner_fqn).is_empty()
-        );
-        assert!(
-            go_embedded_method_set_types(&analyzer, scope.token(), &provider, &owner_fqn, false)
-                .is_empty()
-        );
-
-        let real_provider = AnalyzerGoDefinitionProvider::new(&analyzer, None);
-        let components =
-            go_embedded_field_types(&analyzer, scope.token(), &real_provider, &owner_fqn);
-        assert!(components.contains(&embedded_fqn));
-        assert!(components.contains(&other_fqn));
-    }
-
-    #[hardwon(
         "5c5d4e214494: invalid go.mod makes package absence unknown instead of authoritative"
     )]
     #[test]
@@ -7327,84 +5648,6 @@ func (Right) Build() struct{} { return struct{}{} }
         assert_eq!(go.workspace_path_index_build_count_for_test(), 0);
     }
 
-    #[hardwon(
-        "ec40fea7cc91: field type identity requires agreement from every metadata alternative"
-    )]
-    #[test]
-    fn unbounded_go_field_type_requires_consistent_identity_across_metadata_alternatives() {
-        // When legacy inference is deleted (G1b), move this rule into native with the test.
-        let project = InlineTestProject::with_language(Language::Go)
-            .file(
-                "main.go",
-                "package main\n\ntype Service struct{}\ntype Other struct{}\ntype Holder struct { Next *Service }\n",
-            )
-            .build();
-        let analyzer = GoAnalyzer::new(project.project_dyn());
-        let owner = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.identifier() == "Holder")
-            .expect("Holder declaration");
-        let field = analyzer
-            .get_definitions(&format!("{}.Next", owner.fq_name()))
-            .into_iter()
-            .next()
-            .expect("Holder.Next declaration");
-        let service = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.identifier() == "Service")
-            .expect("Service declaration");
-        let real_provider = AnalyzerGoDefinitionProvider::new(&analyzer, None);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert_eq!(
-            go_field_unit_type_identity(&analyzer, &real_provider, &field).and_then(|identity| {
-                go_resolve_structured_type_fqn(
-                    &real_provider,
-                    scope.token(),
-                    &analyzer,
-                    field.source(),
-                    field.package_name(),
-                    &identity,
-                )
-            }),
-            Some(service.fq_name().to_owned()),
-        );
-        let assert_unresolved = |metadata| {
-            let provider = MetadataOverrideProvider {
-                inner: AnalyzerGoDefinitionProvider::new(&analyzer, None),
-                unit: field.clone(),
-                metadata,
-            };
-            assert!(
-                go_field_unit_type_identity(&analyzer, &provider, &field)
-                    .and_then(|identity| go_resolve_structured_type_fqn(
-                        &provider,
-                        scope.token(),
-                        &analyzer,
-                        field.source(),
-                        field.package_name(),
-                        &identity
-                    ))
-                    .is_none()
-            );
-        };
-
-        assert_unresolved(vec![
-            SignatureMetadata::new("*Service", Vec::new())
-                .with_return_type_text(Some("*Service"))
-                .with_return_type_identity(Some(named_type_identity("Service"))),
-            SignatureMetadata::new("*Service", Vec::new()).with_return_type_text(Some("*Service")),
-        ]);
-        assert_unresolved(vec![
-            SignatureMetadata::new("*Service", Vec::new())
-                .with_return_type_text(Some("*Service"))
-                .with_return_type_identity(Some(named_type_identity("Service"))),
-            SignatureMetadata::new("*Service", Vec::new())
-                .with_return_type_text(Some("*Service"))
-                .with_return_type_identity(Some(named_type_identity("Other"))),
-        ]);
-    }
     mod native_definition_tests {
         use super::*;
         use crate::analyzer::go::native_points::{

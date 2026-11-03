@@ -113,13 +113,10 @@ fn register_bifrost_semantic_model_packs(
         }
         return Ok(());
     }
-    brokk_bifrost_semantic_packs::BIFROST_EMBEDDED_PACKS
-        .register_all(
-            catalog,
-            &brokk_bifrost_analysis::analyzer::semantic_model::DecodeLimits::default(),
-        )
-        .map(|_| ())
-        .map_err(|error| format!("failed to register shipped semantic packs: {error}"))
+    // The engine ships no product packs (#4438). Without a configured bundle
+    // the catalog stays empty; offline hosts point the variable above at an
+    // extracted packs release.
+    Ok(())
 }
 
 /// Pack-consumer profile for this exact engine build.
@@ -133,13 +130,8 @@ pub fn open_pack_engine_profile() -> serde_json::Value {
 
     let capabilities = policy::ENGINE_POLICY_CAPABILITIES;
 
-    let mut model_set = Sha256::new();
-    for pack in semantic_packs::BIFROST_EMBEDDED_PACKS.packs() {
-        model_set.update((pack.source_id().len() as u64).to_le_bytes());
-        model_set.update(pack.source_id().as_bytes());
-        model_set.update((pack.manifest_bytes().len() as u64).to_le_bytes());
-        model_set.update(pack.manifest_bytes());
-    }
+    // The engine registers no built-in models, so its model set is empty.
+    let model_set = Sha256::new();
     serde_json::json!({
         "engine_version": BIFROST_VERSION,
         "build_identity": BIFROST_BUILD_IDENTITY,

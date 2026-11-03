@@ -23,67 +23,102 @@
 
 use super::taint_policy::language_intrinsic_call;
 use brokk_bifrost_analysis::analyzer::semantic::IntrinsicCall;
+use brokk_bifrost_analysis::analyzer::semantic::type_flow::file_for_locator;
+use brokk_bifrost_rust_analysis::analyzer::rust::semantic::canonical_returned_field_member;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::semantic::partial_flow::ports::call_port_values;
+use brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::{
+    GuardEdgeKill, conditional_guard_edge_kills,
+};
 use brokk_bifrost_analysis::analyzer::semantic::partial_flow::{
-    ExtendedPartialFlows, ExtraObservation, ExtraPhase, ExtraSeed, ExtraTarget, ImplicitHeapRead,
-    ObservationFilter, PartialFlowOutcome, PartialFlowPort, ProcedurePartialFlows,
-    call_input_value, caller_exact_read_location, caller_location_carriers, compute_partial_flows,
-    compute_partial_flows_filtered, compute_partial_flows_with_implicit_reads,
-    exact_location_covers_read, file_local_procedure_relations, input_port_seed, join_crossed,
-    observation_value,
+    ExtendedPartialFlows, ExtraObservation, ExtraSeed, ImplicitHeapRead, ObservationFilter,
+    PartialFlowOutcome, PartialFlowPort, ProcedurePartialFlows, compute_partial_flows_filtered,
+    compute_partial_flows_with_edge_kills, compute_partial_flows_with_implicit_reads,
+    file_local_procedure_relations, observation_value,
 };
-use brokk_bifrost_analysis::analyzer::semantic::type_flow::file_for_locator;
-use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
-    GapOpenness, ProcedureOpenness, abort_paths_run_user_code, classify_gap_openness,
-};
+use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::ProcedureOpenness;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    AccessPathRoot, BarrierObservation, CallArgumentEndpoint, CallBinding, CallBindings,
-    CallInvocationMode, CallSiteHandle, CallSiteId, CandidateCoverage, DispatchBoundary,
-    DispatchBoundaryKind, DispatchResult, EvidenceCompleteness, LenientValueTypeBarriers,
-    ObservationPhase, OracleCallContext, ProcedureHandle, ProcedureInvocationKind,
-    ProcedurePortHandle, ProcedurePortKind, ProgramPointId, ProofStatus, SemanticArtifact,
-    SemanticArtifactKey, SemanticCallSite, SemanticCapability, SemanticExecutionBudget,
-    SemanticGapId, SemanticOutcome, SemanticRequest, StrictValueTypeBarriers, ValueFlowEndpoint,
-    ValueId, ValueTypeBarrierDecision, ValueTypeBarrierFilter, ValueTypeBarrierReason,
-    ValueTypePredicate,
+    BarrierObservation, CallArgumentEndpoint, CallInvocationMode, CallSiteHandle, CallSiteId,
+    CallStorageRelationIndex, CandidateCoverage, DispatchBoundary, DispatchBoundaryKind,
+    DispatchResult, EvidenceCompleteness, LenientValueTypeBarriers, ObservationPhase,
+    OracleCallContext, ProcedureHandle, ProcedureInvocationKind, ProgramPointId, ProofStatus,
+    SemanticArtifactKey, SemanticExecutionBudget, SemanticOutcome, SemanticRequest,
+    StrictValueTypeBarriers, ValueFlowEndpoint, ValueTypeBarrierDecision, ValueTypeBarrierFilter,
+    ValueTypeBarrierReason, ValueTypePredicate,
 };
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallerInventoryCoverage;
-use brokk_bifrost_analysis::analyzer::usages::{CallRelationLimits, CallRelationService};
-use brokk_bifrost_analysis::analyzer::{
-    AnalyzerQueryScope, ProjectFile, QueryScope, WorkspaceAnalyzer,
-};
+use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_flow::dataflow::{
     CuratedCallModel, ExternalSemanticSummarySet, SemanticInputStatus, SemanticProcedureSummary,
     SummaryEffect, SummaryEffectKey, SummaryExitKind, SummaryOrigin, SummaryPort, SummaryTransfer,
     UnmodeledCallBehavior,
 };
 use brokk_bifrost_flow::taint::compose::{
-    BlockedGap, BoundSource, CallModel, Callers, Completeness, CompositionProvider, Dispatch,
-    DispatchCandidate as ComposeCandidate, FallbackPorts, HopQuality, InteriorFlow, InteriorFlows,
-    InteriorObservation, InteriorSeed, InteriorTarget, InteriorWitnessStep, ModelTransfer,
-    Openness, ProcedureEndpoints, ValueTypeBarrierCheck,
+    BoundSource, CallModel, Callers, Completeness, CompositionProvider, Dispatch, FallbackPorts,
+    HopQuality, InteriorFlows, InteriorObservation, InteriorSeed, ModelTransfer, Openness,
+    ProcedureEndpoints, StoreChannelLink, StoreChannelLinks, StoreWriteObservation,
+    ValueTypeBarrierCheck, taint_model_kill,
 };
-use brokk_bifrost_flow::taint::{SourceEventKey, TaintAnalysisPlan};
+use brokk_bifrost_flow::taint::{
+    SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction, TaintUniverse,
+};
 use brokk_bifrost_flow::value_flow::{
-    AuthoredArmClosure, BindingCoverage, CallSiteCoverage, DurableCallSiteKey, DurableProcedureKey,
-    SummaryCallBinding, ValueFlowCarrier, ValueFlowObservationPhase, ValueFlowPlanLimits,
-    ValueFlowProvider, authored_call_closures, caller_content_locations,
+    AuthoredArmClosure, CallSiteCoverage, DurableCallSiteKey, DurableProcedureKey,
+    SummaryCallBinding, ValueFlowCarrier, ValueFlowProvider, authored_call_closures,
     closes_as_resolved_constructor,
 };
 
 use crate::definition::PolicyId;
 use crate::resolved::ResolvedEndpointIdentity;
 use crate::taint_policy::{
-    BoundExternalModel, CallResolutionDiscoveryEvidence, CompiledTaintEndpoint,
+    BoundExternalModel, CallResolutionDiscoveryEvidence, CompiledStoreEnd, CompiledTaintEndpoint,
     DiscoveryMaterializationCache, ExternalCallSeams, FrontierEndpoint, FrontierEndpointBinder,
-    FrontierSelector, PolicyDiscoveryProvider, RefusalNotice, TaintPolicyCompileError,
-    UnjudgedSource, intrinsic_call_model, intrinsic_format_result_identity,
+    FrontierSelector, PolicyDiscoveryProvider, RefusalNotice, SanitizerDecline,
+    TaintPolicyCompileError, UnjudgedSource, intrinsic_call_model,
+    intrinsic_format_result_identity,
 };
 use crate::units::WidenReason;
+
+#[derive(Default)]
+struct ProjectionCounter {
+    calls: Cell<u64>,
+    cpu_ns: Cell<u64>,
+}
+
+impl ProjectionCounter {
+    fn start() -> Option<std::time::Duration> {
+        brokk_bifrost_analysis::profiling::enabled()
+            .then(brokk_bifrost_analysis::profiling::thread_cpu_time)
+    }
+
+    fn record(&self, start: Option<std::time::Duration>) {
+        self.calls.set(self.calls.get() + 1);
+        if let Some(start) = start {
+            let elapsed = brokk_bifrost_analysis::profiling::thread_cpu_time()
+                .saturating_sub(start)
+                .as_nanos();
+            self.cpu_ns.set(
+                self.cpu_ns
+                    .get()
+                    .saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX)),
+            );
+        }
+    }
+
+    fn totals(&self) -> (u64, u64) {
+        (self.calls.get(), self.cpu_ns.get())
+    }
+}
+
+#[derive(Clone, Default)]
+struct ConditionalPartitions {
+    baseline: Option<TaintEdgeFunction>,
+    groups: Vec<(TaintEdgeFunction, Vec<GuardEdgeKill>)>,
+}
+
+type ConditionalPartialFlows = Vec<(Option<TaintEdgeFunction>, Arc<ProcedurePartialFlows>)>;
 
 /// The composition's provider over one workspace, one compile and one plan.
 pub(crate) struct PolicyCompositionProvider<'a> {
@@ -98,6 +133,11 @@ pub(crate) struct PolicyCompositionProvider<'a> {
     max_callers_per_procedure: usize,
     /// Partial flows by procedure: the first read or computation per compile.
     partial_flows: RefCell<HashMap<DurableProcedureKey, Arc<ProcedurePartialFlows>>>,
+    conditional_partitions: RefCell<HashMap<DurableProcedureKey, ConditionalPartitions>>,
+    conditional_declines: RefCell<Vec<SanitizerDecline>>,
+    conditional_partial: RefCell<HashMap<DurableProcedureKey, ConditionalPartialFlows>>,
+    /// Incoming relation indexes for the compile's immutable procedure snapshots.
+    call_storage_indexes: RefCell<HashMap<DurableProcedureKey, Arc<CallStorageRelationIndex>>>,
     barriers: Vec<(Box<str>, ValueTypePredicate)>,
     // Open lazily after candidate discovery; drop operations and memos with this query.
     barrier_service: crate::taint_barriers::ValueTypeBarrierService<'a>,
@@ -118,6 +158,9 @@ pub(crate) struct PolicyCompositionProvider<'a> {
     stored_reads: Cell<u64>,
     /// Partial-flow answers computed at query time.
     computed: Cell<u64>,
+    baseline_reads_cost: ProjectionCounter,
+    interior_cost: ProjectionCounter,
+    overlay_cost: ProjectionCounter,
     /// Openness per procedure, decided once per compile.
     openness_memo: RefCell<HashMap<DurableProcedureKey, Openness>>,
     /// The gap sweep of each procedure whose partial flows the search read.
@@ -159,6 +202,9 @@ pub(crate) struct PolicyCompositionProvider<'a> {
     /// Config-inactive reverse sites excluded during this composition batch.
     /// These are configuration exclusions, never incomplete discovery.
     excluded_callers: RefCell<Vec<(ProjectFile, brokk_bifrost_analysis::analyzer::Range)>>,
+    store_writes: Vec<StoreWriteObservation>,
+    store_links: HashMap<(DurableProcedureKey, PartialFlowPort), StoreChannelLinks>,
+    store_calls: HashSet<DurableCallSiteKey>,
 }
 
 /// What the composition learned over one policy run that its batches share.
@@ -188,6 +234,17 @@ pub(crate) struct CompositionMemo {
     /// points-to question, so the run asks it once for a site however many
     /// batches report a flow from it.
     evidence: RefCell<HashMap<EvidenceKey, HopQuality>>,
+}
+
+#[cfg(test)]
+impl CompositionMemo {
+    pub(crate) fn dispatch_calls_for_test(&self) -> Vec<DurableCallSiteKey> {
+        self.dispatches
+            .borrow()
+            .keys()
+            .map(|(_, call)| call.clone())
+            .collect()
+    }
 }
 
 /// One call's dispatch as the composition answers it, with the model that
@@ -233,6 +290,113 @@ struct RecordedDispatch {
 }
 
 impl<'a> PolicyCompositionProvider<'a> {
+    pub(crate) fn conditional_declines(&self) -> Vec<SanitizerDecline> {
+        self.conditional_declines.borrow().clone()
+    }
+
+    fn conditional_partitions(
+        &self,
+        handle: &ProcedureHandle,
+    ) -> Result<ConditionalPartitions, TaintPolicyCompileError> {
+        let key = handle.durable_key();
+        if let Some(partitions) = self.conditional_partitions.borrow().get(&key) {
+            return Ok(partitions.clone());
+        }
+        if !self.binder.borrow().has_conditional_sanitizers() {
+            return Ok(ConditionalPartitions::default());
+        }
+        let selected = self.binder.borrow_mut().conditional_in(handle)?;
+        let universe = self.plan.universe();
+        let guards = selected
+            .iter()
+            .map(|entry| entry.guard.clone())
+            .collect::<Vec<_>>();
+        let derived = conditional_guard_edge_kills(handle, &guards);
+        let mut by_sanitizer = vec![Vec::new(); selected.len()];
+        for decline in derived.declines {
+            self.conditional_declines
+                .borrow_mut()
+                .push(SanitizerDecline {
+                    sanitizer: selected[decline.sanitizer].id.clone(),
+                    point: handle
+                        .point_handle(decline.point)
+                        .expect("validated guard point"),
+                    target: None,
+                    reason: decline.reason.into(),
+                });
+        }
+        for kill in derived.kills {
+            if let Err(reason) = &selected[kill.sanitizer].admission {
+                self.conditional_declines
+                    .borrow_mut()
+                    .push(SanitizerDecline {
+                        sanitizer: selected[kill.sanitizer].id.clone(),
+                        point: handle
+                            .point_handle(kill.kill.point)
+                            .expect("validated guard point"),
+                        target: Some(kill.kill.target_point),
+                        reason: reason.clone(),
+                    });
+            } else {
+                by_sanitizer[kill.sanitizer].push(kill.kill);
+            }
+        }
+        if by_sanitizer.iter().all(Vec::is_empty) {
+            let partitions = ConditionalPartitions::default();
+            self.conditional_partitions
+                .borrow_mut()
+                .insert(key, partitions.clone());
+            return Ok(partitions);
+        }
+        let mut classes_by_kills: HashMap<
+            Vec<usize>,
+            Vec<&brokk_bifrost_flow::taint::SourceClassId>,
+        > = HashMap::new();
+        for class in universe.classes() {
+            let kills = selected
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    (!by_sanitizer[index].is_empty()
+                        && entry
+                            .removes
+                            .iter()
+                            .any(|label| label.as_str() == class.as_str()))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            classes_by_kills.entry(kills).or_default().push(class);
+        }
+        let all = universe
+            .class_set(universe.classes().iter())
+            .expect("the universe contains its own classes");
+        let baseline = classes_by_kills.remove(&Vec::new()).map(|classes| {
+            let keep = universe
+                .class_set(classes)
+                .expect("the universe contains its own classes");
+            TaintEdgeFunction::kill(&all.subtract(&keep))
+        });
+        let mut groups = classes_by_kills
+            .into_iter()
+            .map(|(indexes, classes)| {
+                let keep = universe
+                    .class_set(classes)
+                    .expect("the universe contains its own classes");
+                let function = TaintEdgeFunction::kill(&all.subtract(&keep));
+                let kills = indexes
+                    .into_iter()
+                    .flat_map(|index| by_sanitizer[index].clone())
+                    .collect();
+                (function, kills)
+            })
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| left.0.cmp(&right.0));
+        let partitions = ConditionalPartitions { baseline, groups };
+        self.conditional_partitions
+            .borrow_mut()
+            .insert(key, partitions.clone());
+        Ok(partitions)
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         workspace: &'a WorkspaceAnalyzer,
@@ -269,8 +433,15 @@ impl<'a> PolicyCompositionProvider<'a> {
             strict_witnesses: RefCell::new(HashSet::new()),
             filtered_flows: RefCell::new(HashMap::new()),
             partial_flows: RefCell::new(HashMap::new()),
+            conditional_partitions: RefCell::new(HashMap::new()),
+            conditional_declines: RefCell::new(Vec::new()),
+            conditional_partial: RefCell::new(HashMap::new()),
+            call_storage_indexes: RefCell::new(HashMap::new()),
             stored_reads: Cell::new(0),
             computed: Cell::new(0),
+            baseline_reads_cost: ProjectionCounter::default(),
+            interior_cost: ProjectionCounter::default(),
+            overlay_cost: ProjectionCounter::default(),
             openness_memo: RefCell::new(HashMap::new()),
             sweeps: RefCell::new(HashMap::new()),
             dispatches_made: Cell::new(0),
@@ -286,13 +457,97 @@ impl<'a> PolicyCompositionProvider<'a> {
             unjudged: RefCell::new(HashMap::new()),
             source_evidence_resolved: Cell::new(0),
             excluded_callers: RefCell::new(Vec::new()),
+            store_writes: Vec::new(),
+            store_links: HashMap::new(),
+            store_calls: HashSet::new(),
         }
+    }
+
+    /// Link the compile's selected store ends, once for this query. The
+    /// compiled metadata belongs to one policy, so links cannot cross a
+    /// policy boundary even when channel names coincide.
+    pub(crate) fn with_store_inventory(
+        mut self,
+        writes: &[CompiledStoreEnd],
+        reads: &[CompiledStoreEnd],
+    ) -> Self {
+        self.store_calls
+            .extend(writes.iter().chain(reads).map(|end| end.call.durable_key()));
+        self.store_writes = writes
+            .iter()
+            .map(|write| StoreWriteObservation {
+                procedure: write.call.procedure().durable_key(),
+                owner: write.call.procedure().clone(),
+                point: write.point.id(),
+                phase: write.phase,
+                carrier: write.carrier.clone(),
+            })
+            .collect();
+        for read in reads {
+            let ValueFlowCarrier::Value(value) = &read.carrier else {
+                panic!("a bound store read output has a call-result value carrier")
+            };
+            let row = read
+                .call
+                .procedure()
+                .semantics()
+                .call_site(read.call.id())
+                .expect("a selected store read call is live");
+            let output =
+                brokk_bifrost_flow::composition::result_port(row, read.call.id(), value.id())
+                    .expect("a bound store read output is a call result");
+            let key = (read.call.procedure().durable_key(), output);
+            let answer = self.store_links.entry(key).or_default();
+            if !matches!(read.proof, ProofStatus::Proven)
+                || !matches!(read.completeness, EvidenceCompleteness::Complete)
+            {
+                answer.incomplete = Some("store read endpoint evidence is incomplete".into());
+            }
+            for (index, write) in writes.iter().enumerate() {
+                if write.channel.may_alias(&read.channel) {
+                    if !matches!(write.proof, ProofStatus::Proven)
+                        || !matches!(write.completeness, EvidenceCompleteness::Complete)
+                    {
+                        answer.incomplete =
+                            Some("store write endpoint evidence is incomplete".into());
+                    }
+                    answer.writes.push(StoreChannelLink {
+                        write: index,
+                        write_call: write.call.durable_key(),
+                        read_call: read.call.durable_key(),
+                        read_origin: brokk_bifrost_flow::taint::SourceEventKey::new(
+                            read.event.clone(),
+                        ),
+                        read_phase: read.phase,
+                        read_carrier: read.carrier.clone(),
+                        uncertain: !matches!(write.proof, ProofStatus::Proven)
+                            || !matches!(write.completeness, EvidenceCompleteness::Complete)
+                            || !matches!(read.proof, ProofStatus::Proven)
+                            || !matches!(read.completeness, EvidenceCompleteness::Complete),
+                    });
+                }
+            }
+        }
+        self
     }
 
     pub(crate) fn excluded_callers(
         &self,
     ) -> std::cell::Ref<'_, [(ProjectFile, brokk_bifrost_analysis::analyzer::Range)]> {
         std::cell::Ref::map(self.excluded_callers.borrow(), |sites| sites.as_slice())
+    }
+
+    fn call_storage_index(
+        &self,
+        procedure: &ProcedureHandle,
+        snapshot: &brokk_bifrost_analysis::analyzer::semantic::ValueFlowSnapshot,
+    ) -> Arc<CallStorageRelationIndex> {
+        Arc::clone(
+            self.call_storage_indexes
+                .borrow_mut()
+                .entry(procedure.durable_key())
+                .or_insert_with(|| Arc::new(CallStorageRelationIndex::new(snapshot))),
+        )
     }
 
     /// Points-to evidence runs for frontier sources so far.
@@ -417,6 +672,14 @@ impl<'a> PolicyCompositionProvider<'a> {
         (self.stored_reads.get(), self.computed.get())
     }
 
+    pub(crate) fn projection_counts(&self) -> ((u64, u64), (u64, u64), (u64, u64)) {
+        (
+            self.baseline_reads_cost.totals(),
+            self.interior_cost.totals(),
+            self.overlay_cost.totals(),
+        )
+    }
+
     pub(crate) fn barrier_work_counts(&self) -> (u64, u64, usize) {
         (
             self.barrier_service.checks(),
@@ -477,57 +740,12 @@ impl<'a> PolicyCompositionProvider<'a> {
             .expect("a procedure the composition visited has a materialized artifact")
     }
 
-    /// The live procedure of a durable key. The artifact is the compile's
-    /// canonical instance for the key when one exists, so every handle of one
-    /// compile names the same rows.
     fn procedure(
         &self,
         key: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ProcedureHandle, TaintPolicyCompileError> {
-        let cached = self.cache.artifacts.borrow().get(&key.0).cloned();
-        let artifact = match cached {
-            Some(artifact) => artifact,
-            None => {
-                let root = self.workspace.analyzer().project().root();
-                let file = ProjectFile::new(root.to_path_buf(), key.0.path().as_path());
-                let outcome = self
-                    .workspace
-                    .materialize_program_semantics(
-                        &file,
-                        &mut request.staged_with_execution_budget(&self.execution_budget),
-                    )
-                    .map_err(|error| {
-                        TaintPolicyCompileError::SemanticProvider(error.to_string())
-                    })?;
-                self.discovery
-                    .require_outcome(&outcome, "composition procedure lookup")?;
-                let artifact = outcome.available_value().cloned().ok_or_else(|| {
-                    TaintPolicyCompileError::SemanticUnavailable(format!(
-                        "composition could not materialize {}",
-                        key.0.path()
-                    ))
-                })?;
-                if artifact.key() != &key.0 {
-                    return Err(TaintPolicyCompileError::SemanticUnavailable(format!(
-                        "the artifact of {} changed during composition",
-                        key.0.path()
-                    )));
-                }
-                self.cache
-                    .artifacts
-                    .borrow_mut()
-                    .insert(key.0.clone(), Arc::clone(&artifact));
-                artifact
-            }
-        };
-        artifact.procedure_handle(key.1).ok_or_else(|| {
-            TaintPolicyCompileError::SemanticUnavailable(format!(
-                "procedure {:?} is not in the artifact of {}",
-                key.1,
-                key.0.path()
-            ))
-        })
+        self.discovery.procedure(key, request)
     }
 }
 
@@ -573,286 +791,271 @@ impl ObservationFilter for ProcedureBarrierFilter<'_, '_> {
     }
 }
 
-impl PolicyCompositionProvider<'_> {
-    fn interior_from_snapshot(
+impl brokk_bifrost_flow::composition::InteriorProjectionClient for PolicyCompositionProvider<'_> {
+    type Error = TaintPolicyCompileError;
+
+    fn implicit_heap_reads(&self) -> bool {
+        self.binder.borrow().analysis_type() == crate::definition::PolicyAnalysisType::Taint
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_interior_fixpoint(
         &self,
-        handle: ProcedureHandle,
+        handle: &ProcedureHandle,
         snapshot: &brokk_bifrost_analysis::analyzer::semantic::ValueFlowSnapshot,
-        seeds: &[InteriorSeed],
-        observations: &[InteriorObservation],
+        seeds: &[ExtraSeed],
+        observations: &[ExtraObservation],
         witnesses: bool,
+        implicit_reads: &[ImplicitHeapRead],
+        edge_kills: &[GuardEdgeKill],
         request: &mut SemanticRequest<'_>,
-    ) -> Result<InteriorFlows, TaintPolicyCompileError> {
+    ) -> Result<ExtendedPartialFlows, Self::Error> {
         let procedure = handle.durable_key();
-        let mut extra_seeds = Vec::with_capacity(seeds.len());
-        // The request seed index of each extra seed. A heap input port that no
-        // relation reads carries no value the run can follow, so it has none.
-        let mut request_of_extra = Vec::with_capacity(seeds.len());
-        for (index, seed) in seeds.iter().enumerate() {
-            let extra = match seed {
-                InteriorSeed::Source {
-                    point,
-                    phase,
-                    carrier,
-                } => Some(ExtraSeed {
-                    point: *point,
-                    phase: extra_phase(phase),
-                    carrier: endpoint_of(carrier),
-                }),
-                InteriorSeed::Port(port) => match input_port_seed(&handle, snapshot, port) {
-                    Some(seed) => Some(seed),
-                    None if matches!(port, PartialFlowPort::Heap { .. }) => None,
-                    None => {
-                        return Ok(incomplete_interior(
-                            handle,
-                            "an input port seed is not live in its procedure",
-                        ));
-                    }
+        if !edge_kills.is_empty() {
+            compute_partial_flows_with_edge_kills(
+                handle,
+                snapshot,
+                seeds,
+                observations,
+                witnesses,
+                implicit_reads,
+                edge_kills,
+                &mut ProcedureBarrierFilter {
+                    provider: self,
+                    procedure: handle,
                 },
-            };
-            if let Some(extra) = extra {
-                extra_seeds.push(extra);
-                request_of_extra.push(index);
-            }
+                request,
+            )
+        } else if self.barrier_chop.borrow().contains(&procedure) {
+            let _timing = brokk_bifrost_analysis::profiling::scope("taint.barriers.fixpoint");
+            self.barrier_fixpoints.set(self.barrier_fixpoints.get() + 1);
+            self.barrier_procedures.borrow_mut().insert(procedure);
+            compute_partial_flows_filtered(
+                handle,
+                snapshot,
+                seeds,
+                observations,
+                witnesses,
+                implicit_reads,
+                &mut ProcedureBarrierFilter {
+                    provider: self,
+                    procedure: handle,
+                },
+                request,
+            )
+        } else {
+            Ok(compute_partial_flows_with_implicit_reads(
+                handle,
+                snapshot,
+                seeds,
+                observations,
+                witnesses,
+                implicit_reads,
+                request,
+            ))
         }
-        let mut implicit_reads = Vec::new();
-        let mut extra_observations = Vec::with_capacity(observations.len());
-        // The request observation of each extra observation, and whether the
-        // evidence that names its carrier is uncertain. A caller-side location
-        // can be backed by several caller locations, each its own carrier.
-        let mut observation_of_extra = Vec::with_capacity(observations.len());
-        let mut completeness = Completeness::Complete;
-        for (index, observation) in observations.iter().enumerate() {
-            match observation {
-                InteriorObservation::Sink {
-                    point,
-                    phase,
-                    carrier,
-                } => {
-                    extra_observations.push(ExtraObservation {
-                        point: *point,
-                        phase: extra_phase(phase),
-                        carrier: endpoint_of(carrier),
-                    });
-                    observation_of_extra.push((index, false));
-                }
-                InteriorObservation::Location(location) => {
-                    let site = handle
-                        .semantics()
-                        .call_site(location.call)
-                        .expect("a caller-side location names a call of its procedure");
-                    let value = call_input_value(site, &location.actual)
-                        .expect("a caller-side location is rooted at a call input of its call");
-                    let actual = handle
-                        .value_handle(value)
-                        .expect("a call's input is a live value of its procedure");
-                    // The callee reads what the caller left in the storage
-                    // behind the actual, found as the ICFG engine's
-                    // call-location rules find it.
-                    let origins =
-                        caller_content_locations(&actual, snapshot, ValueFlowPlanLimits::default());
-                    if !origins.complete {
-                        completeness = incomplete(
-                            "the storage behind a caller-side location's actual is not fully known",
-                        );
-                    }
-                    let several = !origins.complete || origins.locations.len() > 1;
-                    for origin in &origins.locations {
-                        // Track containing-value taint at the substituted read
-                        // so a later strong write can kill that descendant.
-                        if self.binder.borrow().analysis_type()
-                            == crate::definition::PolicyAnalysisType::Taint
-                            && let Some(read) = caller_exact_read_location(
-                                &handle,
-                                &origin.location,
-                                &location.selectors,
-                                location.tail,
-                            )
-                        {
-                            let mut seed_carriers = Vec::new();
-                            for seed in &extra_seeds {
-                                if let ValueFlowEndpoint::Port(port) = &seed.carrier
-                                    && matches!(read.path().root(),
-                                        AccessPathRoot::ProcedurePort(root) | AccessPathRoot::CaptureSlot(root)
-                                            if root == port)
-                                {
-                                    seed_carriers.push((seed.carrier.clone(), false));
-                                    continue;
-                                }
-                                let value = match &seed.carrier {
-                                    ValueFlowEndpoint::Value(value) => Some(value.clone()),
-                                    ValueFlowEndpoint::Port(_) => handle
-                                        .semantics()
-                                        .values()
-                                        .iter()
-                                        .map(|value| {
-                                            handle
-                                                .value_handle(value.id)
-                                                .expect("a procedure's semantic value is live")
-                                        })
-                                        .find(|value| {
-                                            ValueFlowEndpoint::for_value(value.clone())
-                                                == seed.carrier
-                                        }),
-                                    ValueFlowEndpoint::Location(_) => None,
-                                };
-                                let Some(value) = value else {
-                                    continue;
-                                };
-                                let seed_origins = caller_content_locations(
-                                    &value,
-                                    snapshot,
-                                    ValueFlowPlanLimits::default(),
-                                );
-                                if !seed_origins.complete {
-                                    completeness = incomplete(
-                                        "the storage behind a taint source is not fully known",
-                                    );
-                                }
-                                for seed_origin in &seed_origins.locations {
-                                    if exact_location_covers_read(&seed_origin.location, &read) {
-                                        seed_carriers.push((
-                                            seed.carrier.clone(),
-                                            !seed_origins.complete
-                                                || seed_origins.locations.len() > 1
-                                                || !seed_origin.proven_complete,
-                                        ));
-                                        break;
-                                    }
-                                }
-                            }
-                            extra_observations.push(ExtraObservation {
-                                point: site.point,
-                                phase: ExtraPhase::BeforeEffects,
-                                carrier: ValueFlowEndpoint::Location(Box::new(read.clone())),
-                            });
-                            observation_of_extra.push((index, several || !origin.proven_complete));
-                            implicit_reads.push(ImplicitHeapRead {
-                                location: read,
-                                seed_carriers,
-                            });
-                        }
-                        for carrier in caller_location_carriers(
-                            snapshot,
-                            &origin.location,
-                            &location.selectors,
-                            location.tail,
-                        ) {
-                            extra_observations.push(ExtraObservation {
-                                point: site.point,
-                                phase: ExtraPhase::BeforeEffects,
-                                carrier,
-                            });
-                            observation_of_extra.push((index, several || !origin.proven_complete));
-                        }
-                    }
-                }
-            }
-        }
-        let mut fixpoint_request = request.staged_with_execution_budget(&self.execution_budget);
-        let ExtendedPartialFlows { partial, flows } =
-            if self.barrier_chop.borrow().contains(&procedure) {
-                let _timing = brokk_bifrost_analysis::profiling::scope("taint.barriers.fixpoint");
-                self.barrier_fixpoints.set(self.barrier_fixpoints.get() + 1);
-                self.barrier_procedures
-                    .borrow_mut()
-                    .insert(procedure.clone());
-                compute_partial_flows_filtered(
-                    &handle,
-                    snapshot,
-                    &extra_seeds,
-                    &extra_observations,
-                    witnesses,
-                    &implicit_reads,
-                    &mut ProcedureBarrierFilter {
-                        provider: self,
-                        procedure: &handle,
-                    },
-                    &mut fixpoint_request,
-                )?
-            } else {
-                compute_partial_flows_with_implicit_reads(
-                    &handle,
-                    snapshot,
-                    &extra_seeds,
-                    &extra_observations,
-                    witnesses,
-                    &implicit_reads,
-                    &mut fixpoint_request,
-                )
-            };
-        if partial.outcome != PartialFlowOutcome::Complete {
-            completeness = incomplete(format!(
-                "the procedure's relations are {:?}",
-                partial.outcome
-            ));
-        }
-        // One flow per seed and target. When two carriers of one observation
-        // both carry a seed, the uncertain derivation is kept and the crossed
-        // calls of both are joined, as the fixpoint does for one carrier.
-        let mut mapped: Vec<InteriorFlow> = Vec::with_capacity(flows.len());
-        let mut index_of = HashMap::new();
-        for flow in flows {
-            let (target, uncertain) = match flow.target {
-                ExtraTarget::Observation(extra) => {
-                    let (index, uncertain) = observation_of_extra[extra];
-                    (
-                        InteriorTarget::Observation(index),
-                        flow.uncertain || uncertain,
-                    )
-                }
-                ExtraTarget::Port(port) => (
-                    InteriorTarget::Port(partial.ports[port.index()].clone()),
-                    flow.uncertain,
-                ),
-            };
-            let interior = InteriorFlow {
-                seed: request_of_extra[flow.seed],
-                target,
-                uncertain,
-                crossed: flow.crossed,
-                witness: flow.witness.map(|steps| {
-                    steps
-                        .iter()
-                        .map(|step| InteriorWitnessStep {
-                            point: step.point,
-                            event: step.event,
-                            source: step.source,
-                            target: step.target,
-                            phase: step.phase,
-                        })
-                        .collect()
+    }
+}
+
+impl brokk_bifrost_flow::composition::CallModelSource for PolicyCompositionProvider<'_> {
+    type Error = TaintPolicyCompileError;
+    type Function = TaintEdgeFunction;
+
+    fn boundary_member_rows(
+        &self,
+        procedure: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<Arc<ProcedurePartialFlows>>, Self::Error> {
+        Ok(Some(self.partial_flows(procedure, request)?))
+    }
+
+    fn canonical_returned_field(
+        &self,
+        callee: &DurableProcedureKey,
+        caller: &DurableProcedureKey,
+        declared: &brokk_bifrost_analysis::analyzer::semantic::SemanticLocator,
+        request: &mut SemanticRequest<'_>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::SemanticLocator> {
+        <Self as CompositionProvider>::canonical_returned_field(
+            self, callee, caller, declared, request,
+        )
+    }
+
+    fn dispatch_model(
+        &self,
+        call: &CallSiteHandle,
+        answer: &SemanticOutcome<DispatchResult>,
+    ) -> Result<brokk_bifrost_flow::composition::CallModelDecision<Self::Function>, Self::Error>
+    {
+        if self.store_calls.contains(&call.durable_key()) {
+            // A selected store end replaces this call's value transfer.
+            return Ok(brokk_bifrost_flow::composition::CallModelDecision {
+                model: Some(CallModel {
+                    transfers: Vec::new(),
+                    proven: true,
+                    completeness: Completeness::Complete,
+                    authored: None,
                 }),
-            };
-            match index_of.entry((interior.seed, interior.target.clone())) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(mapped.len());
-                    mapped.push(interior);
-                }
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    let kept = &mut mapped[*entry.get()];
-                    let crossed = join_crossed(&kept.crossed, &interior.crossed);
-                    if interior.uncertain && !kept.uncertain {
-                        *kept = interior;
-                    }
-                    kept.crossed = crossed;
-                }
-            }
+                continuation: HopQuality::CERTAIN,
+            });
         }
-        let flows = mapped;
-        Ok(InteriorFlows {
-            procedure: handle,
-            flows,
-            completeness,
+        let models = self.call_models(call, answer)?;
+        Ok(brokk_bifrost_flow::composition::CallModelDecision {
+            continuation: continuation_quality(&models, call, answer.available_value()),
+            model: covering_model(
+                &models,
+                call,
+                answer.available_value(),
+                self.plan.universe(),
+            ),
         })
+    }
+
+    fn covers_caller_candidate(
+        &self,
+        call: &CallSiteHandle,
+        answer: &SemanticOutcome<DispatchResult>,
+    ) -> Result<bool, Self::Error> {
+        let models = self.call_models(call, answer)?;
+        Ok(covering_model(
+            &models,
+            call,
+            answer.available_value(),
+            self.plan.universe(),
+        )
+        .is_some())
+    }
+}
+
+impl brokk_bifrost_flow::composition::LocalOpennessClient<PolicyDiscoveryProvider<'_, '_>>
+    for PolicyCompositionProvider<'_>
+{
+    fn relations_complete(
+        &self,
+        procedure: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<bool, TaintPolicyCompileError> {
+        Ok(self.partial_flows(procedure, request)?.relations_complete)
+    }
+
+    fn openness_sweep(
+        &self,
+        procedure: &DurableProcedureKey,
+        handle: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ProcedureOpenness, TaintPolicyCompileError> {
+        self.openness_sweep(procedure, handle, request)
+    }
+
+    fn dispatch_complete(
+        &self,
+        call: &DurableCallSiteKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<bool, TaintPolicyCompileError> {
+        Ok(matches!(
+            self.dispatch(call, request)?.completeness,
+            Completeness::Complete
+        ))
     }
 }
 
 impl CompositionProvider for PolicyCompositionProvider<'_> {
     type Error = TaintPolicyCompileError;
+    type Fact = TaintClassSet;
+    type Function = TaintEdgeFunction;
+
+    fn store_writes(&self) -> Vec<StoreWriteObservation> {
+        self.store_writes.clone()
+    }
+
+    fn store_links(
+        &self,
+        procedure: &DurableProcedureKey,
+        output: &PartialFlowPort,
+    ) -> StoreChannelLinks {
+        self.store_links
+            .get(&(procedure.clone(), output.clone()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn canonical_returned_field(
+        &self,
+        callee: &DurableProcedureKey,
+        caller: &DurableProcedureKey,
+        declared: &brokk_bifrost_analysis::analyzer::semantic::SemanticLocator,
+        request: &mut SemanticRequest<'_>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::SemanticLocator> {
+        if declared.language()
+            == brokk_bifrost_analysis::analyzer::semantic::SemanticLanguage::Standard(
+                brokk_bifrost_analysis::analyzer::Language::Go,
+            )
+        {
+            let handle = self.procedure(caller, request).ok()?;
+            return Some(brokk_bifrost_analysis::analyzer::semantic::partial_flow::caller_returned_member_locator(declared, &handle));
+        }
+        if declared.language()
+            != brokk_bifrost_analysis::analyzer::semantic::SemanticLanguage::Standard(
+                brokk_bifrost_analysis::analyzer::Language::Rust,
+            )
+        {
+            return None;
+        }
+        let handle = self.procedure(callee, request).ok()?;
+        let procedure = handle.semantics().locator();
+        let file = file_for_locator(self.workspace, procedure)?;
+        let source = self
+            .workspace
+            .analyzer()
+            .project()
+            .read_source(&file)
+            .ok()?;
+        canonical_returned_field_member(&source, procedure, declared)
+    }
 
     fn has_value_type_barriers(&self) -> bool {
         !self.barriers.is_empty()
+    }
+
+    fn may_share_call_storage(
+        &self,
+        procedure: &ProcedureHandle,
+        call: CallSiteId,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<bool, Self::Error> {
+        // With no lowered storage location in this interior there is no
+        // member read for a call writeback to reach. Avoid demanding dispatch
+        // solely because a scalar actual has an untraced origin.
+        if procedure.semantics().memory_locations().is_empty() {
+            return Ok(false);
+        }
+        let outcome =
+            self.discovery
+                .procedure_snapshot(procedure, &OracleCallContext::empty(), request)?;
+        let Some(snapshot) = outcome.available_value() else {
+            return Ok(true);
+        };
+        let index = self.call_storage_index(procedure, snapshot);
+        let call = procedure
+            .semantics()
+            .call_site(call)
+            .expect("a call belongs to its procedure");
+        Ok(call
+            .receiver
+            .into_iter()
+            .chain(call.arguments.iter().map(|argument| argument.value))
+            .any(|value| {
+                let actual = CallArgumentEndpoint::Value(
+                    procedure.value_handle(value).expect("a call input is live"),
+                );
+                brokk_bifrost_analysis::analyzer::semantic::argument_shares_storage_with_formal(
+                    &actual,
+                    brokk_bifrost_analysis::analyzer::semantic::CallPassingMode::Value,
+                    brokk_bifrost_analysis::analyzer::semantic::CallWrittenMember::MayTraverseReferent,
+                    snapshot,
+                    &index,
+                ) != brokk_bifrost_analysis::analyzer::semantic::CallStorageSharing::Isolated
+            }))
     }
 
     fn filter_value_type_barriers(&self, chop: &HashSet<DurableProcedureKey>) {
@@ -861,6 +1064,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         self.lenient_chop.replace(chop.clone());
         self.barrier_chop.replace(chop.clone());
         self.filtered_flows.borrow_mut().clear();
+        self.conditional_partial.borrow_mut().clear();
     }
 
     fn strict_value_type_barriers(&self, chop: &HashSet<DurableProcedureKey>) {
@@ -868,6 +1072,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             .replace(Box::new(StrictValueTypeBarriers));
         self.barrier_chop.replace(chop.clone());
         self.filtered_flows.borrow_mut().clear();
+        self.conditional_partial.borrow_mut().clear();
     }
 
     fn permits_value_type_barrier(&self, decision: ValueTypeBarrierDecision) -> bool {
@@ -1021,6 +1226,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             self.barrier_procedures
                 .borrow_mut()
                 .insert(procedure.clone());
+            let overlay_cpu_start = ProjectionCounter::start();
             let filtered = compute_partial_flows_filtered(
                 &handle,
                 snapshot,
@@ -1035,6 +1241,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 &mut fixpoint_request,
             )?
             .partial;
+            self.overlay_cost.record(overlay_cpu_start);
             let stored = self.partial_flows.borrow();
             let baseline = stored
                 .get(procedure)
@@ -1059,10 +1266,10 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             return Ok(Arc::clone(flows));
         }
         let handle = self.procedure(procedure, request)?;
-        let stored = self
-            .workspace
-            .stored_partial_flows(&handle)
-            .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
+        let baseline_cpu_start = ProjectionCounter::start();
+        let stored =
+            brokk_bifrost_flow::composition::stored_partial_flows(&self.discovery, &handle)?;
+        self.baseline_reads_cost.record(baseline_cpu_start);
         let flows = match stored {
             Some(flows)
                 if matches!(
@@ -1074,27 +1281,14 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 Arc::new(flows)
             }
             _ => {
-                let mut fixpoint_request =
-                    request.staged_with_execution_budget(&self.execution_budget);
-                let outcome = file_local_procedure_relations(
+                let flows = brokk_bifrost_flow::composition::project_partial_flows(
+                    &self.discovery,
                     &handle,
-                    &OracleCallContext::empty(),
-                    &mut fixpoint_request,
-                )
-                .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
-                self.discovery
-                    .require_outcome(&outcome, "composition partial flows")?;
-                let snapshot = outcome.available_value().ok_or_else(|| {
-                    TaintPolicyCompileError::SemanticUnavailable(
-                        "composition could not project the procedure's relations".to_owned(),
-                    )
-                })?;
+                    &self.execution_budget,
+                    request,
+                )?;
                 self.computed.set(self.computed.get() + 1);
-                Arc::new(compute_partial_flows(
-                    &handle,
-                    snapshot,
-                    &mut fixpoint_request,
-                ))
+                Arc::new(flows)
             }
         };
         self.partial_flows
@@ -1102,6 +1296,64 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             .insert(procedure.clone(), Arc::clone(&flows));
         self.announce_refinement_calls(procedure, &handle, request)?;
         Ok(flows)
+    }
+
+    fn projected_partial_flows(
+        &self,
+        procedure: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Vec<(Option<TaintEdgeFunction>, Arc<ProcedurePartialFlows>)>, Self::Error> {
+        if let Some(cached) = self.conditional_partial.borrow().get(procedure) {
+            return Ok(cached.clone());
+        }
+        let baseline = self.partial_flows(procedure, request)?;
+        let handle = self.procedure(procedure, request)?;
+        let partitions = self.conditional_partitions(&handle)?;
+        if partitions.groups.is_empty() {
+            return Ok(vec![(None, baseline)]);
+        }
+        let mut projected = Vec::new();
+        if let Some(function) = partitions.baseline {
+            projected.push((Some(function), baseline.clone()));
+        }
+        let mut fixpoint_request = request.staged_with_execution_budget(&self.execution_budget);
+        let outcome = file_local_procedure_relations(
+            &handle,
+            &OracleCallContext::empty(),
+            &mut fixpoint_request,
+        )
+        .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
+        for (function, kills) in partitions.groups {
+            let partial = if let Some(snapshot) = outcome.available_value() {
+                compute_partial_flows_with_edge_kills(
+                    &handle,
+                    snapshot,
+                    &[],
+                    &[],
+                    false,
+                    &[],
+                    &kills,
+                    &mut ProcedureBarrierFilter {
+                        provider: self,
+                        procedure: &handle,
+                    },
+                    &mut fixpoint_request,
+                )?
+                .partial
+            } else {
+                let mut open = (*baseline).clone();
+                open.outcome = PartialFlowOutcome::Error;
+                open.detail = Some("conditional sanitizer projection unavailable".into());
+                open.open = true;
+                open.relations_complete = false;
+                open
+            };
+            projected.push((Some(function), Arc::new(partial)));
+        }
+        self.conditional_partial
+            .borrow_mut()
+            .insert(procedure.clone(), projected.clone());
+        Ok(projected)
     }
 
     fn interior_flows(
@@ -1113,17 +1365,81 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<InteriorFlows, Self::Error> {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.interior");
+        let interior_cpu_start = ProjectionCounter::start();
         let handle = self.procedure(procedure, request)?;
         let outcome =
             self.discovery
                 .procedure_snapshot(&handle, &OracleCallContext::empty(), request)?;
         let Some(snapshot) = outcome.available_value() else {
-            return Ok(incomplete_interior(
+            self.interior_cost.record(interior_cpu_start);
+            return Ok(brokk_bifrost_flow::composition::incomplete_interior(
                 handle,
                 "the procedure's value-flow snapshot is unavailable",
             ));
         };
-        self.interior_from_snapshot(handle, snapshot, seeds, observations, witnesses, request)
+        let flows = brokk_bifrost_flow::composition::interior_from_snapshot(
+            self,
+            handle,
+            snapshot,
+            seeds,
+            observations,
+            witnesses,
+            &[],
+            &self.execution_budget,
+            request,
+        )?;
+        self.interior_cost.record(interior_cpu_start);
+        Ok(flows)
+    }
+
+    fn projected_interior_flows(
+        &self,
+        procedure: &DurableProcedureKey,
+        seeds: &[InteriorSeed],
+        observations: &[InteriorObservation],
+        witnesses: bool,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Vec<(Option<TaintEdgeFunction>, InteriorFlows)>, Self::Error> {
+        let handle = self.procedure(procedure, request)?;
+        let partitions = self.conditional_partitions(&handle)?;
+        if partitions.groups.is_empty() {
+            return Ok(vec![(
+                None,
+                self.interior_flows(procedure, seeds, observations, witnesses, request)?,
+            )]);
+        }
+        let mut projected = Vec::new();
+        if let Some(function) = partitions.baseline {
+            projected.push((
+                Some(function),
+                self.interior_flows(procedure, seeds, observations, witnesses, request)?,
+            ));
+        }
+        let outcome =
+            self.discovery
+                .procedure_snapshot(&handle, &OracleCallContext::empty(), request)?;
+        for (function, kills) in partitions.groups {
+            let flows = if let Some(snapshot) = outcome.available_value() {
+                brokk_bifrost_flow::composition::interior_from_snapshot(
+                    self,
+                    handle.clone(),
+                    snapshot,
+                    seeds,
+                    observations,
+                    witnesses,
+                    &kills,
+                    &self.execution_budget,
+                    request,
+                )?
+            } else {
+                brokk_bifrost_flow::composition::incomplete_interior(
+                    handle.clone(),
+                    "conditional sanitizer projection unavailable",
+                )
+            };
+            projected.push((Some(function), flows));
+        }
+        Ok(projected)
     }
 
     fn stored_interior_flows(
@@ -1137,16 +1453,79 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         if self.barriers.is_empty() {
             return self.interior_flows(procedure, seeds, observations, witnesses, request);
         }
+        let interior_cpu_start = ProjectionCounter::start();
         let handle = self.procedure(procedure, request)?;
         let outcome = file_local_procedure_relations(&handle, &OracleCallContext::empty(), request)
             .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
         let Some(snapshot) = outcome.available_value() else {
-            return Ok(incomplete_interior(
+            self.interior_cost.record(interior_cpu_start);
+            return Ok(brokk_bifrost_flow::composition::incomplete_interior(
                 handle,
                 "file-local witness relations are unavailable",
             ));
         };
-        self.interior_from_snapshot(handle, snapshot, seeds, observations, witnesses, request)
+        let flows = brokk_bifrost_flow::composition::interior_from_snapshot(
+            self,
+            handle,
+            snapshot,
+            seeds,
+            observations,
+            witnesses,
+            &[],
+            &self.execution_budget,
+            request,
+        )?;
+        self.interior_cost.record(interior_cpu_start);
+        Ok(flows)
+    }
+
+    fn projected_stored_interior_flows(
+        &self,
+        procedure: &DurableProcedureKey,
+        seeds: &[InteriorSeed],
+        observations: &[InteriorObservation],
+        witnesses: bool,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Vec<(Option<TaintEdgeFunction>, InteriorFlows)>, Self::Error> {
+        let handle = self.procedure(procedure, request)?;
+        let partitions = self.conditional_partitions(&handle)?;
+        if partitions.groups.is_empty() {
+            return Ok(vec![(
+                None,
+                self.stored_interior_flows(procedure, seeds, observations, witnesses, request)?,
+            )]);
+        }
+        let mut projected = Vec::new();
+        if let Some(function) = partitions.baseline {
+            projected.push((
+                Some(function),
+                self.stored_interior_flows(procedure, seeds, observations, witnesses, request)?,
+            ));
+        }
+        let outcome = file_local_procedure_relations(&handle, &OracleCallContext::empty(), request)
+            .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
+        for (function, kills) in partitions.groups {
+            let flows = if let Some(snapshot) = outcome.available_value() {
+                brokk_bifrost_flow::composition::interior_from_snapshot(
+                    self,
+                    handle.clone(),
+                    snapshot,
+                    seeds,
+                    observations,
+                    witnesses,
+                    &kills,
+                    &self.execution_budget,
+                    request,
+                )?
+            } else {
+                brokk_bifrost_flow::composition::incomplete_interior(
+                    handle.clone(),
+                    "conditional sanitizer witness projection unavailable",
+                )
+            };
+            projected.push((Some(function), flows));
+        }
+        Ok(projected)
     }
 
     fn dispatch(
@@ -1157,6 +1536,8 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         let key = (self.policy.clone(), call.clone());
         let memoized = self.memo.dispatches.borrow().get(&key).cloned();
         let memoized = match memoized {
+            // The run memo outlives each batch's discovery materialization.
+            // Re-resolving here would charge the next batch for the same call.
             Some(memoized) => memoized,
             None => {
                 let memoized = Arc::new(self.dispatch_uncached(call, request)?);
@@ -1181,149 +1562,15 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Callers, Self::Error> {
-        let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.callers");
-        let handle = self.procedure(procedure, request)?;
-        let analyzer = self.workspace.analyzer();
-        let Some(file) = file_for_locator(self.workspace, handle.semantics().locator()) else {
-            return Ok(Callers {
-                calls: Vec::new(),
-                completeness: incomplete("the procedure's file is not known"),
-            });
-        };
-        let span = handle.semantics().locator().anchor().span();
-        let (start, end) = (span.start_byte() as usize, span.end_byte() as usize);
-        let mut matching = Vec::new();
-        for declaration in analyzer.declarations(&file).iter() {
-            if declaration.is_callable()
-                && analyzer
-                    .ranges(declaration)
-                    .iter()
-                    .any(|range| range.start_byte == start && range.end_byte == end)
-            {
-                matching.push(declaration.clone());
-            }
-        }
-        let [target] = matching.as_slice() else {
-            return Ok(Callers {
-                calls: Vec::new(),
-                completeness: incomplete(format!(
-                    "{} callable declarations match the procedure's span",
-                    matching.len()
-                )),
-            });
-        };
-        let scope = AnalyzerQueryScope::with_cancellation(analyzer, request.cancellation);
-        // The enumeration stops at the caller lane. Its truncation is reported
-        // as incomplete, the same as the composition's own truncation below.
-        let limits = CallRelationLimits {
-            max_files: usize::MAX,
-            max_source_bytes: usize::MAX,
-            max_candidates: self.max_callers_per_procedure,
-        };
-        let mut sites = CallRelationService::incoming_bounded(
-            analyzer,
-            scope.token(),
-            target,
-            limits,
-            Some(request.cancellation),
-        );
-        let mut completeness = Completeness::Complete;
-        if sites.truncated || sites.cancelled {
-            completeness = incomplete("the incoming-call enumeration was truncated or cancelled");
-        }
-        // The reverse inventory is a name-based candidate list, and a site's
-        // `UsageProof` says only whether the reverse resolver could prove that
-        // the site calls the target. The ICFG never enumerates callers: its
-        // region is a forward closure from the root, so it sees only forward
-        // dispatch answers. Each retained site is therefore dispatched forward
-        // and that dispatch decides. The target among the candidates makes the
-        // site a caller. Otherwise a complete dispatch (a model-covered call
-        // and an exact external boundary included) refutes the site, and an
-        // incomplete one leaves the enumeration incomplete, because the site
-        // might still call the target. The dispatch's own uncertainty reaches
-        // the search on the hop (`Hop::Caller { uncertain }`), so the reverse
-        // proof is not read here. A truncated or cancelled enumeration also
-        // leaves the inventory uncertified; its reason above is the more
-        // specific one, so it is kept.
-        if matches!(completeness, Completeness::Complete)
-            && sites.caller_inventory != CallerInventoryCoverage::Complete
-        {
-            completeness = incomplete("no certified reverse inventory");
-        }
-        let compiled = self
-            .workspace
-            .semantic_oracle_provider()
-            .caller_sites_compiled(&sites.sites, request.cancellation)
-            .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
-        assert_eq!(compiled.len(), sites.sites.len());
-        let mut compiled = compiled.into_iter();
-        sites.sites.retain(|site| {
-            if compiled
-                .next()
-                .expect("one activity answer per caller site")
-            {
-                true
-            } else {
-                self.excluded_callers
-                    .borrow_mut()
-                    .push((site.file.clone(), site.range));
-                false
-            }
-        });
-        self.discovery.prefetch_callers(&sites.sites, request)?;
-        let target_key = handle.durable_key();
-        let mut calls = Vec::new();
-        let mut seen = HashSet::new();
-        for site in &sites.sites {
-            let outcome = self
-                .workspace
-                .materialize_program_semantics(
-                    &site.file,
-                    &mut request.staged_with_execution_budget(&self.execution_budget),
-                )
-                .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
-            self.discovery
-                .require_outcome(&outcome, "composition callers")?;
-            let Some(caller) = outcome.available_value().cloned() else {
-                completeness = incomplete("the caller's file has no semantic artifact");
-                continue;
-            };
-            let matched =
-                self.matching_calls(&caller, (site.range.start_byte, site.range.end_byte));
-            if matched.is_empty() {
-                completeness = incomplete("an incoming call site has no semantic call");
-            }
-            for (caller_handle, call_handle) in matched {
-                let answer = self.discovery.resolve_call(&call_handle, request)?;
-                let Some(result) = answer.available_value() else {
-                    completeness = incomplete("the dispatch of an incoming call has no answer");
-                    continue;
-                };
-                let confirmed = result
-                    .candidates()
-                    .iter()
-                    .any(|candidate| candidate.target().durable_key() == target_key);
-                if confirmed {
-                    let key = (caller_handle.durable_key(), call_handle.id());
-                    if seen.insert(key.clone()) {
-                        calls.push(key);
-                    }
-                } else {
-                    let models = self.call_models(&call_handle, &answer)?;
-                    if covering_model(&models, &call_handle, Some(result)).is_none()
-                        && !dispatch_completeness(&answer, result).is_complete()
-                    {
-                        completeness = incomplete(
-                            "an incoming candidate's dispatch is incomplete and does not name the procedure",
-                        );
-                    }
-                }
-            }
-        }
-        Ok(Callers {
-            calls,
-            completeness,
-        })
+        brokk_bifrost_flow::composition::callers(
+            &self.discovery,
+            self,
+            procedure,
+            self.max_callers_per_procedure,
+            &self.execution_budget,
+            &self.excluded_callers,
+            request,
+        )
     }
 
     fn lexical_parent(
@@ -1376,25 +1623,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 call.1
             ))
         })?;
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
-        for (port, _) in call_port_values(row) {
-            match port {
-                PartialFlowPort::CallReceiver { .. } | PartialFlowPort::CallArgument { .. } => {
-                    inputs.push(port);
-                }
-                PartialFlowPort::CallResult { ordinal: None, .. }
-                | PartialFlowPort::CallThrown { .. } => outputs.push(port),
-                PartialFlowPort::CallResult {
-                    ordinal: Some(_), ..
-                } => {}
-                _ => unreachable!("call_port_values yields only call ports"),
-            }
-        }
-        Ok(FallbackPorts {
-            inputs: inputs.into_boxed_slice(),
-            outputs: outputs.into_boxed_slice(),
-        })
+        Ok(brokk_bifrost_flow::composition::fallback_ports(row))
     }
 
     fn openness(
@@ -1432,6 +1661,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             );
             gaps.extend(matched.gaps.iter().cloned());
         }
+        endpoints.extend(self.binder.borrow().entry_points_in(procedure));
         let (mut answer, sources, unjudged) =
             self.binder.borrow().procedure_endpoints(endpoints)?;
         self.frontier_sources.borrow_mut().extend(sources);
@@ -1488,96 +1718,23 @@ impl PolicyCompositionProvider<'_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<MemoizedDispatch, TaintPolicyCompileError> {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.dispatch");
-        let handle = self.procedure(&call.0, request)?;
-        let call_handle = handle.call_site_handle(call.1).ok_or_else(|| {
-            TaintPolicyCompileError::SemanticUnavailable(format!(
-                "call {:?} is not in its procedure",
-                call.1
-            ))
-        })?;
-        let answer = {
-            let _timing =
-                brokk_bifrost_analysis::profiling::scope("taint.compose.dispatch.resolve");
-            self.discovery.resolve_call(&call_handle, request)?
-        };
-        let result = answer.available_value();
-        let status = SemanticInputStatus::from_outcome(&answer);
-        let mut record = RecordedDispatch {
-            handle: call_handle.clone(),
-            status,
-            coverage: result.map_or_else(
-                || CallSiteCoverage::unavailable(status),
-                |result| CallSiteCoverage::from_dispatch(status, result),
-            ),
-        };
-        let boundaries = result
-            .map(|result| result.boundaries().into())
-            .unwrap_or_default();
-        let models = self.call_models(&call_handle, &answer)?;
-        let continuation = continuation_quality(&models, &call_handle, result);
-        // A call a model covers is not a boundary: the model replaces it, and
-        // the candidate set beneath it is not read.
-        let model = covering_model(&models, &call_handle, result);
-        if let Some(model) = model {
-            return Ok(MemoizedDispatch {
-                dispatch: Dispatch {
-                    candidates: Vec::new(),
-                    completeness: Completeness::Complete,
-                    continuation,
-                },
-                model: Some(model),
-                record: (record, boundaries),
-            });
-        }
-        let Some(result) = result else {
-            return Ok(MemoizedDispatch {
-                dispatch: Dispatch {
-                    candidates: Vec::new(),
-                    completeness: incomplete("the dispatch of the call has no answer"),
-                    continuation,
-                },
-                model: None,
-                record: (record, boundaries),
-            });
-        };
-        let mut completeness = dispatch_completeness(&answer, result);
-        let mut candidates = Vec::new();
-        let mut entered = Vec::new();
-        let mut bindings = Vec::new();
-        for candidate in result.candidates() {
-            let outcome = self.discovery.call_bindings(
-                &call_handle,
-                candidate,
-                &OracleCallContext::empty(),
-                request,
-            )?;
-            bindings.push(BindingCoverage::Answered {
-                status: SemanticInputStatus::from_outcome(&outcome),
-            });
-            let composed = outcome
-                .available_value()
-                .ok_or_else(|| "the call bindings have no answer".to_owned())
-                .and_then(|bindings| {
-                    composition_candidate(&call_handle, candidate.target().durable_key(), bindings)
-                });
-            match composed {
-                Ok(composed) => {
-                    entered.push(candidate.target().clone());
-                    candidates.push(composed);
-                }
-                Err(reason) => completeness = incomplete(reason),
-            }
-        }
-        record.coverage.entered = entered;
-        record.coverage.bindings = bindings;
+        let local = brokk_bifrost_flow::composition::dispatch_uncached(
+            &self.discovery,
+            self,
+            call,
+            request,
+        )?;
         Ok(MemoizedDispatch {
-            dispatch: Dispatch {
-                candidates,
-                completeness,
-                continuation,
-            },
-            model: None,
-            record: (record, boundaries),
+            dispatch: local.dispatch,
+            model: local.model,
+            record: (
+                RecordedDispatch {
+                    handle: local.handle,
+                    status: local.status,
+                    coverage: local.coverage,
+                },
+                local.boundaries,
+            ),
         })
     }
 
@@ -1705,91 +1862,7 @@ impl PolicyCompositionProvider<'_> {
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Openness, TaintPolicyCompileError> {
-        let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.openness");
-        let handle = self.procedure(procedure, request)?;
-        // The ICFG engine blocks a snapshot with an unproven relation before
-        // it classifies any gap (`classify_snapshot_openness`), and a gap sweep
-        // cannot see the relation. The head's fact answers it from the
-        // memoized partial-flow read the search already made. The head keeps
-        // only the projection's status label, which does not determine a
-        // `SemanticInputStatus` (an unsupported capability or an exceeded
-        // budget carry data), so the status comes from `snapshot_status`, on
-        // this path only.
-        if !self.partial_flows(procedure, request)?.relations_complete {
-            return Ok(Openness::Open {
-                residual: Box::default(),
-                blocked: None,
-                status: self.snapshot_status(&handle, request)?,
-                reason: "a relation of the procedure is not proven complete".into(),
-            });
-        }
-        let sweep = self.openness_sweep(procedure, &handle, request)?;
-        if !sweep.open {
-            return Ok(Openness::Closed);
-        }
-        if sweep.relevant_gaps.is_empty() {
-            // The procedure is open with no gap to refine: a value-flow
-            // capability or a Go builtin assumption. No dispatch answers it.
-            return Ok(Openness::Open {
-                residual: Box::default(),
-                blocked: None,
-                status: self.snapshot_status(&handle, request)?,
-                reason: "a value-flow capability or builtin assumption keeps the procedure open"
-                    .into(),
-            });
-        }
-        let abort_user_code = abort_paths_run_user_code(handle.semantics());
-        let mut answered: HashMap<CallSiteId, bool> = HashMap::new();
-        let mut residual: Vec<DurableCallSiteKey> = Vec::new();
-        let mut blocked: Vec<(SemanticGapId, SemanticCapability)> = Vec::new();
-        for gap_id in &sweep.relevant_gaps {
-            let gap = handle
-                .semantics()
-                .gap(*gap_id)
-                .expect("a relevant gap is a gap of its procedure");
-            match classify_gap_openness(handle.semantics(), gap, abort_user_code) {
-                GapOpenness::RefinementCall(call) => {
-                    let complete = match answered.get(&call) {
-                        Some(complete) => *complete,
-                        None => {
-                            let dispatch = self.dispatch(&(procedure.clone(), call), request)?;
-                            let complete = matches!(dispatch.completeness, Completeness::Complete);
-                            answered.insert(call, complete);
-                            complete
-                        }
-                    };
-                    let key = (procedure.clone(), call);
-                    if !complete && !residual.contains(&key) {
-                        residual.push(key);
-                    }
-                }
-                GapOpenness::Blocked => blocked.push((*gap_id, gap.capability)),
-                GapOpenness::Irrelevant | GapOpenness::Discharged => unreachable!(
-                    "the gap sweep keeps a gap open only when classification leaves it: {gap:?}"
-                ),
-            }
-        }
-        if residual.is_empty() && blocked.is_empty() {
-            return Ok(Openness::Closed);
-        }
-        let reason = format!(
-            "residual calls {residual:?} and blocked gaps {blocked:?} keep the procedure open"
-        );
-        // A blocked gap decides the diagnostic even when residual calls
-        // remain: the ICFG engine's plan returns its blocked gap whenever one
-        // exists in the procedure (`classify_snapshot_openness`).
-        let blocked = blocked.first().map(|(gap, capability)| BlockedGap {
-            gap: handle
-                .gap_handle(*gap)
-                .expect("a blocked gap is a gap of its procedure"),
-            capability: *capability,
-        });
-        Ok(Openness::Open {
-            residual: residual.into_boxed_slice(),
-            blocked,
-            status: self.snapshot_status(&handle, request)?,
-            reason: reason.into(),
-        })
+        brokk_bifrost_flow::composition::decide_openness(&self.discovery, self, procedure, request)
     }
 
     /// The gap sweep of one procedure: whether it is open and the gaps that
@@ -1803,23 +1876,12 @@ impl PolicyCompositionProvider<'_> {
         if let Some(sweep) = self.sweeps.borrow().get(procedure) {
             return Ok(sweep.clone());
         }
-        let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.openness.sweep");
-        let outcome = self
-            .workspace
-            .semantic_oracle_provider()
-            .procedure_openness(
-                handle,
-                &OracleCallContext::empty(),
-                &mut request.staged_with_execution_budget(&self.execution_budget),
-            )
-            .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
-        self.discovery
-            .require_outcome(&outcome, "composition openness")?;
-        let sweep = outcome.available_value().cloned().ok_or_else(|| {
-            TaintPolicyCompileError::SemanticUnavailable(
-                "composition could not decide the procedure's openness".to_owned(),
-            )
-        })?;
+        let sweep = brokk_bifrost_flow::composition::openness_sweep(
+            &self.discovery,
+            handle,
+            &self.execution_budget,
+            request,
+        )?;
         self.sweeps
             .borrow_mut()
             .insert(procedure.clone(), sweep.clone());
@@ -1837,76 +1899,12 @@ impl PolicyCompositionProvider<'_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<(), TaintPolicyCompileError> {
         let sweep = self.openness_sweep(procedure, handle, request)?;
-        if !sweep.open {
-            return Ok(());
-        }
-        let abort_user_code = abort_paths_run_user_code(handle.semantics());
         let memo = self.memo.dispatches.borrow();
-        let mut calls = Vec::new();
-        let mut seen = HashSet::new();
-        for gap_id in &sweep.relevant_gaps {
-            let gap = handle
-                .semantics()
-                .gap(*gap_id)
-                .expect("a relevant gap is a gap of its procedure");
-            let GapOpenness::RefinementCall(call) =
-                classify_gap_openness(handle.semantics(), gap, abort_user_code)
-            else {
-                continue;
-            };
-            if seen.insert(call)
-                && !memo.contains_key(&(self.policy.clone(), (procedure.clone(), call)))
-                && let Some(call) = handle.call_site_handle(call)
-            {
-                calls.push(call);
-            }
-        }
+        let calls = brokk_bifrost_flow::composition::refinement_calls(handle, &sweep, |call| {
+            memo.contains_key(&(self.policy.clone(), (procedure.clone(), call)))
+        });
         self.discovery.expect_calls(&calls);
         Ok(())
-    }
-
-    /// The snapshot input status the ICFG engine attaches to a procedure. It
-    /// reads the discovery provider's cached snapshot, the one its plan reads.
-    /// The gap sweep's own outcome is always complete, so it cannot supply
-    /// this status.
-    fn snapshot_status(
-        &self,
-        handle: &ProcedureHandle,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticInputStatus, TaintPolicyCompileError> {
-        let outcome =
-            self.discovery
-                .procedure_snapshot(handle, &OracleCallContext::empty(), request)?;
-        Ok(SemanticInputStatus::from_outcome(&outcome))
-    }
-
-    /// The calls of `caller` whose source range is `range`, with their live
-    /// procedure handles. A caller file can hold more than one call at one
-    /// range, so every match is returned and each is confirmed separately.
-    fn matching_calls(
-        &self,
-        caller: &Arc<SemanticArtifact>,
-        range: (usize, usize),
-    ) -> Vec<(ProcedureHandle, CallSiteHandle)> {
-        let mut matched = Vec::new();
-        for procedure in caller.procedures() {
-            let Some(handle) = caller.procedure_handle(procedure.id()) else {
-                continue;
-            };
-            for row in procedure.call_sites() {
-                let Some(mapping) = procedure.source_mapping(row.source) else {
-                    continue;
-                };
-                let span = mapping.locator.anchor().span();
-                if (span.start_byte() as usize, span.end_byte() as usize) != range {
-                    continue;
-                }
-                if let Some(call) = handle.call_site_handle(row.id) {
-                    matched.push((handle.clone(), call));
-                }
-            }
-        }
-        matched
     }
 }
 
@@ -1994,6 +1992,7 @@ fn covering_model(
     models: &CallModels,
     call: &CallSiteHandle,
     result: Option<&DispatchResult>,
+    universe: &TaintUniverse,
 ) -> Option<CallModel> {
     if let Some(curated) = &models.curated {
         return Some(models.with_receiver_storage(call_model(
@@ -2003,6 +2002,7 @@ fn covering_model(
             SummaryCallBinding::default(),
             curated.is_proven_complete(),
             None,
+            universe,
         )));
     }
     let result = result?;
@@ -2061,6 +2061,7 @@ fn covering_model(
         mapping,
         true,
         authored,
+        universe,
     )))
 }
 
@@ -2118,6 +2119,7 @@ fn call_model(
     actual_to_formal: SummaryCallBinding<'_>,
     proven: bool,
     authored: Option<Box<[AuthoredArmClosure]>>,
+    universe: &TaintUniverse,
 ) -> CallModel {
     let row = call.procedure().semantics().call_site(call.id());
     let mut model_transfers = Vec::new();
@@ -2180,8 +2182,7 @@ fn call_model(
         }
         model_transfers.push(ModelTransfer {
             actual,
-            moved: None,
-            removed: removed.into_iter().collect(),
+            function: taint_model_kill(universe, &removed.into_iter().collect::<Vec<_>>()),
         });
     }
     CallModel {
@@ -2195,179 +2196,5 @@ fn call_model(
 fn incomplete(reason: impl Into<Box<str>>) -> Completeness {
     Completeness::Incomplete {
         reason: reason.into(),
-    }
-}
-
-fn incomplete_interior(procedure: ProcedureHandle, reason: &str) -> InteriorFlows {
-    InteriorFlows {
-        procedure,
-        flows: Vec::new(),
-        completeness: incomplete(reason),
-    }
-}
-
-fn extra_phase(phase: &ValueFlowObservationPhase) -> ExtraPhase {
-    match phase {
-        ValueFlowObservationPhase::BeforeEffects => ExtraPhase::BeforeEffects,
-        ValueFlowObservationPhase::AfterEffects => ExtraPhase::AfterEffects,
-    }
-}
-
-fn endpoint_of(carrier: &ValueFlowCarrier) -> ValueFlowEndpoint {
-    match carrier {
-        ValueFlowCarrier::Value(value) => ValueFlowEndpoint::Value(value.clone()),
-        ValueFlowCarrier::Port(port) => ValueFlowEndpoint::Port(port.clone()),
-        ValueFlowCarrier::Location(location) => ValueFlowEndpoint::Location(location.clone()),
-    }
-}
-
-/// Whether a dispatch answer covers every candidate and every boundary is
-/// proven and complete. Only a call no model covers reaches this check.
-fn dispatch_completeness(
-    answer: &SemanticOutcome<DispatchResult>,
-    result: &DispatchResult,
-) -> Completeness {
-    if !matches!(answer, SemanticOutcome::Complete { .. }) {
-        return incomplete("the dispatch answer is not complete");
-    }
-    if result.coverage() != CandidateCoverage::Exhaustive {
-        return incomplete(format!("the dispatch coverage is {:?}", result.coverage()));
-    }
-    if result.boundaries().iter().any(|boundary| {
-        boundary.proof != ProofStatus::Proven
-            || boundary.completeness != EvidenceCompleteness::Complete
-    }) {
-        return incomplete("the dispatch leaves a boundary that is not proven and complete");
-    }
-    Completeness::Complete
-}
-
-/// One dispatch candidate as the composition reads it: each binding of the
-/// candidate, mapped from the call's value to its call port and from the
-/// callee's formal or return to its port. A binding whose value is not a
-/// port of the call, or that binds a location rather than a value, has no
-/// port and makes the candidate unusable; the error names why.
-fn composition_candidate(
-    call: &CallSiteHandle,
-    callee: DurableProcedureKey,
-    bindings: &CallBindings,
-) -> Result<ComposeCandidate, String> {
-    let call_id = call.id();
-    let row = call
-        .procedure()
-        .semantics()
-        .call_site(call_id)
-        .ok_or("the call is not a call of its procedure")?;
-    let mut arguments = Vec::new();
-    let mut returns = Vec::new();
-    for binding in bindings.bindings() {
-        match binding {
-            CallBinding::Receiver { formal, .. } => arguments.push((
-                PartialFlowPort::CallReceiver { call: call_id },
-                formal_port(formal)?,
-            )),
-            CallBinding::ArgumentGroup(group) => {
-                for mapping in group.mappings() {
-                    let mapping = mapping.value();
-                    let actual = match mapping.actual() {
-                        CallArgumentEndpoint::Value(value) => value.id(),
-                        CallArgumentEndpoint::Location { .. } => {
-                            return Err("an argument binds a location, not a value".to_owned());
-                        }
-                    };
-                    arguments.push((
-                        actual_port(row, call_id, actual)?,
-                        formal_port(mapping.formal())?,
-                    ));
-                }
-            }
-            CallBinding::ImplicitArgument { .. } => {
-                return Err("an implicit argument has no call port".to_owned());
-            }
-            CallBinding::NormalReturn { formal, result, .. } => returns.push((
-                return_port(formal)?,
-                result_port(row, call_id, result.id())?,
-            )),
-            CallBinding::ExceptionalReturn { formal, result, .. } => returns.push((
-                return_port(formal)?,
-                thrown_port(row, call_id, result.id())?,
-            )),
-        }
-    }
-    Ok(ComposeCandidate {
-        procedure: callee,
-        arguments: arguments.into_boxed_slice(),
-        returns: returns.into_boxed_slice(),
-    })
-}
-
-fn actual_port(
-    row: &SemanticCallSite,
-    call: brokk_bifrost_analysis::analyzer::semantic::CallSiteId,
-    value: ValueId,
-) -> Result<PartialFlowPort, String> {
-    if row.receiver == Some(value) {
-        return Ok(PartialFlowPort::CallReceiver { call });
-    }
-    row.arguments
-        .iter()
-        .position(|argument| argument.value == value)
-        .map(|ordinal| PartialFlowPort::CallArgument {
-            call,
-            ordinal: u32::try_from(ordinal).expect("a call's argument count fits u32"),
-        })
-        .ok_or_else(|| "a bound actual is not a receiver or argument of the call".to_owned())
-}
-
-fn result_port(
-    row: &SemanticCallSite,
-    call: brokk_bifrost_analysis::analyzer::semantic::CallSiteId,
-    value: ValueId,
-) -> Result<PartialFlowPort, String> {
-    if row.result == Some(value) {
-        return Ok(PartialFlowPort::CallResult {
-            call,
-            ordinal: None,
-        });
-    }
-    row.normal_results
-        .iter()
-        .position(|&result| result == value)
-        .map(|ordinal| PartialFlowPort::CallResult {
-            call,
-            ordinal: Some(u32::try_from(ordinal).expect("a call's result count fits u32")),
-        })
-        .ok_or_else(|| "a bound result is not a result of the call".to_owned())
-}
-
-fn thrown_port(
-    row: &SemanticCallSite,
-    call: brokk_bifrost_analysis::analyzer::semantic::CallSiteId,
-    value: ValueId,
-) -> Result<PartialFlowPort, String> {
-    if row.thrown == Some(value) {
-        return Ok(PartialFlowPort::CallThrown { call });
-    }
-    Err("a bound thrown value is not the thrown value of the call".to_owned())
-}
-
-/// The callee's input port (receiver or parameter) of a formal.
-fn formal_port(formal: &ProcedurePortHandle) -> Result<PartialFlowPort, String> {
-    match formal.kind() {
-        ProcedurePortKind::Receiver => Ok(PartialFlowPort::Receiver),
-        ProcedurePortKind::Parameter { ordinal } => Ok(PartialFlowPort::Parameter { ordinal }),
-        _ => Err("a formal is not an input port".to_owned()),
-    }
-}
-
-/// The callee's return port of a formal.
-fn return_port(formal: &ProcedurePortHandle) -> Result<PartialFlowPort, String> {
-    match formal.kind() {
-        ProcedurePortKind::NormalReturn => Ok(PartialFlowPort::NormalReturn),
-        ProcedurePortKind::IndexedNormalReturn { ordinal } => {
-            Ok(PartialFlowPort::IndexedNormalReturn { ordinal })
-        }
-        ProcedurePortKind::ExceptionalReturn => Ok(PartialFlowPort::ExceptionalReturn),
-        _ => Err("a return formal is not a return port".to_owned()),
     }
 }

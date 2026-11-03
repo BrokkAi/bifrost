@@ -13,7 +13,1632 @@ use super::*;
 use crate::analyzer::semantic::SemanticBudgetDimension;
 use crate::query::PlanPartitioning;
 use crate::structural::execution::plan::StepOutputCap;
+use crate::structural::identifier_dictionary::IdentifierDictionary;
 use std::path::Path;
+
+/// Native operand rows from one seed at a root intersect cut. The rows remain
+/// typed until the physical set operator and its suffix consume them.
+#[derive(Debug)]
+pub struct IntersectPrefixProduct {
+    seed: ProjectFile,
+    pub(super) operands: Vec<Vec<PipelineRow>>,
+    operand_step_outputs: Vec<Vec<u64>>,
+    pub work: CodeQueryExecutionWork,
+    pub budgeted_work: CodeQueryBudgetedWork,
+    pub completion: CodeQueryCompletion,
+    pub diagnostics: Vec<CodeQueryDiagnostic>,
+    pub reads: Vec<crate::analyzer::read_ledger::ReadKey>,
+    pub reads_closed: bool,
+}
+
+impl IntersectPrefixProduct {
+    /// Check the complete stored prefix against this run's residual physical
+    /// grant, including summed shared lanes and its whole-plan step slots.
+    pub fn reached_limit(
+        &self,
+        query: &CodeQuery,
+        limits: &CodeQueryExecutionLimits,
+    ) -> Option<MergedLimit> {
+        let PlanPartitioning::Prefix { cut } = PlanPartitioning::classify_for_prefix(&query.plan)
+        else {
+            return Some(MergedLimit::UnitTruncated);
+        };
+        let whole = select_physical_plan(query, UnionExecutionStrategy::Sequential, 1, 0)
+            .expect("eligible intersect has a physical plan");
+        let mut cut_node = whole.node(whole.root()).dependencies()[0];
+        while matches!(
+            whole.node(cut_node).operator(),
+            PhysicalQueryOperator::PipelineStep
+        ) {
+            cut_node = whole.node(cut_node).dependencies()[0];
+        }
+        let mut steps = vec![0_u64; unit_step_output_caps(query).len()];
+        for (branch, operand) in cut.operands(&query.plan).iter().enumerate() {
+            let branch_query = CodeQuery {
+                plan: operand.clone(),
+                limit: usize::MAX,
+                ..query.clone()
+            };
+            let branch_plan =
+                select_physical_plan(&branch_query, UnionExecutionStrategy::Sequential, 1, 0)
+                    .expect("eligible operand has a physical plan");
+            let mut pending = vec![(
+                branch_plan.node(branch_plan.root()).dependencies()[0],
+                whole.node(cut_node).dependencies()[branch],
+            )];
+            while let Some((source, target)) = pending.pop() {
+                steps[target.index()] = steps[target.index()]
+                    .saturating_add(self.operand_step_outputs[branch][source.index()]);
+                pending.extend(
+                    branch_plan
+                        .node(source)
+                        .dependencies()
+                        .iter()
+                        .copied()
+                        .zip(whole.node(target).dependencies().iter().copied()),
+                );
+            }
+        }
+        let mut budgeted = self.budgeted_work.clone();
+        budgeted.step_outputs = steps;
+        reached_limit_counters(
+            &self.work,
+            &budgeted,
+            self.completion != CodeQueryCompletion::Complete,
+            0,
+            1,
+            &unit_step_output_caps(query),
+            limits,
+            limits.max_pipeline_rows,
+            usize::MAX,
+        )
+    }
+    /// Require the exact blob-pinned receipt before hydrating any value named
+    /// by a file. A trace may name a caller file other than the seed.
+    fn require_file_receipt(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> Result<(), CorruptIntersectProduct> {
+        let provider = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == file.language())
+            .ok_or(CorruptIntersectProduct)?;
+        let read = provider
+            .structural_file_read_key(file)
+            .ok_or(CorruptIntersectProduct)?;
+        if !self.reads.contains(&read) {
+            return Err(CorruptIntersectProduct);
+        }
+        analyzer.record_read(read);
+        Ok(())
+    }
+
+    fn named_file(&self, rel_path: &str) -> Result<ProjectFile, CorruptIntersectProduct> {
+        let file = self.seed.with_rel_path(Path::new(rel_path));
+        (rel_path_string(&file) == rel_path)
+            .then_some(file)
+            .ok_or(CorruptIntersectProduct)
+    }
+
+    fn hydrate_declaration(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        rel_path: &str,
+        declaration_id: &str,
+        start_byte: usize,
+        end_byte: usize,
+        structural_kind: Option<NormalizedKind>,
+    ) -> Result<DeclarationValue, CorruptIntersectProduct> {
+        let file = self.named_file(rel_path)?;
+        self.require_file_receipt(analyzer, &file)?;
+        let mut matches = analyzer
+            .get_declarations(&file)
+            .into_iter()
+            .flat_map(|unit| {
+                analyzer
+                    .ranges_of(&unit)
+                    .into_iter()
+                    .map(move |range| (unit.clone(), range))
+            })
+            .filter(|(unit, range)| {
+                unit.declaration_id().to_string() == declaration_id
+                    && range.start_byte == start_byte
+                    && range.end_byte == end_byte
+            });
+        let (unit, range) = matches.next().ok_or(CorruptIntersectProduct)?;
+        if matches.next().is_some() {
+            return Err(CorruptIntersectProduct);
+        }
+        Ok(DeclarationValue {
+            unit,
+            range,
+            structural_kind,
+        })
+    }
+
+    fn hydrate_occurrence(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        rel_path: &str,
+        node: u32,
+        role: &str,
+    ) -> Result<OccurrenceValue, CorruptIntersectProduct> {
+        let file = self.named_file(rel_path)?;
+        self.require_file_receipt(analyzer, &file)?;
+        let role = OccurrenceRole::from_label(role).ok_or(CorruptIntersectProduct)?;
+        let mut cache =
+            OccurrenceTraversalCache::with_options(OccurrenceDerivationOptions::IDENTITY_ONLY);
+        let result = cache
+            .rows_for_file(
+                analyzer,
+                &file,
+                &OccurrenceFilter {
+                    roles: vec![role],
+                    ..OccurrenceFilter::default()
+                },
+                None,
+            )
+            .ok_or(CorruptIntersectProduct)?;
+        let mut matches = result
+            .rows
+            .iter()
+            .filter(|row| row.node == node && row.role == role);
+        let row = matches.next().ok_or(CorruptIntersectProduct)?;
+        if matches.next().is_some() {
+            return Err(CorruptIntersectProduct);
+        }
+        Ok(OccurrenceValue {
+            row: Arc::new(row.clone()),
+        })
+    }
+
+    fn hydrate_trace_value(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        workspace: Option<&WorkspaceAnalyzer>,
+        limits: CodeQueryExecutionLimits,
+        identity: IntersectTraceValueIdentity,
+    ) -> Result<PipelineTraceValue, CorruptIntersectProduct> {
+        match identity {
+            IntersectTraceValueIdentity::StructuralMatch { rel_path, node } => {
+                let file = self.named_file(&rel_path)?;
+                self.require_file_receipt(analyzer, &file)?;
+                let provider = analyzer
+                    .structural_fact_providers()
+                    .into_iter()
+                    .find(|provider| provider.structural_language() == file.language())
+                    .ok_or(CorruptIntersectProduct)?;
+                let facts = provider
+                    .structural_facts(&file)
+                    .ok_or(CorruptIntersectProduct)?;
+                facts
+                    .nodes()
+                    .get(node as usize)
+                    .ok_or(CorruptIntersectProduct)?;
+                Ok(PipelineTraceValue::StructuralMatch(Arc::new(SeedMatch {
+                    language: file.language(),
+                    file,
+                    facts,
+                    fact_match: FactMatch {
+                        node,
+                        captures: Vec::new(),
+                        reported_range: None,
+                        heuristic: None,
+                    },
+                    python_import: None,
+                })))
+            }
+            IntersectTraceValueIdentity::Declaration {
+                rel_path,
+                declaration_id,
+                start_byte,
+                end_byte,
+                structural_kind,
+            } => Ok(PipelineTraceValue::Declaration(self.hydrate_declaration(
+                analyzer,
+                &rel_path,
+                &declaration_id,
+                start_byte,
+                end_byte,
+                structural_kind,
+            )?)),
+            IntersectTraceValueIdentity::Occurrence {
+                rel_path,
+                node,
+                role,
+                identity_only: true,
+            } => Ok(PipelineTraceValue::Occurrence(
+                self.hydrate_occurrence(analyzer, &rel_path, node, &role)?,
+            )),
+            IntersectTraceValueIdentity::Occurrence { .. } => Err(CorruptIntersectProduct),
+            IntersectTraceValueIdentity::Binding {
+                rel_path,
+                index,
+                id,
+                shadowed,
+                reached_from,
+            } => {
+                let file = self.named_file(&rel_path)?;
+                self.require_file_receipt(analyzer, &file)?;
+                let result = Arc::new(super::super::lexical_environment::environment_for_file(
+                    analyzer, &file,
+                ));
+                result.bindings.get(index).ok_or(CorruptIntersectProduct)?;
+                let value = BindingValue {
+                    file,
+                    result,
+                    index,
+                    shadowed,
+                    reached_from,
+                };
+                if value.id() != id {
+                    return Err(CorruptIntersectProduct);
+                }
+                Ok(PipelineTraceValue::Binding(value))
+            }
+            IntersectTraceValueIdentity::DispatchTarget {
+                rel_path,
+                site_id,
+                start_byte,
+                end_byte,
+                ordinal,
+                target_id,
+            } => {
+                let workspace = workspace.ok_or(CorruptIntersectProduct)?;
+                let file = self.named_file(&rel_path)?;
+                self.require_file_receipt(analyzer, &file)?;
+                let provider = analyzer
+                    .structural_fact_providers()
+                    .into_iter()
+                    .find(|provider| provider.structural_language() == file.language())
+                    .ok_or(CorruptIntersectProduct)?;
+                let facts = provider
+                    .structural_facts(&file)
+                    .ok_or(CorruptIntersectProduct)?;
+                if start_byte >= end_byte || end_byte > facts.source().len() {
+                    return Err(CorruptIntersectProduct);
+                }
+                let range = Range {
+                    start_byte,
+                    end_byte,
+                    start_line: facts.line_column_of_byte(start_byte).0,
+                    end_line: facts.line_column_of_byte(end_byte).0,
+                };
+                let (computed_id, site_ast_id) =
+                    super::dispatch::dispatch_site_identity(analyzer, &file, range, Some(&facts))
+                        .ok_or(CorruptIntersectProduct)?;
+                if computed_id != site_id {
+                    return Err(CorruptIntersectProduct);
+                }
+                let mut semantic = SemanticQueryContext::new_with_analysis(
+                    workspace,
+                    None,
+                    limits.semantic,
+                    limits.typestate,
+                    limits.value_flow,
+                    limits.taint,
+                    0,
+                    None,
+                    analyzer.active_semantic_model_snapshot(),
+                    None,
+                    None,
+                    super::type_flow::CodeQueryRootAllotment::from_execution_limits(&limits),
+                );
+                let (answer, incompleteness) = semantic.dispatch_at_source_with_cause(&file, range);
+                if incompleteness.execution_cause().is_some() {
+                    return Err(CorruptIntersectProduct);
+                }
+                let answer = Arc::new(answer);
+                if answer
+                    .arms
+                    .get(ordinal)
+                    .is_none_or(|arm| arm.target_id != target_id)
+                {
+                    return Err(CorruptIntersectProduct);
+                }
+                Ok(PipelineTraceValue::DispatchTarget(Box::new(
+                    DispatchTargetValue {
+                        site: DispatchSiteValue {
+                            file,
+                            range,
+                            site_id,
+                            site_ast_id,
+                            answer,
+                        },
+                        ordinal,
+                    },
+                )))
+            }
+        }
+    }
+
+    fn hydrate_call_site(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        identity: IntersectTraceViaIdentity,
+    ) -> Result<PipelineVia, CorruptIntersectProduct> {
+        let IntersectTraceViaIdentity::CallSite {
+            rel_path,
+            site_id,
+            start_byte,
+            end_byte,
+            caller_id,
+            callee_rel_path,
+            callee_id,
+        } = identity;
+        let file = self.named_file(&rel_path)?;
+        let callee_file = self.named_file(&callee_rel_path)?;
+        self.require_file_receipt(analyzer, &file)?;
+        self.require_file_receipt(analyzer, &callee_file)?;
+        let callers: Vec<_> = analyzer
+            .get_declarations(&file)
+            .into_iter()
+            .filter(|unit| unit.declaration_id().to_string() == caller_id)
+            .collect();
+        let [caller] = callers.as_slice() else {
+            return Err(CorruptIntersectProduct);
+        };
+        let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        let result = CallRelationService::outgoing(analyzer, scope.token(), caller, usize::MAX);
+        if result.truncated || result.cancelled {
+            return Err(CorruptIntersectProduct);
+        }
+        let mut matches = result.sites.into_iter().filter(|site| {
+            site.file == file
+                && site.range.start_byte == start_byte
+                && site.range.end_byte == end_byte
+                && site.caller.declaration_id().to_string() == caller_id
+                && site.callee.source() == &callee_file
+                && site.callee.declaration_id().to_string() == callee_id
+        });
+        let site = matches.next().ok_or(CorruptIntersectProduct)?;
+        if matches.next().is_some() {
+            return Err(CorruptIntersectProduct);
+        }
+        let value = CallSiteValue::new(
+            site,
+            CallBindingStatus::Unavailable,
+            None,
+            CallSiteIdentityFacts::default(),
+        );
+        if value.2 != site_id {
+            return Err(CorruptIntersectProduct);
+        }
+        Ok(PipelineVia::CallSite(value))
+    }
+
+    /// Number of native rows in each authored operand.
+    pub fn operand_row_counts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.operands.iter().map(Vec::len)
+    }
+
+    /// The persisted product envelope. The read keys live in the unit's
+    /// relational read ledger; the digest binds this JSONB value to that
+    /// receipt without copying a second serialized key vocabulary into it.
+    pub fn encode_product_json(
+        &self,
+        plan: &crate::query::CodeQueryPlan,
+    ) -> Result<serde_json::Value, CorruptIntersectProduct> {
+        let crate::query::PlanPartitioning::Prefix { cut } =
+            PlanPartitioning::classify_for_prefix(plan)
+        else {
+            return Err(CorruptIntersectProduct);
+        };
+        if self.operands.len() != cut.operands(plan).len() {
+            return Err(CorruptIntersectProduct);
+        }
+        let envelope = IntersectPrefixEnvelope {
+            seed: rel_path_string(&self.seed),
+            operands: self.encode_rows_json(plan)?,
+            operand_step_outputs: self.operand_step_outputs.clone(),
+            work: self.work,
+            budgeted_work: self.budgeted_work.clone(),
+            completion: self.completion.clone(),
+            diagnostics: self.diagnostics.clone(),
+            diagnostic_causes: self
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.incompleteness.into())
+                .collect(),
+            reads_closed: self.reads_closed,
+            read_set_digest: crate::analyzer::read_ledger::read_set_digest(&self.reads).to_string(),
+        };
+        serde_json::to_value(envelope).map_err(|_| CorruptIntersectProduct)
+    }
+
+    /// Load one product after the policy reader has verified its read set.
+    /// Any mismatch is a cache miss, including an invalid row identity.
+    pub fn decode_product_json(
+        analyzer: &dyn IAnalyzer,
+        plan: &crate::query::CodeQueryPlan,
+        seed: ProjectFile,
+        reads: Vec<crate::analyzer::read_ledger::ReadKey>,
+        encoded: serde_json::Value,
+    ) -> Result<Self, CorruptIntersectProduct> {
+        Self::decode_product_json_with_workspace(analyzer, None, plan, seed, reads, encoded)
+    }
+
+    /// Hydrate semantic trace values using this request's workspace oracle.
+    pub fn decode_product_json_with_workspace(
+        analyzer: &dyn IAnalyzer,
+        workspace: Option<&WorkspaceAnalyzer>,
+        plan: &crate::query::CodeQueryPlan,
+        seed: ProjectFile,
+        reads: Vec<crate::analyzer::read_ledger::ReadKey>,
+        encoded: serde_json::Value,
+    ) -> Result<Self, CorruptIntersectProduct> {
+        Self::decode_product_json_with_limits(
+            analyzer,
+            workspace,
+            CodeQueryExecutionLimits::default(),
+            plan,
+            seed,
+            reads,
+            encoded,
+        )
+    }
+
+    /// Decode with the originating policy's limits so a dispatch rederivation
+    /// uses the same semantic allowance as the prefix that published it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_product_json_with_limits(
+        analyzer: &dyn IAnalyzer,
+        workspace: Option<&WorkspaceAnalyzer>,
+        limits: CodeQueryExecutionLimits,
+        plan: &crate::query::CodeQueryPlan,
+        seed: ProjectFile,
+        reads: Vec<crate::analyzer::read_ledger::ReadKey>,
+        encoded: serde_json::Value,
+    ) -> Result<Self, CorruptIntersectProduct> {
+        let envelope: IntersectPrefixEnvelope =
+            serde_json::from_value(encoded).map_err(|_| CorruptIntersectProduct)?;
+        let crate::query::PlanPartitioning::Prefix { cut } =
+            PlanPartitioning::classify_for_prefix(plan)
+        else {
+            return Err(CorruptIntersectProduct);
+        };
+        if envelope.seed != rel_path_string(&seed)
+            || !envelope.reads_closed
+            || reads.is_empty()
+            || envelope.read_set_digest
+                != crate::analyzer::read_ledger::read_set_digest(&reads).to_string()
+            || envelope.completion != CodeQueryCompletion::Complete
+        {
+            return Err(CorruptIntersectProduct);
+        }
+        let rows = envelope
+            .operands
+            .as_array()
+            .ok_or(CorruptIntersectProduct)?;
+        if rows.len() != envelope.operand_step_outputs.len()
+            || rows.len() != cut.operands(plan).len()
+        {
+            return Err(CorruptIntersectProduct);
+        }
+        for (operand, slots) in cut
+            .operands(plan)
+            .iter()
+            .zip(&envelope.operand_step_outputs)
+        {
+            let operand_query = CodeQuery {
+                schema_version: 1,
+                plan: operand.clone(),
+                limit: usize::MAX,
+                result_detail: crate::query::CodeQueryResultDetail::Compact,
+                execution_mode: Default::default(),
+            };
+            let physical =
+                select_physical_plan(&operand_query, UnionExecutionStrategy::Sequential, 1, 0)
+                    .map_err(|_| CorruptIntersectProduct)?;
+            if slots.len() != physical.step_output_caps().len() {
+                return Err(CorruptIntersectProduct);
+            }
+        }
+        if envelope.diagnostics.len() != envelope.diagnostic_causes.len() {
+            return Err(CorruptIntersectProduct);
+        }
+        let mut diagnostics = envelope.diagnostics;
+        for (diagnostic, cause) in diagnostics.iter_mut().zip(envelope.diagnostic_causes) {
+            diagnostic.incompleteness = cause.into();
+        }
+        let mut product = Self {
+            seed,
+            operands: vec![Vec::new(); rows.len()],
+            operand_step_outputs: envelope.operand_step_outputs,
+            work: envelope.work,
+            budgeted_work: envelope.budgeted_work,
+            completion: envelope.completion,
+            diagnostics,
+            reads,
+            reads_closed: true,
+        };
+        product.decode_rows_json_with_limits(
+            analyzer,
+            workspace,
+            limits,
+            plan,
+            envelope.operands,
+        )?;
+        Ok(product)
+    }
+
+    /// SQL-readable identities for the admitted intersect operands.
+    pub fn encode_rows_json(
+        &self,
+        plan: &crate::query::CodeQueryPlan,
+    ) -> Result<serde_json::Value, CorruptIntersectProduct> {
+        if !self.reads_closed || self.completion != CodeQueryCompletion::Complete {
+            return Err(CorruptIntersectProduct);
+        }
+        let mut operands = Vec::with_capacity(self.operands.len());
+        for rows in &self.operands {
+            let mut encoded = Vec::with_capacity(rows.len());
+            for row in rows {
+                if row.provenance_truncated
+                    || row.traces.is_empty()
+                    || !row.row_projection.is_empty()
+                    || row.traces.iter().any(|trace| {
+                        trace.window_order.is_some()
+                            || trace.seed.file != self.seed
+                            || trace.seed.python_import.is_some()
+                            || !trace.seed.fact_match.captures.is_empty()
+                            || trace.seed.fact_match.reported_range.is_some()
+                            || trace.seed.fact_match.heuristic.is_some()
+                    })
+                {
+                    return Err(CorruptIntersectProduct);
+                }
+                let traces = row
+                    .traces
+                    .iter()
+                    .map(|trace| {
+                        Ok(IntersectTraceIdentity {
+                            branch: trace.branch.clone(),
+                            seed_rel_path: rel_path_string(&trace.seed.file),
+                            seed_node: trace.seed.fact_match.node,
+                            steps: encode_trace_steps(plan, trace)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, CorruptIntersectProduct>>()?;
+                let identity = match &row.value {
+                    PipelineValue::StructuralMatch(seed) => {
+                        if seed.file != self.seed {
+                            return Err(CorruptIntersectProduct);
+                        }
+                        let node = seed.facts.node(seed.fact_match.node);
+                        IntersectRowIdentity::StructuralMatch {
+                            rel_path: rel_path_string(&seed.file),
+                            node: seed.fact_match.node,
+                            kind: node.kind,
+                            span: node.span(),
+                            traces,
+                        }
+                    }
+                    PipelineValue::Declaration(value) => IntersectRowIdentity::Declaration {
+                        rel_path: rel_path_string(value.unit.source()),
+                        declaration_id: value.declaration_id(),
+                        start_byte: value.range.start_byte,
+                        end_byte: value.range.end_byte,
+                        structural_kind: value.structural_kind,
+                        traces,
+                    },
+                    PipelineValue::Occurrence(value) => {
+                        if !occurrence_is_identity_only(&value.row) {
+                            return Err(CorruptIntersectProduct);
+                        }
+                        IntersectRowIdentity::Occurrence {
+                            rel_path: rel_path_string(value.file()),
+                            node: value.row.node,
+                            role: value.row.role.label().to_owned(),
+                            identity_only: true,
+                            traces,
+                        }
+                    }
+                    PipelineValue::Semantic(_)
+                    | PipelineValue::File(_)
+                    | PipelineValue::ReferenceSite(_)
+                    | PipelineValue::CallSite(_)
+                    | PipelineValue::ExpressionSite(_)
+                    | PipelineValue::JsxAttributeValue(_)
+                    | PipelineValue::ReceiverAnalysis(_)
+                    | PipelineValue::MemberTargetAnalysis(_)
+                    | PipelineValue::ReceiverOutcome(_)
+                    | PipelineValue::ReceiverEvidence(_)
+                    | PipelineValue::PointsToCandidate(_)
+                    | PipelineValue::FieldWriteValue(_)
+                    | PipelineValue::RuntimeKeyedReadValue(_)
+                    | PipelineValue::CallShape(_)
+                    | PipelineValue::CallArgumentGroup(_)
+                    | PipelineValue::CallArgument(_)
+                    | PipelineValue::CallBinding(_)
+                    | PipelineValue::CallEffect(_)
+                    | PipelineValue::CallResultContract(_)
+                    | PipelineValue::CallResultObligation(_)
+                    | PipelineValue::ResultSubjectUse(_)
+                    | PipelineValue::ResultContractUse(_)
+                    | PipelineValue::ResultContractFailureUse(_)
+                    | PipelineValue::NilnessOperation(_)
+                    | PipelineValue::SwitchCoverage(_)
+                    | PipelineValue::AssignmentRelation(_)
+                    | PipelineValue::ClassSetRow(_)
+                    | PipelineValue::AbsentMemberFinding(_)
+                    | PipelineValue::DetachedTaskTransfer(_)
+                    | PipelineValue::ProcedureEffect(_)
+                    | PipelineValue::CallableSignature(_)
+                    | PipelineValue::LiteralOccurrence(_)
+                    | PipelineValue::CallableMetrics(_)
+                    | PipelineValue::SignatureParameter(_)
+                    | PipelineValue::DecoratedParameter(_)
+                    | PipelineValue::CallableApplicability(_)
+                    | PipelineValue::OverloadSelection(_)
+                    | PipelineValue::MemberSelection(_)
+                    | PipelineValue::DispatchOutcome(_)
+                    | PipelineValue::DispatchTarget(_)
+                    | PipelineValue::MemberFamily(_)
+                    | PipelineValue::MemberFamilyEdge(_)
+                    | PipelineValue::PythonHierarchyFact(_)
+                    | PipelineValue::LexicalScope(_)
+                    | PipelineValue::Binding(_)
+                    | PipelineValue::ResolutionCandidate(_)
+                    | PipelineValue::CandidateHop(_)
+                    | PipelineValue::GenerationSite(_)
+                    | PipelineValue::Export(_)
+                    | PipelineValue::DeclarationState(_)
+                    | PipelineValue::ReferenceEdge(_)
+                    | PipelineValue::StateEvent(_)
+                    | PipelineValue::BindingInitializerCall(_)
+                    | PipelineValue::FlowRelation(_)
+                    | PipelineValue::ControlRelation(_)
+                    | PipelineValue::BranchRelation(_)
+                    | PipelineValue::LoopRelation(_)
+                    | PipelineValue::CppExpression(_)
+                    | PipelineValue::FailureHandlerState(_)
+                    | PipelineValue::StatementReachability(_)
+                    | PipelineValue::PendingCleanupFlow(_)
+                    | PipelineValue::PythonRuleFact(_)
+                    | PipelineValue::Guard(_)
+                    | PipelineValue::SourceSet(_)
+                    | PipelineValue::BuildTarget(_)
+                    | PipelineValue::TopologyEdge(_)
+                    | PipelineValue::BuildConfiguration(_)
+                    | PipelineValue::RewritePath(_)
+                    | PipelineValue::QualifiedPath(_)
+                    | PipelineValue::PathSegment(_)
+                    | PipelineValue::ConfigurationFact(_)
+                    | PipelineValue::CrossDomain(_)
+                    | PipelineValue::DependencyEvidence(_) => return Err(CorruptIntersectProduct),
+                };
+                encoded.push(identity);
+            }
+            operands.push(encoded);
+        }
+        serde_json::to_value(operands).map_err(|_| CorruptIntersectProduct)
+    }
+
+    /// Hydrate a persisted product against the exact seed blob. A malformed
+    /// or stale row is a cache miss; callers recompute its prefix.
+    pub fn decode_rows_json(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        plan: &crate::query::CodeQueryPlan,
+        encoded: serde_json::Value,
+    ) -> Result<(), CorruptIntersectProduct> {
+        self.decode_rows_json_with_workspace(analyzer, None, plan, encoded)
+    }
+
+    pub fn decode_rows_json_with_workspace(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        workspace: Option<&WorkspaceAnalyzer>,
+        plan: &crate::query::CodeQueryPlan,
+        encoded: serde_json::Value,
+    ) -> Result<(), CorruptIntersectProduct> {
+        self.decode_rows_json_with_limits(
+            analyzer,
+            workspace,
+            CodeQueryExecutionLimits::default(),
+            plan,
+            encoded,
+        )
+    }
+
+    pub fn decode_rows_json_with_limits(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        workspace: Option<&WorkspaceAnalyzer>,
+        limits: CodeQueryExecutionLimits,
+        plan: &crate::query::CodeQueryPlan,
+        encoded: serde_json::Value,
+    ) -> Result<(), CorruptIntersectProduct> {
+        let operands: Vec<Vec<IntersectRowIdentity>> =
+            serde_json::from_value(encoded).map_err(|_| CorruptIntersectProduct)?;
+        if operands.len() != self.operands.len() {
+            return Err(CorruptIntersectProduct);
+        }
+        let provider = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == self.seed.language())
+            .ok_or(CorruptIntersectProduct)?;
+        self.require_file_receipt(analyzer, &self.seed)?;
+        let facts = provider
+            .structural_facts(&self.seed)
+            .ok_or(CorruptIntersectProduct)?;
+        let mut hydrated = Vec::with_capacity(operands.len());
+        for (branch, rows) in operands.into_iter().enumerate() {
+            let mut output = Vec::with_capacity(rows.len());
+            for row in rows {
+                let (value, traces) = match row {
+                    IntersectRowIdentity::StructuralMatch {
+                        rel_path,
+                        node: node_id,
+                        kind,
+                        span,
+                        traces,
+                    } => {
+                        let node = facts
+                            .nodes()
+                            .get(node_id as usize)
+                            .ok_or(CorruptIntersectProduct)?;
+                        if rel_path != rel_path_string(&self.seed)
+                            || kind != node.kind
+                            || span != node.span()
+                        {
+                            return Err(CorruptIntersectProduct);
+                        }
+                        let seed = Arc::new(SeedMatch {
+                            language: self.seed.language(),
+                            file: self.seed.clone(),
+                            facts: Arc::clone(&facts),
+                            fact_match: FactMatch {
+                                node: node_id,
+                                captures: Vec::new(),
+                                reported_range: None,
+                                heuristic: None,
+                            },
+                            python_import: None,
+                        });
+                        (PipelineValue::StructuralMatch(seed), traces)
+                    }
+                    IntersectRowIdentity::Declaration {
+                        rel_path,
+                        declaration_id,
+                        start_byte,
+                        end_byte,
+                        structural_kind,
+                        traces,
+                    } => (
+                        PipelineValue::Declaration(self.hydrate_declaration(
+                            analyzer,
+                            &rel_path,
+                            &declaration_id,
+                            start_byte,
+                            end_byte,
+                            structural_kind,
+                        )?),
+                        traces,
+                    ),
+                    IntersectRowIdentity::Occurrence {
+                        rel_path,
+                        node,
+                        role,
+                        identity_only: true,
+                        traces,
+                    } => (
+                        PipelineValue::Occurrence(
+                            self.hydrate_occurrence(analyzer, &rel_path, node, &role)?,
+                        ),
+                        traces,
+                    ),
+                    IntersectRowIdentity::Occurrence { .. } => return Err(CorruptIntersectProduct),
+                };
+                if traces.is_empty()
+                    || traces.iter().any(|trace| {
+                        trace.branch.first() != Some(&branch)
+                            || trace.seed_rel_path != rel_path_string(&self.seed)
+                            || trace.steps.iter().any(|step| {
+                                !trace.branch.starts_with(&step.source_path)
+                                    || resolve_intersect_step_slot(
+                                        plan,
+                                        &step.source_path,
+                                        step.index,
+                                    )
+                                    .is_none()
+                            })
+                    })
+                {
+                    return Err(CorruptIntersectProduct);
+                }
+                output.push(PipelineRow {
+                    value,
+                    traces: traces
+                        .into_iter()
+                        .map(|trace| {
+                            facts
+                                .nodes()
+                                .get(trace.seed_node as usize)
+                                .ok_or(CorruptIntersectProduct)?;
+                            let steps = trace
+                                .steps
+                                .into_iter()
+                                .map(|step| {
+                                    let op = resolve_intersect_step_slot(
+                                        plan,
+                                        &step.source_path,
+                                        step.index,
+                                    )
+                                    .ok_or(CorruptIntersectProduct)?
+                                    .clone();
+                                    let value = self.hydrate_trace_value(
+                                        analyzer, workspace, limits, step.value,
+                                    )?;
+                                    let via = match step.via {
+                                        None => None,
+                                        Some(identity) => {
+                                            Some(self.hydrate_call_site(analyzer, identity)?)
+                                        }
+                                    };
+                                    Ok(PipelineTraceStep { op, value, via })
+                                })
+                                .collect::<Result<Vec<_>, CorruptIntersectProduct>>()?;
+                            Ok(PipelineTrace {
+                                window_order: None,
+                                branch: trace.branch,
+                                seed: Arc::new(SeedMatch {
+                                    language: self.seed.language(),
+                                    file: self.seed.clone(),
+                                    facts: Arc::clone(&facts),
+                                    fact_match: FactMatch {
+                                        node: trace.seed_node,
+                                        captures: Vec::new(),
+                                        reported_range: None,
+                                        heuristic: None,
+                                    },
+                                    python_import: None,
+                                }),
+                                steps,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, CorruptIntersectProduct>>()?,
+                    provenance_truncated: false,
+                    row_projection: Vec::new(),
+                });
+            }
+            hydrated.push(output);
+        }
+        self.operands = hydrated;
+        Ok(())
+    }
+}
+
+fn occurrence_is_identity_only(row: &OccurrenceRow) -> bool {
+    row.resolution_status.is_none()
+        && row.candidates.is_none()
+        && matches!(
+            row.target,
+            OccurrenceTarget::None | OccurrenceTarget::NotDerived
+        )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorruptIntersectProduct;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntersectPrefixEnvelope {
+    seed: String,
+    operands: serde_json::Value,
+    operand_step_outputs: Vec<Vec<u64>>,
+    work: CodeQueryExecutionWork,
+    budgeted_work: CodeQueryBudgetedWork,
+    completion: CodeQueryCompletion,
+    diagnostics: Vec<CodeQueryDiagnostic>,
+    diagnostic_causes: Vec<IntersectDiagnosticCause>,
+    reads_closed: bool,
+    read_set_digest: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IntersectDiagnosticCause {
+    Content,
+    Cancelled,
+    Budget,
+    Snapshot,
+    Provider,
+}
+
+impl From<brokk_bifrost_rql::Incompleteness> for IntersectDiagnosticCause {
+    fn from(value: brokk_bifrost_rql::Incompleteness) -> Self {
+        match value {
+            brokk_bifrost_rql::Incompleteness::Content => Self::Content,
+            brokk_bifrost_rql::Incompleteness::Operational(DiagnosticExecutionCause::Cancelled) => {
+                Self::Cancelled
+            }
+            brokk_bifrost_rql::Incompleteness::Operational(DiagnosticExecutionCause::Budget) => {
+                Self::Budget
+            }
+            brokk_bifrost_rql::Incompleteness::Operational(DiagnosticExecutionCause::Snapshot) => {
+                Self::Snapshot
+            }
+            brokk_bifrost_rql::Incompleteness::Operational(DiagnosticExecutionCause::Provider) => {
+                Self::Provider
+            }
+        }
+    }
+}
+
+impl From<IntersectDiagnosticCause> for brokk_bifrost_rql::Incompleteness {
+    fn from(value: IntersectDiagnosticCause) -> Self {
+        match value {
+            IntersectDiagnosticCause::Content => Self::Content,
+            IntersectDiagnosticCause::Cancelled => {
+                Self::Operational(DiagnosticExecutionCause::Cancelled)
+            }
+            IntersectDiagnosticCause::Budget => Self::Operational(DiagnosticExecutionCause::Budget),
+            IntersectDiagnosticCause::Snapshot => {
+                Self::Operational(DiagnosticExecutionCause::Snapshot)
+            }
+            IntersectDiagnosticCause::Provider => {
+                Self::Operational(DiagnosticExecutionCause::Provider)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum IntersectRowIdentity {
+    StructuralMatch {
+        rel_path: String,
+        node: u32,
+        kind: NormalizedKind,
+        span: Span,
+        traces: Vec<IntersectTraceIdentity>,
+    },
+    Declaration {
+        rel_path: String,
+        declaration_id: String,
+        start_byte: usize,
+        end_byte: usize,
+        structural_kind: Option<NormalizedKind>,
+        traces: Vec<IntersectTraceIdentity>,
+    },
+    Occurrence {
+        rel_path: String,
+        node: u32,
+        role: String,
+        identity_only: bool,
+        traces: Vec<IntersectTraceIdentity>,
+    },
+}
+
+/// One provenance path stays separate from row identity: an intersect keeps
+/// the first representative but may merge traces from several authored arms.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntersectTraceIdentity {
+    branch: Vec<usize>,
+    seed_rel_path: String,
+    seed_node: u32,
+    steps: Vec<IntersectTraceStepIdentity>,
+}
+
+/// The step slot is the path from the query root through authored set branches
+/// and the index within that plan's `steps`, not a serialized `QueryStep`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntersectTraceStepIdentity {
+    source_path: Vec<usize>,
+    index: usize,
+    value: IntersectTraceValueIdentity,
+    via: Option<IntersectTraceViaIdentity>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum IntersectTraceValueIdentity {
+    StructuralMatch {
+        rel_path: String,
+        node: u32,
+    },
+    Declaration {
+        rel_path: String,
+        declaration_id: String,
+        start_byte: usize,
+        end_byte: usize,
+        structural_kind: Option<NormalizedKind>,
+    },
+    DispatchTarget {
+        rel_path: String,
+        site_id: String,
+        start_byte: usize,
+        end_byte: usize,
+        ordinal: usize,
+        target_id: String,
+    },
+    Occurrence {
+        rel_path: String,
+        node: u32,
+        role: String,
+        identity_only: bool,
+    },
+    Binding {
+        rel_path: String,
+        index: usize,
+        id: String,
+        shadowed: bool,
+        reached_from: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum IntersectTraceViaIdentity {
+    CallSite {
+        rel_path: String,
+        site_id: String,
+        start_byte: usize,
+        end_byte: usize,
+        caller_id: String,
+        callee_rel_path: String,
+        callee_id: String,
+    },
+}
+
+fn encode_trace_steps(
+    plan: &crate::query::CodeQueryPlan,
+    trace: &PipelineTrace,
+) -> Result<Vec<IntersectTraceStepIdentity>, CorruptIntersectProduct> {
+    let mut slots = Vec::new();
+    for depth in (1..=trace.branch.len()).rev() {
+        let path = &trace.branch[..depth];
+        let mut current = plan;
+        for &branch in path {
+            let crate::query::CodeQueryPlanSource::Set { branches, .. } = &current.source else {
+                return Err(CorruptIntersectProduct);
+            };
+            current = branches.get(branch).ok_or(CorruptIntersectProduct)?;
+        }
+        slots.extend((0..current.steps.len()).map(|index| (path.to_vec(), index)));
+    }
+    let mut cursor = 0;
+    let mut encoded = Vec::with_capacity(trace.steps.len());
+    for step in &trace.steps {
+        let found = slots[cursor..]
+            .iter()
+            .position(|(path, index)| {
+                resolve_intersect_step_slot(plan, path, *index) == Some(&step.op)
+            })
+            .ok_or(CorruptIntersectProduct)?;
+        cursor += found;
+        let (source_path, index) = slots[cursor].clone();
+        encoded.push(IntersectTraceStepIdentity {
+            source_path,
+            index,
+            value: encode_trace_value(&step.value)?,
+            via: step.via.as_ref().map(encode_trace_via).transpose()?,
+        });
+        if cursor + 1 < slots.len() && slots[cursor + 1].1 == index + 1 {
+            cursor += 1;
+        }
+    }
+    Ok(encoded)
+}
+
+fn encode_trace_value(
+    value: &PipelineTraceValue,
+) -> Result<IntersectTraceValueIdentity, CorruptIntersectProduct> {
+    Ok(match value {
+        PipelineTraceValue::StructuralMatch(seed)
+            if seed.python_import.is_none()
+                && seed.fact_match.captures.is_empty()
+                && seed.fact_match.reported_range.is_none()
+                && seed.fact_match.heuristic.is_none() =>
+        {
+            IntersectTraceValueIdentity::StructuralMatch {
+                rel_path: rel_path_string(&seed.file),
+                node: seed.fact_match.node,
+            }
+        }
+        PipelineTraceValue::StructuralMatch(_) => return Err(CorruptIntersectProduct),
+        PipelineTraceValue::Declaration(value) => IntersectTraceValueIdentity::Declaration {
+            rel_path: rel_path_string(value.unit.source()),
+            declaration_id: value.declaration_id(),
+            start_byte: value.range.start_byte,
+            end_byte: value.range.end_byte,
+            structural_kind: value.structural_kind,
+        },
+        PipelineTraceValue::DispatchTarget(value) => IntersectTraceValueIdentity::DispatchTarget {
+            rel_path: rel_path_string(value.file()),
+            site_id: value.site.site_id.clone(),
+            start_byte: value.site.range.start_byte,
+            end_byte: value.site.range.end_byte,
+            ordinal: value.ordinal,
+            target_id: value.arm().target_id.clone(),
+        },
+        PipelineTraceValue::Occurrence(value) => {
+            if !occurrence_is_identity_only(&value.row) {
+                return Err(CorruptIntersectProduct);
+            }
+            IntersectTraceValueIdentity::Occurrence {
+                rel_path: rel_path_string(value.file()),
+                node: value.row.node,
+                role: value.row.role.label().to_owned(),
+                identity_only: true,
+            }
+        }
+        PipelineTraceValue::Binding(value) => IntersectTraceValueIdentity::Binding {
+            rel_path: rel_path_string(value.file()),
+            index: value.index,
+            id: value.id(),
+            shadowed: value.shadowed,
+            reached_from: value.reached_from.clone(),
+        },
+        PipelineTraceValue::Semantic(_)
+        | PipelineTraceValue::File(_)
+        | PipelineTraceValue::ReferenceSite(_)
+        | PipelineTraceValue::CallSite(_)
+        | PipelineTraceValue::ExpressionSite(_)
+        | PipelineTraceValue::JsxAttributeValue(_)
+        | PipelineTraceValue::ReceiverAnalysis(_)
+        | PipelineTraceValue::MemberTargetAnalysis(_)
+        | PipelineTraceValue::ReceiverOutcome(_)
+        | PipelineTraceValue::ReceiverEvidence(_)
+        | PipelineTraceValue::PointsToCandidate(_)
+        | PipelineTraceValue::FieldWriteValue(_)
+        | PipelineTraceValue::RuntimeKeyedReadValue(_)
+        | PipelineTraceValue::CallShape(_)
+        | PipelineTraceValue::CallArgumentGroup(_)
+        | PipelineTraceValue::CallArgument(_)
+        | PipelineTraceValue::CallBinding(_)
+        | PipelineTraceValue::CallEffect(_)
+        | PipelineTraceValue::CallResultContract(_)
+        | PipelineTraceValue::CallResultObligation(_)
+        | PipelineTraceValue::ResultSubjectUse(_)
+        | PipelineTraceValue::ResultContractUse(_)
+        | PipelineTraceValue::ResultContractFailureUse(_)
+        | PipelineTraceValue::NilnessOperation(_)
+        | PipelineTraceValue::SwitchCoverage(_)
+        | PipelineTraceValue::AssignmentRelation(_)
+        | PipelineTraceValue::ClassSetRow(_)
+        | PipelineTraceValue::AbsentMemberFinding(_)
+        | PipelineTraceValue::DetachedTaskTransfer(_)
+        | PipelineTraceValue::ProcedureEffect(_)
+        | PipelineTraceValue::CallableSignature(_)
+        | PipelineTraceValue::LiteralOccurrence(_)
+        | PipelineTraceValue::CallableMetrics(_)
+        | PipelineTraceValue::SignatureParameter(_)
+        | PipelineTraceValue::DecoratedParameter(_)
+        | PipelineTraceValue::CallableApplicability(_)
+        | PipelineTraceValue::OverloadSelection(_)
+        | PipelineTraceValue::MemberSelection(_)
+        | PipelineTraceValue::DispatchOutcome(_)
+        | PipelineTraceValue::MemberFamily(_)
+        | PipelineTraceValue::MemberFamilyEdge(_)
+        | PipelineTraceValue::PythonHierarchyFact(_)
+        | PipelineTraceValue::LexicalScope(_)
+        | PipelineTraceValue::ResolutionCandidate(_)
+        | PipelineTraceValue::CandidateHop(_)
+        | PipelineTraceValue::GenerationSite(_)
+        | PipelineTraceValue::Export(_)
+        | PipelineTraceValue::DeclarationState(_)
+        | PipelineTraceValue::ReferenceEdge(_)
+        | PipelineTraceValue::StateEvent(_)
+        | PipelineTraceValue::BindingInitializerCall(_)
+        | PipelineTraceValue::FlowRelation(_)
+        | PipelineTraceValue::ControlRelation(_)
+        | PipelineTraceValue::BranchRelation(_)
+        | PipelineTraceValue::LoopRelation(_)
+        | PipelineTraceValue::CppExpression(_)
+        | PipelineTraceValue::FailureHandlerState(_)
+        | PipelineTraceValue::StatementReachability(_)
+        | PipelineTraceValue::PendingCleanupFlow(_)
+        | PipelineTraceValue::PythonRuleFact(_)
+        | PipelineTraceValue::Guard(_)
+        | PipelineTraceValue::SourceSet(_)
+        | PipelineTraceValue::BuildTarget(_)
+        | PipelineTraceValue::TopologyEdge(_)
+        | PipelineTraceValue::BuildConfiguration(_)
+        | PipelineTraceValue::RewritePath(_)
+        | PipelineTraceValue::QualifiedPath(_)
+        | PipelineTraceValue::PathSegment(_)
+        | PipelineTraceValue::ConfigurationFact(_)
+        | PipelineTraceValue::CrossDomain(_)
+        | PipelineTraceValue::DependencyEvidence(_) => return Err(CorruptIntersectProduct),
+    })
+}
+
+fn encode_trace_via(
+    via: &PipelineVia,
+) -> Result<IntersectTraceViaIdentity, CorruptIntersectProduct> {
+    match via {
+        PipelineVia::CallSite(value)
+            if value.1 == CallBindingStatus::Unavailable
+                && value.3.is_none()
+                && value.4.is_none()
+                && value.5 == CallSiteIdentityFacts::default() =>
+        {
+            Ok(IntersectTraceViaIdentity::CallSite {
+                rel_path: rel_path_string(&value.0.file),
+                site_id: value.2.clone(),
+                start_byte: value.0.range.start_byte,
+                end_byte: value.0.range.end_byte,
+                caller_id: value.0.caller.declaration_id().to_string(),
+                callee_rel_path: rel_path_string(value.0.callee.source()),
+                callee_id: value.0.callee.declaration_id().to_string(),
+            })
+        }
+        PipelineVia::CallSite(_) => Err(CorruptIntersectProduct),
+        PipelineVia::ReferenceSite(_) => Err(CorruptIntersectProduct),
+    }
+}
+
+fn resolve_intersect_step_slot<'a>(
+    plan: &'a crate::query::CodeQueryPlan,
+    source_path: &[usize],
+    index: usize,
+) -> Option<&'a crate::query::QueryStep> {
+    let mut current = plan;
+    for &branch in source_path {
+        let crate::query::CodeQueryPlanSource::Set { branches, .. } = &current.source else {
+            return None;
+        };
+        current = branches.get(branch)?;
+    }
+    current.steps.get(index)
+}
+
+// Every native variant must choose a persisted shape before admission.
+
+/// A continuation either yields a complete detailed answer or withholds it.
+/// An incomplete prefix never contributes a partial intersect membership.
+#[derive(Debug)]
+pub struct IntersectContinuationResult {
+    pub detailed: Option<DetailedCodeQueryResult>,
+    pub completion: CodeQueryCompletion,
+    pub diagnostics: Vec<CodeQueryDiagnostic>,
+}
+
+impl IntersectContinuationResult {
+    /// Project the once-executed suffix into the existing policy merge port.
+    /// A withheld continuation carries no rows and remains incomplete.
+    pub fn into_merged_rows(self, query: &CodeQuery) -> MergedUnitRows {
+        match self.detailed {
+            Some(detailed) => MergedUnitRows {
+                items: detailed
+                    .result
+                    .results
+                    .iter()
+                    .map(UnitRowItem::project)
+                    .collect(),
+                evidence: detailed
+                    .evidence
+                    .iter()
+                    .map(UnitRowEvidence::project)
+                    .collect(),
+                work: detailed.work,
+                budgeted_work: detailed.budgeted_work,
+                diagnostics: detailed.result.diagnostics,
+                truncated: detailed.result.truncated,
+                fair_share_divisor: 1,
+                step_output_caps: unit_step_output_caps(query),
+            },
+            None => MergedUnitRows {
+                items: Vec::new(),
+                evidence: Vec::new(),
+                work: CodeQueryExecutionWork::default(),
+                budgeted_work: CodeQueryBudgetedWork::default(),
+                diagnostics: self.diagnostics,
+                truncated: true,
+                fair_share_divisor: 1,
+                step_output_caps: unit_step_output_caps(query),
+            },
+        }
+    }
+}
+
+/// Merge every seed's native operands in whole-run order, evaluate the
+/// intersect once, then let the physical executor run the ancestor suffix.
+#[allow(clippy::too_many_arguments)]
+pub fn continue_intersect_prefix(
+    analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    seeds: &[ProjectFile],
+    prefixes: Vec<IntersectPrefixProduct>,
+) -> IntersectContinuationResult {
+    let crate::query::PlanPartitioning::Prefix { cut } =
+        PlanPartitioning::classify_for_prefix(&query.plan)
+    else {
+        panic!("intersect continuation requires an eligible cut");
+    };
+    let mut diagnostics = Vec::new();
+    let complete = prefixes.len() == seeds.len()
+        && prefixes.iter().zip(seeds).all(|(prefix, seed)| {
+            prefix.seed == *seed
+                && prefix.reads_closed
+                && prefix.completion == CodeQueryCompletion::Complete
+                && !prefix.reads.is_empty()
+        });
+    if !complete || cancellation.is_some_and(CancellationToken::is_cancelled) {
+        for prefix in prefixes {
+            diagnostics.extend(prefix.diagnostics);
+        }
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message:
+                "intersect continuation withheld because a seed prefix or read proof is incomplete"
+                    .to_string(),
+            source: None,
+            related: Vec::new(),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        }));
+        return IntersectContinuationResult {
+            detailed: None,
+            completion: code_query_completion(true, &diagnostics),
+            diagnostics,
+        };
+    }
+    let mut merged_operands = Vec::new();
+    for (branch, plan) in cut.operands(&query.plan).iter().enumerate() {
+        let mut rows = Vec::new();
+        for prefix in &prefixes {
+            rows.extend(prefix.operands[branch].iter().cloned());
+        }
+        if PlanPartitioning::classify(plan).is_seed_union() {
+            // Physical union rows carry their authored branch in every trace.
+            // A stable sort restores branch-major order across seed products.
+            rows.sort_by(|left, right| {
+                left.traces
+                    .first()
+                    .map(|trace| &trace.branch[1..])
+                    .cmp(&right.traces.first().map(|trace| &trace.branch[1..]))
+            });
+            rows = combine_set_rows(SetOperator::Union, vec![rows], false).0;
+        }
+        merged_operands.push(rows);
+    }
+    let mut row_keys = Vec::new();
+    let mut prefix_work = CodeQueryExecutionWork::default();
+    let mut prefix_budgeted = CodeQueryBudgetedWork::default();
+    for prefix in &prefixes {
+        prefix_work = prefix_work.saturating_add(prefix.work);
+        prefix_budgeted.provenance_steps = prefix_budgeted
+            .provenance_steps
+            .saturating_add(prefix.budgeted_work.provenance_steps);
+        prefix_budgeted.import_files_resolved = prefix_budgeted
+            .import_files_resolved
+            .saturating_add(prefix.budgeted_work.import_files_resolved);
+        prefix_budgeted.import_edges_resolved = prefix_budgeted
+            .import_edges_resolved
+            .saturating_add(prefix.budgeted_work.import_edges_resolved);
+    }
+    let Some(suffix_limits) = remaining_unit_limits(limits, &prefix_work, &prefix_budgeted) else {
+        push_budget_diagnostic(&mut diagnostics, &CodeQueryExecutionBudget::default());
+        return IntersectContinuationResult {
+            detailed: None,
+            completion: code_query_completion(true, &diagnostics),
+            diagnostics,
+        };
+    };
+    let mut detailed = execute_detailed_unit(
+        analyzer,
+        flow_state,
+        workspace,
+        query,
+        suffix_limits,
+        cancellation,
+        CodeQueryExecutionScope::whole_workspace().with_intersect_operands(merged_operands),
+        &mut row_keys,
+        None,
+    );
+    let whole_plan = select_physical_plan(query, UnionExecutionStrategy::Sequential, 1, 0)
+        .expect("eligible intersect has a physical plan");
+    let mut cut_node = whole_plan.node(whole_plan.root()).dependencies()[0];
+    while matches!(
+        whole_plan.node(cut_node).operator(),
+        PhysicalQueryOperator::PipelineStep
+    ) {
+        cut_node = whole_plan.node(cut_node).dependencies()[0];
+    }
+    assert_eq!(
+        whole_plan.node(cut_node).operator(),
+        PhysicalQueryOperator::SequentialIntersection
+    );
+    // The injected cut output is charged while rendering the continuation so
+    // its retained rows have budget evidence. The ordinary set operator does
+    // not add that charge to published work.
+    detailed.work.pipeline_rows = detailed
+        .work
+        .pipeline_rows
+        .saturating_sub(detailed.budgeted_work.step_outputs[cut_node.index()]);
+    for (branch, operand) in cut.operands(&query.plan).iter().enumerate() {
+        let branch_query = CodeQuery {
+            plan: operand.clone(),
+            limit: usize::MAX,
+            ..query.clone()
+        };
+        let branch_plan =
+            select_physical_plan(&branch_query, UnionExecutionStrategy::Sequential, 1, 0)
+                .expect("eligible operand has a physical plan");
+        for prefix in &prefixes {
+            let slots = &prefix.operand_step_outputs[branch];
+            let mut pending = vec![(
+                branch_plan.node(branch_plan.root()).dependencies()[0],
+                whole_plan.node(cut_node).dependencies()[branch],
+            )];
+            while let Some((source, target)) = pending.pop() {
+                detailed.budgeted_work.step_outputs[target.index()] =
+                    detailed.budgeted_work.step_outputs[target.index()]
+                        .saturating_add(slots[source.index()]);
+                let source_children = branch_plan.node(source).dependencies();
+                let target_children = whole_plan.node(target).dependencies();
+                assert_eq!(source_children.len(), target_children.len());
+                pending.extend(
+                    source_children
+                        .iter()
+                        .copied()
+                        .zip(target_children.iter().copied()),
+                );
+            }
+        }
+    }
+    for prefix in &prefixes {
+        detailed.work = detailed.work.saturating_add(prefix.work);
+        detailed.budgeted_work.provenance_steps = detailed
+            .budgeted_work
+            .provenance_steps
+            .saturating_add(prefix.budgeted_work.provenance_steps);
+        detailed.budgeted_work.import_files_resolved = detailed
+            .budgeted_work
+            .import_files_resolved
+            .saturating_add(prefix.budgeted_work.import_files_resolved);
+        detailed.budgeted_work.import_edges_resolved = detailed
+            .budgeted_work
+            .import_edges_resolved
+            .saturating_add(prefix.budgeted_work.import_edges_resolved);
+    }
+    for branch in 0..cut.operands(&query.plan).len() {
+        for prefix in &prefixes {
+            diagnostics.extend(
+                prefix
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.branch.first() == Some(&branch))
+                    .cloned(),
+            );
+        }
+    }
+    diagnostics.extend(detailed.result.diagnostics.iter().cloned());
+    detailed.result.diagnostics = diagnostics.clone();
+    let completion = detailed.result.completion();
+    IntersectContinuationResult {
+        detailed: Some(detailed),
+        completion,
+        diagnostics,
+    }
+}
+
+/// Execute every operand below a root intersect for one narrowed seed. The
+/// returned port preserves native values and branch order for continuation.
+/// A caller must still prove complete seed enumeration before reuse.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_intersect_prefix(
+    analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    scope: CodeQueryExecutionScope<'_>,
+) -> IntersectPrefixProduct {
+    let crate::query::PlanPartitioning::Prefix { cut } =
+        PlanPartitioning::classify_for_prefix(&query.plan)
+    else {
+        panic!("intersect prefix requires an eligible cut");
+    };
+    assert_eq!(
+        scope.seed_files().expect("prefix requires one seed").len(),
+        1
+    );
+    let seed_file = scope.seed_files().expect("one seed")[0].clone();
+    let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let _read_scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+        analyzer,
+        std::sync::Arc::clone(&ledger),
+    );
+    // Intersect membership includes absence: a newly published seed may add
+    // a match to another operand without changing this seed's blob.
+    analyzer.record_read(analyzer.workspace_scope_read_key(&Language::ALL));
+    let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut prefix_query = query.clone();
+    prefix_query.plan.steps.clear();
+    prefix_query.limit = usize::MAX;
+    let mut row_keys = Vec::new();
+    let detailed = execute_detailed_unit(
+        analyzer,
+        flow_state,
+        workspace,
+        &prefix_query,
+        limits,
+        cancellation,
+        scope.with_intersect_prefix_capture(std::sync::Arc::clone(&capture)),
+        &mut row_keys,
+        None,
+    );
+    let operands = capture
+        .lock()
+        .expect("prefix capture lock is not poisoned")
+        .take()
+        .unwrap_or_default();
+    let physical = select_physical_plan(&prefix_query, UnionExecutionStrategy::Sequential, 1, 0)
+        .expect("eligible intersect has a physical plan");
+    let cut_node = physical.node(physical.root()).dependencies()[0];
+    assert_eq!(
+        physical.node(cut_node).operator(),
+        PhysicalQueryOperator::SequentialIntersection
+    );
+    let mut operand_step_outputs = Vec::with_capacity(cut.operands(&query.plan).len());
+    for (branch, operand) in cut.operands(&query.plan).iter().enumerate() {
+        let branch_query = CodeQuery {
+            plan: operand.clone(),
+            limit: usize::MAX,
+            ..query.clone()
+        };
+        let branch_plan =
+            select_physical_plan(&branch_query, UnionExecutionStrategy::Sequential, 1, 0)
+                .expect("eligible operand has a physical plan");
+        let mut slots = vec![0_u64; branch_plan.step_output_caps().len()];
+        let mut pending = vec![(
+            branch_plan.node(branch_plan.root()).dependencies()[0],
+            physical.node(cut_node).dependencies()[branch],
+        )];
+        while let Some((source, target)) = pending.pop() {
+            slots[source.index()] = detailed.budgeted_work.step_outputs[target.index()];
+            pending.extend(
+                branch_plan
+                    .node(source)
+                    .dependencies()
+                    .iter()
+                    .copied()
+                    .zip(physical.node(target).dependencies().iter().copied()),
+            );
+        }
+        operand_step_outputs.push(slots);
+    }
+    let complete = detailed.result.completion() == CodeQueryCompletion::Complete
+        && operands.len() == cut.operands(&query.plan).len();
+    let reads_closed =
+        ledger.is_bounded() && ledger.first_refusal().is_none() && !ledger.is_empty();
+    IntersectPrefixProduct {
+        seed: seed_file,
+        operands,
+        operand_step_outputs,
+        work: detailed.work,
+        budgeted_work: detailed.budgeted_work,
+        completion: if complete && reads_closed {
+            CodeQueryCompletion::Complete
+        } else {
+            CodeQueryCompletion::Incomplete {
+                codes: vec![CodeQueryDiagnosticCode::SemanticResultsOmitted],
+            }
+        },
+        diagnostics: detailed.result.diagnostics,
+        reads: ledger.keys(),
+        reads_closed,
+    }
+}
 
 /// Which files a query's seed enumeration runs over.
 ///
@@ -27,6 +1652,8 @@ use std::path::Path;
 /// file counts. The caller computes `workspace_files` once and hands the same
 /// slice to every unit, which is what keeps unit-wise execution linear in the
 /// file count instead of quadratic.
+type IntersectPrefixCapture = std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<PipelineRow>>>>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct CodeQueryExecutionScope<'a> {
     seed_files: Option<&'a [ProjectFile]>,
@@ -39,6 +1666,12 @@ pub struct CodeQueryExecutionScope<'a> {
     /// scans. The analyzer and model authority are rechecked at query entry.
     shared_call_target_outcomes:
         Option<crate::analyzer::usages::call_relations::CallTargetOutcomeCache>,
+    intersect_operands: Option<std::sync::Arc<Vec<Vec<PipelineRow>>>>,
+    intersect_prefix_capture: Option<IntersectPrefixCapture>,
+    /// Words the host accepts as spelled correctly, for relations that guess
+    /// at misspellings. A result that consulted it is valid only for this
+    /// dictionary, so a host that caches results keys them by its digest.
+    identifier_dictionary: Option<&'a IdentifierDictionary>,
 }
 
 impl<'a> CodeQueryExecutionScope<'a> {
@@ -50,6 +1683,9 @@ impl<'a> CodeQueryExecutionScope<'a> {
             branch_path: &[],
             inherited_suffix_steps: 0,
             shared_call_target_outcomes: None,
+            intersect_operands: None,
+            intersect_prefix_capture: None,
+            identifier_dictionary: None,
         }
     }
 
@@ -74,6 +1710,9 @@ impl<'a> CodeQueryExecutionScope<'a> {
             branch_path,
             inherited_suffix_steps: 0,
             shared_call_target_outcomes: None,
+            intersect_operands: None,
+            intersect_prefix_capture: None,
+            identifier_dictionary: None,
         }
     }
 
@@ -91,6 +1730,26 @@ impl<'a> CodeQueryExecutionScope<'a> {
     pub(super) fn with_shared_call_target_outcomes_from(mut self, source: &Self) -> Self {
         self.shared_call_target_outcomes = source.shared_call_target_outcomes.clone();
         self
+    }
+
+    /// Accept `dictionary`'s words in relations that guess at misspellings.
+    pub const fn with_identifier_dictionary(
+        mut self,
+        dictionary: &'a IdentifierDictionary,
+    ) -> Self {
+        self.identifier_dictionary = Some(dictionary);
+        self
+    }
+
+    pub(super) fn with_identifier_dictionary_from(mut self, source: &Self) -> Self {
+        self.identifier_dictionary = source.identifier_dictionary;
+        self
+    }
+
+    /// The accepted identifier words, empty when the host supplied none.
+    pub(super) fn identifier_dictionary(&self) -> &'a IdentifierDictionary {
+        static EMPTY: IdentifierDictionary = IdentifierDictionary::EMPTY;
+        self.identifier_dictionary.unwrap_or(&EMPTY)
     }
 
     /// The exact files seed enumeration is restricted to, if any.
@@ -116,6 +1775,24 @@ impl<'a> CodeQueryExecutionScope<'a> {
         &self,
     ) -> Option<&crate::analyzer::usages::call_relations::CallTargetOutcomeCache> {
         self.shared_call_target_outcomes.as_ref()
+    }
+
+    pub(super) fn with_intersect_operands(mut self, rows: Vec<Vec<PipelineRow>>) -> Self {
+        self.intersect_operands = Some(std::sync::Arc::new(rows));
+        self
+    }
+
+    pub(super) fn intersect_operands(&self) -> Option<&[Vec<PipelineRow>]> {
+        self.intersect_operands.as_deref().map(Vec::as_slice)
+    }
+
+    pub(super) fn with_intersect_prefix_capture(mut self, capture: IntersectPrefixCapture) -> Self {
+        self.intersect_prefix_capture = Some(capture);
+        self
+    }
+
+    pub(super) fn intersect_prefix_capture(&self) -> Option<&IntersectPrefixCapture> {
+        self.intersect_prefix_capture.as_ref()
     }
 }
 
@@ -151,26 +1828,39 @@ pub fn execute_code_query_unit(
             1,
             "a seed-union unit must narrow exactly one seed file"
         );
-        return execute_seed_union_unit(
-            analyzer,
-            flow_state.clone(),
-            workspace,
-            query,
-            limits,
-            cancellation,
-            scope,
-        );
+        if !PlanPartitioning::union_has_post_merge_suffix(&query.plan) {
+            return execute_seed_union_unit(
+                analyzer,
+                flow_state.clone(),
+                workspace,
+                query,
+                limits,
+                cancellation,
+                scope,
+            );
+        }
     }
+    let unit_query = if PlanPartitioning::classify(&query.plan).is_seed_union()
+        && PlanPartitioning::union_has_post_merge_suffix(&query.plan)
+    {
+        Some(CodeQuery {
+            limit: usize::MAX,
+            ..query.clone()
+        })
+    } else {
+        None
+    };
     let mut row_keys = Vec::new();
     let detailed = execute_detailed_unit(
         analyzer,
         flow_state.clone(),
         workspace,
-        query,
+        unit_query.as_ref().unwrap_or(query),
         limits,
         cancellation,
         scope,
         &mut row_keys,
+        None,
     );
     project_unit_result(&detailed, row_keys)
 }
@@ -271,7 +1961,8 @@ fn execute_seed_union_unit(
                 .expect("a seed-union unit requires whole-workspace files"),
             &branch_path,
         )
-        .with_shared_call_target_outcomes_from(&scope);
+        .with_shared_call_target_outcomes_from(&scope)
+        .with_identifier_dictionary_from(&scope);
         leaf_scope.inherited_suffix_steps = inherited_suffix_steps;
         let detailed = execute_detailed_unit(
             analyzer,
@@ -282,6 +1973,7 @@ fn execute_seed_union_unit(
             cancellation,
             leaf_scope,
             &mut row_keys,
+            None,
         );
         let mut leaf_result = project_unit_result(&detailed, row_keys);
         work = work.saturating_add(leaf_result.work);
@@ -461,6 +2153,7 @@ fn execute_detailed_selector_unit(
         None,
         scope,
         Some(row_keys),
+        None,
     )
 }
 
@@ -475,6 +2168,7 @@ fn execute_detailed_unit(
     cancellation: Option<&CancellationToken>,
     scope: CodeQueryExecutionScope<'_>,
     row_keys: &mut Vec<UnitRowKey>,
+    native_rows: Option<&mut Vec<PipelineRow>>,
 ) -> DetailedCodeQueryResult {
     let query_scope = AnalyzerQueryScope::new(analyzer);
     let token = query_scope.token();
@@ -499,6 +2193,7 @@ fn execute_detailed_unit(
         None,
         scope,
         Some(row_keys),
+        native_rows,
     )
 }
 
@@ -858,6 +2553,7 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::SourceSet(entity) => key("source_set").text(&entity.id).finish(),
         PipelineKey::BuildTarget(entity) => key("build_target").text(&entity.id).finish(),
         PipelineKey::TopologyEdge(edge) => key("topology_edge").text(&edge.id).finish(),
+        PipelineKey::BuildConfiguration(id) => key("build_configuration").text(id).finish(),
         PipelineKey::ClassSetRow(id) => key("class_set_row").text(id).finish(),
         PipelineKey::AbsentMemberFinding(id) => key("absent_member_finding").text(id).finish(),
         PipelineKey::RewritePath(path) => key("rewrite_path")
@@ -1807,6 +3503,7 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::SourceSet { .. }
             | CodeQueryResultValue::BuildTarget { .. }
             | CodeQueryResultValue::TopologyEdge { .. }
+            | CodeQueryResultValue::BuildConfiguration { .. }
             | CodeQueryResultValue::DependencyEvidence { .. }
             | CodeQueryResultValue::ConfigurationFact { .. } => UnitRowItemTerminal::SourcePosition,
             CodeQueryResultValue::CrossDomain { value } => UnitRowItemTerminal::CrossDomain {
@@ -1951,6 +3648,7 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::SourceSet { value } => &value.build_file,
         CodeQueryResultValue::BuildTarget { value } => &value.build_file,
         CodeQueryResultValue::TopologyEdge { value } => &value.build_file,
+        CodeQueryResultValue::BuildConfiguration { value } => &value.path,
         CodeQueryResultValue::Procedure { value } => &value.path,
         CodeQueryResultValue::ProgramPoint { value } => &value.path,
         CodeQueryResultValue::ControlEdge { value } => &value.path,
@@ -2540,8 +4238,9 @@ impl MergedUnitRows {
 
 fn unit_step_output_caps(query: &CodeQuery) -> Vec<Option<StepOutputCap>> {
     let union = PlanPartitioning::classify(&query.plan).is_seed_union();
+    let flattened_union = union && !PlanPartitioning::union_has_post_merge_suffix(&query.plan);
     let mut caps = Vec::new();
-    let plans = if union {
+    let plans = if flattened_union {
         PlanPartitioning::union_leaf_plans(&query.plan)
             .expect("a seed union has flattened leaves")
             .into_iter()
@@ -2557,14 +4256,24 @@ fn unit_step_output_caps(query: &CodeQuery) -> Vec<Option<StepOutputCap>> {
             })
             .collect::<Vec<_>>()
     } else {
-        vec![(query.clone(), 0)]
+        vec![(
+            if union {
+                CodeQuery {
+                    limit: usize::MAX,
+                    ..query.clone()
+                }
+            } else {
+                query.clone()
+            },
+            0,
+        )]
     };
     for (query, inherited) in plans {
         let plan = select_physical_plan(&query, UnionExecutionStrategy::Sequential, 1, inherited)
             .expect("executed unit queries have valid physical plans");
         caps.extend(plan.step_output_caps().into_iter().map(|cap| {
             cap.map(|cap| {
-                if union {
+                if flattened_union {
                     StepOutputCap::PipelineRows
                 } else {
                     cap
@@ -2612,7 +4321,9 @@ pub fn merge_unit_rows(
             PlanPartitioning::fair_share_divisor(&query.plan)
                 .expect("a seed-partitioned set has a checked fair-share divisor")
         }
-        PlanPartitioning::BySeed | PlanPartitioning::Whole(_) => 1,
+        PlanPartitioning::BySeed | PlanPartitioning::Prefix { .. } | PlanPartitioning::Whole(_) => {
+            1
+        }
     };
     let step_output_caps = unit_step_output_caps(query);
     let mut raw_rows = Vec::new();
@@ -2623,15 +4334,20 @@ pub fn merge_unit_rows(
             Some(summed) => summed.saturating_add(&unit.budgeted_work),
             None => unit.budgeted_work,
         });
-        diagnostics.extend(unit.diagnostics);
+        diagnostics.extend(unit.diagnostics); // Policy adaptation sorts in normalize_policy_diagnostics_bounded.
         truncated |= unit.truncated;
         raw_rows.extend(unit.rows);
     }
 
     if union {
-        for row in &raw_rows {
-            row_branch(row);
+        if !PlanPartitioning::union_has_post_merge_suffix(&query.plan) {
+            for row in &raw_rows {
+                row_branch(row);
+            }
         }
+        // A post-merge unit can carry traces from several branches. Its first
+        // trace names the retained representative chosen by the shared set
+        // executor. Stable sorting keeps seed and output order for ties.
         raw_rows.sort_by(|left, right| {
             left.item.provenance[0]
                 .branch
@@ -2768,7 +4484,7 @@ pub fn structural_seed_file_order(left: &ProjectFile, right: &ProjectFile) -> st
 ///
 /// [`Whole`]: crate::query::PlanPartitioning::Whole
 pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<ProjectFile> {
-    let (leaves, structural) = match PlanPartitioning::classify(plan) {
+    let (leaves, structural) = match PlanPartitioning::classify_for_prefix(plan) {
         PlanPartitioning::BySeedUnion => {
             let leaves = PlanPartitioning::union_leaf_plans(plan)
                 .expect("seed-union enumeration requires an eligible union plan")
@@ -2795,6 +4511,26 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
                     _ => leaves.push(current.clone()),
                 }
             }
+            (leaves, structural)
+        }
+        PlanPartitioning::Prefix { cut } => {
+            let mut leaves = Vec::new();
+            let mut pending: Vec<_> = cut.operands(plan).iter().collect();
+            while let Some(current) = pending.pop() {
+                match &current.source {
+                    CodeQueryPlanSource::Set {
+                        op: SetOperator::Union,
+                        branches,
+                    } => pending.extend(branches),
+                    _ => leaves.push(current.clone()),
+                }
+            }
+            let structural = seed_languages(
+                leaves
+                    .first()
+                    .expect("an eligible intersect has at least one seed leaf"),
+            )
+            .1;
             (leaves, structural)
         }
         PlanPartitioning::BySeed | PlanPartitioning::Whole(_) => {
@@ -2921,104 +4657,157 @@ impl MergedUnitRows {
         limits: &CodeQueryExecutionLimits,
         result_limit: usize,
     ) -> Option<MergedLimit> {
-        let reached = |lane: u64, cap: usize| lane >= cap as u64;
-        let physical_cap = |cap: usize| cap / self.fair_share_divisor;
-        if self.truncated {
-            return Some(MergedLimit::UnitTruncated);
-        }
-        if self.items.len() >= result_limit {
-            return Some(MergedLimit::ResultLimit);
-        }
-        if reached(
-            self.work
-                .scanned_files
-                .saturating_add(self.budgeted_work.import_files_resolved),
-            physical_cap(limits.max_scanned_files),
-        ) {
-            return Some(MergedLimit::ScannedFiles);
-        }
-        if reached(
-            self.work.scanned_source_bytes,
-            physical_cap(limits.max_scanned_source_bytes),
-        ) {
-            return Some(MergedLimit::ScannedSourceBytes);
-        }
-        if reached(
-            self.work
-                .fact_nodes
-                .saturating_add(self.work.examined_references),
-            physical_cap(limits.max_fact_nodes),
-        ) {
-            return Some(MergedLimit::FactNodes);
-        }
-        if reached(
-            self.work
-                .pipeline_rows
-                .saturating_add(self.budgeted_work.provenance_steps)
-                .saturating_add(self.budgeted_work.import_edges_resolved),
-            physical_cap(limits.max_pipeline_rows),
-        ) {
-            return Some(MergedLimit::PipelineRows);
-        }
-        assert!(
-            self.budgeted_work.step_outputs.is_empty()
-                || self.budgeted_work.step_outputs.len() == self.step_output_caps.len(),
-            "step output counters follow the executed physical plan layout"
-        );
-        // The executor can stop at equality, before examining another input.
-        // Set plans retain the existing conservative branch-share allowance.
-        if self
-            .budgeted_work
-            .step_outputs
-            .iter()
-            .zip(&self.step_output_caps)
-            .any(|(&outputs, cap)| {
-                cap.is_some_and(|cap| {
-                    reached(outputs, cap.resolve(physical_cap(limits.max_pipeline_rows)))
-                })
-            })
-        {
-            return Some(MergedLimit::StepOutputs);
-        }
-        self.reached_semantic_limit(&limits.semantic)
+        reached_limit_counters(
+            &self.work,
+            &self.budgeted_work,
+            self.truncated,
+            self.items.len(),
+            self.fair_share_divisor,
+            &self.step_output_caps,
+            limits,
+            limits.max_pipeline_rows,
+            result_limit,
+        )
     }
+}
 
-    /// The semantic half of [`Self::reached_limit`].
-    fn reached_semantic_limit(&self, limits: &CodeQuerySemanticLimits) -> Option<MergedLimit> {
-        let semantic = &self.work.semantic;
-        let reached = |lane: u64, cap: usize| lane >= cap as u64;
-        if semantic.budget_exhausted {
-            return Some(MergedLimit::SemanticBudgetExhausted);
-        }
-        if reached(
-            semantic.unique_materialized_files,
-            limits.max_materialized_files,
-        ) {
-            return Some(MergedLimit::SemanticMaterializedFiles);
-        }
-        if reached(
-            semantic.resident_peaks.source_bytes as u64,
-            limits.max_source_bytes,
-        ) {
-            return Some(MergedLimit::SemanticSourceBytes);
-        }
-        if reached(
-            semantic.resident_retained_bytes_peak,
-            limits.max_retained_bytes,
-        ) {
-            return Some(MergedLimit::SemanticRetainedBytes);
-        }
-
-        for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
-            let cap = limits
-                .rows_per_dimension
-                .map_or(limits.max_rows_per_dimension, |rows| rows.get(dimension));
-            if reached(semantic_row_work(semantic, dimension), cap) {
-                return Some(MergedLimit::SemanticRows(dimension));
+impl UnitExecutionResult {
+    /// Check a stored unit's own work without copying its rows.
+    pub fn reached_limit(
+        &self,
+        query: &CodeQuery,
+        limits: &CodeQueryExecutionLimits,
+        step_pipeline_rows: usize,
+        result_limit: usize,
+    ) -> Option<MergedLimit> {
+        let partitioning = PlanPartitioning::classify(&query.plan);
+        let fair_share_divisor = match partitioning {
+            PlanPartitioning::BySeedUnion | PlanPartitioning::BySeedExcept => {
+                PlanPartitioning::fair_share_divisor(&query.plan)
+                    .expect("a seed-partitioned set has a checked fair-share divisor")
             }
-        }
-        None
+            PlanPartitioning::BySeed
+            | PlanPartitioning::Prefix { .. }
+            | PlanPartitioning::Whole(_) => 1,
+        };
+        reached_limit_counters(
+            &self.work,
+            &self.budgeted_work,
+            self.truncated,
+            self.rows.len(),
+            fair_share_divisor,
+            &unit_step_output_caps(query),
+            limits,
+            step_pipeline_rows,
+            result_limit,
+        )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reached_limit_counters(
+    work: &CodeQueryExecutionWork,
+    budgeted_work: &CodeQueryBudgetedWork,
+    truncated: bool,
+    item_count: usize,
+    fair_share_divisor: usize,
+    step_output_caps: &[Option<StepOutputCap>],
+    limits: &CodeQueryExecutionLimits,
+    step_pipeline_rows: usize,
+    result_limit: usize,
+) -> Option<MergedLimit> {
+    let reached = |lane: u64, cap: usize| lane >= cap as u64;
+    let physical_cap = |cap: usize| cap / fair_share_divisor;
+    if truncated {
+        return Some(MergedLimit::UnitTruncated);
+    }
+    if item_count >= result_limit {
+        return Some(MergedLimit::ResultLimit);
+    }
+    if reached(
+        work.scanned_files
+            .saturating_add(budgeted_work.import_files_resolved),
+        physical_cap(limits.max_scanned_files),
+    ) {
+        return Some(MergedLimit::ScannedFiles);
+    }
+    if reached(
+        work.scanned_source_bytes,
+        physical_cap(limits.max_scanned_source_bytes),
+    ) {
+        return Some(MergedLimit::ScannedSourceBytes);
+    }
+    if reached(
+        work.fact_nodes.saturating_add(work.examined_references),
+        physical_cap(limits.max_fact_nodes),
+    ) {
+        return Some(MergedLimit::FactNodes);
+    }
+    if reached(
+        work.pipeline_rows
+            .saturating_add(budgeted_work.provenance_steps)
+            .saturating_add(budgeted_work.import_edges_resolved),
+        physical_cap(limits.max_pipeline_rows),
+    ) {
+        return Some(MergedLimit::PipelineRows);
+    }
+    assert!(
+        budgeted_work.step_outputs.is_empty()
+            || budgeted_work.step_outputs.len() == step_output_caps.len(),
+        "step output counters follow the executed physical plan layout"
+    );
+    // The executor can stop at equality, before examining another input.
+    // Set plans retain the existing conservative branch-share allowance.
+    if budgeted_work
+        .step_outputs
+        .iter()
+        .zip(step_output_caps)
+        .any(|(&outputs, cap)| {
+            cap.is_some_and(|cap| reached(outputs, cap.resolve(physical_cap(step_pipeline_rows))))
+        })
+    {
+        return Some(MergedLimit::StepOutputs);
+    }
+    reached_semantic_limit(&work.semantic, &limits.semantic)
+}
+
+/// The semantic half of the merged limit check.
+fn reached_semantic_limit(
+    semantic: &CodeQuerySemanticWork,
+    limits: &CodeQuerySemanticLimits,
+) -> Option<MergedLimit> {
+    let reached = |lane: u64, cap: usize| lane >= cap as u64;
+    if semantic.budget_exhausted {
+        return Some(MergedLimit::SemanticBudgetExhausted);
+    }
+    if reached(
+        semantic.unique_materialized_files,
+        limits.max_materialized_files,
+    ) {
+        return Some(MergedLimit::SemanticMaterializedFiles);
+    }
+    if reached(
+        semantic.resident_peaks.source_bytes as u64,
+        limits.max_source_bytes,
+    ) {
+        return Some(MergedLimit::SemanticSourceBytes);
+    }
+    if reached(
+        semantic.resident_retained_bytes_peak,
+        limits.max_retained_bytes,
+    ) {
+        return Some(MergedLimit::SemanticRetainedBytes);
+    }
+
+    for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
+        let cap = limits
+            .rows_per_dimension
+            .map_or(limits.max_rows_per_dimension, |rows| rows.get(dimension));
+        if reached(semantic_row_work(semantic, dimension), cap) {
+            return Some(MergedLimit::SemanticRows(dimension));
+        }
+    }
+    None
 }
 
 /// One semantic row lane of a merged product, by the dimension it is capped

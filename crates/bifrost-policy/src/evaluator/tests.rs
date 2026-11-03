@@ -1396,6 +1396,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                 evidence.clone(),
                 &[],
                 &mut HashMap::new(),
+                &mut HashMap::new(),
             )
             .unwrap();
             assert!(matches!(
@@ -1422,6 +1423,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                 item.clone(),
                 unavailable,
                 &[],
+                &mut HashMap::new(),
                 &mut HashMap::new(),
             )
             .unwrap();
@@ -1476,6 +1478,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                         bad_item,
                         bad_evidence,
                         &[],
+                        &mut HashMap::new(),
                         &mut HashMap::new()
                     )
                     .is_err(),
@@ -1728,6 +1731,7 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
         UnitRowEvidence::project(&evidence),
         &[],
         &mut HashMap::new(),
+        &mut HashMap::new(),
     )
     .expect("synthetic detailed/public terminal pair adapts");
 
@@ -1894,6 +1898,7 @@ fn proven_call_without_a_stable_caller_identity_is_name_based_but_keeps_strong_a
         UnitRowEvidence::project(&evidence),
         &detailed.result.diagnostics,
         &mut ordinals,
+        &mut HashMap::new(),
     )
     .expect("candidate");
 
@@ -1920,6 +1925,78 @@ fn proven_call_without_a_stable_caller_identity_is_name_based_but_keeps_strong_a
             ..
         }
     ));
+}
+
+/// The finding id of the one class declaration named `name` in `source`,
+/// through the strong anchor or, with the source slice withheld, the weak one.
+fn class_declaration_finding_id(source: &str, name: &str, weak: bool) -> PolicyFindingId {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "widget.ts")
+        .write(source)
+        .expect("write widget");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let policy_id = PolicyId::new("test.declaration-anchor").expect("policy id");
+    let query = CodeQuery::from_json(&json!({
+        "where": ["widget.ts"],
+        "match": { "kind": "class", "name": name },
+        "steps": [{ "op": "enclosing_decl" }],
+        "result_detail": "full"
+    }))
+    .expect("query");
+    let mut detailed = execute_code_query_detailed(
+        &analyzer,
+        &query,
+        brokk_bifrost_rql::structural::CodeQueryExecutionLimits::default(),
+        None,
+    );
+    assert_eq!(detailed.result.results.len(), 1, "{detailed:#?}");
+    let item = detailed.result.results.pop().expect("declaration result");
+    let mut evidence = UnitRowEvidence::project(&detailed.evidence.pop().expect("evidence"));
+    assert_eq!(evidence.domain, DetailedCodeQueryDomain::Declaration);
+    assert!(evidence.source_slice_sha256.is_some(), "{evidence:#?}");
+    if weak {
+        evidence.source_slice_sha256 = None;
+    }
+    let candidate = adapt_match_candidate(
+        &policy_id,
+        UnitRowItem::project(&item),
+        evidence,
+        &detailed.result.diagnostics,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+    )
+    .expect("candidate");
+    assert_eq!(
+        matches!(candidate.evidence.anchor(), MatchFindingAnchor::Weak(_)),
+        weak
+    );
+    candidate.id
+}
+
+#[brokk_bifrost_test_macros::hardwon(
+    "#9084: an edit inside a class gave its declaration-level finding a new id"
+)]
+#[test]
+fn declaration_finding_id_survives_body_edits_on_both_anchor_paths() {
+    let original = "export class Widget {\n  run() {}\n}\n";
+    // A line above shifts every coordinate; the body gains a doc comment, a
+    // changed statement and a new member.
+    let edited = "// header\n\nexport class Widget {\n  /** Docs. */\n  run() { return 1; }\n  stop() {}\n}\n";
+    let renamed = "export class Gadget {\n  run() {}\n}\n";
+    for weak in [false, true] {
+        let id = class_declaration_finding_id(original, "Widget", weak);
+        assert_eq!(
+            id,
+            class_declaration_finding_id(edited, "Widget", weak),
+            "weak={weak}"
+        );
+        assert_ne!(
+            id,
+            class_declaration_finding_id(renamed, "Gadget", weak),
+            "weak={weak}"
+        );
+    }
 }
 
 #[test]
@@ -1987,7 +2064,7 @@ fn invalid_owner_candidate_forces_weak_anchor() {
     assert!(matches!(OwnerCandidate::Rejected, OwnerCandidate::Rejected));
     let projected = UnitRowEvidence::project(&evidence);
     let path = workspace_relative_path(&projected.rel_path).expect("workspace-relative path");
-    let key = weak_finding_key(&projected, &path);
+    let key = weak_finding_key(weak_finding_digest(&projected, &path, None), 0);
     assert!(key.as_str().starts_with("code-query:"));
 }
 
@@ -2031,7 +2108,12 @@ fn weak_key_is_domain_and_span_separated() {
         runtime_keyed_read: None,
     };
     let path = WorkspaceRelativePath::new("src/app.ts").expect("path");
-    let key = |span| weak_finding_key(&UnitRowEvidence::project(&evidence(span)), &path);
+    let key = |span| {
+        weak_finding_key(
+            weak_finding_digest(&UnitRowEvidence::project(&evidence(span)), &path, None),
+            0,
+        )
+    };
     assert_ne!(key(0..4), key(5..9));
 }
 
@@ -2355,6 +2437,7 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
                             item.clone(),
                             tampered,
                             &[],
+                            &mut HashMap::new(),
                             &mut HashMap::new()
                         )
                         .is_err(),
@@ -2418,6 +2501,7 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
                                 invalid_item,
                                 invalid_detailed,
                                 &[],
+                                &mut HashMap::new(),
                                 &mut HashMap::new()
                             )
                             .is_err(),
@@ -2438,6 +2522,7 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
                         item.clone(),
                         wrong_endpoint,
                         &[],
+                        &mut HashMap::new(),
                         &mut HashMap::new()
                     )
                     .is_err(),
@@ -2450,6 +2535,7 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
                     truncated,
                     detailed.clone(),
                     &[],
+                    &mut HashMap::new(),
                     &mut HashMap::new(),
                 )
                 .unwrap();
@@ -2489,6 +2575,7 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
                     open_detailed,
                     &[],
                     &mut HashMap::new(),
+                    &mut HashMap::new(),
                 )
                 .unwrap();
                 assert!(
@@ -2503,6 +2590,7 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
                     item,
                     detailed,
                     &[],
+                    &mut HashMap::new(),
                     &mut HashMap::new(),
                 )
                 .unwrap();

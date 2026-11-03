@@ -1,17 +1,19 @@
 //! Pipeline execution for the `call_effects` and `procedure_effects` steps
 //! (issue #2437, slice 2).
 //!
-//! Both steps consume the analyzer's existing answers and add no new call-graph
-//! walker of their own:
+//! Both steps consume the analyzer's existing dispatch and active model answers.
+//! Native Rust and Go procedure effects use the shared execution composition
+//! search, with invocation ownership from validated semantic IR. That route
+//! preserves producer coverage, including uncertainty on retained named arms.
+//!
+//! Other languages retain the existing graph acquisition and solver:
 //!
 //! - the callee set of a call site is
 //!   [`crate::structural::search::semantic::SemanticQueryContext::dispatch_at_source_with_cause`],
 //!   the exact answer the `dispatch_outcome` and `dispatch_target` rows
 //!   publish, so an effect row's proof is copied rather than re-derived. The
-//!   site's candidate coverage is copied too, with the one reinterpretation
-//!   [`site_coverage`] states and justifies: the oracle spells "this callee has
-//!   no workspace definition" and "I found a residual I could not name" with
-//!   the same `Open`, and only the second is a missing callee;
+//!   existing path's coverage reinterpretation is under audit in #8971 and is
+//!   not used by the native execution client;
 //! - the call sites of a procedure are the facts arena's own call nodes inside
 //!   the declaration's range, the same nodes `call_shape` derives from, so an
 //!   effect row's `site_id` is literally a `call_shape` row id; and
@@ -23,6 +25,8 @@
 //! The algebra over those inputs — certainty meets, timing joins, coverage
 //! degradation, the bounded fixpoint — lives in
 //! [`crate::analyzer::usages::effects`] and is unit-tested without a workspace.
+
+mod compose;
 
 use super::dispatch::DispatchBoundaryClass;
 use super::*;
@@ -870,11 +874,11 @@ fn open_result_subject_use(
 /// Trace one ordinary result using the same alias closure as result contracts.
 /// Every establishment additionally needs Java reference-conversion evidence.
 /// This relation identifies a returned reference, never an allocation.
-pub(super) fn result_subject_use_expansions(
-    workspace: &WorkspaceAnalyzer,
+pub(super) fn result_subject_use_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     model_cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     result: &SemanticCallResultValue,
@@ -1502,109 +1506,14 @@ impl ResultUseIndex {
                 selected_callable: proof.selected_callable.clone(),
                 provider_selection: proof.provider_selection,
             };
-            let cached = proof
-                .proofs
-                .read(&memo_attribution(proof.analyzer), |proofs| {
-                    proofs.borrow().get(&proof_key).copied()
-                });
-            let exact = if let Some(exact) = cached {
-                exact
-                    && proof.cancellation.is_none_or(|token| !token.is_cancelled())
-                    && semantic.charge_consumer_traversal(
-                        proof.file,
-                        0,
-                        "Go result assignment type proof",
-                    )
-            } else {
-                let cancellation = proof.cancellation.cloned().unwrap_or_default();
-                let result_key = (proof.selected_callable.clone(), proof.provider_selection);
-                let result_types = proof
-                    .result_types
-                    .read(&memo_attribution(proof.analyzer), |memo| {
-                        memo.borrow().get(&result_key).cloned()
-                    });
-                let result_types = if let Some(cached) = result_types {
-                    cached
-                } else {
-                    let lowered = brokk_bifrost_go_analysis::analyzer::go_selected_callable_result_type_identities(
-                        proof.analyzer, proof.file, proof.selected_callable, &cancellation,
-                    );
-                    let types = lowered.and_then(|(types, work)| {
-                        semantic
-                            .charge_consumer_traversal(
-                                proof.file,
-                                work,
-                                "Go selected callable result lowering",
-                            )
-                            .then_some(types)
-                    });
-                    proof
-                        .result_types
-                        .read(&memo_attribution(proof.analyzer), |memo| {
-                            memo.borrow_mut().insert(result_key, types.clone())
-                        });
-                    types
-                };
-                let result_type = result_types
-                    .and_then(|types| types.get(result_ordinal as usize).copied().flatten());
-                let binding_key = (proof.file.clone(), binding_declaration, source_identity);
-                let binding_type = proof
-                    .binding_types
-                    .read(&memo_attribution(proof.analyzer), |memo| {
-                        memo.borrow().get(&binding_key).copied()
-                    });
-                let binding_type = if let Some(cached) = binding_type {
-                    cached
-                } else {
-                    use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
-                    let answer =
-                        brokk_bifrost_go_analysis::analyzer::go_explicit_binding_type_identity(
-                            proof.analyzer,
-                            proof.file,
-                            proof.source,
-                            binding_declaration,
-                            &cancellation,
-                        );
-                    let (ty, work) = match answer {
-                        BoundedResolution::Complete { value, work } => (value, work),
-                        BoundedResolution::Exceeded { work, .. }
-                        | BoundedResolution::Cancelled { work } => (None, work),
-                    };
-                    let work = work
-                        .setup_nodes
-                        .saturating_add(work.scope_nodes)
-                        .saturating_add(work.resolution_rounds)
-                        .saturating_add(work.summary_expansions);
-                    let ty = semantic
-                        .charge_consumer_traversal(
-                            proof.file,
-                            work,
-                            "Go explicit binding type resolution",
-                        )
-                        .then_some(ty)
-                        .flatten();
-                    proof
-                        .binding_types
-                        .read(&memo_attribution(proof.analyzer), |memo| {
-                            memo.borrow_mut().insert(binding_key, ty)
-                        });
-                    ty
-                };
-                let exact = !cancellation.is_cancelled()
-                    && result_type.is_some()
-                    && result_type == binding_type
-                    && semantic.charge_consumer_traversal(
-                        proof.file,
-                        0,
-                        "Go result assignment type proof",
-                    );
-                proof
-                    .proofs
-                    .read(&memo_attribution(proof.analyzer), |proofs| {
-                        proofs.borrow_mut().insert(proof_key, exact)
-                    });
-                exact
-            };
+            let exact = go_assignment_conversion_types_exact(
+                semantic,
+                &proof,
+                proof_key,
+                binding_declaration,
+                source_identity,
+                result_ordinal,
+            );
             if !exact {
                 return ExactResultAssignmentConversion::open();
             }
@@ -1723,6 +1632,162 @@ fn result_assignment_conversion_proof_context<'a>(
         binding_types,
         cancellation,
     })
+}
+
+fn go_assignment_conversion_types_exact(
+    semantic: &mut SemanticQueryContext<'_>,
+    proof: &ResultAssignmentConversionProofContext<'_>,
+    proof_key: ResultAssignmentConversionProofKey,
+    binding_declaration: Range,
+    source_identity: ContentIdentity,
+    result_ordinal: u32,
+) -> bool {
+    let cached = proof
+        .proofs
+        .read(&memo_attribution(proof.analyzer), |proofs| {
+            proofs.borrow().get(&proof_key).copied()
+        });
+    if let Some(exact) = cached {
+        if proof
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            proof.analyzer.record_query_incomplete(
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled,
+            );
+            false
+        } else {
+            exact
+                && semantic.charge_consumer_traversal(
+                    proof.file,
+                    0,
+                    "Go result assignment type proof",
+                )
+        }
+    } else {
+        let cancellation = proof.cancellation.cloned().unwrap_or_default();
+        let mut stopped = false;
+        let result_key = (proof.selected_callable.clone(), proof.provider_selection);
+        let result_types = proof
+            .result_types
+            .read(&memo_attribution(proof.analyzer), |memo| {
+                memo.borrow().get(&result_key).cloned()
+            });
+        let result_types = if let Some(cached) = result_types {
+            cached
+        } else {
+            let lowered =
+                brokk_bifrost_go_analysis::analyzer::go_selected_callable_result_type_identities(
+                    proof.analyzer,
+                    proof.file,
+                    proof.selected_callable,
+                    &cancellation,
+                );
+            let types = lowered.and_then(|(types, work)| {
+                let charged = semantic.charge_consumer_traversal(
+                    proof.file,
+                    work,
+                    "Go selected callable result lowering",
+                );
+                stopped |= !charged;
+                charged.then_some(types)
+            });
+            if let Some(types) = &types {
+                proof
+                    .result_types
+                    .read(&memo_attribution(proof.analyzer), |memo| {
+                        memo.borrow_mut().insert(result_key, Some(types.clone()))
+                    });
+            }
+            types
+        };
+        let result_types_present = result_types.is_some();
+        let result_type =
+            result_types.and_then(|types| types.get(result_ordinal as usize).copied().flatten());
+        let binding_key = (proof.file.clone(), binding_declaration, source_identity);
+        let binding_type = proof
+            .binding_types
+            .read(&memo_attribution(proof.analyzer), |memo| {
+                memo.borrow().get(&binding_key).copied()
+            });
+        let binding_type = if let Some(cached) = binding_type {
+            cached
+        } else {
+            use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+            let mut binding_stopped = false;
+            let answer = brokk_bifrost_go_analysis::analyzer::go_explicit_binding_type_identity(
+                proof.analyzer,
+                proof.file,
+                proof.source,
+                binding_declaration,
+                &cancellation,
+            );
+            let (ty, work) = match answer {
+                BoundedResolution::Complete { value, work } => (value, work),
+                BoundedResolution::Exceeded { limit, work } => {
+                    binding_stopped = true;
+                    proof.analyzer.record_query_incomplete(
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                            format!("Go explicit binding type resolution budget exceeded: {limit:?}").into(),
+                        ),
+                    );
+                    (None, work)
+                }
+                BoundedResolution::Cancelled { work } => {
+                    binding_stopped = true;
+                    proof.analyzer.record_query_incomplete(
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled,
+                    );
+                    (None, work)
+                }
+            };
+            let work = work
+                .setup_nodes
+                .saturating_add(work.scope_nodes)
+                .saturating_add(work.resolution_rounds)
+                .saturating_add(work.summary_expansions);
+            let charged = semantic.charge_consumer_traversal(
+                proof.file,
+                work,
+                "Go explicit binding type resolution",
+            );
+            binding_stopped |= !charged;
+            stopped |= binding_stopped;
+            let ty = charged.then_some(ty).flatten();
+            if !binding_stopped {
+                proof
+                    .binding_types
+                    .read(&memo_attribution(proof.analyzer), |memo| {
+                        memo.borrow_mut().insert(binding_key, ty)
+                    });
+            }
+            ty
+        };
+        let cancelled = cancellation.is_cancelled();
+        if cancelled && !stopped {
+            proof.analyzer.record_query_incomplete(
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled,
+            );
+        }
+        stopped |= cancelled;
+        let exact = !cancelled && result_type.is_some() && result_type == binding_type && {
+            let charged = semantic.charge_consumer_traversal(
+                proof.file,
+                0,
+                "Go result assignment type proof",
+            );
+            stopped |= !charged;
+            charged
+        };
+        if !stopped && result_types_present {
+            proof
+                .proofs
+                .read(&memo_attribution(proof.analyzer), |proofs| {
+                    proofs.borrow_mut().insert(proof_key, exact)
+                });
+        }
+        exact
+    }
 }
 
 #[derive(Default)]
@@ -2331,6 +2396,51 @@ impl EffectTraversalCache {
             models: CaptureScopedMemo::new(Some(models)),
             ..Self::default()
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn facts_for_effects(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        semantic: &mut SemanticQueryContext<'_>,
+        file: &ProjectFile,
+        budget: &mut CodeQueryExecutionBudget,
+        limits: CodeQueryExecutionLimits,
+        cancellation: Option<&CancellationToken>,
+        diagnostics: &mut Vec<CodeQueryDiagnostic>,
+        cache_profile: &mut Option<QueryCacheProfile>,
+    ) -> Option<Arc<FileFacts>> {
+        if let Some(facts) = self.facts.read(&memo_attribution(analyzer), |facts| {
+            facts.get(file).cloned()
+        }) {
+            return facts;
+        }
+        semantic.effect_work.source_acquisitions =
+            semantic.effect_work.source_acquisitions.saturating_add(1);
+        let resolved = match receiver::receiver_facts_for_pipeline_row(
+            analyzer,
+            &[],
+            file,
+            &mut HashMap::default(),
+            budget,
+            limits,
+            cancellation,
+            diagnostics,
+            cache_profile,
+        ) {
+            PipelineReceiverFacts::Available(facts) => {
+                semantic.effect_work.source_bytes = semantic
+                    .effect_work
+                    .source_bytes
+                    .saturating_add(facts.source().len() as u64);
+                Some(facts)
+            }
+            PipelineReceiverFacts::Unavailable | PipelineReceiverFacts::Halted => None,
+        };
+        self.facts.read_mut(&memo_attribution(analyzer), |facts| {
+            facts.insert(file.clone(), resolved.clone())
+        });
+        resolved
     }
 
     fn models(&mut self, analyzer: &dyn IAnalyzer) -> Option<Arc<ResolvedActiveSemanticModels>> {
@@ -3558,12 +3668,12 @@ fn prepare_result_operation_call_lookups(
 /// set; selecting one modeled arm out of a dynamic call would turn pack order
 /// into semantics.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn call_result_contract_expansions(
+pub(super) fn call_result_contract_expansions<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     shape: &CallShapeValue,
@@ -4939,6 +5049,7 @@ fn native_go_call_result_obligation_expansions(
                     &outcome.file,
                     outcome.range,
                     result_ordinal,
+                    semantic.cancellation(),
                 )
                     },
                 );
@@ -4955,12 +5066,19 @@ fn native_go_call_result_obligation_expansions(
             reason = Some("dispatch_open");
         }
 
-        let coverage =
+        let mut coverage =
             use_coverage.meet(if native_obligation.is_some() && answer.arms.is_empty() {
                 EffectCoverage::Exhaustive
             } else {
                 native_dispatch_coverage
             });
+        if !answer.arms.is_empty()
+            && !all_arm_signatures_known
+            && native_obligation.is_none()
+            && excluded_reason.is_none()
+        {
+            coverage = coverage.meet(EffectCoverage::Open);
+        }
         let row = CallResultObligationValue {
             file: outcome.file.clone(),
             range: outcome.range,
@@ -7342,12 +7460,12 @@ fn result_use_row_id(site_id: &str, result_ordinal: u32) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_result_contract_value_uses(
+fn validate_result_contract_value_uses<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -7389,12 +7507,12 @@ fn validate_result_contract_value_uses(
 /// fields are populated. Model projection and lifecycle composition therefore
 /// do not inherit incompleteness from a consumer they did not request.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn result_contract_use_expansions(
+pub(super) fn result_contract_use_expansions<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -7432,12 +7550,12 @@ pub(super) fn result_contract_use_expansions(
 /// reviewed no-precondition operations carry `not_required` and can never be
 /// selected as an unguarded use.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn result_contract_operation_use_expansions(
+pub(super) fn result_contract_operation_use_expansions<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -7624,12 +7742,12 @@ pub(super) fn nilness_supports_dialect(dialect: crate::analyzer::LanguageDialect
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn nilness_operation_expansions(
+pub(super) fn nilness_operation_expansions<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -9023,12 +9141,12 @@ fn open_result_contract_failure_use_expansions(
 /// Project structured return and call-argument values that execute inside the
 /// exact failure arm of a reviewed conditional result contract.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn result_contract_failure_use_expansions(
+pub(super) fn result_contract_failure_use_expansions<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     filter: &crate::query::ResultContractFailureUseFilter,
@@ -9401,12 +9519,12 @@ struct ResultSuccessGuardSubject {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn result_contract_success_guards(
+fn result_contract_success_guards<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     model_cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     cancellation: Option<&CancellationToken>,
     file: &ProjectFile,
     range: Range,
@@ -12304,12 +12422,12 @@ fn conditional_predicate_use_answer(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_result_contract_uses(
+fn validate_result_contract_uses<'a>(
     analyzer: &dyn IAnalyzer,
-    workspace: &WorkspaceAnalyzer,
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     model_cache: &mut EffectTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     file: &ProjectFile,
@@ -14124,6 +14242,8 @@ struct DispatchedArms {
 /// this association intact prevents a nested callable's source-contained call
 /// from becoming an edge of its lexical parent.
 struct DispatchedArm {
+    /// Index into the same cached oracle answer, before effect-row sorting.
+    dispatch_index: usize,
     effect: CallEffectArm,
     call_context: usize,
     callee: Option<CodeUnit>,
@@ -14200,19 +14320,16 @@ fn external_arm_lookup(
     (lookup, Some(leaf))
 }
 
-/// Run dispatch at one call range and pair every arm with its pack answer.
-fn dispatch_arms(
+/// Pair retained dispatch arms with their authored declarations. Coverage
+/// adjudication remains separate so the native client can preserve the
+/// producer's exact coverage and residuals.
+fn classify_dispatch_arms(
     analyzer: &dyn IAnalyzer,
-    semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
-    diagnostics: &mut Vec<CodeQueryDiagnostic>,
-    file: &ProjectFile,
-    range: Range,
-) -> DispatchedArms {
-    let (answer, dispatch_incompleteness) =
-        cache.dispatch_at_source_with_cause(semantic, file, range);
+    answer: &super::dispatch::DispatchSiteAnswer,
+) -> Vec<DispatchedArm> {
     let mut arms = Vec::with_capacity(answer.arms.len());
-    for arm in &answer.arms {
+    for (dispatch_index, arm) in answer.arms.iter().enumerate() {
         let callee = arm.target_unit.clone();
         let mut external_callee = None;
         let proof = if arm.proof == "proven" {
@@ -14269,6 +14386,7 @@ fn dispatch_arms(
             },
         };
         arms.push(DispatchedArm {
+            dispatch_index,
             effect: CallEffectArm {
                 target_id: arm.target_id.clone(),
                 callee_declaration_id: declaration_id,
@@ -14287,6 +14405,21 @@ fn dispatch_arms(
         (&left.effect.target_id, left.call_context)
             .cmp(&(&right.effect.target_id, right.call_context))
     });
+    arms
+}
+
+/// Run dispatch at one call range and pair every arm with its pack answer.
+fn dispatch_arms(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    file: &ProjectFile,
+    range: Range,
+) -> DispatchedArms {
+    let (answer, dispatch_incompleteness) =
+        cache.dispatch_at_source_with_cause(semantic, file, range);
+    let arms = classify_dispatch_arms(analyzer, cache, &answer);
     // The site's coverage is read after the arms are classified: whether an
     // unresolved residual is discharged depends on what the activated packs
     // answered for the arms beside it.
@@ -14523,8 +14656,32 @@ fn procedure_effect_expansions_for_root(
     let report = match cache.reports.read(&memo_attribution(analyzer), |reports| {
         reports.get(&identity).cloned()
     }) {
-        Some(report) => report,
+        Some(report) => {
+            semantic.effect_work.request_hits = semantic.effect_work.request_hits.saturating_add(1);
+            report
+        }
+        None if compose::admitted(declaration) => {
+            let report = compose::report(
+                semantic,
+                cache,
+                budget,
+                limits,
+                cancellation,
+                diagnostics,
+                cache_profile,
+                declaration,
+                root_procedure,
+                &identity,
+            );
+            cache
+                .reports
+                .read_mut(&memo_attribution(analyzer), |reports| {
+                    reports.insert(identity.clone(), Arc::clone(&report));
+                });
+            report
+        }
         None => {
+            semantic.effect_work.acquisitions = semantic.effect_work.acquisitions.saturating_add(1);
             let graph = discover_effect_graph(
                 analyzer,
                 semantic,
@@ -14538,7 +14695,56 @@ fn procedure_effect_expansions_for_root(
                 root_procedure,
                 ProcedureEffectBudget::default(),
             );
-            let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+            semantic.effect_work.acquired_procedures = semantic
+                .effect_work
+                .acquired_procedures
+                .saturating_add(graph.procedures.len() as u64);
+            semantic.effect_work.acquired_edges = semantic
+                .effect_work
+                .acquired_edges
+                .saturating_add(graph.edges.len() as u64);
+            let summary = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+            semantic.effect_work.scc_node_visits = semantic
+                .effect_work
+                .scc_node_visits
+                .saturating_add(summary.work.scc_node_visits);
+            semantic.effect_work.scc_edge_visits = semantic
+                .effect_work
+                .scc_edge_visits
+                .saturating_add(summary.work.scc_edge_visits);
+            semantic.effect_work.scc_components = semantic
+                .effect_work
+                .scc_components
+                .saturating_add(summary.work.scc_components);
+            semantic.effect_work.propagation_rounds = semantic
+                .effect_work
+                .propagation_rounds
+                .saturating_add(summary.work.propagation_rounds);
+            semantic.effect_work.propagation_node_visits = semantic
+                .effect_work
+                .propagation_node_visits
+                .saturating_add(summary.work.propagation_node_visits);
+            semantic.effect_work.propagation_edge_visits = semantic
+                .effect_work
+                .propagation_edge_visits
+                .saturating_add(summary.work.propagation_edge_visits);
+            semantic.effect_work.inherited_effect_candidates = semantic
+                .effect_work
+                .inherited_effect_candidates
+                .saturating_add(summary.work.inherited_effect_candidates);
+            semantic.effect_work.coverage_rounds = semantic
+                .effect_work
+                .coverage_rounds
+                .saturating_add(summary.work.coverage_rounds);
+            semantic.effect_work.coverage_edge_visits = semantic
+                .effect_work
+                .coverage_edge_visits
+                .saturating_add(summary.work.coverage_edge_visits);
+            semantic.effect_work.projected_rows = semantic
+                .effect_work
+                .projected_rows
+                .saturating_add(summary.work.projected_rows);
+            let reports = summary.reports;
             let mut selected = None;
             for report in reports {
                 let report = Arc::new(report);
@@ -14780,32 +14986,16 @@ fn discover_effect_graph(
             continue;
         }
         let file = unit.source().clone();
-        let facts = match cache.facts.read(&memo_attribution(analyzer), |facts| {
-            facts.get(&file).cloned()
-        }) {
-            Some(facts) => facts,
-            None => {
-                let resolved = match receiver::receiver_facts_for_pipeline_row(
-                    analyzer,
-                    &[],
-                    &file,
-                    &mut HashMap::default(),
-                    budget,
-                    limits,
-                    cancellation,
-                    diagnostics,
-                    cache_profile,
-                ) {
-                    PipelineReceiverFacts::Available(facts) => Some(facts),
-                    PipelineReceiverFacts::Unavailable | PipelineReceiverFacts::Halted => None,
-                };
-                cache.facts.read_mut(&memo_attribution(analyzer), |facts| {
-                    facts.insert(file.clone(), resolved.clone())
-                });
-                resolved
-            }
-        };
-        let Some(facts) = facts else {
+        let Some(facts) = cache.facts_for_effects(
+            analyzer,
+            semantic,
+            &file,
+            budget,
+            limits,
+            cancellation,
+            diagnostics,
+            cache_profile,
+        ) else {
             continue;
         };
         let static_const_initializer_calls =
@@ -15618,6 +15808,234 @@ func inspect(input *item) (result int) {
             arms: Vec::new(),
             call_application: ModeledCallApplication::Unknown,
             coverage: ModeledCallTargetCoverage::Unmodeled,
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "b82b65513132: a memoized stopped Go assignment proof replayed without its typed cause"
+    )]
+    fn stopped_go_assignment_proof_replays_its_cause_in_one_memo_owner() {
+        use crate::analyzer::i_analyzer::capture_read_execution_cause;
+        use crate::analyzer::read_ledger::{DerivationExecutionCause, ReadLedger};
+
+        let source = "package p\nfunc f() { var err error; _ = err }\n";
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("main.go", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let file = project.file("main.go");
+        let ledger = Arc::new(ReadLedger::new());
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut semantic = SemanticQueryContext::new(
+            &workspace,
+            Some(&cancellation),
+            CodeQuerySemanticLimits::default(),
+        );
+        let cache = EffectTraversalCache::default();
+        let modeled_target = ModeledProcedureKey {
+            language: "go".to_owned(),
+            owner: "p".to_owned(),
+            member: "f".to_owned(),
+            has_receiver: false,
+            parameter_count: 0,
+        };
+        let selected_callable = ModelSymbolRef {
+            symbol_id: "f".into(),
+            provider: ModelProvider {
+                pack_id: "test".into(),
+                pack_version: "1".into(),
+                pack_digest: "test".into(),
+            },
+        };
+        let provider_selection = [0; 32];
+        let source_identity = ContentIdentity::hash_bytes(source.as_bytes());
+        let binding_start = "package p\nfunc f() { var ".len();
+        let binding_declaration = Range {
+            start_byte: binding_start,
+            end_byte: binding_start + 3,
+            start_line: 2,
+            end_line: 2,
+        };
+        {
+            let _query = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            cache
+                .go_result_types
+                .read(&memo_attribution(analyzer), |memo| {
+                    memo.borrow_mut().insert(
+                        (selected_callable.clone(), provider_selection),
+                        Some(vec![None]),
+                    );
+                });
+        }
+        let proof = ResultAssignmentConversionProofContext {
+            analyzer,
+            file: &file,
+            source,
+            source_identities: &cache.exact_source_identities,
+            modeled_target: &modeled_target,
+            selected_callable: &selected_callable,
+            provider_selection,
+            cancellation: Some(&cancellation),
+            proofs: &cache.result_assignment_conversion_proofs,
+            result_types: &cache.go_result_types,
+            binding_types: &cache.go_binding_types,
+        };
+        let proof_key = ResultAssignmentConversionProofKey {
+            file: file.clone(),
+            modeled_target: modeled_target.clone(),
+            selected_callable: selected_callable.clone(),
+            provider_selection,
+            result_ordinal: 0,
+            binding_declaration,
+            source_identity,
+        };
+        for _ in 0..2 {
+            let _query = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            let (exact, cause) = capture_read_execution_cause(analyzer, || {
+                go_assignment_conversion_types_exact(
+                    &mut semantic,
+                    &proof,
+                    proof_key.clone(),
+                    binding_declaration,
+                    source_identity,
+                    0,
+                )
+            });
+            assert!(!exact);
+            assert_eq!(cause, Some(DerivationExecutionCause::Cancelled));
+        }
+
+        let live = CancellationToken::default();
+        let canonical = {
+            let _query = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            match brokk_bifrost_go_analysis::analyzer::go_explicit_binding_type_identity(
+                analyzer,
+                &file,
+                source,
+                binding_declaration,
+                &live,
+            ) {
+                brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete {
+                    value: Some(identity), ..
+                } => identity,
+                other => panic!("explicit error binding needs a canonical identity: {other:?}"),
+            }
+        };
+        {
+            let _query = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            cache
+                .go_result_types
+                .read(&memo_attribution(analyzer), |memo| {
+                    memo.borrow_mut().insert(
+                        (selected_callable.clone(), provider_selection),
+                        Some(vec![Some(canonical)]),
+                    );
+                });
+        }
+        let warm_proof = ResultAssignmentConversionProofContext {
+            cancellation: Some(&live),
+            ..proof
+        };
+        let mut warm_semantic =
+            SemanticQueryContext::new(&workspace, Some(&live), CodeQuerySemanticLimits::default());
+        {
+            let _query = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            let (exact, cause) = capture_read_execution_cause(analyzer, || {
+                go_assignment_conversion_types_exact(
+                    &mut warm_semantic,
+                    &warm_proof,
+                    proof_key.clone(),
+                    binding_declaration,
+                    source_identity,
+                    0,
+                )
+            });
+            assert!(
+                exact,
+                "the explicit error binding matches its modeled result"
+            );
+            assert_eq!(cause, None);
+            assert_eq!(
+                cache
+                    .result_assignment_conversion_proofs
+                    .read(&memo_attribution(analyzer), |memo| {
+                        memo.borrow().get(&proof_key).copied()
+                    }),
+                Some(true),
+            );
+        }
+        live.cancel();
+        {
+            let _query = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            let (exact, cause) = capture_read_execution_cause(analyzer, || {
+                go_assignment_conversion_types_exact(
+                    &mut warm_semantic,
+                    &warm_proof,
+                    proof_key.clone(),
+                    binding_declaration,
+                    source_identity,
+                    0,
+                )
+            });
+            assert!(!exact);
+            assert_eq!(cause, Some(DerivationExecutionCause::Cancelled));
+        }
+
+        let live_false = CancellationToken::default();
+        let false_proof = ResultAssignmentConversionProofContext {
+            cancellation: Some(&live_false),
+            ..proof
+        };
+        let false_key = ResultAssignmentConversionProofKey {
+            result_ordinal: 1,
+            ..proof_key
+        };
+        let mut false_semantic = SemanticQueryContext::new(
+            &workspace,
+            Some(&live_false),
+            CodeQuerySemanticLimits::default(),
+        );
+        {
+            let _query = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            let (exact, cause) = capture_read_execution_cause(analyzer, || {
+                go_assignment_conversion_types_exact(
+                    &mut false_semantic,
+                    &false_proof,
+                    false_key.clone(),
+                    binding_declaration,
+                    source_identity,
+                    1,
+                )
+            });
+            assert!(!exact);
+            assert_eq!(cause, None);
+            assert_eq!(
+                cache
+                    .result_assignment_conversion_proofs
+                    .read(&memo_attribution(analyzer), |memo| {
+                        memo.borrow().get(&false_key).copied()
+                    }),
+                Some(false),
+            );
+        }
+        live_false.cancel();
+        {
+            let _query = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            let (exact, cause) = capture_read_execution_cause(analyzer, || {
+                go_assignment_conversion_types_exact(
+                    &mut false_semantic,
+                    &false_proof,
+                    false_key.clone(),
+                    binding_declaration,
+                    source_identity,
+                    1,
+                )
+            });
+            assert!(!exact);
+            assert_eq!(cause, Some(DerivationExecutionCause::Cancelled));
         }
     }
 

@@ -100,6 +100,11 @@ pub(super) fn call_declaration_expansions(
     cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::Callers(_));
+    if incoming {
+        // A newly registered caller can change a negative membership result
+        // even when the current caller files and their blobs are unchanged.
+        analyzer.record_read(analyzer.workspace_scope_read_key(&Language::ANALYZABLE));
+    }
     let declared_non_exhaustive = incoming
         && filter.completeness == brokk_bifrost_rql::CallTraversalCompleteness::ProvenSubset;
     let diagnostic_start = diagnostics.len();

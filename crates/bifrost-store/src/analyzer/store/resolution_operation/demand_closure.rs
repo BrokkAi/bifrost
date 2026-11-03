@@ -48,7 +48,7 @@ pub(super) fn closer_step(
     !cancellation.is_cancelled() && session.scope_step()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[doc(hidden)]
 pub struct HalfId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -67,6 +67,7 @@ pub struct ProofId(pub usize);
 pub struct RootFrame {
     pub(super) query_obligations: crate::analyzer::resolution::QueryObligations,
     pub(super) endpoint: EndpointSignature,
+    pub(super) relation: DemandRelationKey,
     pub(super) sources: Box<[RootSource]>,
     pub(super) halves: Vec<SelectedRootPathHalf>,
     pub(super) context: Option<ContextId>,
@@ -89,6 +90,7 @@ impl RootFrame {
     ) -> Self {
         Self {
             query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
+            relation: DemandRelationKey::caller(endpoint.clone()),
             endpoint,
             sources,
             halves,
@@ -115,16 +117,19 @@ pub struct PrefixOperand {
     pub source_halves: Box<[HalfId]>,
 }
 
+#[derive(Clone, Copy)]
 #[doc(hidden)]
 pub struct PrefixAnswer<'a> {
     pub key: PrefixKey,
     pub answer: &'a FactResolutionAnswer,
 }
 /// Only one keyed prefix's selected material and unjoined evidence. The answer
-/// supplies exact binding targets, binding-projection kinds and typed frontiers;
-/// no root, sibling answer, or member completion is exposed to this hook.
+/// supplies exact binding targets, binding-projection kinds and typed frontiers.
+/// The endpoint identifies the consuming route; no root frame, sibling answer,
+/// or member completion is exposed to this hook.
 #[doc(hidden)]
 pub struct PrefixCompletionInput<'a> {
+    pub endpoint: &'a EndpointSignature,
     pub key: PrefixKey,
     pub raw: &'a ResolutionCompletion,
     pub selected: &'a FactResolutionAnswer,
@@ -137,6 +142,7 @@ pub struct ResolvedPrefixOperand {
     pub operand: PrefixOperand,
     pub answer: FactResolutionAnswer,
 }
+#[derive(Clone, Copy)]
 #[doc(hidden)]
 pub struct PrefixAnswers<'a> {
     pub entries: &'a [PrefixAnswer<'a>],
@@ -862,6 +868,7 @@ pub struct SourceHalf {
     pub token: SemanticId,
     pub demand: ResolutionLookupSemanticRecipe,
     pub route: Vec<ResolutionLookupSemanticRecipe>,
+    pub walk_route: Vec<ResolutionLookupSemanticRecipe>,
     pub anchor: ResolutionRootImportAnchor,
     pub anchor_semantic: SemanticId,
     pub prefix: Option<SemanticId>,
@@ -1215,6 +1222,17 @@ pub trait HalfRules {
     ) -> impl RouteRules<ClosureTag> + 'a {
         EmptyHalf
     }
+    fn positioned_route_target(
+        &self,
+        cursor: &WalkCursor<ClosureTag>,
+        rank: Option<&Self::Rank>,
+        scope: Option<ResolutionScopeId>,
+    ) -> Self::Target {
+        self.route_target(cursor.location.clone(), rank, scope)
+    }
+    fn take_positioned_alternatives(&self) -> Vec<PositionedRouteAlternative> {
+        Vec::new()
+    }
     fn route_target(
         &self,
         _: RouteLocation,
@@ -1378,6 +1396,10 @@ impl HalfRules for OpenHalf {
 
 #[doc(hidden)]
 pub struct ClosureFacts<'a> {
+    /// Reduced positioned inventories must prove absence before a language can
+    /// certify an authoritative empty source route. Positive candidates keep
+    /// their own proofs; this is not source-half completion evidence.
+    pub positioned_absence_closed: bool,
     pub witness: &'a ClosureWitness,
     pub members: Option<&'a DemandMemberSelection>,
     pub generated: &'a [(CandidatePathIdentity, SourceDemandKey)],
@@ -1421,6 +1443,7 @@ impl ClosureFacts<'_> {
 
 #[doc(hidden)]
 pub struct HalfClosureFacts {
+    pub keeps_complete_terminal: bool,
     pub providers: Box<[crate::analyzer::resolution::HierarchyProviderObservation]>,
     pub member_reads: Box<[MemberReadObservation]>,
     pub placements: Box<[PlacementObservation]>,
@@ -1512,6 +1535,8 @@ pub struct ProviderRows {
 }
 
 pub(super) struct RouteClosure<K = ()> {
+    pub positioned_absence_closed: bool,
+    pub query_scope: ClosedQueryScope,
     pub endpoint_completion: Option<ResolutionCompletion>,
     pub disposition: RouteDisposition,
     pub preparation: Option<K>,
@@ -1587,6 +1612,15 @@ impl ClosurePolicy {
         }
     }
     pub(crate) fn with_query_scope(mut self, scope: ClosedQueryScope) -> Self {
+        // Terminal facts only promote positioned openings. A scope with neither
+        // openings nor obligations must not enroll unrelated language routes in
+        // reference refinement merely because their half was closed.
+        if scope.positioned_open.is_empty()
+            && scope.pending_query_obligations.is_empty()
+            && scope.query_obligations.is_empty()
+        {
+            return self;
+        }
         self.query_scope
             .get_or_insert_with(Default::default)
             .merge(scope);
@@ -1758,6 +1792,13 @@ pub struct QualifiedMembers<'a>(
 
 #[doc(hidden)]
 pub trait DemandRules {
+    fn source_prefix_namespace(
+        &self,
+        _half: &SelectedRootPathHalf,
+    ) -> Result<Option<ResolutionNamespace>> {
+        Ok(None)
+    }
+
     fn qualified_members(&mut self) -> Option<QualifiedMembers<'_>> {
         None
     }
@@ -1959,8 +2000,12 @@ pub trait DemandRules {
         Ok(Read::ready(Vec::new()))
     }
     /// Existing selection of raw evidence, before language normalization.
-    fn raw_prefix_completion(&self, answer: &FactResolutionAnswer) -> ResolutionCompletion {
-        answer.completion().clone()
+    fn raw_prefix_completion(
+        &self,
+        _endpoint: &EndpointSignature,
+        prefix: PrefixAnswer<'_>,
+    ) -> ResolutionCompletion {
+        prefix.answer.completion().clone()
     }
     /// Retain a subset of this prefix's raw reasons. None means the selected
     /// provenance read was cancelled; errors propagate without publication.
@@ -2359,7 +2404,7 @@ where
             );
             let evidence = frame
                 .prefix_evidence_with(inputs, |prefix| {
-                    self.rules.raw_prefix_completion(prefix.answer)
+                    self.rules.raw_prefix_completion(&frame.endpoint, prefix)
                 })
                 .combine(member_completion);
             if self.cancellation.is_cancelled() || !self.session.scope_step() {
@@ -2404,6 +2449,10 @@ where
         endpoint: &EndpointSignature,
     ) -> Result<LanguageRootDiscovery<RootFrame>> {
         discover_root(self, endpoint)
+    }
+    fn bind_relation(&self, frame: &mut RootFrame, relation: &DemandRelationKey) {
+        assert_eq!(frame.endpoint, relation.endpoint);
+        frame.relation = relation.clone();
     }
     fn context_key(&self, frame: &RootFrame) -> Option<ContextId> {
         self.rules.context_identity(frame)
@@ -2464,7 +2513,7 @@ where
     ) -> Result<LanguageClosure> {
         let evidence = frame
             .prefix_evidence_with(inputs, |prefix| {
-                self.rules.raw_prefix_completion(prefix.answer)
+                self.rules.raw_prefix_completion(&frame.endpoint, prefix)
             })
             .combine(&selection.completion);
         if self.cancellation.is_cancelled() || !self.session.scope_step() {
@@ -2528,7 +2577,7 @@ where
     ) -> Result<LanguageClosure> {
         let evidence = frame
             .prefix_evidence_with(inputs, |prefix| {
-                self.rules.raw_prefix_completion(prefix.answer)
+                self.rules.raw_prefix_completion(&frame.endpoint, prefix)
             })
             .combine(member_completion);
         if self.cancellation.is_cancelled() || !self.session.scope_step() {
@@ -2595,6 +2644,7 @@ impl RootFrame {
         Self {
             query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
             endpoint: endpoint.clone(),
+            relation: DemandRelationKey::caller(endpoint.clone()),
             sources: (0..halves.len())
                 .map(|index| RootSource::Positioned {
                     key: source,
@@ -2650,11 +2700,11 @@ impl RootFrame {
     ) -> Result<Option<ResolutionCompletion>> {
         let mut stop = None;
         let evidence = self.prefix_evidence_with(inputs, |prefix| {
-            let raw = rules.raw_prefix_completion(prefix.answer);
+            let raw = rules.raw_prefix_completion(&self.endpoint, prefix);
             // After a cancelled/failed read retain all remaining raw evidence,
             // but never run another language normalization or selected read.
             if stop.is_some() { return raw; }
-            match rules.prefix_completion(PrefixCompletionInput { key: prefix.key, raw: &raw, selected: prefix.answer }) {
+            match rules.prefix_completion(PrefixCompletionInput { endpoint: &self.endpoint, key: prefix.key, raw: &raw, selected: prefix.answer }) {
                 Ok(Some(retained)) => {
                     if retained != raw && let ResolutionCompletion::Incomplete(reasons) = &retained {
                         assert!(reasons.iter().all(|reason| raw.contains_reason(*reason)),
@@ -2961,6 +3011,176 @@ mod tests {
 
     use crate::analyzer::resolution::PartialPathId;
     use crate::analyzer::resolution::StackPattern;
+
+    #[test]
+    fn provider_frame_only_positioned_opening_survives_query_scope_guard() {
+        let owner = RouteAlternativeOwner::ProviderFrame(DemandRelationKey::caller(
+            EndpointSignature::new(
+                BindingNodeId::universal_root(),
+                StackPattern::closed([SemanticId::for_test("frame-only-lookup")]),
+                StackPattern::closed(Vec::<BindingNodeId>::new()),
+            ),
+        ));
+        let reason = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(
+            "frame-only-opening",
+        ));
+        let mut completion = ResolutionCompletion::Complete;
+        let mut scope = ClosedQueryScope::default();
+        let mut absence_closed = true;
+        reduce_positioned_alternatives(
+            vec![PositionedRouteAlternative {
+                position: RouteAlternativePosition {
+                    owner: owner.clone(),
+                    consumed_prefix_segments: 0,
+                    start_step: 0,
+                    namespace: ResolutionNamespace::Type,
+                    qualifier: RouteLocation::Container {
+                        unit: 0,
+                        container: "java.io".to_owned(),
+                    },
+                    name: "File".to_owned(),
+                },
+                tier: 0,
+                outcome: PositionedRouteOutcome::OpenEmpty(RouteOpenOutcome {
+                    reducible: false,
+                    reason,
+                    pending: None,
+                }),
+            }],
+            &mut completion,
+            &mut scope,
+            &mut absence_closed,
+            false,
+        );
+        let (_, retained) = ClosurePolicy::new(
+            completion,
+            BaseEligibility::Retain,
+            DemandClosureDischarges::default(),
+            Box::new([]),
+        )
+        .with_query_scope(scope)
+        .into_carriers();
+        assert_eq!(retained.unwrap().positioned_open, vec![(owner, reason)]);
+    }
+
+    #[test]
+    fn positioned_package_partial_and_proven_empty_respect_precedence() {
+        let position = RouteAlternativePosition {
+            owner: RouteAlternativeOwner::Half(HalfId(0)),
+            consumed_prefix_segments: 2,
+            start_step: 0,
+            namespace: ResolutionNamespace::Type,
+            qualifier: RouteLocation::Container {
+                unit: 0,
+                container: "library".to_owned(),
+            },
+            name: "Owner".to_owned(),
+        };
+        let reason = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(
+            "jvm-package-provider-partial",
+        ));
+        // Missing unit metadata is not discharged by any provider support.
+        for reducible in [true, false] {
+            for support in [None, Some(0), Some(1), Some(2)] {
+                let mut alternatives = vec![PositionedRouteAlternative {
+                    position: position.clone(),
+                    tier: 1,
+                    outcome: PositionedRouteOutcome::OpenEmpty(RouteOpenOutcome {
+                        reducible,
+                        reason,
+                        pending: None,
+                    }),
+                }];
+                if let Some(tier) = support {
+                    alternatives.push(PositionedRouteAlternative {
+                        position: position.clone(),
+                        tier,
+                        outcome: PositionedRouteOutcome::Supported(PositiveRouteSupport::Exports {
+                            complete: true,
+                        }),
+                    });
+                }
+                let mut completion = ResolutionCompletion::Complete;
+                let mut scope = ClosedQueryScope::default();
+                let mut absence = true;
+                reduce_positioned_alternatives(
+                    alternatives,
+                    &mut completion,
+                    &mut scope,
+                    &mut absence,
+                    false,
+                );
+                let reduced = reducible && support.is_some_and(|tier| tier <= 1);
+                assert_eq!(
+                    completion == ResolutionCompletion::Complete,
+                    reduced,
+                    "support tier {support:?}"
+                );
+                assert_eq!(absence, reduced, "support tier {support:?}");
+                if !reduced {
+                    assert!(
+                        completion.contains_reason(reason),
+                        "a lower-tier target must never strip Partial: {completion:?}"
+                    );
+                }
+                assert!(scope.pending_query_obligations.is_empty());
+            }
+        }
+        let mut completion = ResolutionCompletion::Complete;
+        let mut scope = ClosedQueryScope::default();
+        let mut absence = true;
+        reduce_positioned_alternatives(
+            vec![PositionedRouteAlternative {
+                position: position.clone(),
+                tier: 1,
+                outcome: PositionedRouteOutcome::Closed,
+            }],
+            &mut completion,
+            &mut scope,
+            &mut absence,
+            false,
+        );
+        assert_eq!(completion, ResolutionCompletion::Complete);
+        assert!(absence);
+        assert!(scope.pending_query_obligations.is_empty());
+
+        // A complete terminal from another package keeps the target, but
+        // cannot reduce this mounted package's Partial inventory.
+        let mut other_package = position.clone();
+        other_package.qualifier = RouteLocation::Container {
+            unit: 0,
+            container: "com.acme".to_owned(),
+        };
+        let mut completion = ResolutionCompletion::Complete;
+        let mut scope = ClosedQueryScope::default();
+        let mut absence = true;
+        reduce_positioned_alternatives(
+            vec![
+                PositionedRouteAlternative {
+                    position,
+                    tier: 1,
+                    outcome: PositionedRouteOutcome::OpenEmpty(RouteOpenOutcome {
+                        reducible: true,
+                        reason,
+                        pending: None,
+                    }),
+                },
+                PositionedRouteAlternative {
+                    position: other_package,
+                    tier: 1,
+                    outcome: PositionedRouteOutcome::Supported(PositiveRouteSupport::Exports {
+                        complete: true,
+                    }),
+                },
+            ],
+            &mut completion,
+            &mut scope,
+            &mut absence,
+            true,
+        );
+        assert!(completion.contains_reason(reason));
+        assert!(!absence);
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -3326,6 +3546,7 @@ mod tests {
             demand: SemanticId::for_test("demand"),
         };
         let half = |number, prefix| SelectedRootPathHalf::Reference {
+            source_origin: Default::default(),
             identity: CandidatePathIdentity::new(fragment, PartialPathId::context_local(number)),
             source_reference: BindingNodeId::for_test("reference"),
             source_scope_head: BindingNodeId::for_test("source-scope"),
@@ -4137,7 +4358,18 @@ fn decode_source_half(
     else {
         return Ok(None);
     };
+    let mut walk_route = route.clone();
+    if let Some(namespace) = shared.rules.source_prefix_namespace(half)? {
+        for prefix in &mut walk_route {
+            *prefix = ResolutionLookupSemanticRecipe::new_in_domain(
+                prefix.identity_domain(),
+                namespace,
+                prefix.spelling(),
+            );
+        }
+    }
     Ok(Some(SourceHalf {
+        walk_route,
         identity,
         scope,
         token,
@@ -4302,6 +4534,8 @@ pub(super) fn deadend_bridge(
 }
 
 struct SourceAccumulator {
+    positioned_absence_closed: bool,
+    query_scope: ClosedQueryScope,
     endpoint_completion: Option<ResolutionCompletion>,
     descriptors: Vec<SelectedRootBridgeDescriptor>,
     associations: Vec<ContextAssociation>,
@@ -4315,6 +4549,8 @@ struct SourceAccumulator {
 impl Default for SourceAccumulator {
     fn default() -> Self {
         Self {
+            positioned_absence_closed: true,
+            query_scope: ClosedQueryScope::default(),
             endpoint_completion: None,
             descriptors: Vec::new(),
             associations: Vec::new(),
@@ -4327,12 +4563,220 @@ impl Default for SourceAccumulator {
         }
     }
 }
+// One positioned qualifier obligation; tiers compete only within this key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[doc(hidden)]
+pub enum RouteAlternativeOwner {
+    Half(HalfId),
+    ProviderFrame(DemandRelationKey),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[doc(hidden)]
+pub struct RouteAlternativePosition {
+    pub owner: RouteAlternativeOwner,
+    pub consumed_prefix_segments: usize,
+    pub start_step: usize,
+    pub namespace: ResolutionNamespace,
+    pub qualifier: RouteLocation,
+    pub name: String,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub enum PositionedRouteOutcome {
+    Supported(PositiveRouteSupport),
+    Closed,
+    OpenEmpty(RouteOpenOutcome),
+}
+
+/// Positive package classifications are support markers, not candidate proofs.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub enum PositiveRouteSupport {
+    Exports {
+        complete: bool,
+    },
+    ExternalOwner {
+        complete: bool,
+        authority: OwnerAuthority,
+    },
+    Intrinsic,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub enum OwnerAuthority {
+    LanguageRoot,
+    Declaration,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct RouteOpenOutcome {
+    pub reducible: bool,
+    pub reason: ResolutionIncompleteReason,
+    pub(crate) pending:
+        Option<crate::analyzer::resolution::query_obligations::PendingQueryObligation>,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct PositionedRouteAlternative {
+    pub position: RouteAlternativePosition,
+    pub tier: usize,
+    pub outcome: PositionedRouteOutcome,
+}
+
+// #7869: an unacquired provider is an obligation when this route keeps a
+// complete terminal referent. Keep this predicate together for #8500's target
+// shape unification; a prefix owner alone never supplies terminal support.
+pub(in crate::analyzer) struct HalfTerminalEvidence<'a> {
+    authorities: &'a TargetProofGroups,
+    member_bridges: &'a [SelectedRootBridgeDescriptor],
+    export_bridges: &'a [SelectedRootBridgeDescriptor],
+    alternatives: &'a [PositionedRouteAlternative],
+    terminal_index: usize,
+    terminal: &'a ResolutionLookupSemanticRecipe,
+}
+
+pub(in crate::analyzer) fn route_keeps_complete_terminal(
+    half: Option<HalfTerminalEvidence<'_>>,
+    frame: Option<FrameTerminalEvidence<'_>>,
+    selected: Option<(
+        &crate::analyzer::resolution::ResolutionAnswer,
+        &[ResolutionIncompleteReason],
+    )>,
+) -> bool {
+    // #7869: typed/member selection can prove the terminal after half closure.
+    // #8500 replaces this arm when all owners become binding targets.
+    selected.is_some_and(|(answer, own)| {
+        !answer.targets().is_empty()
+            && match answer.completion() {
+                ResolutionCompletion::Complete => true,
+                ResolutionCompletion::Incomplete(reasons) => {
+                    reasons.iter().all(|r| own.contains(r))
+                }
+            }
+    }) || frame.is_some_and(|frame| {
+        frame.alternatives.iter().any(|alternative| {
+            alternative.position.owner == *frame.owner
+                && alternative.position.consumed_prefix_segments == 0
+                && alternative.position.namespace == frame.namespace
+                && alternative.position.name == frame.name
+                && matches!(
+                    alternative.outcome,
+                    PositionedRouteOutcome::Supported(
+                        PositiveRouteSupport::Intrinsic
+                            | PositiveRouteSupport::Exports { complete: true }
+                            | PositiveRouteSupport::ExternalOwner { complete: true, .. }
+                    )
+                )
+        })
+    }) || half.is_some_and(|half| {
+        let HalfTerminalEvidence {
+            authorities,
+            member_bridges,
+            export_bridges,
+            alternatives,
+            terminal_index,
+            terminal,
+        } = half;
+        authorities
+            .values()
+            .any(|(_, _, evidence)| *evidence == ResolutionCompletion::Complete)
+            || member_bridges
+                .iter()
+                .chain(export_bridges)
+                .any(|bridge| *bridge.completion() == ResolutionCompletion::Complete)
+            || alternatives.iter().any(|alternative| {
+                alternative.position.consumed_prefix_segments == terminal_index
+                    && alternative.position.namespace == terminal.namespace()
+                    && alternative.position.name == terminal.spelling()
+                    && matches!(
+                        alternative.outcome,
+                        PositionedRouteOutcome::Supported(
+                            PositiveRouteSupport::Intrinsic
+                                | PositiveRouteSupport::Exports { complete: true }
+                                | PositiveRouteSupport::ExternalOwner { complete: true, .. }
+                        )
+                    )
+            })
+    })
+}
+
+pub(in crate::analyzer) struct FrameTerminalEvidence<'a> {
+    pub owner: &'a RouteAlternativeOwner,
+    pub alternatives: &'a [PositionedRouteAlternative],
+    pub namespace: ResolutionNamespace,
+    pub name: &'a str,
+}
+
+pub(in crate::analyzer) fn reduce_positioned_alternatives(
+    alternatives: Vec<PositionedRouteAlternative>,
+    completion: &mut ResolutionCompletion,
+    scope: &mut ClosedQueryScope,
+    absence_closed: &mut bool,
+    keeps_terminal: bool,
+) {
+    let mut supported: HashMap<RouteAlternativePosition, usize> = HashMap::default();
+    for alternative in &alternatives {
+        if matches!(alternative.outcome, PositionedRouteOutcome::Supported(_)) {
+            supported
+                .entry(alternative.position.clone())
+                .and_modify(|tier| *tier = (*tier).min(alternative.tier))
+                .or_insert(alternative.tier);
+        }
+    }
+    for alternative in alternatives {
+        if matches!(
+            alternative.outcome,
+            PositionedRouteOutcome::Supported(PositiveRouteSupport::Intrinsic)
+        ) {
+            // A language-owned intrinsic answers on another route. It supplies
+            // no source candidate and cannot prove this source route empty.
+            *absence_closed = false;
+        }
+        if let PositionedRouteOutcome::OpenEmpty(RouteOpenOutcome {
+            reason,
+            pending,
+            reducible,
+        }) = alternative.outcome
+        {
+            // Acquisition assumptions are not competing alternatives. Only
+            // partial mounted inventories can lose to equal/higher support.
+            if reducible
+                && pending.is_none()
+                && supported
+                    .get(&alternative.position)
+                    .is_some_and(|tier| *tier <= alternative.tier)
+            {
+                continue;
+            }
+            *absence_closed = false;
+            let opening = (alternative.position.owner.clone(), reason);
+            if !scope.positioned_open.contains(&opening) {
+                scope.positioned_open.push(opening);
+            }
+            if pending.is_none() || !keeps_terminal {
+                *completion = completion.combine(&ResolutionCompletion::incomplete([reason]));
+            }
+            if let Some(pending) = pending
+                && !scope.pending_query_obligations.contains(&pending)
+            {
+                scope.pending_query_obligations.push(pending);
+            }
+        }
+    }
+}
+
 struct HalfAccumulator {
     providers: crate::analyzer::resolution::ProviderObservationStore,
     member_reads: Vec<MemberReadObservation>,
     observation: HalfObservation,
     placement_observations: Vec<PlacementObservation>,
     alternatives: HashMap<TargetAuthority, Vec<ProofId>>,
+    positioned_alternatives: Vec<PositionedRouteAlternative>,
     blockers: TargetProofGroups,
     authorities: TargetProofGroups,
     member_bridges: Vec<SelectedRootBridgeDescriptor>,
@@ -4438,8 +4882,8 @@ fn poll_source_starts<R: DemandRules>(
                             route.member_position = Some(MemberRoutePosition::Terminal);
                             return Ok(Read::ready(Some(request)));
                         }
-                        active.facts.targets.push(rules.route_target(
-                            cursor.location,
+                        active.facts.targets.push(rules.positioned_route_target(
+                            &cursor,
                             route.rank.as_ref(),
                             route.scope,
                         ));
@@ -5137,9 +5581,15 @@ fn finish_source_half<'a, R: DemandRules + 'a>(
     source: &SourceHalf,
     rules: &mut R::Half<'a>,
     accum: &mut SourceAccumulator,
-    half_accum: HalfAccumulator,
+    mut half_accum: HalfAccumulator,
 ) -> Result<Read<()>> {
+    half_accum
+        .positioned_alternatives
+        .extend(rules.take_positioned_alternatives());
     let SourceAccumulator {
+        positioned_absence_closed,
+        query_scope,
+        endpoint_completion: _,
         descriptors,
         associations,
         half_facts,
@@ -5154,6 +5604,7 @@ fn finish_source_half<'a, R: DemandRules + 'a>(
         mut observation,
         placement_observations,
         mut alternatives,
+        positioned_alternatives,
         blockers,
         authorities,
         mut member_bridges,
@@ -5178,9 +5629,50 @@ fn finish_source_half<'a, R: DemandRules + 'a>(
             hook_completion.combine(&cancelled_completion()),
         ));
     };
+    let keeps_terminal = route_keeps_complete_terminal(
+        Some(HalfTerminalEvidence {
+            authorities: &authorities,
+            member_bridges: &member_bridges,
+            export_bridges: &export_bridges,
+            alternatives: &positioned_alternatives,
+            terminal_index: source.route.len(),
+            terminal: &source.demand,
+        }),
+        None,
+        None,
+    );
+    let terminal_support = positioned_alternatives.iter().filter(|alternative| {
+        alternative.position.consumed_prefix_segments == source.route.len()
+            && alternative.position.namespace == source.demand.namespace()
+            && alternative.position.name == source.demand.spelling()
+    });
+    let mut terminal_proof =
+        crate::analyzer::resolution::fact_resolution::demand_scheduler::TerminalProof {
+            support: keeps_terminal,
+            ..Default::default()
+        };
+    for alternative in terminal_support {
+        match alternative.outcome {
+            PositionedRouteOutcome::Supported(PositiveRouteSupport::Intrinsic)
+            | PositionedRouteOutcome::Supported(PositiveRouteSupport::ExternalOwner {
+                complete: true,
+                authority: OwnerAuthority::LanguageRoot,
+                ..
+            }) => terminal_proof.language = true,
+            _ => {}
+        }
+    }
     descriptors.extend(export_bridges);
     let published_member_bridge = !member_bridges.is_empty();
     descriptors.append(&mut member_bridges);
+    let mut positioned_completion = ResolutionCompletion::Complete;
+    reduce_positioned_alternatives(
+        positioned_alternatives,
+        &mut positioned_completion,
+        query_scope,
+        positioned_absence_closed,
+        keeps_terminal,
+    );
     if authorities.is_empty() && !published_member_bridge {
         let Some(boundary) = rules.boundary(&observation)? else {
             return Ok(Read::Cancelled(
@@ -5221,6 +5713,9 @@ fn finish_source_half<'a, R: DemandRules + 'a>(
             hook_completion.combine(&cancelled_completion()),
         ));
     };
+    query_scope
+        .terminal_referents
+        .insert(RouteAlternativeOwner::Half(half_id), terminal_proof);
     candidates.extend(half_candidates);
     assert!(alternatives.is_empty());
     proofs.proofs[route_proof.0].local = observation.completion.clone();
@@ -5237,6 +5732,7 @@ fn finish_source_half<'a, R: DemandRules + 'a>(
     };
     let deferred_member_selection = !member_reads.is_empty();
     half_facts.push(HalfClosureFacts {
+        keeps_complete_terminal: keeps_terminal,
         providers,
         member_reads: member_reads.into_boxed_slice(),
         half: half_id,
@@ -5324,6 +5820,7 @@ fn poll_source_rows<R: DemandRules>(
                     },
                     placement_observations: Vec::new(),
                     alternatives: HashMap::default(),
+                    positioned_alternatives: Vec::new(),
                     blockers: TargetProofGroups::default(),
                     authorities: TargetProofGroups::default(),
                     member_bridges: Vec::new(),
@@ -5426,7 +5923,7 @@ fn poll_source_rows<R: DemandRules>(
                 match poll_source_starts(
                     &rules,
                     &mut active,
-                    &current.source.route,
+                    &current.source.walk_route,
                     &current.source.demand,
                     shared.cancellation,
                 )? {
@@ -5646,6 +6143,8 @@ fn poll_source_rows<R: DemandRules>(
         state.half_index += 1;
     }
     let SourceAccumulator {
+        positioned_absence_closed,
+        query_scope,
         endpoint_completion,
         descriptors,
         associations,
@@ -5658,6 +6157,8 @@ fn poll_source_rows<R: DemandRules>(
     } = std::mem::take(&mut state.accum);
     Ok(Read::Ready {
         value: SourceRowsProgress::Continue(RouteClosure {
+            positioned_absence_closed,
+            query_scope,
             endpoint_completion,
             disposition: RouteDisposition::Publish,
             preparation: None,
@@ -5682,6 +6183,8 @@ pub(super) fn close_provider_rows<R: DemandRules>(
     preparation: ProviderPreparation<R::PreparationKey>,
 ) -> Result<Option<RouteClosure<R::PreparationKey>>> {
     let mut route = RouteClosure {
+        positioned_absence_closed: true,
+        query_scope: ClosedQueryScope::default(),
         endpoint_completion: None,
         disposition: RouteDisposition::Publish,
         preparation: None,
@@ -5832,6 +6335,7 @@ pub(super) fn close_provider_rows<R: DemandRules>(
             });
         }
         route.halves.push(HalfClosureFacts {
+            keeps_complete_terminal: false,
             providers: Box::new([]),
             member_reads: Box::new([]),
             placements: placement_observations.finish(),
@@ -5943,6 +6447,8 @@ fn close_member_rows<R: DemandRules>(
         Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
     };
     let mut route = RouteClosure {
+        positioned_absence_closed: true,
+        query_scope: ClosedQueryScope::default(),
         endpoint_completion: None,
         disposition: RouteDisposition::Publish,
         preparation: None,
@@ -6016,6 +6522,7 @@ fn close_member_rows<R: DemandRules>(
         route.candidates.extend(candidates);
         route.bridges.extend(bridges);
         route.halves.push(HalfClosureFacts {
+            keeps_complete_terminal: false,
             providers: Box::new([]),
             member_reads: Box::new([]),
             placements: Box::new([]),
@@ -6200,7 +6707,7 @@ fn poll_root<R: DemandRules>(
     else {
         return Ok(CloseProgress::Ready(LanguageClosure::cancelled(
             plan.prefix_evidence_with(inputs, |prefix| {
-                shared.rules.raw_prefix_completion(prefix.answer)
+                shared.rules.raw_prefix_completion(&plan.endpoint, prefix)
             })
             .combine(member_completion)
             .combine(&cancelled_completion()),
@@ -6324,6 +6831,8 @@ pub(super) fn publish_closure<R: DemandRules>(
     members: Option<&DemandMemberSelection>,
 ) -> Result<LanguageClosure> {
     let RouteClosure {
+        positioned_absence_closed,
+        query_scope: positioned_scope,
         endpoint_completion,
         disposition,
         preparation,
@@ -6350,6 +6859,7 @@ pub(super) fn publish_closure<R: DemandRules>(
             std::ops::ControlFlow::Break(closure) => return Ok(closure),
         };
         let facts = ClosureFacts {
+            positioned_absence_closed,
             witness: &witness,
             members,
             generated: &[],
@@ -6394,7 +6904,7 @@ pub(super) fn publish_closure<R: DemandRules>(
                     .is_none()
             );
         }
-        let (discharges, query_scope) = policy.into_carriers();
+        let (discharges, query_scope) = policy.with_query_scope(positioned_scope).into_carriers();
         return Ok(LanguageClosure {
             outcome: crate::analyzer::resolution::RootClosure::Published(evidence),
             query_scope,
@@ -6614,6 +7124,7 @@ pub(super) fn publish_closure<R: DemandRules>(
         std::ops::ControlFlow::Break(closure) => return Ok(closure),
     };
     let facts = ClosureFacts {
+        positioned_absence_closed,
         witness: &witness,
         members,
         generated: &generated,
@@ -6723,7 +7234,7 @@ pub(super) fn publish_closure<R: DemandRules>(
         shared.rules.commit_associations(&policy.associations);
     }
     shared.rules.note_closure_work("demand_close_published");
-    let (discharges, query_scope) = policy.into_carriers();
+    let (discharges, query_scope) = policy.with_query_scope(positioned_scope).into_carriers();
     Ok(LanguageClosure {
         outcome: crate::analyzer::resolution::RootClosure::Published(evidence),
         query_scope,

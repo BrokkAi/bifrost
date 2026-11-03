@@ -4,6 +4,7 @@
 mod common;
 
 use brokk_bifrost_analysis::Language;
+use brokk_bifrost_analysis::path_normalization::NormalizePath;
 use brokk_bifrost_mcp::benchmark_api::{
     BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
 };
@@ -1474,6 +1475,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
         correlation.starts_with("sha256:") && correlation.len() > "sha256:".len(),
         "correlation id must be a hash, not the raw request id: {correlation}"
     );
+    assert_sha256_correlation(correlation);
     assert_eq!(structured["status"], "finding", "{baseline}");
     assert_eq!(structured["exit_status"], 1, "{baseline}");
     assert_eq!(structured["report"], expected_report, "{baseline}");
@@ -2214,10 +2216,64 @@ fn bifrost_mcp_reports_absolute_paths_outside_workspace_as_tool_errors() {
         .expect("tool error text");
     assert!(message.contains("outside active workspace"), "{message}");
     assert!(!message.contains("not found"), "{message}");
+    assert!(
+        message.contains(&outside_file.display().to_string()),
+        "{message}"
+    );
+    // The server reports its canonical root, which differs from the raw temp
+    // path where `/var` is a symlink to `/private/var` (macOS).
+    let workspace_root = fixture_root
+        .path()
+        .canonicalize()
+        .expect("canonicalize fixture root")
+        .normalize()
+        .display()
+        .to_string();
+    assert!(message.contains(&workspace_root), "{message}");
+    let (offending, workspace) = message
+        .split_once(" (workspace: ")
+        .expect("error identifies the workspace path");
+    assert!(
+        offending.ends_with(&outside_file.display().to_string()),
+        "submitted path must be the offender: {message}"
+    );
+    assert_eq!(
+        workspace.strip_suffix(')'),
+        Some(workspace_root.as_str()),
+        "workspace field must identify the active root: {message}"
+    );
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_mcp_rejects_absolute_path_with_workspace_name_prefix() {
+    let parent = TempDir::new().expect("temp dir");
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).expect("workspace");
+    let outside = parent.path().join("workspace-other").join("Absent.java");
+    let mut child = spawn_server(&root, "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "get_file_contents",
+                "arguments": { "file_paths": [outside.display().to_string()] } } }),
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let message = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(message.contains("outside active workspace"), "{message}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
 }
 
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
@@ -2591,6 +2647,406 @@ fn bifrost_mcp_budgets_large_get_summaries_responses() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+#[test]
+#[hardwon("98d3d99b13a7: one oversized compact file escaped the summaries budget")]
+fn bifrost_mcp_bounds_single_file_compact_outline() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    let mut source = String::from("public class LargeOutline {\n");
+    for index in 0..240 {
+        source.push_str(&format!(
+            "  public int method{index:03}(int value) {{ return value + {index}; }}\n"
+        ));
+    }
+    source.push_str("}\n");
+    fs::write(fixture_root.path().join("LargeOutline.java"), source).expect("write fixture");
+
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "get_summaries", "arguments": { "targets": ["LargeOutline.java"] } }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let value = &response["result"]["structuredContent"];
+    assert_eq!(value["degraded"], true, "{value}");
+    assert_eq!(
+        value["degradation"]["returned_format"], "compact_symbols",
+        "{value}"
+    );
+    assert!(serde_json::to_vec(value).unwrap().len() <= 4096, "{value}");
+    assert_eq!(value["compact_symbols"]["truncated"], true, "{value}");
+    let files = value["compact_symbols"]["files"].as_array().expect("files");
+    assert_eq!(files.len(), 1, "{value}");
+    assert_eq!(files[0]["path"], "LargeOutline.java");
+    let lines = files[0]["lines"].as_array().expect("lines");
+    assert!(!lines.is_empty(), "{value}");
+    for line in lines {
+        let line = line.as_str().expect("symbol line");
+        assert!(
+            line == "- LargeOutline" || line.starts_with("  - method"),
+            "{line}"
+        );
+    }
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+#[hardwon("b7ad378b8dc0: get_summaries text budget cut panicked inside a UTF-8 character")]
+fn get_summaries_unicode_text_budget_cut_preserves_utf8() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    let mut source = String::from("public class UnicodeOutline {\n");
+    for index in 0..240 {
+        source.push_str(&format!(
+            "  public int 方法方法{index:03}(int value) {{ return value + {index}; }}\n"
+        ));
+    }
+    source.push_str("}\n");
+    fs::write(fixture_root.path().join("UnicodeOutline.java"), source).expect("write fixture");
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"get_summaries","arguments":{"targets":["UnicodeOutline.java"]}}}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text");
+    assert!(text.len() <= 4096, "{} bytes", text.len());
+    assert!(
+        text.contains("[truncated for MCP text budget"),
+        "{response}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn bifrost_mcp_bounds_two_file_compact_outline() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    for file in ["First", "Second"] {
+        let mut source = format!("public class {file} {{\n");
+        for index in 0..240 {
+            source.push_str(&format!(
+                "  public int method{index:03}(int value) {{ return value + {index}; }}\n"
+            ));
+        }
+        source.push_str("}\n");
+        fs::write(fixture_root.path().join(format!("{file}.java")), source).expect("write fixture");
+    }
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"get_summaries","arguments":{"targets":["First.java","Second.java"]}}}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let value = &response["result"]["structuredContent"];
+    assert_eq!(
+        value["degradation"]["returned_format"], "compact_symbols",
+        "{value}"
+    );
+    assert!(serde_json::to_vec(value).unwrap().len() <= 4096, "{value}");
+    assert_eq!(value["compact_symbols"]["truncated"], true, "{value}");
+    let files = value["compact_symbols"]["files"].as_array().expect("files");
+    assert!(
+        files.iter().any(|file| file["lines"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty())),
+        "{value}"
+    );
+    for file in files {
+        assert!(
+            matches!(file["path"].as_str(), Some("First.java" | "Second.java")),
+            "{file}"
+        );
+        for line in file["lines"].as_array().expect("lines") {
+            let line = line.as_str().expect("line");
+            assert!(
+                line == "- First"
+                    || line == "- Second"
+                    || line
+                        .strip_prefix("  - method")
+                        .and_then(|name| name.parse::<usize>().ok())
+                        .is_some_and(|index| index < 240),
+                "{line}"
+            );
+        }
+    }
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn bifrost_mcp_reports_truncated_container_entries_consistently() {
+    let root = TempDir::new().expect("temp dir");
+    fs::create_dir(root.path().join("many")).expect("many directory");
+    fs::create_dir(root.path().join("single")).expect("single directory");
+    fs::create_dir(root.path().join("many").join("nested")).expect("nested directory");
+    fs::write(
+        root.path().join("single").join("Only.java"),
+        "class Only {}\n",
+    )
+    .expect("single file");
+    for index in 0..180 {
+        fs::write(
+            root.path().join("many").join(format!(
+                "File{index:03}_meaningful_declaration_name_for_budget.java"
+            )),
+            format!("class File{index:03} {{}}\n"),
+        )
+        .expect("many file");
+    }
+    let mut child = spawn_server(root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"get_summaries","arguments":{"targets":["many","single","many/*.java"]}}}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let value = &response["result"]["structuredContent"];
+    assert_eq!(value["degraded"], true, "{value}");
+    assert_eq!(
+        value["degradation"]["returned_format"], "truncated_container_listing",
+        "{value}"
+    );
+    assert!(serde_json::to_vec(value).unwrap().len() <= 4096, "{value}");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text");
+    assert!(text.len() <= 4096, "{text}");
+    assert!(text.len() > 2048, "{} bytes: {text}", text.len());
+    assert!(
+        !text.contains("[truncated for MCP text budget"),
+        "{} bytes: {text}",
+        text.len()
+    );
+    let skipped = &value["too_broad"][0];
+    assert_eq!(skipped["target"], "many/*.java", "{value}");
+    assert_eq!(skipped["cap"], 20, "{value}");
+    assert!(
+        skipped["matched"].as_u64().expect("matched") > 20,
+        "{value}"
+    );
+    assert!(text.contains("Too broad: target many/*.java"), "{text}");
+    assert!(text.contains("over the 20 file limit"), "{text}");
+    let listings = value["listings"].as_array().expect("listings");
+    let single = listings
+        .iter()
+        .find(|listing| listing["target"] == "single")
+        .expect("single directory listing");
+    assert_eq!(single["truncated"], false, "{single}");
+    assert_eq!(
+        single["entries"].as_array().expect("single entries").len(),
+        1,
+        "{single}"
+    );
+    let single_text = text
+        .split("Directory single")
+        .nth(1)
+        .expect("single listing in text")
+        .split("\n\n")
+        .next()
+        .expect("single listing block");
+    assert!(single_text.contains("[file] single/Only.java"), "{text}");
+    assert!(!single_text.contains("(empty)"), "{text}");
+    assert!(
+        listings.iter().any(|listing| listing["truncated"] == true),
+        "{value}"
+    );
+    for listing in listings {
+        for entry in listing["entries"].as_array().expect("entries") {
+            let path = entry["path"].as_str().expect("path");
+            let kind = entry["kind"].as_str().expect("kind");
+            assert!(root.path().join(path).exists(), "{entry}");
+            assert!(text.contains(&format!("[{kind}] {path}")), "{text}");
+        }
+        if !listing["entries"].as_array().expect("entries").is_empty() {
+            assert!(
+                !text.contains(&format!(
+                    "Directory {}\n(empty)",
+                    listing["target"].as_str().unwrap()
+                )),
+                "{text}"
+            );
+        }
+    }
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+#[test]
+fn bifrost_mcp_watcher_off_retains_snapshot_until_refresh() {
+    let off_root = TempDir::new().expect("off root");
+    let on_root = TempDir::new().expect("on root");
+    for root in [&off_root, &on_root] {
+        fs::write(root.path().join("Changed.java"), "class BeforeChange {}\n")
+            .expect("initial source");
+    }
+    let mut off = mcp_server_command(off_root.path(), "searchtools", &[])
+        .env("BIFROST_MCP_FILE_WATCHER", "off")
+        .spawn()
+        .expect("off server");
+    let mut on = mcp_server_command(on_root.path(), "searchtools", &[])
+        .env("BIFROST_MCP_FILE_WATCHER", "on")
+        .spawn()
+        .expect("on server");
+    let mut off_in = off.stdin.take().expect("off stdin");
+    let mut off_out = BufReader::new(off.stdout.take().expect("off stdout"));
+    let mut off_err = DrainedStderr::spawn(off.stderr.take().expect("off stderr"));
+    let mut on_in = on.stdin.take().expect("on stdin");
+    let mut on_out = BufReader::new(on.stdout.take().expect("on stdout"));
+    let mut on_err = DrainedStderr::spawn(on.stderr.take().expect("on stderr"));
+    initialize_session(&mut off_in, &mut off_out, &mut off_err);
+    initialize_session(&mut on_in, &mut on_out, &mut on_err);
+    let search = |id, name| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+        "params":{"name":"search_symbols","arguments":{"patterns":[name]}}})
+    };
+    for (stdin, stdout, stderr) in [
+        (&mut off_in, &mut off_out, &mut off_err),
+        (&mut on_in, &mut on_out, &mut on_err),
+    ] {
+        let before = round_trip(stdin, stdout, stderr, search(1, "BeforeChange"));
+        assert!(
+            !before["result"]["structuredContent"]["files"]
+                .as_array()
+                .expect("files")
+                .is_empty(),
+            "{before}"
+        );
+    }
+    sleep_for_mtime_tick();
+    for root in [&off_root, &on_root] {
+        fs::write(root.path().join("Changed.java"), "class AfterChange {}\n")
+            .expect("changed source");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let updated = round_trip(
+            &mut on_in,
+            &mut on_out,
+            &mut on_err,
+            search(2, "AfterChange"),
+        );
+        if !updated["result"]["structuredContent"]["files"]
+            .as_array()
+            .expect("files")
+            .is_empty()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watcher did not observe edit: {updated}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let stale = round_trip(
+        &mut off_in,
+        &mut off_out,
+        &mut off_err,
+        search(3, "AfterChange"),
+    );
+    assert!(
+        stale["result"]["structuredContent"]["files"]
+            .as_array()
+            .expect("files")
+            .is_empty(),
+        "{stale}"
+    );
+    drop(off_in);
+    drop(on_in);
+    assert!(off.wait().expect("off exit").success());
+    assert!(on.wait().expect("on exit").success());
+}
+
+#[test]
+fn bifrost_mcp_advertises_tool_effects_and_required_inputs() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    let tools = response["result"]["tools"].as_array().expect("tools");
+    for (name, read_only) in [
+        ("search_symbols", true),
+        ("get_summaries", true),
+        ("refresh", false),
+        ("activate_workspace", false),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .expect("descriptor");
+        assert_eq!(tool["annotations"]["readOnlyHint"], read_only, "{tool}");
+        assert_eq!(tool["annotations"]["destructiveHint"], false, "{tool}");
+    }
+    for (name, field) in [
+        ("get_symbol_sources", "symbols"),
+        ("get_summaries", "targets"),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .expect("descriptor");
+        assert!(
+            tool["inputSchema"]["required"]
+                .as_array()
+                .expect("required")
+                .iter()
+                .any(|value| value == field),
+            "{tool}"
+        );
+    }
+    let slopcop = tools
+        .iter()
+        .find(|tool| tool["name"] == "report_long_method_and_god_object_smells")
+        .expect("slopcop descriptor");
+    let threshold = &slopcop["inputSchema"]["properties"]["long_method_span_lines"]["description"];
+    assert!(
+        threshold.as_str().expect("description").contains("<= 0"),
+        "{slopcop}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
 fn sleep_for_mtime_tick() {
     thread::sleep(Duration::from_millis(25));
 }
@@ -2600,6 +3056,17 @@ fn tool_names(tools: &[Value]) -> Vec<&str> {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect()
+}
+
+fn assert_sha256_correlation(correlation: &str) {
+    let digest = correlation.strip_prefix("sha256:").expect("sha256 prefix");
+    assert_eq!(digest.len(), 64, "{correlation}");
+    assert!(
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "{correlation}"
+    );
 }
 
 fn assert_tool_schema_contains_property(tools: &[Value], tool_name: &str, property_name: &str) {
@@ -2727,6 +3194,121 @@ fn assert_structured_content_matches_advertised_schema(
         violations.is_empty(),
         "{tool_name} structuredContent violates its advertised outputSchema: {violations:?}\nschema: {schema}\ninstance: {structured}"
     );
+}
+
+#[test]
+fn query_code_advertised_input_schema_accepts_its_registered_filters() {
+    use brokk_bifrost_rql::query::schema::{
+        ALL_CONFIGURATION_FACTS_FILTER_FIELDS, ALL_USAGE_KINDS, QueryStepField,
+        environment_filter_labels,
+    };
+
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("sample.py", "def f():\n    pass\n")
+        .build();
+    let mut child = spawn_server(project.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    let mut reader = BufReader::new(stdout);
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+    );
+    let tool = response["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == "query_code")
+        .expect("query_code tool");
+    let validator =
+        jsonschema::draft202012::new(&tool["inputSchema"]).expect("published input schema");
+    let valid = [
+        json!({"bindings":{"kind":["local"],"hoisting":["scope_wide"]}}),
+        json!({"bindings":{"name":["a".repeat(256)]}}),
+        json!({"bindings":{"kind":["local"]}}),
+        json!({"paths":{"min_segments":1}}),
+        json!({"scopes":{"kind":["function"]}}),
+        json!({"occurrences":{"namespace":["type"]}}),
+        json!({"generation_sites":{"input":["literal"]}}),
+        json!({"exports":{"name":["a".repeat(256)]}}),
+        json!({"configuration_facts":{"formats":["json"],"value_gt":1.5,"xml_peer_min_shared_children":0}}),
+        json!({"dependency_evidence":{}}),
+        json!({"dependency_evidence":{},"where":["sample.py"]}),
+        json!({"paths":{"min_segments":2},"where":["sample.py"],"languages":["python"]}),
+        json!({"match":{"kind":"call"},"steps":[{"op":"candidates_of","tier":["lexical_binding"],"outcome":["selected"],"boundary":["workspace_local"]}]}),
+        json!({"match":{"kind":"call"},"steps":[{"op":"edges_of","usage":[ALL_USAGE_KINDS[0].wire_label()],"relation":["same_owner"]}]}),
+        json!({"require_both":{"code":{"match":{"kind":"call"}},"configuration":{"configuration_facts":{}}}}),
+        json!({"correlate":{"relation":{"configuration_key":{"documents":["settings.properties"]}},"code":{"match":{"kind":"call"}},"configuration":{"configuration_facts":{}}}}),
+    ];
+    for query in &valid {
+        assert!(validator.is_valid(query), "valid query rejected: {query}");
+    }
+    let invalid = [
+        json!({"bindings":{"kind":["local","local"]}}),
+        json!({"bindings":{"kind":["scope_wide"]}}),
+        json!({"bindings":{"hoisting":["local"]}}),
+        json!({"bindings":{"name":["a".repeat(257)]}}),
+        json!({"scopes":{"kind":["function"],"typo":true}}),
+        json!({"paths":{"min_segments":0}}),
+        json!({"occurrences":{"namespace":["read"]}}),
+        json!({"generation_sites":{"input":["unknown"]}}),
+        json!({"exports":{"name":["a".repeat(257)]}}),
+        json!({"configuration_facts":{"unknown":[]}}),
+        json!({"configuration_facts":{"value_gt":"1.5"}}),
+        json!({"configuration_facts":{"xml_peer_min_shared_children":-1}}),
+        json!({"dependency_evidence":{"typo":["x"]}}),
+        json!({"dependency_evidence":{},"languages":["python"]}),
+        json!({"paths":{"min_segments":2},"inside":{"kind":"call"}}),
+        json!({"require_both":{"code":{"match":{"kind":"call"}}}}),
+        json!({"correlate":{"relation":{"configuration_key":{"documents":["settings.properties"]}},"code":{"match":{"kind":"call"}}}}),
+        json!({"match":{"kind":"call"},"steps":[{"op":"candidates_of","tier":["selected"]}]}),
+        json!({"match":{"kind":"call"},"steps":[{"op":"candidates_of","outcome":["lexical_binding"]}]}),
+        json!({"match":{"kind":"call"},"steps":[{"op":"candidates_of","boundary":["lexical_binding"]}]}),
+    ];
+    for query in &invalid {
+        assert!(
+            !validator.is_valid(query),
+            "invalid query advertised: {query}"
+        );
+    }
+    for (field, labels) in [
+        (
+            "kind",
+            environment_filter_labels(QueryStepField::BindingKinds),
+        ),
+        (
+            "hoisting",
+            environment_filter_labels(QueryStepField::BindingHoisting),
+        ),
+    ] {
+        let published =
+            &tool["inputSchema"]["properties"]["bindings"]["properties"][field]["items"]["enum"];
+        assert_eq!(
+            published,
+            &json!(labels),
+            "binding {field} vocabulary drifted"
+        );
+    }
+    let published = tool["inputSchema"]["properties"]["configuration_facts"]["properties"]
+        .as_object()
+        .expect("configuration axes");
+    let expected = ALL_CONFIGURATION_FACTS_FILTER_FIELDS
+        .iter()
+        .map(|field| field.label())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        published
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
 }
 
 fn call_tool(
@@ -5195,11 +5777,10 @@ fn assert_compact_malformed_run_policy_reply(response: &Value, task_capable: boo
     let structured = &response["result"]["structuredContent"];
     assert_eq!(structured["status"], "unreliable", "{response}");
     assert_eq!(structured["exit_status"], 2, "{response}");
-    assert!(
+    assert_sha256_correlation(
         structured["request_correlation_id"]
             .as_str()
-            .is_some_and(|correlation| correlation.starts_with("sha256:")),
-        "early run_policy replies retain correlation: {response}"
+            .expect("early run_policy correlation"),
     );
     let report = &structured["report"];
     assert_eq!(report["schema_version"], 6, "{response}");
@@ -5366,11 +5947,10 @@ fn mcp_tasks_run_policy_completes_through_a_task_handle() {
     assert_eq!(structured["status"], "finding", "{terminal}");
     assert_eq!(structured["exit_status"], 1, "{terminal}");
     assert_eq!(structured["report"], expected_report, "{terminal}");
-    assert!(
+    assert_sha256_correlation(
         structured["request_correlation_id"]
             .as_str()
-            .is_some_and(|correlation| correlation.starts_with("sha256:")),
-        "task results keep the run_policy correlation contract: {terminal}"
+            .expect("task correlation"),
     );
 
     drop(stdin);
@@ -6353,6 +6933,173 @@ fn legacy_semantic_model_evidence_accepts_semver_and_reports_invalid_versions() 
 }
 
 #[test]
+fn semantic_model_configuration_rejects_empty_values_and_accepts_multiple_records() {
+    let project = InlineTestProject::new()
+        .file("Main.java", PACK_ACTIVATION_JAVA)
+        .build();
+    install_pack_activation_fixture(project.root());
+    let catalog = project.root().join(".bifrost/packs-catalog");
+    let homes = TempDir::new().expect("fake JDK home root");
+    let java_home = fake_jdk_home(homes.path(), "21.0.2");
+    // The fixture shard requires both the JDK toolchain and the JVM target.
+    let record = json!({
+        "language": "java", "ecosystem": "jdk",
+        "package": {"name": "fixture.jdk", "version": "21.0.2"},
+        "module": {"name": "java.base", "version": "21.0.2"},
+        "toolchain": {"name": "jdk", "version": "21.0.2"},
+        "target": "jvm"
+    });
+    for (setting, evidence, expected_state) in [
+        (Some(""), None, "unavailable"),
+        (Some("off"), None, "no_models"),
+        (None, Some("[]".to_owned()), "unavailable"),
+        (None, Some(json!([record.clone()]).to_string()), "ready"),
+        (
+            None,
+            Some(json!([record.clone(), record]).to_string()),
+            "ready",
+        ),
+    ] {
+        let mut command = mcp_server_command(project.root(), "searchtools", &[]);
+        command.env("JAVA_HOME", &java_home);
+        command.env_remove("BIFROST_OPEN_PACKS_DISABLE");
+        command.env("BIFROST_WORKSPACE_SEMANTIC_MODELS", setting.unwrap_or("on"));
+        if let Some(evidence) = evidence {
+            command.env("BIFROST_SEMANTIC_PACK_CATALOG", &catalog);
+            command.env("BIFROST_SEMANTIC_PACK_EVIDENCE", evidence);
+        }
+        let mut child = command.spawn().expect("spawn configured server");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+        initialize_session(&mut stdin, &mut reader, &mut stderr);
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let mut id = 1;
+        loop {
+            let response = round_trip(
+                &mut stdin,
+                &mut reader,
+                &mut stderr,
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "get_active_workspace", "arguments": {}}
+                }),
+            );
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            let workspace: Value = serde_json::from_str(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("workspace text"),
+            )
+            .expect("valid workspace JSON");
+            let state = workspace["semantic_model_overlay"]["state"]
+                .as_str()
+                .unwrap_or("");
+            if state != "pending" {
+                if expected_state == "ready" {
+                    assert_eq!(state, expected_state, "{response}");
+                    assert_eq!(workspace["semantic_packs_ready"], true, "{response}");
+                } else {
+                    assert_eq!(state, expected_state, "{response}");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "activation stayed pending: {response}"
+            );
+            id += 1;
+            thread::sleep(Duration::from_millis(100));
+        }
+        drop(stdin);
+        assert!(child.wait().expect("wait server").success());
+    }
+}
+
+#[test]
+fn explain_policy_requires_one_question_and_one_policy() {
+    let project = InlineTestProject::new()
+        .file("app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+    let mut child = spawn_server(project.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    for (id, arguments) in [
+        (
+            1,
+            json!({"policy_files": ["policies/dynamic-eval.rqlp"],
+            "candidate": {"path": "app.py", "byte_start": 0},
+            "near_misses": {"candidates": [{"path": "app.py", "byte_start": 0}]}}),
+        ),
+        (2, json!({"candidate": {"path": "app.py", "byte_start": 0}})),
+    ] {
+        let response = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "explain_policy", "arguments": arguments}
+            }),
+        );
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    let single_target = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "explain_policy", "arguments": {
+                "policy_files": ["policies/dynamic-eval.rqlp"],
+                "candidate": {"path": "app.py", "byte_start": 0}
+            }}
+        }),
+    );
+    assert_eq!(single_target["result"]["isError"], false, "{single_target}");
+    assert_eq!(
+        single_target["result"]["structuredContent"]["explanation"]["question"], "why_not",
+        "{single_target}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait server").success());
+}
+
+#[test]
+fn explain_policy_accepts_a_policy_path_longer_than_a_selector() {
+    let directory = format!("policies/{}/{}", "a".repeat(145), "b".repeat(145));
+    let path = format!("{directory}/dynamic-eval.rqlp");
+    assert!(path.len() > 256 && path.len() < 1024);
+    let project = InlineTestProject::new()
+        .file("app.py", MCP_POLICY_APP)
+        .file(path.clone(), MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+    let mut child = spawn_server(project.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "explain_policy", "arguments": {
+                "policy_files": [path],
+                "candidate": {"path": "app.py", "byte_start": 0}
+            }}
+        }),
+    );
+    assert!(response["error"].is_null(), "{response}");
+    drop(stdin);
+    assert!(child.wait().expect("wait server").success());
+}
+
+#[test]
 fn symbol_sources_rejects_responses_over_source_budget() {
     let root = TempDir::new().expect("workspace");
     let mut symbols = Vec::new();
@@ -6402,4 +7149,670 @@ fn symbol_sources_rejects_responses_over_source_budget() {
     assert!(message.contains("narrower symbols"), "{message}");
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn guidance_list_advertises_public_cache_hints() {
+    let workspace = InlineTestProject::new()
+        .file("Guide.java", "class Guide {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": common::mcp_server::stateless_meta()}
+        }),
+    );
+    let listed = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "resources/list",
+            "params": {"_meta": common::mcp_server::stateless_meta()}
+        }),
+    );
+    assert_eq!(listed["result"]["ttlMs"], 3_600_000, "{listed}");
+    assert_eq!(listed["result"]["cacheScope"], "public", "{listed}");
+    assert_eq!(
+        listed["result"]["resources"][0]["uri"], "bifrost://agent-guidance/agents.md",
+        "{listed}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn policy_catalog_accepts_omitted_arguments() {
+    let workspace = InlineTestProject::new()
+        .file("Empty.java", "class Empty {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let listed = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "list_policies"}
+        }),
+    );
+    assert_eq!(listed["result"]["isError"], false, "{listed}");
+    assert!(
+        listed["result"]["structuredContent"]["packs"].is_array(),
+        "{listed}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn stateless_roots_activation_nonces_are_single_use_and_evict_oldest() {
+    let plugin = TempDir::new().expect("plugin dir");
+    let workspace = InlineTestProject::new()
+        .file("NonceWorkspace.java", "class NonceWorkspace {}\n")
+        .build();
+    let mut child = spawn_rootless_server(plugin.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    let discover = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover",
+            "params":{"_meta":common::mcp_server::stateless_meta()}}),
+    );
+    assert!(
+        discover["result"]["supportedVersions"].is_array(),
+        "{discover}"
+    );
+
+    let mut nonces = Vec::new();
+    for id in 2..=34 {
+        let response = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            common::stateless_search_symbols_call(id, "NonceWorkspace"),
+        );
+        assert_eq!(
+            response["result"]["resultType"], "input_required",
+            "{response}"
+        );
+        nonces.push(
+            response["result"]["requestState"]
+                .as_str()
+                .expect("nonce")
+                .to_owned(),
+        );
+    }
+    let uri = url::Url::from_directory_path(workspace.root())
+        .expect("file URI")
+        .to_string();
+    let mut retry = |id: i64, nonce: &str, root_uri: &str| {
+        let mut request = common::stateless_search_symbols_call(id, "NonceWorkspace");
+        request["params"]["requestState"] = json!(nonce);
+        request["params"]["inputResponses"] = json!({"roots":{"roots":[{"uri":root_uri}]}});
+        round_trip(&mut stdin, &mut reader, &mut stderr, request)
+    };
+    // At capacity 32, only the oldest of 33 activations is displaced.
+    let oldest = retry(35, &nonces[0], &uri);
+    assert!(oldest["error"].is_object(), "{oldest}");
+    // A malformed roots answer consumes its nonce but leaves the server unbound.
+    let refused = retry(36, &nonces[1], "relative");
+    assert!(refused["error"].is_object(), "{refused}");
+    let replay = retry(37, &nonces[1], &uri);
+    assert!(replay["error"].is_object(), "{replay}");
+    let newest = retry(38, &nonces[31], &uri);
+    assert_eq!(newest["result"]["resultType"], "complete", "{newest}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn stateless_roots_activation_keeps_nonce_above_half_capacity() {
+    let plugin = TempDir::new().expect("plugin dir");
+    let workspace = InlineTestProject::new()
+        .file("CapacityWorkspace.java", "class CapacityWorkspace {}\n")
+        .build();
+    let mut child = spawn_rootless_server(plugin.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    let discover = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover",
+            "params":{"_meta":common::mcp_server::stateless_meta()}}),
+    );
+    assert!(
+        discover["result"]["supportedVersions"].is_array(),
+        "{discover}"
+    );
+    let mut oldest = None;
+    for id in 2..=18 {
+        let response = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            common::stateless_search_symbols_call(id, "CapacityWorkspace"),
+        );
+        assert_eq!(
+            response["result"]["resultType"], "input_required",
+            "{response}"
+        );
+        if oldest.is_none() {
+            oldest = Some(
+                response["result"]["requestState"]
+                    .as_str()
+                    .expect("nonce")
+                    .to_owned(),
+            );
+        }
+    }
+    let uri = url::Url::from_directory_path(workspace.root())
+        .expect("file URI")
+        .to_string();
+    let mut retry = common::stateless_search_symbols_call(19, "CapacityWorkspace");
+    retry["params"]["requestState"] = json!(oldest.expect("oldest nonce"));
+    retry["params"]["inputResponses"] = json!({"roots":{"roots":[{"uri":uri}]}});
+    let bound = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
+    assert_eq!(bound["result"]["resultType"], "complete", "{bound}");
+    assert!(bound.to_string().contains("CapacityWorkspace"), "{bound}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn rootless_mcp_uses_second_root_when_first_is_unusable() {
+    let plugin = TempDir::new().expect("plugin dir");
+    let workspace = InlineTestProject::new()
+        .file("SecondRoot.java", "class SecondRoot {}\n")
+        .build();
+    let mut child = spawn_rootless_server(plugin.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    let initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-11-25",
+                "capabilities":{"roots":{"listChanged":true}},
+                "clientInfo":{"name":"roots-client","version":"1"}}}),
+    );
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "bifrost");
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+    let uri = url::Url::from_directory_path(workspace.root())
+        .expect("file URI")
+        .to_string();
+    let result = call_tool_answering_roots(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"search_symbols","arguments":{"patterns":["SecondRoot"]}}}),
+        json!({"roots":[{"uri":"relative"},{"uri":uri}]}),
+    );
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert!(result.to_string().contains("SecondRoot"), "{result}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+fn explicit_root_mcp_watches_source_edits() {
+    let workspace = InlineTestProject::new()
+        .file("Watched.java", "class BeforeEdit {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let search = |id: i64, pattern: &str| {
+        json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":"search_symbols","arguments":{"patterns":[pattern]}}
+        })
+    };
+    let baseline = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        search(100, "BeforeEdit"),
+    );
+    assert_eq!(baseline["result"]["isError"], false, "{baseline}");
+    // Every response echoes its patterns, so only the structured symbol shows
+    // what the index holds.
+    let first_class = |result: &Value| {
+        result["result"]["structuredContent"]["files"][0]["classes"][0]["symbol"].clone()
+    };
+    assert_eq!(first_class(&baseline), "BeforeEdit", "{baseline}");
+    fs::write(
+        workspace.root().join("Watched.java"),
+        "class AfterEdit {}\n",
+    )
+    .expect("edit source");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut id = 101;
+    loop {
+        let updated = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            search(id, "AfterEdit"),
+        );
+        assert_eq!(updated["result"]["isError"], false, "{updated}");
+        if first_class(&updated) == "AfterEdit" {
+            let old = round_trip(
+                &mut stdin,
+                &mut reader,
+                &mut stderr,
+                search(id + 1, "BeforeEdit"),
+            );
+            assert_eq!(
+                old["result"]["structuredContent"]["files"],
+                json!([]),
+                "{old}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watcher did not index edit: {updated}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        id += 2;
+    }
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn client_roots_scope_ignores_codex_sandbox_on_later_calls() {
+    let plugin = TempDir::new().expect("plugin dir");
+    let root = InlineTestProject::new()
+        .file("RootsOnly.java", "class RootsOnly {}\n")
+        .build();
+    let sandbox = InlineTestProject::new()
+        .file("SandboxOnly.java", "class SandboxOnly {}\n")
+        .build();
+    let mut child = spawn_rootless_server(plugin.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    let initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-11-25",
+                "capabilities":{},
+                "clientInfo":{"name":"roots-client","version":"1"}}}),
+    );
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "bifrost");
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+    let root_uri = url::Url::from_directory_path(root.root())
+        .expect("file URI")
+        .to_string();
+    let activation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        common::stateless_search_symbols_call(2, "RootsOnly"),
+    );
+    assert_eq!(
+        activation["result"]["resultType"], "input_required",
+        "{activation}"
+    );
+    let mut retry = common::stateless_search_symbols_call(3, "RootsOnly");
+    retry["params"]["requestState"] = activation["result"]["requestState"].clone();
+    retry["params"]["inputResponses"] = json!({"roots":{"roots":[{"uri":root_uri}]}});
+    let bound = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
+    assert_eq!(
+        bound["result"]["isError"], false,
+        "{bound}; activation={activation}"
+    );
+    let mut sandbox_call = common::stateless_search_symbols_call(4, "SandboxOnly");
+    sandbox_call["params"]["_meta"]["codex/sandbox-state-meta"] =
+        codex_sandbox_metadata(sandbox.root(), "roots-conflict")["codex/sandbox-state-meta"]
+            .clone();
+    sandbox_call["params"]["_meta"]["threadId"] = json!("roots-conflict");
+    let sandbox_search = round_trip(&mut stdin, &mut reader, &mut stderr, sandbox_call);
+    assert_eq!(
+        sandbox_search["result"]["structuredContent"]["files"],
+        json!([]),
+        "{sandbox_search}"
+    );
+    let roots_search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        common::stateless_search_symbols_call(5, "RootsOnly"),
+    );
+    assert!(
+        !roots_search["result"]["structuredContent"]["files"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{roots_search}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn legacy_request_metadata_cannot_authorize_rootless_workspace() {
+    let plugin = TempDir::new().expect("plugin dir");
+    let sandbox = InlineTestProject::new()
+        .file("LegacySandbox.java", "class LegacySandbox {}\n")
+        .build();
+    let mut child = spawn_rootless_server(plugin.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    let discover = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover",
+            "params":{"_meta":common::mcp_server::stateless_meta()}}),
+    );
+    assert!(
+        discover["result"]["supportedVersions"].is_array(),
+        "{discover}"
+    );
+    let mut call = codex_search_symbols_call(2, sandbox.root(), "legacy-request", "LegacySandbox");
+    call["params"]["requestState"] = json!("unsolicited");
+    call["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2025-11-25");
+    call["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, call);
+    assert!(refused["error"].is_object(), "{refused}");
+    assert!(!refused.to_string().contains("LegacySandbox"), "{refused}");
+    assert!(
+        !sandbox
+            .root()
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
+            .exists()
+    );
+    let activation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        common::stateless_search_symbols_call(3, "LegacySandbox"),
+    );
+    assert_eq!(
+        activation["result"]["resultType"], "input_required",
+        "{activation}"
+    );
+    let uri = url::Url::from_directory_path(sandbox.root())
+        .expect("file URI")
+        .to_string();
+    let mut retry = common::stateless_search_symbols_call(4, "LegacySandbox");
+    retry["params"]["requestState"] = activation["result"]["requestState"].clone();
+    retry["params"]["inputResponses"] = json!({"roots":{"roots":[{"uri":uri}]}});
+    let bound = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
+    assert_eq!(bound["result"]["resultType"], "complete", "{bound}");
+    assert!(
+        !bound["result"]["structuredContent"]["files"]
+            .as_array()
+            .expect("search files")
+            .is_empty(),
+        "{bound}"
+    );
+
+    let mut legacy =
+        codex_search_symbols_call(5, sandbox.root(), "legacy-request", "LegacySandbox");
+    legacy["params"]["requestState"] = json!("unsolicited");
+    legacy["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2025-11-25");
+    legacy["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
+    let refused_while_bound = round_trip(&mut stdin, &mut reader, &mut stderr, legacy);
+    assert!(
+        refused_while_bound["error"].is_object(),
+        "{refused_while_bound}"
+    );
+    let still_bound = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        common::stateless_search_symbols_call(6, "LegacySandbox"),
+    );
+    assert_eq!(
+        still_bound["result"]["resultType"], "complete",
+        "{still_bound}"
+    );
+    assert!(
+        !still_bound["result"]["structuredContent"]["files"]
+            .as_array()
+            .expect("search files")
+            .is_empty(),
+        "{still_bound}"
+    );
+    drop(stdin);
+    child.wait().expect("wait bifrost");
+}
+
+#[test]
+fn usage_scans_reject_malformed_scope_arguments() {
+    use brokk_bifrost_mcp::searchtools_service::{SearchToolsService, SearchToolsServiceErrorCode};
+
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", "pub struct Target;\n")
+        .build();
+    let service = SearchToolsService::new_manual_persisted(project.root().to_path_buf())
+        .expect("build workspace");
+    for (id, name, arguments) in [
+        (
+            1,
+            "scan_usages_by_reference",
+            json!({"symbols": ["main.rs#Target", " "]}),
+        ),
+        (
+            2,
+            "scan_usages_by_location",
+            json!({"targets": [{"path": "main.rs", "line": 1}], "max_duration_secs": "bad"}),
+        ),
+        (
+            3,
+            "scan_usages_by_reference",
+            json!({"symbols": ["main.rs#Target"], "include_tests": "yes"}),
+        ),
+    ] {
+        let error = service
+            .call_tool_value(name, arguments.clone())
+            .expect_err("malformed scope must be rejected by the service");
+        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        let extra_args: &[&str] = if name == "scan_usages_by_reference" {
+            &["--no-line-numbers"]
+        } else {
+            &[]
+        };
+        let mut child = spawn_server(project.root(), "searchtools", extra_args);
+        let mut stdin = child.stdin.take().expect("stdin");
+        let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+        initialize_session(&mut stdin, &mut reader, &mut stderr);
+        let response = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }),
+        );
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        drop(stdin);
+        assert!(child.wait().expect("wait bifrost").success());
+    }
+}
+
+#[test]
+fn symbol_locations_accepts_legacy_kind_filter() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", "pub struct Target;\n")
+        .build();
+    let mut child = spawn_server(project.root(), "searchtools", &["--no-line-numbers"]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "get_symbol_locations",
+                          "arguments": {"symbols": ["main.rs#Target"], "kind_filter": "class"}}}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn symbol_sources_accepts_output_between_half_and_full_budget() {
+    let root = TempDir::new().expect("workspace");
+    let mut symbols = Vec::new();
+    for index in 0..10 {
+        let name = format!("Source{index}");
+        let source = format!(
+            "class {name} {{\n/*{}*/\n}}\n",
+            format!("{}\n", "x".repeat(70)).repeat(13_000)
+        );
+        fs::write(root.path().join(format!("{name}.java")), source).expect("write source");
+        symbols.push(format!("{name}.java#{name}"));
+    }
+    let mut child = spawn_server(root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "get_symbol_sources", "arguments": {"symbols": symbols}}}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["sources"]
+            .as_array()
+            .map(Vec::len),
+        Some(10),
+        "{response}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn active_workspace_reports_unavailable_semantic_activation() {
+    let project = InlineTestProject::new()
+        .file("Main.java", "class Main {}\n")
+        .build();
+    install_pack_activation_fixture(project.root());
+    let catalog = project.root().join(".bifrost/packs-catalog");
+    let evidence = json!([{
+        "language": "java", "ecosystem": "jdk",
+        "package": {"name": "fixture.jdk", "version": "not-a-version"},
+        "module": {"name": "java.base", "version": "not-a-version"},
+        "toolchain": {"name": "jdk", "version": "not-a-version"}
+    }]);
+    let mut child = mcp_server_command(project.root(), "searchtools", &[])
+        .env("BIFROST_SEMANTIC_PACK_CATALOG", &catalog)
+        .env("BIFROST_SEMANTIC_PACK_EVIDENCE", evidence.to_string())
+        .spawn()
+        .expect("spawn configured server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut id = 1;
+    loop {
+        let response = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                   "params": {"name": "get_active_workspace", "arguments": {}}}),
+        );
+        let workspace: Value = response["result"]["content"][0]["text"]
+            .as_str()
+            .and_then(|text| serde_json::from_str(text).ok())
+            .expect("workspace JSON");
+        let state = &workspace["semantic_model_overlay"]["state"];
+        if state != "pending" {
+            assert_eq!(state, "unavailable", "{response}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "activation stayed pending: {response}"
+        );
+        id += 1;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+fn symbol_sources_accepts_exact_source_byte_budget() {
+    use brokk_bifrost_mcp::searchtools_service::SearchToolsService;
+
+    let root = TempDir::new().expect("workspace");
+    let mut symbols = Vec::new();
+    for index in 0..16 {
+        let name = format!("Boundary{index}");
+        let prefix = format!("class {name} {{\n/*");
+        let suffix = "*/\n}";
+        let comment = format!("{}\n", "x".repeat(70)).repeat(15_000);
+        let source = format!(
+            "{prefix}{}{suffix}",
+            &comment[..1024 * 1024 - prefix.len() - suffix.len()]
+        );
+        fs::write(root.path().join(format!("{name}.java")), source).expect("write source");
+        symbols.push(format!("{name}.java#{name}"));
+    }
+    let service = SearchToolsService::new_manual_persisted(root.path().to_path_buf())
+        .expect("build workspace");
+    let output = service
+        .call_tool_value("get_symbol_sources", json!({"symbols": symbols}))
+        .expect("exact byte budget must be admitted");
+    let sources = output["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 16);
+    assert_eq!(
+        sources
+            .iter()
+            .map(|source| source["text"].as_str().expect("source text").len())
+            .sum::<usize>(),
+        16 * 1024 * 1024,
+        "boundary fixture must reach the exact budget"
+    );
 }

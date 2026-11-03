@@ -107,6 +107,11 @@ pub const MIN_OUTPUT_BYTES: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemanticIrLimits {
     pub max_procedures: usize,
+    /// Maximum rendered rows. Artifact source, revision, adapter, and versions;
+    /// each capability and procedure locator; and every value, allocation,
+    /// memory location, capture, call site, source mapping, evidence, gap,
+    /// block, program point, event, and control edge each charge one row.
+    /// Pure containers and artifact/procedure headers do not charge rows.
     pub max_rows: usize,
     pub max_source_entries: usize,
     pub max_output_bytes: usize,

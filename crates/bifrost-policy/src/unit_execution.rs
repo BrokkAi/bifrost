@@ -54,10 +54,11 @@ use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_flow::type_flow::{FieldSlotIndex, FieldSlotIndexCache};
 use brokk_bifrost_flow::value_flow::ValueFlowCache;
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryExecutionScope, MergedUnitRows, UnitExecutionResult, execute_code_query_unit,
-    merge_unit_rows, plan_seed_files, push_skipped_unit_diagnostic, remaining_unit_limits,
+    CodeQueryExecutionScope, IntersectPrefixProduct, MergedUnitRows, UnitExecutionResult,
+    continue_intersect_prefix, execute_code_query_unit, execute_intersect_prefix, merge_unit_rows,
+    plan_seed_files, push_skipped_unit_diagnostic, remaining_unit_limits,
 };
-use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryExecutionLimits};
+use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryExecutionLimits, QueryValueKind};
 use brokk_bifrost_rql::{PlanPartitioning, PlanWidenDetail};
 
 use super::budget::PolicyBudget;
@@ -75,16 +76,34 @@ use super::units::{
 /// enumerated forty units and recomputed one before the merge reached a cap
 /// reports both numbers, because that is the diagnosis a reader needs and a
 /// widened policy reporting zeros would hide it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct UnitAttempt {
     total: u64,
     reused: u64,
     recomputed: u64,
     unbounded: u64,
+    all_recomputed_published: bool,
     widen_detail: Option<PlanWidenDetail>,
 }
 
+impl Default for UnitAttempt {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            reused: 0,
+            recomputed: 0,
+            unbounded: 0,
+            all_recomputed_published: true,
+            widen_detail: None,
+        }
+    }
+}
+
 impl UnitAttempt {
+    pub(crate) fn all_recomputed_published(&self) -> bool {
+        self.all_recomputed_published
+    }
+
     pub(crate) fn set_widen_detail(&mut self, detail: Option<PlanWidenDetail>) {
         self.widen_detail = detail;
     }
@@ -371,6 +390,14 @@ impl<'a> UnitReuse<'a> {
         &mut self,
         key: &PolicyUnitKey,
     ) -> Result<Option<PolicyUnitProduct>, WidenReason> {
+        self.published_with_reads(key)
+            .map(|value| value.map(|(product, _)| product))
+    }
+
+    fn published_with_reads(
+        &mut self,
+        key: &PolicyUnitKey,
+    ) -> Result<Option<(PolicyUnitProduct, Vec<ReadKey>)>, WidenReason> {
         let started = Instant::now();
         let replayed_before = self.memo.replay_elapsed();
         let result = self.published_inner(key);
@@ -386,7 +413,7 @@ impl<'a> UnitReuse<'a> {
     fn published_inner(
         &mut self,
         key: &PolicyUnitKey,
-    ) -> Result<Option<PolicyUnitProduct>, WidenReason> {
+    ) -> Result<Option<(PolicyUnitProduct, Vec<ReadKey>)>, WidenReason> {
         // A repeated consumer must see this attempt's writes. Use the same
         // verification and accounting path as a committed product; publication
         // remains atomic with recording the complete policy unit set.
@@ -464,6 +491,7 @@ impl<'a> UnitReuse<'a> {
                         RetentionReason::InputsUnchanged { artifact },
                     ));
                 let product = unit.product().clone();
+                let reads = unit.reads().to_vec();
                 // Verification proved the unit's index answers on
                 // `verified_on` are its answers on this head too, and on the
                 // base when no probe names a moved name. Recording that is
@@ -482,7 +510,7 @@ impl<'a> UnitReuse<'a> {
                         store.attest(key, verified_on, &attested);
                     }
                 }
-                Ok(Some(product))
+                Ok(Some((product, reads)))
             }
             ReadVerdict::Changed(changed) => {
                 let missing = matches!(
@@ -529,7 +557,9 @@ impl<'a> UnitReuse<'a> {
             | UnitPartition::Binding { rel_path, .. }
             | UnitPartition::AssertFile { rel_path, .. }
             | UnitPartition::Root { rel_path, .. }
-            | UnitPartition::Selector { rel_path, .. } => {
+            | UnitPartition::Selector { rel_path, .. }
+            | UnitPartition::Prefix { rel_path, .. }
+            | UnitPartition::Output { rel_path, .. } => {
                 let file = brokk_bifrost_analysis::analyzer::ProjectFile::new(
                     workspace.analyzer().project().root().to_path_buf(),
                     std::path::Path::new(rel_path.as_ref()),
@@ -732,6 +762,11 @@ pub(crate) struct SlicedQuery {
 /// A query-local prefix, merge, and suffix contract. The generic evaluator
 /// owns lookup, read capture, publication, and ordered product collection.
 /// Instances supply only the product and budget rules that differ.
+pub(crate) enum UnitDecodeError {
+    Corrupt,
+    Widen(WidenReason),
+}
+
 pub(crate) trait UnitSlice {
     type Capture<'a>;
     type Seed;
@@ -741,6 +776,14 @@ pub(crate) trait UnitSlice {
     type Allowance: Copy;
     type Merged;
     type Output;
+
+    fn before_lookup(
+        &self,
+        _state: &mut Self::BudgetState,
+        _seed: &Self::Seed,
+    ) -> Result<(), WidenReason> {
+        Ok(())
+    }
 
     fn remaining(&self, state: &Self::BudgetState) -> Option<Self::Allowance>;
     fn prefix(
@@ -752,9 +795,13 @@ pub(crate) trait UnitSlice {
         &self,
         seed: &Self::Seed,
         product: PolicyUnitProduct,
-    ) -> Result<Self::Prefix, WidenReason>;
+        reads: &[ReadKey],
+    ) -> Result<Self::Prefix, UnitDecodeError>;
     fn encode(&self, prefix: &Self::Prefix) -> PolicyUnitProduct;
     fn charge(&self, _state: &mut Self::BudgetState, _prefix: &Self::Prefix) {}
+    fn fits(&self, _state: &Self::BudgetState, _prefix: &Self::Prefix) -> bool {
+        true
+    }
     fn capture<'a>(&self, _analyzer: &'a dyn IAnalyzer) -> Self::Capture<'a>;
     fn after_recompute(
         &self,
@@ -769,7 +816,18 @@ pub(crate) trait UnitSlice {
     fn publishable(&self, _prefix: &Self::Prefix) -> bool {
         true
     }
-    fn missing_reads(&self, attempt: &mut UnitAttempt) -> Result<(), WidenReason> {
+    /// Whether a recomputed product depended on execution state its reads
+    /// cannot reproduce, such as a refused or exhausted budget, so its reads
+    /// do not license publication. Such a unit counts as unbounded.
+    fn execution_dependent(&self, _prefix: &Self::Prefix) -> bool {
+        false
+    }
+    fn set_reads(&self, _prefix: &mut Self::Prefix, _reads: &[ReadKey]) {}
+    fn missing_reads(
+        &self,
+        attempt: &mut UnitAttempt,
+        _prefix: &mut Self::Prefix,
+    ) -> Result<(), WidenReason> {
         attempt.unbounded();
         Ok(())
     }
@@ -791,10 +849,26 @@ pub(crate) fn evaluate_reusable_slice<'a, S: UnitSlice>(
     let mut skipped = 0;
     let mut products = Vec::new();
     for (seed, key) in seeds {
-        let prefix = match reuse.published(key)? {
-            Some(product) => {
+        slice.before_lookup(&mut state, &seed)?;
+        let decoded = match reuse.published_with_reads(key)? {
+            Some((product, reads)) => match slice.decode(&seed, product, &reads) {
+                Ok(prefix) => Some(prefix),
+                Err(UnitDecodeError::Corrupt) => None,
+                Err(UnitDecodeError::Widen(reason)) => return Err(reason),
+            },
+            None => None,
+        };
+        let prefix = match decoded.filter(|prefix| {
+            // A failed fit does not count admitted reuse or debit the
+            // cumulative execution allowance. Recompute it under that grant.
+            slice.validate(prefix).is_ok()
+                && !cancellation.is_some_and(CancellationToken::is_cancelled)
+                && slice.fits(&state, prefix)
+        }) {
+            Some(prefix) => {
                 attempt.reused();
-                slice.decode(&seed, product)?
+                slice.charge(&mut state, &prefix);
+                prefix
             }
             None => {
                 let Some(allowance) = slice.remaining(&state) else {
@@ -813,19 +887,26 @@ pub(crate) fn evaluate_reusable_slice<'a, S: UnitSlice>(
                     slice.after_recompute(prefix, &capture, cancellation);
                 }
                 reuse.record_recompute(elapsed);
-                let prefix = match result {
+                let mut prefix = match result {
                     Ok(prefix) => prefix,
                     Err(error) => return Ok(slice.failure(error, products)),
                 };
                 slice.charge(&mut state, &prefix);
+                let reads = reads.filter(|_| !slice.execution_dependent(&prefix));
                 match reads {
                     Some(reads) => {
+                        slice.set_reads(&mut prefix, &reads);
                         slice.validate(&prefix)?;
                         if slice.publishable(&prefix) {
                             reuse.publish(key.clone(), slice.encode(&prefix), reads);
+                        } else {
+                            attempt.all_recomputed_published = false;
                         }
                     }
-                    None => slice.missing_reads(attempt)?,
+                    None => {
+                        attempt.all_recomputed_published = false;
+                        slice.missing_reads(attempt, &mut prefix)?;
+                    }
                 }
                 prefix
             }
@@ -874,8 +955,9 @@ where
         &self,
         _seed: &Self::Seed,
         product: PolicyUnitProduct,
-    ) -> Result<Self::Prefix, WidenReason> {
-        product.into_rows().ok_or(WidenReason::ProductLoadFailed)
+        _reads: &[ReadKey],
+    ) -> Result<Self::Prefix, UnitDecodeError> {
+        product.into_rows().ok_or(UnitDecodeError::Corrupt)
     }
 
     fn encode(&self, prefix: &Self::Prefix) -> PolicyUnitProduct {
@@ -891,6 +973,43 @@ where
                 .resize(rows.budgeted_work.step_outputs.len(), 0);
         }
         state.1 = state.1.saturating_add(&rows.budgeted_work);
+    }
+
+    fn fits(&self, state: &Self::BudgetState, rows: &Self::Prefix) -> bool {
+        let Some(allowance) = self.remaining(state) else {
+            return false;
+        };
+        let work = rows.work;
+        let budgeted = &rows.budgeted_work;
+        let below = |used: u64, cap: usize| used < cap as u64;
+        // A product must have been complete under its own physical plan caps.
+        // The cumulative step-output proof belongs to the final merge.
+        if rows
+            .reached_limit(
+                self.query,
+                &allowance,
+                self.execution.limits.max_pipeline_rows,
+                self.query.limit,
+            )
+            .is_some()
+        {
+            return false;
+        }
+        below(
+            work.scanned_files.max(budgeted.import_files_resolved),
+            allowance.max_scanned_files,
+        ) && below(
+            work.scanned_source_bytes,
+            allowance.max_scanned_source_bytes,
+        ) && below(
+            work.fact_nodes.saturating_add(work.examined_references),
+            allowance.max_fact_nodes,
+        ) && below(
+            work.pipeline_rows
+                .max(budgeted.provenance_steps)
+                .max(budgeted.import_edges_resolved),
+            allowance.max_pipeline_rows,
+        )
     }
 
     fn capture<'b>(&self, analyzer: &'b dyn IAnalyzer) -> Self::Capture<'b> {
@@ -935,6 +1054,177 @@ where
     }
 }
 
+struct IntersectPrefixSlice<'a> {
+    query: &'a CodeQuery,
+    execution: &'a UnitQueryExecution<'a>,
+    seeds: &'a [ProjectFile],
+}
+
+impl UnitSlice for IntersectPrefixSlice<'_> {
+    type Capture<'a> = AnalyzerQueryScope<'a>;
+    type Seed = ProjectFile;
+    type Prefix = IntersectPrefixProduct;
+    type Error = std::convert::Infallible;
+    type BudgetState = (
+        brokk_bifrost_rql::structural::search::CodeQueryExecutionWork,
+        brokk_bifrost_rql::structural::CodeQueryBudgetedWork,
+    );
+    type Allowance = CodeQueryExecutionLimits;
+    type Merged = Vec<IntersectPrefixProduct>;
+    type Output = MergedUnitRows;
+
+    fn remaining(&self, state: &Self::BudgetState) -> Option<Self::Allowance> {
+        remaining_unit_limits(self.execution.limits, &state.0, &state.1)
+    }
+
+    fn prefix(
+        &self,
+        file: &Self::Seed,
+        allowance: Self::Allowance,
+    ) -> Result<Self::Prefix, Self::Error> {
+        Ok(execute_intersect_prefix(
+            self.execution.analyzer,
+            self.execution.flow_state.clone(),
+            self.execution.workspace,
+            self.query,
+            allowance,
+            self.execution.cancellation,
+            CodeQueryExecutionScope::for_seed_files(
+                std::slice::from_ref(file),
+                self.execution.workspace_files,
+            ),
+        ))
+    }
+
+    fn decode(
+        &self,
+        file: &Self::Seed,
+        product: PolicyUnitProduct,
+        reads: &[ReadKey],
+    ) -> Result<Self::Prefix, UnitDecodeError> {
+        let PolicyUnitProduct::Prefix(json) = product else {
+            return Err(UnitDecodeError::Corrupt);
+        };
+        let value = serde_json::from_str(&json).map_err(|_| UnitDecodeError::Corrupt)?;
+        IntersectPrefixProduct::decode_product_json_with_limits(
+            self.execution.analyzer,
+            self.execution.workspace,
+            self.execution.limits,
+            &self.query.plan,
+            file.clone(),
+            reads.to_vec(),
+            value,
+        )
+        .map_err(|_| UnitDecodeError::Corrupt)
+    }
+
+    fn encode(&self, prefix: &Self::Prefix) -> PolicyUnitProduct {
+        PolicyUnitProduct::Prefix(
+            prefix
+                .encode_product_json(&self.query.plan)
+                .expect("publishable intersect prefix has an encodable product")
+                .to_string(),
+        )
+    }
+
+    fn charge(&self, state: &mut Self::BudgetState, prefix: &Self::Prefix) {
+        state.0 = state.0.saturating_add(prefix.work);
+        if state.1.step_outputs.is_empty() {
+            state
+                .1
+                .step_outputs
+                .resize(prefix.budgeted_work.step_outputs.len(), 0);
+        }
+        state.1 = state.1.saturating_add(&prefix.budgeted_work);
+    }
+
+    fn fits(&self, state: &Self::BudgetState, prefix: &Self::Prefix) -> bool {
+        let Some(allowance) = self.remaining(state) else {
+            return false;
+        };
+        if prefix.reached_limit(self.query, &allowance).is_some() {
+            return false;
+        }
+        let work = prefix.work;
+        let budgeted = &prefix.budgeted_work;
+        let below = |used: u64, cap: usize| used < cap as u64;
+        below(
+            work.scanned_files.max(budgeted.import_files_resolved),
+            allowance.max_scanned_files,
+        ) && below(
+            work.scanned_source_bytes,
+            allowance.max_scanned_source_bytes,
+        ) && below(
+            work.fact_nodes.saturating_add(work.examined_references),
+            allowance.max_fact_nodes,
+        ) && below(
+            work.pipeline_rows
+                .max(budgeted.provenance_steps)
+                .max(budgeted.import_edges_resolved),
+            allowance.max_pipeline_rows,
+        )
+    }
+
+    fn capture<'a>(&self, analyzer: &'a dyn IAnalyzer) -> Self::Capture<'a> {
+        AnalyzerQueryScope::capturing_read_incompleteness(analyzer)
+    }
+
+    fn after_recompute(
+        &self,
+        prefix: &mut Self::Prefix,
+        capture: &Self::Capture<'_>,
+        cancellation: Option<&CancellationToken>,
+    ) {
+        if !capture.captured_read_incompleteness().is_empty()
+            || cancellation.is_some_and(CancellationToken::is_cancelled)
+        {
+            prefix.reads_closed = false;
+        }
+    }
+
+    fn set_reads(&self, prefix: &mut Self::Prefix, reads: &[ReadKey]) {
+        prefix.reads = reads.to_vec();
+    }
+
+    fn missing_reads(
+        &self,
+        attempt: &mut UnitAttempt,
+        prefix: &mut Self::Prefix,
+    ) -> Result<(), WidenReason> {
+        attempt.unbounded();
+        prefix.reads_closed = false;
+        Ok(())
+    }
+
+    fn publishable(&self, prefix: &Self::Prefix) -> bool {
+        prefix.reads_closed
+            && prefix.completion == brokk_bifrost_rql::CodeQueryCompletion::Complete
+            && prefix.encode_product_json(&self.query.plan).is_ok()
+    }
+
+    fn failure(&self, error: Self::Error, _products: Vec<Self::Prefix>) -> Self::Output {
+        match error {}
+    }
+
+    fn merge(&self, products: impl IntoIterator<Item = Self::Prefix>) -> Self::Merged {
+        products.into_iter().collect()
+    }
+
+    fn suffix(&self, products: Self::Merged, _skipped: usize) -> Self::Output {
+        continue_intersect_prefix(
+            self.execution.analyzer,
+            self.execution.flow_state.clone(),
+            self.execution.workspace,
+            self.query,
+            self.execution.limits,
+            self.execution.cancellation,
+            self.seeds,
+            products,
+        )
+        .into_merged_rows(self.query)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QuerySlicingWiden {
     pub(crate) reason: WidenReason,
@@ -948,13 +1238,27 @@ pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<QuerySlici
             detail,
         })
     } else {
-        match PlanPartitioning::classify(&query.plan) {
+        match policy_partitioning(query) {
             PlanPartitioning::Whole(detail) => Some(QuerySlicingWiden {
                 reason: WidenReason::PlanCrossesSeeds,
                 detail,
             }),
             _ => None,
         }
+    }
+}
+
+fn policy_partitioning(query: &CodeQuery) -> PlanPartitioning {
+    let partitioning = PlanPartitioning::classify_for_prefix(&query.plan);
+    if matches!(partitioning, PlanPartitioning::Prefix { .. })
+        && !matches!(
+            query.validate_row_kinds().as_deref(),
+            Ok([QueryValueKind::Declaration | QueryValueKind::Occurrence])
+        )
+    {
+        PlanPartitioning::classify(&query.plan)
+    } else {
+        partitioning
     }
 }
 
@@ -1018,6 +1322,28 @@ pub(crate) fn sliced_query_units(
     attempt.enumerated(seed_files.len());
     let inputs = incremental.inputs();
 
+    let prefix_digests = match policy_partitioning(query) {
+        PlanPartitioning::Prefix { cut } => {
+            let cut_digest = StableDigest::sha256("bifrost.rql.root_intersect.cut.v1");
+            let operand_inputs: Vec<_> = cut
+                .operands(&query.plan)
+                .iter()
+                .map(|operand| {
+                    CodeQuery {
+                        plan: operand.clone(),
+                        ..query.clone()
+                    }
+                    .to_canonical_query_plan_json()
+                })
+                .collect();
+            let input_digest = StableDigest::sha256(
+                serde_json::to_string(&operand_inputs).expect("canonical operand inputs are JSON"),
+            );
+            Some((cut_digest, input_digest))
+        }
+        _ => None,
+    };
+
     let mut keys = Vec::with_capacity(seed_files.len());
     for file in &seed_files {
         let language = language_for_file(file);
@@ -1028,19 +1354,50 @@ pub(crate) fn sliced_query_units(
             // than evidence of sameness.
             return Err(WidenReason::ReverseDependencyEvidenceMissing);
         };
-        keys.push(inputs.unit_key(
-            policy,
-            partition(SeedPartition {
+        let partition = match prefix_digests {
+            Some((cut, input)) => UnitPartition::Prefix {
+                language,
+                rel_path: rel_path.into_boxed_str(),
+                blob,
+                cut,
+                input,
+            },
+            None => partition(SeedPartition {
                 language,
                 rel_path,
                 blob,
             }),
-        ));
+        };
+        keys.push(inputs.unit_key(policy, partition));
     }
     reuse.prefetch(
         &keys,
         Some(brokk_bifrost_rql::structural::unit_plan_node_count(query)),
     )?;
+
+    if prefix_digests.is_some() {
+        let slice = IntersectPrefixSlice {
+            query,
+            execution,
+            seeds: &seed_files,
+        };
+        let merged = evaluate_reusable_slice(
+            &slice,
+            seed_files.iter().cloned().zip(keys.iter()),
+            reuse,
+            attempt,
+            execution.analyzer,
+            execution.cancellation,
+        )?;
+        if merged.completion() == brokk_bifrost_rql::CodeQueryCompletion::Complete
+            && merged
+                .reached_limit(&execution.limits, query.limit)
+                .is_some()
+        {
+            return Err(WidenReason::MergedLimitReached);
+        }
+        return Ok(SlicedQuery { merged, keys });
+    }
 
     let slice = FileQuerySlice {
         query,
@@ -1085,6 +1442,13 @@ pub(crate) fn sliced_query_units(
         execution.analyzer,
         execution.cancellation,
     )?;
+    if merged.completion() == brokk_bifrost_rql::CodeQueryCompletion::Complete
+        && merged
+            .reached_limit(&execution.limits, query.limit)
+            .is_some()
+    {
+        return Err(WidenReason::MergedLimitReached);
+    }
     Ok(SlicedQuery { merged, keys })
 }
 

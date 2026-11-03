@@ -36,18 +36,19 @@ use crate::analyzer::semantic::{
 };
 use crate::dataflow::{SemanticInputStatus, UnmodeledCallBehavior};
 use crate::hash::{HashMap, HashSet};
-use crate::taint::{TaintAnalysisPlan, TaintEdgeFunction};
 use crate::value_flow::{
     DurableCallSiteKey, DurableProcedureKey, ValueFlowCarrier, ValueFlowObservationPhase,
-    ValueFlowSinkId,
+    ValueFlowPlan, ValueFlowSinkId,
 };
 
-use super::graph::{ComposedSourceId, Endpoint, Hop, HopQuality};
-use super::labels::{hops_function, label_classes};
+use super::graph::{ComposedSourceId, Endpoint, ExecutionTarget, Hop, HopQuality};
+use super::labels::{ComposeLabels, LabelFunctionId, LabelFunctions};
+use super::provider::bound_return_member_matches;
 use super::provider::{
     BlockedGap, BoundSanitizer, BoundSource, BoundTransform, CallModel, CallerLocation,
-    Completeness, CompositionProvider, DispatchCandidate, EndpointEvidence, InteriorObservation,
-    InteriorSeed, InteriorTarget, Openness,
+    Completeness, CompositionProvider, DispatchCandidate, EndpointEvidence, ExecutionArmContext,
+    ExecutionEndpointStatus, ExecutionSource, InteriorObservation, InteriorSeed, InteriorTarget,
+    Openness, StoreChannelLink, StoreWriteObservation,
 };
 use super::{ComposeError, CompositionBudget};
 
@@ -61,6 +62,25 @@ pub struct SourceSinkPair {
     pub paths: Vec<(Vec<Hop>, HopQuality)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionReach {
+    pub root: DurableProcedureKey,
+    pub source: usize,
+    pub function: LabelFunctionId,
+    pub quality: HopQuality,
+    pub hops: Vec<Hop>,
+    pub incoming: Option<ExecutionArmContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionOutcome<L: ComposeLabels> {
+    pub sources: Vec<ExecutionSource<L::Fact>>,
+    pub reaches: Vec<ExecutionReach>,
+    pub functions: LabelFunctions<L>,
+    pub incomplete: Vec<Incompleteness>,
+    pub stats: SearchStats,
+}
+
 /// A budget lane of [`CompositionBudget`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BudgetLane {
@@ -72,6 +92,10 @@ pub enum BudgetLane {
 /// Why the composed result may miss a flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Incompleteness {
+    Execution {
+        procedure: DurableProcedureKey,
+        reason: Box<str>,
+    },
     /// A dispatch on the frontier was open, unproven or exceeded.
     Dispatch {
         call: DurableCallSiteKey,
@@ -125,6 +149,11 @@ pub enum Incompleteness {
         procedure: DurableProcedureKey,
         reason: Box<str>,
     },
+    /// The selected write inventory for a demanded store read was incomplete.
+    StoreInventory {
+        procedure: DurableProcedureKey,
+        reason: Box<str>,
+    },
     /// A source, of the plan or matched on the frontier, at `point` whose
     /// selector evidence is not proven and complete, as the ICFG engine's
     /// plan reports it.
@@ -140,12 +169,16 @@ pub enum Incompleteness {
 
 /// The result of stage 1.
 #[derive(Debug, Clone)]
-pub struct SearchOutcome {
+pub struct SearchOutcome<L: ComposeLabels> {
+    pub execution_sources: Vec<ExecutionSource<L::Fact>>,
+    pub execution_reaches: Vec<ExecutionReach>,
     pub pairs: Vec<SourceSinkPair>,
     pub strict_pairs: Vec<SourceSinkPair>,
     /// The source table the pairs index: the plan's sources, then those the
     /// provider matched on the frontier.
-    pub sources: Vec<BoundSource>,
+    pub sources: Vec<BoundSource<L::Fact>>,
+    /// The label functions the pairs' hops name.
+    pub functions: LabelFunctions<L>,
     /// Whether every sanitizer of the plan and every sanitizer the provider
     /// matched on the frontier is resolved.
     pub sanitizers_resolved: bool,
@@ -180,10 +213,35 @@ pub struct SearchStats {
 
 /// What a set of path items reaches: a bound sink, or an output port of one
 /// procedure.
+/// What one composition asks, in the client's labels: the value-flow plan
+/// whose points and carriers the endpoints name, the bound sinks in order
+/// with what each accepts, and the client's own sources, sanitizers and
+/// in-place transforms. The provider adds the endpoints it matches on the
+/// frontier.
+pub(super) struct ComposeQuery<'a, L: ComposeLabels> {
+    pub(super) execution_roots: Vec<DurableProcedureKey>,
+    pub(super) value_flow: Option<&'a ValueFlowPlan>,
+    pub(super) labels: L,
+    pub(super) sinks: Vec<(ValueFlowSinkId, L::Fact)>,
+    pub(super) sources: Vec<BoundSource<L::Fact>>,
+    pub(super) sanitizers: Vec<BoundSanitizer<L::Function>>,
+    pub(super) transforms: Vec<InPlaceTransform<L::Function>>,
+}
+
+/// A transform applied in place on the paths through its call, as opposed to
+/// a matched [`BoundTransform`], which is a flow of its own.
+pub(super) struct InPlaceTransform<Function> {
+    pub(super) point: ProgramPointHandle,
+    pub(super) carrier: ValueFlowCarrier,
+    pub(super) function: Function,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Root {
+    Execution(Box<DurableProcedureKey>),
     Sink(ValueFlowSinkId),
     Port(Box<(DurableProcedureKey, PartialFlowPort)>),
+    StoreWrite(usize),
 }
 
 impl Root {
@@ -191,8 +249,10 @@ impl Root {
     /// the procedure through every caller.
     fn unbalanced(&self) -> bool {
         match self {
+            Self::Execution(_) => false,
             Self::Sink(_) => true,
             Self::Port(port) => matches!(port.1, PartialFlowPort::CaptureOut { .. }),
+            Self::StoreWrite(_) => true,
         }
     }
 }
@@ -203,7 +263,8 @@ struct ItemKey {
     root: Root,
     node: Endpoint,
     /// Label function of the path from `node` to `root`.
-    function: TaintEdgeFunction,
+    function: LabelFunctionId,
+    execution_arm: Option<ExecutionArmContext>,
 }
 
 /// How an item was derived. Every index names an item or reach that existed
@@ -313,8 +374,9 @@ impl<D: Clone> Derivations<D> {
 struct ReachKey {
     root: Root,
     source: ComposedSourceId,
+    store_origin: Option<crate::taint::SourceEventKey>,
     /// Label function of the path from the source to the root.
-    function: TaintEdgeFunction,
+    function: LabelFunctionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,11 +417,18 @@ struct CaptureWaiter {
     hop: Hop,
 }
 
+#[derive(Debug, Clone)]
+struct StoreWaiter {
+    item: usize,
+    link: StoreChannelLink,
+}
+
 /// One flow into a position of a procedure: where it starts, whether its
 /// relations are uncertain, and the calls its path classes crossed.
 #[derive(Debug, Clone)]
 struct Inflow<From> {
     from: From,
+    function: LabelFunctionId,
     uncertain: bool,
     crossed: CrossedCalls,
 }
@@ -411,14 +480,35 @@ enum Work {
     Reach(usize),
 }
 
-struct Search<'a, Provider: CompositionProvider> {
-    plan: &'a TaintAnalysisPlan,
+struct Search<'a, Provider, L>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
+    execution_roots: Vec<DurableProcedureKey>,
+    value_flow: Option<&'a ValueFlowPlan>,
+    /// What each bound sink accepts.
+    accepted: HashMap<ValueFlowSinkId, L::Fact>,
     provider: &'a Provider,
     budget: CompositionBudget,
-    identity: TaintEdgeFunction,
-    /// Every source the search can reach: the plan's, then those matched on
+    /// The label functions of every path key and hop of this search.
+    functions: LabelFunctions<L>,
+    /// Every source the search can reach: the query's, then those matched on
     /// the frontier.
-    sources: Vec<BoundSource>,
+    sources: Vec<BoundSource<L::Fact>>,
+    execution_sources: Vec<ExecutionSource<L::Fact>>,
+    execution_source_ids: HashMap<(ExecutionTarget, Box<str>, Option<ExecutionArmContext>), usize>,
+    execution_reaches: Vec<ExecutionReach>,
+    execution_reach_ids: HashMap<
+        (
+            DurableProcedureKey,
+            usize,
+            LabelFunctionId,
+            Option<ExecutionArmContext>,
+        ),
+        usize,
+    >,
+    execution_visited: HashSet<DurableProcedureKey>,
     sources_in: HashMap<DurableProcedureKey, Vec<ComposedSourceId>>,
     sinks_in: HashMap<DurableProcedureKey, Vec<ValueFlowSinkId>>,
     annotations: HashMap<DurableCallSiteKey, Vec<Annotation>>,
@@ -433,7 +523,7 @@ struct Search<'a, Provider: CompositionProvider> {
     /// Live handles of procedures an interior run has served.
     handles: HashMap<DurableProcedureKey, ProcedureHandle>,
     dispatches: HashMap<DurableCallSiteKey, Arc<DispatchAnswer>>,
-    models: HashMap<DurableCallSiteKey, Option<Arc<CallModel>>>,
+    models: HashMap<DurableCallSiteKey, Option<Arc<CallModel<L::Function>>>>,
     callers: HashMap<DurableProcedureKey, Arc<[DurableCallSiteKey]>>,
     parents: HashMap<DurableProcedureKey, Option<DurableProcedureKey>>,
     items: Vec<Item>,
@@ -448,6 +538,10 @@ struct Search<'a, Provider: CompositionProvider> {
     registered_call_waiters: HashSet<(usize, Root)>,
     capture_waiters: HashMap<Root, Vec<CaptureWaiter>>,
     registered_capture_waiters: HashSet<(usize, Root)>,
+    store_writes: Vec<StoreWriteObservation>,
+    store_writes_in: HashMap<DurableProcedureKey, Vec<usize>>,
+    store_waiters: HashMap<Root, Vec<StoreWaiter>>,
+    registered_store_waiters: HashSet<(usize, Root)>,
     work: Vec<Work>,
     incomplete: Vec<Incompleteness>,
     incomplete_seen: HashSet<Incompleteness>,
@@ -468,32 +562,51 @@ struct Search<'a, Provider: CompositionProvider> {
     changed_edges: HashSet<Hop>,
 }
 
-/// Run stage 1 over every bound sink of the plan.
-pub(super) fn search_pairs<Provider: CompositionProvider>(
-    plan: &TaintAnalysisPlan,
-    provider: &Provider,
+/// Run stage 1 over every bound sink of the query.
+pub(super) fn search_pairs<'a, Provider, L>(
+    query: ComposeQuery<'a, L>,
+    provider: &'a Provider,
     budget: CompositionBudget,
     request: &mut SemanticRequest<'_>,
-) -> Result<SearchOutcome, ComposeError> {
-    let mut search = Search::new(plan, provider, budget);
+) -> Result<SearchOutcome<L>, ComposeError>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
+    let value_flow = query.value_flow;
+    let sinks = query
+        .sinks
+        .iter()
+        .map(|(sink, _)| *sink)
+        .collect::<Vec<_>>();
+    let mut search = Search::new(query, provider, budget);
+    for procedure in search.execution_roots.clone() {
+        search.add_item(
+            procedure.clone(),
+            Root::Execution(Box::new(procedure.clone())),
+            Endpoint::Execution(Box::new(ExecutionTarget::Procedure(Box::new(procedure)))),
+            LabelFunctionId::IDENTITY,
+            HopQuality::CERTAIN,
+            Derivation::Root,
+        );
+    }
     // Every bound endpoint must carry proven and complete selector evidence,
     // as the ICFG engine's plan requires of its endpoints, whether or not a
     // path reaches them. The plan's sources are noted as `Search::new` adds
     // them, and a source matched on the frontier as the search enters its
     // procedure.
-    for (_, spec) in plan.value_flow().sinks() {
+    for (_, spec) in value_flow.into_iter().flat_map(ValueFlowPlan::sinks) {
         if !evidence_quality(spec.proof(), spec.completeness()).is_certain() {
             search.note(Incompleteness::SinkEvidence {
                 point: spec.point().clone(),
             });
         }
     }
-    for binding in plan.sinks() {
-        let sink = binding.sink();
-        let spec = plan
-            .value_flow()
+    for sink in sinks {
+        let spec = value_flow
+            .expect("a value sink has a value plan")
             .sink(sink)
-            .expect("a sink binding names a sink of its plan");
+            .expect("a bound sink names a sink of its plan");
         let procedure = spec.point().procedure().durable_key();
         // The ICFG engine materializes a meeting on the edges that leave the
         // sink's point. At a call's point those are the call's own edges, and
@@ -509,12 +622,11 @@ pub(super) fn search_pairs<Provider: CompositionProvider>(
             None => HopQuality::CERTAIN,
         }
         .conjoin(evidence_quality(spec.proof(), spec.completeness()));
-        let identity = search.identity.clone();
         search.add_item(
             procedure,
             Root::Sink(sink),
             Endpoint::Sink(sink),
-            identity,
+            LabelFunctionId::IDENTITY,
             quality,
             Derivation::Root,
         );
@@ -564,15 +676,19 @@ pub(super) fn search_pairs<Provider: CompositionProvider>(
         changed_edge_qualities: search.changed_edge_qualities,
         baseline_candidate_pairs: search.baseline_candidate_pairs,
         strict_replays: search.strict_replays,
-        procedures: search.visited.len(),
-        hops: search.items.len() + search.reaches.len(),
+        procedures: search.visited.len() + search.execution_visited.len(),
+        hops: search.items.len() + search.reaches.len() + search.execution_reaches.len(),
         dispatches: search.dispatches.len(),
         callers: search.callers.values().map(|calls| calls.len()).sum(),
     };
+    let pairs = search.pairs();
     Ok(SearchOutcome {
-        pairs: search.pairs(),
+        execution_sources: search.execution_sources,
+        execution_reaches: search.execution_reaches,
+        pairs,
         strict_pairs: search.strict_pairs,
         sources: search.sources,
+        functions: search.functions,
         sanitizers_resolved: search.sanitizers_resolved,
         incomplete: search.incomplete,
         abstained: search.abstained,
@@ -585,25 +701,53 @@ pub(super) fn provider_error(error: impl std::fmt::Display) -> ComposeError {
     ComposeError::Provider(error.to_string().into_boxed_str())
 }
 
-impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
-    fn new(plan: &'a TaintAnalysisPlan, provider: &'a Provider, budget: CompositionBudget) -> Self {
+impl<'a, Provider, L> Search<'a, Provider, L>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
+    fn new(query: ComposeQuery<'a, L>, provider: &'a Provider, budget: CompositionBudget) -> Self {
+        let ComposeQuery {
+            execution_roots,
+            value_flow,
+            labels,
+            sinks,
+            sources,
+            sanitizers,
+            transforms,
+        } = query;
+        let store_writes = provider.store_writes();
+        let mut store_writes_in: HashMap<DurableProcedureKey, Vec<usize>> = HashMap::default();
+        for (index, write) in store_writes.iter().enumerate() {
+            store_writes_in
+                .entry(write.procedure.clone())
+                .or_default()
+                .push(index);
+        }
         let mut sinks_in: HashMap<DurableProcedureKey, Vec<ValueFlowSinkId>> = HashMap::default();
-        for binding in plan.sinks() {
-            let spec = plan
-                .value_flow()
-                .sink(binding.sink())
-                .expect("a sink binding names a sink of its plan");
+        for (sink, _) in &sinks {
+            let spec = value_flow
+                .expect("a value sink has a value plan")
+                .sink(*sink)
+                .expect("a bound sink names a sink of its plan");
             sinks_in
                 .entry(spec.point().procedure().durable_key())
                 .or_default()
-                .push(binding.sink());
+                .push(*sink);
         }
         let mut search = Self {
-            plan,
+            execution_roots,
+            value_flow,
+            accepted: sinks.into_iter().collect(),
             provider,
             budget,
-            identity: TaintEdgeFunction::identity(plan.universe()),
+            functions: LabelFunctions::new(labels),
             sources: Vec::new(),
+            execution_sources: Vec::new(),
+            execution_source_ids: HashMap::default(),
+            execution_reaches: Vec::new(),
+            execution_reach_ids: HashMap::default(),
+            execution_visited: HashSet::default(),
             sources_in: HashMap::default(),
             sinks_in,
             annotations: HashMap::default(),
@@ -629,6 +773,10 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             registered_call_waiters: HashSet::default(),
             capture_waiters: HashMap::default(),
             registered_capture_waiters: HashSet::default(),
+            store_writes,
+            store_writes_in,
+            store_waiters: HashMap::default(),
+            registered_store_waiters: HashSet::default(),
             work: Vec::new(),
             incomplete: Vec::new(),
             incomplete_seen: HashSet::default(),
@@ -648,28 +796,19 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             strict_replays: 0,
             changed_edges: HashSet::default(),
         };
-        for binding in plan.sources() {
-            let spec = plan
-                .value_flow()
-                .source(binding.source())
-                .expect("a source binding names a source of its plan");
-            search.add_source(BoundSource {
-                point: spec.point().clone(),
-                phase: spec.phase(),
-                carrier: spec.carrier().clone(),
-                classes: binding.classes().clone(),
-                origin: binding.origin().clone(),
-                evidence: EndpointEvidence::Known(evidence_quality(
-                    spec.proof(),
-                    spec.completeness(),
-                )),
-            });
+        for source in sources {
+            search.add_source(source);
         }
-        search.place_annotations();
+        for sanitizer in &sanitizers {
+            search.place_sanitizer(sanitizer);
+        }
+        for transform in transforms {
+            search.place_in_place_transform(transform);
+        }
         search
     }
 
-    fn add_source(&mut self, source: BoundSource) {
+    fn add_source(&mut self, source: BoundSource<L::Fact>) {
         if matches!(source.evidence, EndpointEvidence::Known(quality) if !quality.is_certain()) {
             self.note(Incompleteness::SourceEvidence {
                 point: source.point.clone(),
@@ -727,46 +866,37 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         }
     }
 
-    /// Place every sanitizer and in-place transform of the plan on the ports
-    /// of the call whose input or output carrier it binds.
-    fn place_annotations(&mut self) {
-        let plan = self.plan;
-        let carrier = |id| {
-            plan.value_flow()
-                .carrier(id)
-                .expect("a bound carrier is a carrier of its plan")
-                .clone()
+    /// Place one in-place transform on the ports of the call whose carrier
+    /// it binds.
+    fn place_in_place_transform(&mut self, transform: InPlaceTransform<L::Function>) {
+        let function = self.functions.intern(transform.function);
+        let hop_for = |call: DurableCallSiteKey| Hop::Transform {
+            call,
+            function,
+            uncertain: false,
         };
-        for sanitizer in plan.sanitizers() {
-            self.place_sanitizer(&BoundSanitizer {
-                point: sanitizer.point().clone(),
-                input: carrier(sanitizer.carrier()),
-                output: carrier(sanitizer.output()),
-                removed: sanitizer.removed().clone(),
-                proven: sanitizer.is_proven(),
-                resolved: sanitizer.is_resolved(),
-            });
-        }
-        for transform in plan.transforms() {
-            let hop_for = |call: DurableCallSiteKey| Hop::Transform {
-                call,
-                function: transform.function().clone(),
-                uncertain: false,
-            };
-            let carrier = carrier(transform.carrier());
-            let placed = place_transfer(transform.point(), &carrier, &carrier, hop_for);
-            self.annotate_many(placed, transform.point(), &carrier);
-        }
+        let placed = place_transfer(
+            &transform.point,
+            &transform.carrier,
+            &transform.carrier,
+            hop_for,
+        );
+        self.annotate_many(placed, &transform.point, &transform.carrier);
     }
 
     /// Place one sanitizer on the ports of the call whose input or output
     /// carrier it binds. A sanitizer that is not resolved leaves the run
     /// incomplete.
-    fn place_sanitizer(&mut self, sanitizer: &BoundSanitizer) {
+    fn place_sanitizer(&mut self, sanitizer: &BoundSanitizer<L::Function>) {
         self.sanitizers_resolved &= sanitizer.resolved;
+        let function = if sanitizer.proven {
+            self.functions.intern(sanitizer.function.clone())
+        } else {
+            LabelFunctionId::IDENTITY
+        };
         let hop_for = |call: DurableCallSiteKey| Hop::Sanitizer {
             call,
-            removed: sanitizer.removed.clone(),
+            function,
             proven: sanitizer.proven,
             uncertain: !sanitizer.resolved,
         };
@@ -781,10 +911,11 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
 
     /// Place one matched transform as a flow of its own from the call input
     /// it reads to the call output it produces.
-    fn place_link(&mut self, transform: &BoundTransform) {
+    fn place_link(&mut self, transform: &BoundTransform<L::Function>) {
+        let function = self.functions.intern(transform.function.clone());
         let hop_for = |call: DurableCallSiteKey| Hop::Transform {
             call,
-            function: transform.function.clone(),
+            function,
             uncertain: transform.uncertain,
         };
         let placed = place_transfer(
@@ -863,8 +994,8 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
     /// cannot pick up the annotation through `annotations_for`.
     fn sink_annotations(&self, sink: ValueFlowSinkId) -> Vec<Hop> {
         let spec = self
-            .plan
-            .value_flow()
+            .value_flow
+            .expect("value observation has a value plan")
             .sink(sink)
             .expect("a sink item names a sink of its plan");
         let ValueFlowCarrier::Value(value) = spec.carrier() else {
@@ -909,16 +1040,24 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         procedure: DurableProcedureKey,
         root: Root,
         node: Endpoint,
-        function: TaintEdgeFunction,
+        function: LabelFunctionId,
         quality: HopQuality,
         derivation: Derivation,
     ) {
-        let key = ItemKey {
-            procedure,
-            root,
-            node,
-            function,
-        };
+        self.add_item_with_arm(
+            ItemKey {
+                procedure,
+                root,
+                node,
+                function,
+                execution_arm: None,
+            },
+            quality,
+            derivation,
+        );
+    }
+
+    fn add_item_with_arm(&mut self, key: ItemKey, quality: HopQuality, derivation: Derivation) {
         if let Some(&id) = self.item_ids.get(&key) {
             if self.provider.has_value_type_barriers()
                 && !self.items[id].alternatives.contains(&derivation)
@@ -935,7 +1074,9 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             }
             return;
         }
-        if self.items.len() + self.reaches.len() >= self.budget.max_hops {
+        if self.items.len() + self.reaches.len() + self.execution_reaches.len()
+            >= self.budget.max_hops
+        {
             self.exhaust(BudgetLane::Hops);
             self.stopped = true;
             return;
@@ -966,13 +1107,24 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         &mut self,
         root: Root,
         source: ComposedSourceId,
-        function: TaintEdgeFunction,
+        function: LabelFunctionId,
         quality: HopQuality,
         derivation: ReachDerivation,
     ) {
+        let store_origin = match &derivation {
+            ReachDerivation::Direct { .. } => None,
+            ReachDerivation::Through { inner, hops, .. } => hops
+                .iter()
+                .find_map(|hop| match hop {
+                    Hop::Store { read_origin, .. } => Some(read_origin.clone()),
+                    _ => None,
+                })
+                .or_else(|| self.reaches[*inner].key.store_origin.clone()),
+        };
         let key = ReachKey {
             root,
             source,
+            store_origin,
             function,
         };
         if let Some(&id) = self.reach_ids.get(&key) {
@@ -1039,25 +1191,59 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             self.procedures.insert(procedure.clone(), None);
             return Ok(None);
         }
+        let projections = self
+            .provider
+            .projected_partial_flows(procedure, request)
+            .map_err(provider_error)?;
+        assert!(
+            !projections.is_empty(),
+            "a procedure has at least one label partition"
+        );
         let flows = self
             .provider
             .partial_flows(procedure, request)
             .map_err(provider_error)?;
-        if flows.outcome != PartialFlowOutcome::Complete {
-            self.note(Incompleteness::PartialFlows {
-                procedure: procedure.clone(),
-                outcome: flows.outcome,
-            });
-        }
         let mut into: HashMap<PartialFlowPort, Vec<Inflow<PartialFlowPort>>> = HashMap::default();
-        for flow in &flows.flows {
-            into.entry(flows.ports[flow.to.index()].clone())
-                .or_default()
-                .push(Inflow {
-                    from: flows.ports[flow.from.index()].clone(),
-                    uncertain: flow.uncertain,
-                    crossed: flow.crossed.clone(),
+        for (function, projection) in projections {
+            if projection.outcome != PartialFlowOutcome::Complete {
+                self.note(Incompleteness::PartialFlows {
+                    procedure: procedure.clone(),
+                    outcome: projection.outcome,
                 });
+            }
+            // The stored (or ordinary fresh) rows retain the usual path-sensitive
+            // openness refinement. An extra-kill projection may remove a path
+            // before it reaches that worklist, so its relation proof and any
+            // *new* openness must be checked here. Openness already present in
+            // the baseline is still handled by the dispatch/gap sweep. A fresh
+            // snapshot may discharge fewer gaps than the stored one, so verify
+            // that it did not lose a baseline discharge certificate.
+            if !Arc::ptr_eq(&projection, &flows)
+                && (!projection.relations_complete
+                    || (projection.open && !flows.open)
+                    || flows
+                        .discharged_gaps
+                        .iter()
+                        .any(|gap| !projection.discharged_gaps.contains(gap)))
+            {
+                self.note(Incompleteness::Interior {
+                    procedure: procedure.clone(),
+                    reason: "a label-group projection has open relations".into(),
+                });
+            }
+            let function = function.map_or(LabelFunctionId::IDENTITY, |function| {
+                self.functions.intern(function)
+            });
+            for flow in &projection.flows {
+                into.entry(projection.ports[flow.to.index()].clone())
+                    .or_default()
+                    .push(Inflow {
+                        from: projection.ports[flow.from.index()].clone(),
+                        function,
+                        uncertain: flow.uncertain,
+                        crossed: flow.crossed.clone(),
+                    });
+            }
         }
         let data = Arc::new(ProcedureData { flows, into });
         self.visited.push(procedure.clone());
@@ -1142,7 +1328,7 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         Ok((quality, class.clone()))
     }
 
-    fn model(&mut self, call: &DurableCallSiteKey) -> Option<Arc<CallModel>> {
+    fn model(&mut self, call: &DurableCallSiteKey) -> Option<Arc<CallModel<L::Function>>> {
         if let Some(model) = self.models.get(call) {
             return model.clone();
         }
@@ -1214,6 +1400,91 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         (seeds, ends)
     }
 
+    /// Seed only callee heap outputs that can write shared caller storage.
+    /// The provider places these at the normal-return continuation, before
+    /// that point's events, so earlier reads never see the write.
+    fn writeback_seeds(
+        &mut self,
+        handle: &ProcedureHandle,
+        seeds: &mut Vec<InteriorSeed>,
+        ends: &mut Vec<Endpoint>,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(), ComposeError> {
+        let caller = handle.durable_key();
+        for call in handle.semantics().call_sites() {
+            if !self
+                .provider
+                .may_share_call_storage(handle, call.id, request)
+                .map_err(provider_error)?
+            {
+                continue;
+            }
+            let call_key = (caller.clone(), call.id);
+            let dispatch = self.dispatch(&call_key, request)?;
+            if self.model(&call_key).is_some() {
+                continue;
+            }
+            for candidate in &dispatch.candidates {
+                let Some(data) = self.procedure(&candidate.procedure, request)? else {
+                    continue;
+                };
+                for heap in data.into.keys() {
+                    let PartialFlowPort::Heap {
+                        root,
+                        selectors,
+                        tail,
+                    } = heap
+                    else {
+                        continue;
+                    };
+                    for binding in candidate
+                        .writeback
+                        .iter()
+                        .filter(|binding| &binding.formal == root.as_ref())
+                    {
+                        match heap_sharing(binding, selectors, *tail) {
+                            crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
+                            crate::analyzer::semantic::CallStorageSharing::Unknown => {
+                                self.note(Incompleteness::Dispatch {
+                                    call: call_key.clone(),
+                                    reason: "a call writeback has unknown storage sharing".into(),
+                                });
+                                continue;
+                            }
+                            crate::analyzer::semantic::CallStorageSharing::Shares => {}
+                        }
+                        if !binding.proven
+                            || !binding.complete
+                            || !binding.conversion_preserves_identity
+                        {
+                            self.note(Incompleteness::Dispatch {
+                                call: call_key.clone(),
+                                reason: "a call writeback has unproven shared storage".into(),
+                            });
+                            continue;
+                        }
+                        for storage in &binding.storage {
+                            seeds.push(InteriorSeed::Writeback {
+                                call: call.id,
+                                storage: Box::new(storage.clone()),
+                                selectors: selectors.clone(),
+                                tail: *tail,
+                            });
+                            ends.push(Endpoint::Writeback {
+                                call: call.id,
+                                candidate: Box::new((**candidate).clone()),
+                                heap: heap.clone(),
+                                storage: Box::new(storage.clone()),
+                                uncertain: dispatch.uncertain,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Run one interior run and note its incompleteness.
     fn run_interior(
         &mut self,
@@ -1221,19 +1492,26 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         seeds: &[InteriorSeed],
         observations: &[InteriorObservation],
         request: &mut SemanticRequest<'_>,
-    ) -> Result<Vec<super::provider::InteriorFlow>, ComposeError> {
-        let flows = self
+    ) -> Result<Vec<(LabelFunctionId, super::provider::InteriorFlow)>, ComposeError> {
+        let projections = self
             .provider
-            .interior_flows(procedure, seeds, observations, false, request)
+            .projected_interior_flows(procedure, seeds, observations, false, request)
             .map_err(provider_error)?;
-        if let Completeness::Incomplete { reason } = flows.completeness {
-            self.note(Incompleteness::Interior {
-                procedure: procedure.clone(),
-                reason,
+        let mut answer = Vec::new();
+        for (function, flows) in projections {
+            if let Completeness::Incomplete { reason } = flows.completeness {
+                self.note(Incompleteness::Interior {
+                    procedure: procedure.clone(),
+                    reason,
+                });
+            }
+            self.handles.insert(procedure.clone(), flows.procedure);
+            let function = function.map_or(LabelFunctionId::IDENTITY, |function| {
+                self.functions.intern(function)
             });
+            answer.extend(flows.flows.into_iter().map(|flow| (function, flow)));
         }
-        self.handles.insert(procedure.clone(), flows.procedure);
-        Ok(flows.flows)
+        Ok(answer)
     }
 
     /// The interior flows of one procedure, run once with its sources and,
@@ -1249,13 +1527,19 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             return Ok(interior.clone());
         }
         let sinks = self.sinks_in.get(procedure).cloned().unwrap_or_default();
-        if sinks.is_empty() && !self.sources_in.contains_key(procedure) {
+        let writes = self
+            .store_writes_in
+            .get(procedure)
+            .cloned()
+            .unwrap_or_default();
+        if sinks.is_empty() && writes.is_empty() && !self.sources_in.contains_key(procedure) {
             self.interiors.insert(procedure.clone(), None);
             return Ok(None);
         }
-        let (seeds, seed_ends) = self.interior_seeds(procedure, data, !sinks.is_empty());
-        let value_flow = self.plan.value_flow();
-        let observations = sinks
+        let (mut seeds, mut seed_ends) =
+            self.interior_seeds(procedure, data, !sinks.is_empty() || !writes.is_empty());
+        let value_flow = self.value_flow.expect("an interior run has a value plan");
+        let mut observations = sinks
             .iter()
             .map(|&sink| {
                 let spec = value_flow
@@ -1268,17 +1552,44 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                 }
             })
             .collect::<Vec<_>>();
+        observations.extend(writes.iter().map(|&write| {
+            let write = &self.store_writes[write];
+            InteriorObservation::Sink {
+                point: write.point,
+                phase: write.phase,
+                carrier: write.carrier.clone(),
+            }
+        }));
+        if !sinks.is_empty() || !writes.is_empty() {
+            let handle = if let Some(&sink) = sinks.first() {
+                value_flow
+                    .sink(sink)
+                    .expect("a bound sink exists")
+                    .point()
+                    .procedure()
+                    .clone()
+            } else {
+                self.store_writes[writes[0]].owner.clone()
+            };
+            self.writeback_seeds(&handle, &mut seeds, &mut seed_ends, request)?;
+        }
         let mut index = InteriorIndex::default();
-        for flow in self.run_interior(procedure, &seeds, &observations, request)? {
+        for (function, flow) in self.run_interior(procedure, &seeds, &observations, request)? {
             let seed = seed_ends[flow.seed].clone();
             let target = match flow.target {
-                InteriorTarget::Observation(observation) => Endpoint::Sink(sinks[observation]),
+                InteriorTarget::Observation(observation) if observation < sinks.len() => {
+                    Endpoint::Sink(sinks[observation])
+                }
+                InteriorTarget::Observation(observation) => {
+                    Endpoint::StoreWrite(writes[observation - sinks.len()])
+                }
                 // Port-to-port flows are the stored flows.
                 InteriorTarget::Port(_) if matches!(seed, Endpoint::Port(_)) => continue,
                 InteriorTarget::Port(port) => Endpoint::Port(port),
             };
             index.into.entry(target).or_default().push(Inflow {
                 from: seed,
+                function,
                 uncertain: flow.uncertain,
                 crossed: flow.crossed,
             });
@@ -1308,15 +1619,219 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         let reaching: Reaching = self
             .run_interior(procedure, &seeds, &observations, request)?
             .into_iter()
-            .filter(|flow| flow.target == InteriorTarget::Observation(0))
-            .map(|flow| Inflow {
+            .filter(|(_, flow)| flow.target == InteriorTarget::Observation(0))
+            .map(|(function, flow)| Inflow {
                 from: seed_ends[flow.seed].clone(),
+                function,
                 uncertain: flow.uncertain,
                 crossed: flow.crossed,
             })
             .collect();
         self.location_interiors.insert(key, Arc::clone(&reaching));
         Ok(reaching)
+    }
+
+    fn process_execution_item(
+        &mut self,
+        id: usize,
+        target: ExecutionTarget,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(), ComposeError> {
+        let key = self.items[id].key.clone();
+        let Root::Execution(root) = &key.root else {
+            unreachable!("execution items have execution roots");
+        };
+        let root = root.as_ref().clone();
+        let quality = self.items[id].quality;
+        let endpoints = self
+            .provider
+            .execution_endpoints(&target, key.execution_arm.as_ref(), request)
+            .map_err(provider_error)?;
+        // An authored external summary can close a body-incomplete dispatch arm;
+        // its raw arm quality remains on the invocation hop and reach.
+        let closed = matches!(endpoints.status, ExecutionEndpointStatus::Complete)
+            && match &target {
+                ExecutionTarget::External(identity) => {
+                    matches!(
+                        identity.as_ref(),
+                        super::graph::ExternalTargetIdentity::Exact { .. }
+                    ) || endpoints.covers_overrides
+                }
+                ExecutionTarget::Procedure(_) => key
+                    .execution_arm
+                    .as_ref()
+                    .is_none_or(|arm| arm.quality.complete),
+            };
+        if !closed
+            && (matches!(target, ExecutionTarget::External(_))
+                || !matches!(endpoints.status, ExecutionEndpointStatus::Absent))
+        {
+            self.note(Incompleteness::Execution {
+                procedure: key.procedure.clone(),
+                reason: format!(
+                    "execution endpoints at {target:?} are open: {:?}, incoming {:?}",
+                    endpoints.status, key.execution_arm
+                )
+                .into(),
+            });
+        }
+        for source in endpoints.sources {
+            let source_key = (
+                target.clone(),
+                source.identity.clone(),
+                key.execution_arm.clone(),
+            );
+            let source_id = if let Some(&source_id) = self.execution_source_ids.get(&source_key) {
+                source_id
+            } else {
+                let source_id = self.execution_sources.len();
+                self.execution_sources.push(source);
+                self.execution_source_ids.insert(source_key, source_id);
+                source_id
+            };
+            let reach_key = (
+                root.clone(),
+                source_id,
+                key.function,
+                key.execution_arm.clone(),
+            );
+            let reach_quality = quality.conjoin(HopQuality::new(true, closed));
+            if let Some(&reach_id) = self.execution_reach_ids.get(&reach_key) {
+                if !self.execution_reaches[reach_id]
+                    .quality
+                    .dominates(reach_quality)
+                {
+                    let hops = self.execution_item_path(id, reach_quality);
+                    let reach = &mut self.execution_reaches[reach_id];
+                    reach.quality = reach.quality.join(reach_quality);
+                    reach.hops = hops;
+                }
+                continue;
+            }
+            if self.items.len() + self.reaches.len() + self.execution_reaches.len()
+                >= self.budget.max_hops
+            {
+                self.exhaust(BudgetLane::Hops);
+                self.stopped = true;
+                return Ok(());
+            }
+            self.execution_reach_ids
+                .insert(reach_key, self.execution_reaches.len());
+            self.execution_reaches.push(ExecutionReach {
+                root: root.clone(),
+                source: source_id,
+                function: key.function,
+                quality: reach_quality,
+                hops: self.execution_item_path(id, reach_quality),
+                incoming: key.execution_arm.clone(),
+            });
+        }
+        let ExecutionTarget::Procedure(procedure) = target else {
+            return Ok(());
+        };
+        let procedure = *procedure;
+        if self.execution_visited.insert(procedure.clone())
+            && self.execution_visited.len() > self.budget.max_procedures
+        {
+            self.exhaust(BudgetLane::Procedures);
+            self.stopped = true;
+            return Ok(());
+        }
+        let inventory = self
+            .provider
+            .invocations(&procedure, request)
+            .map_err(provider_error)?;
+        if let Completeness::Incomplete { reason } = inventory.coverage {
+            self.note(Incompleteness::Execution {
+                procedure: procedure.clone(),
+                reason,
+            });
+        }
+        for site in inventory.sites {
+            let dispatch = self
+                .provider
+                .execution_dispatch(&site.call, request)
+                .map_err(provider_error)?;
+            let residual_discharged = !dispatch.arms.is_empty()
+                && dispatch.coverage != crate::analyzer::semantic::CandidateCoverage::Truncated
+                && matches!(
+                    dispatch.residuals.as_slice(),
+                    [crate::analyzer::semantic::DispatchBoundaryKind::Unresolved]
+                )
+                && self
+                    .provider
+                    .discharge_execution_residual(&site.call, &dispatch);
+            let dispatch_closed = dispatch.outcome
+                == super::provider::ExecutionDispatchOutcome::Complete
+                && !dispatch.arms.is_empty()
+                && ((dispatch.coverage.is_exhaustive() && dispatch.residuals.is_empty())
+                    || residual_discharged);
+            if !dispatch_closed {
+                self.note(Incompleteness::Execution {
+                    procedure: procedure.clone(),
+                    reason: format!("execution dispatch {:?} is open: {:?}", site.call, dispatch)
+                        .into(),
+                });
+            }
+            for (ordinal, arm) in dispatch.arms.into_iter().enumerate() {
+                let function = self.functions.intern(arm.function);
+                let composed = self.functions.then(function, key.function);
+                let hop = Hop::Invocation {
+                    call: site.call.clone(),
+                    ordinal,
+                    target: Box::new(arm.target.clone()),
+                    function,
+                    quality: arm.quality,
+                };
+                let owner = match &arm.target {
+                    ExecutionTarget::Procedure(procedure) => procedure.as_ref().clone(),
+                    ExecutionTarget::External(_) => procedure.clone(),
+                };
+                self.add_item_with_arm(
+                    ItemKey {
+                        procedure: owner,
+                        root: key.root.clone(),
+                        node: Endpoint::Execution(Box::new(arm.target)),
+                        function: composed,
+                        execution_arm: Some(ExecutionArmContext {
+                            call: site.call.clone(),
+                            ordinal,
+                            quality: arm.quality,
+                        }),
+                    },
+                    quality.conjoin(arm.quality),
+                    Derivation::Step {
+                        hops: vec![hop],
+                        next: id,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn execution_item_path(&self, id: usize, quality: HopQuality) -> Vec<Hop> {
+        let mut path = Vec::new();
+        let mut next = id;
+        let chain = if quality.is_certain() {
+            Chain::Certain
+        } else if quality.proven {
+            Chain::Proven
+        } else if quality.complete {
+            Chain::Complete
+        } else {
+            Chain::First
+        };
+        loop {
+            match self.items[next].derivations.get(chain) {
+                Derivation::Root => return path,
+                Derivation::Step { hops, next: outer } => {
+                    path.extend(hops.iter().cloned());
+                    next = *outer;
+                }
+                Derivation::Summary(_) => unreachable!("execution has no value summary"),
+            }
+        }
     }
 
     fn process_item(
@@ -1326,9 +1841,16 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
     ) -> Result<(), ComposeError> {
         let key = self.items[id].key.clone();
         let quality = self.items[id].quality;
+        if let Endpoint::Execution(target) = &key.node {
+            self.process_execution_item(id, target.as_ref().clone(), request)?;
+            return Ok(());
+        }
         let Some(data) = self.procedure(&key.procedure, request)? else {
             return Ok(());
         };
+        if let Endpoint::Port(port @ PartialFlowPort::CallResult { .. }) = &key.node {
+            self.open_store_read(id, port);
+        }
         if let Endpoint::Port(port) = &key.node {
             for flow in data.into.get(port).cloned().unwrap_or_default() {
                 let (flow_quality, crossed) =
@@ -1337,14 +1859,17 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                     procedure: key.procedure.clone(),
                     from: flow.from.clone(),
                     to: port.clone(),
+                    function: flow.function,
                     quality: flow_quality,
                     crossed,
                 };
+                let along = self.functions.hops(std::slice::from_ref(&hop));
+                let function = self.functions.then(along, key.function);
                 self.add_item(
                     key.procedure.clone(),
                     key.root.clone(),
                     Endpoint::Port(flow.from),
-                    key.function.clone(),
+                    function,
                     flow_quality.conjoin(quality),
                     Derivation::Step {
                         hops: vec![hop],
@@ -1375,12 +1900,14 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                     procedure: key.procedure.clone(),
                     from: seed.clone(),
                     to: key.node.clone(),
+                    function: flow.function,
                     quality: flow_quality,
                     crossed,
                 }];
                 hops.extend(sink_annotations.iter().cloned());
                 let path_quality = Hop::path_quality(&hops).conjoin(quality);
-                let function = hops_function(&hops, self.plan.universe()).compose(&key.function);
+                let along = self.functions.hops(&hops);
+                let function = self.functions.then(along, key.function);
                 match seed {
                     Endpoint::Source(source) => self.add_reach(
                         key.root.clone(),
@@ -1394,7 +1921,7 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                         }),
                         ReachDerivation::Direct { hops, next: id },
                     ),
-                    Endpoint::Port(_) => self.add_item(
+                    Endpoint::Port(_) | Endpoint::Writeback { .. } => self.add_item(
                         key.procedure.clone(),
                         key.root.clone(),
                         seed,
@@ -1402,16 +1929,52 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                         path_quality,
                         Derivation::Step { hops, next: id },
                     ),
-                    Endpoint::Sink(_) | Endpoint::Location(_) => {
+                    Endpoint::Sink(_)
+                    | Endpoint::StoreWrite(_)
+                    | Endpoint::Location(_)
+                    | Endpoint::Execution(_) => {
                         unreachable!("sinks and locations are never interior seeds")
                     }
                 }
             }
         }
         match &key.node {
+            Endpoint::Writeback {
+                call,
+                candidate,
+                heap,
+                uncertain,
+                ..
+            } => {
+                let call_key = (key.procedure.clone(), *call);
+                self.open_callee_root(
+                    id,
+                    &call_key,
+                    &Arc::new((**candidate).clone()),
+                    heap.clone(),
+                    *uncertain,
+                );
+                Ok(())
+            }
             Endpoint::Port(
                 PartialFlowPort::CallResult { call, .. } | PartialFlowPort::CallThrown { call },
             ) => self.descend(id, *call, request),
+            Endpoint::Port(PartialFlowPort::Heap { root, .. })
+                if matches!(
+                    root.as_ref(),
+                    PartialFlowPort::CallReceiver { .. } | PartialFlowPort::CallArgument { .. }
+                ) =>
+            {
+                self.descend_heap(id, request)
+            }
+            Endpoint::Port(PartialFlowPort::Heap { root, .. })
+                if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }) =>
+            {
+                let PartialFlowPort::CallResult { call, .. } = root.as_ref() else {
+                    unreachable!()
+                };
+                self.descend(id, *call, request)
+            }
             Endpoint::Port(port) if is_formal_or_heap_input(port) => self.formal(id, request),
             Endpoint::Location(location) => {
                 let handle = self.handles[&key.procedure].clone();
@@ -1433,8 +1996,8 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             }
             Endpoint::Sink(sink) => {
                 let spec = self
-                    .plan
-                    .value_flow()
+                    .value_flow
+                    .expect("value observation has a value plan")
                     .sink(*sink)
                     .expect("a sink item names a sink of its plan");
                 let ValueFlowCarrier::Location(location) = spec.carrier() else {
@@ -1475,6 +2038,18 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         self.linked(id, &call_key);
         let dispatch = self.dispatch(&call_key, request)?;
         if let Some(model) = self.model(&call_key) {
+            // Scalar normal-return transfers do not describe the content of a
+            // member read through the result. A modeled dispatch may have no
+            // candidates, so dropping this demand would falsely complete it.
+            if matches!(&key.node, Endpoint::Port(PartialFlowPort::Heap { root, .. })
+                if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
+            {
+                self.note(Incompleteness::Model {
+                    call: call_key,
+                    reason: "a call model does not describe a returned member".into(),
+                });
+                return Ok(());
+            }
             self.apply_model(id, &call_key, &model);
             return Ok(());
         }
@@ -1482,17 +2057,119 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             unreachable!("only call results descend");
         };
         for candidate in &dispatch.candidates {
-            let callee_ports = candidate
-                .returns
-                .iter()
-                .filter(|(_, caller_side)| caller_side == result)
-                .map(|(callee_side, _)| callee_side.clone())
-                .collect::<Vec<_>>();
+            let rows = self
+                .provider
+                .partial_flows(&candidate.procedure, request)
+                .map_err(provider_error)?;
+            let callee_ports =
+                returned_member_callee_ports(candidate, result, &rows.ports, |declared| {
+                    self.provider.canonical_returned_field(
+                        &candidate.procedure,
+                        &call_key.0,
+                        declared,
+                        request,
+                    )
+                });
             for callee_port in callee_ports {
                 self.open_callee_root(id, &call_key, candidate, callee_port, dispatch.uncertain);
             }
         }
         if dispatch.candidates.is_empty() || dispatch.uncertain {
+            self.unmodeled(id, &call_key, request)?;
+        }
+        Ok(())
+    }
+
+    /// Bind a caller-side stored call heap port to each matching callee heap
+    /// output. The producer publishes this port only for a call writeback;
+    /// the search still checks each candidate's storage-sharing evidence.
+    fn descend_heap(
+        &mut self,
+        id: usize,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(), ComposeError> {
+        let key = self.items[id].key.clone();
+        let Endpoint::Port(PartialFlowPort::Heap {
+            root,
+            selectors,
+            tail,
+        }) = &key.node
+        else {
+            unreachable!("only a call heap port descends here");
+        };
+        let call = match root.as_ref() {
+            PartialFlowPort::CallReceiver { call } | PartialFlowPort::CallArgument { call, .. } => {
+                *call
+            }
+            _ => unreachable!("a caller heap port is rooted at a call input"),
+        };
+        let call_key = (key.procedure.clone(), call);
+        let dispatch = self.dispatch(&call_key, request)?;
+        if self.model(&call_key).is_some() {
+            return Ok(());
+        }
+        for candidate in &dispatch.candidates {
+            for binding in candidate
+                .writeback
+                .iter()
+                .filter(|binding| &binding.actual == root.as_ref())
+            {
+                let sharing = heap_sharing(binding, selectors, *tail);
+                match sharing {
+                    crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
+                    crate::analyzer::semantic::CallStorageSharing::Unknown => {
+                        self.note(Incompleteness::Dispatch {
+                            call: call_key.clone(),
+                            reason: "a stored call heap port has unknown storage sharing".into(),
+                        });
+                    }
+                    crate::analyzer::semantic::CallStorageSharing::Shares => {}
+                }
+                if !binding.proven
+                    || !binding.complete
+                    || !binding.conversion_preserves_identity
+                    || binding.storage.is_empty()
+                {
+                    self.note(Incompleteness::Dispatch {
+                        call: call_key.clone(),
+                        reason: "a stored call heap port has unproven shared storage".into(),
+                    });
+                    continue;
+                }
+                let heap = PartialFlowPort::Heap {
+                    root: Box::new(binding.formal.clone()),
+                    selectors: selectors.clone(),
+                    tail: *tail,
+                };
+                let Some(data) = self.procedure(&candidate.procedure, request)? else {
+                    continue;
+                };
+                if data.into.contains_key(&heap) {
+                    self.open_callee_root(
+                        id,
+                        &call_key,
+                        candidate,
+                        heap,
+                        dispatch.uncertain
+                            || sharing == crate::analyzer::semantic::CallStorageSharing::Unknown,
+                    );
+                } else if !data.flows.relations_complete {
+                    self.note(Incompleteness::Dispatch {
+                        call: call_key.clone(),
+                        reason: "a callee heap output is not fully covered".into(),
+                    });
+                }
+            }
+        }
+        if dispatch.candidates.is_empty() {
+            self.note(Incompleteness::Dispatch {
+                call: call_key.clone(),
+                reason: "a post-call heap demand has no proven callee binding".into(),
+            });
+        }
+        if dispatch.candidates.is_empty() || dispatch.uncertain {
+            // Scalar fallback ports cannot describe a member of shared storage.
+            // Still record the policy's unmodeled-call abstention when required.
             self.unmodeled(id, &call_key, request)?;
         }
         Ok(())
@@ -1511,10 +2188,10 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         let Endpoint::Port(output) = &key.node else {
             unreachable!("only call results descend");
         };
-        let universe = self.plan.universe();
         for link in links.into_iter().filter(|link| &link.output == output) {
             let hops = vec![link.hop];
-            let function = hops_function(&hops, universe).compose(&key.function);
+            let along = self.functions.hops(&hops);
+            let function = self.functions.then(along, key.function);
             let quality = Hop::path_quality(&hops).conjoin(item_quality);
             self.add_item(
                 key.procedure.clone(),
@@ -1561,7 +2238,6 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                 if !ports.outputs.contains(output) {
                     return Ok(());
                 }
-                let universe = self.plan.universe();
                 for input in ports.inputs.iter() {
                     let mut hops = vec![Hop::Unmodeled {
                         call: call.clone(),
@@ -1569,7 +2245,8 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                         output: output.clone(),
                     }];
                     hops.extend(self.annotations_for(call, Some(input), &key.node));
-                    let function = hops_function(&hops, universe).compose(&key.function);
+                    let along = self.functions.hops(&hops);
+                    let function = self.functions.then(along, key.function);
                     self.add_item(
                         key.procedure.clone(),
                         key.root.clone(),
@@ -1608,12 +2285,11 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                 .or_default()
                 .push(waiter.clone());
         }
-        let identity = self.identity.clone();
         self.add_item(
             candidate.procedure.clone(),
             root.clone(),
             Endpoint::Port(callee_port),
-            identity,
+            LabelFunctionId::IDENTITY,
             HopQuality::CERTAIN,
             Derivation::Root,
         );
@@ -1653,49 +2329,96 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                 .or_else(|| origins.addressed_binding_origins(value).unique_binding())
         };
         let wanted = origin(value);
-        let bound = |candidate: ValueId| {
-            candidate == value || (wanted.is_some() && origin(candidate) == wanted)
-        };
-        let mut actuals = Vec::new();
+        let caller = procedure.durable_key();
         for call in procedure.semantics().call_sites() {
             if Some(call.id) == excluded {
                 continue;
             }
-            if call.receiver.is_some_and(bound) {
-                actuals.push(PartialFlowPort::CallReceiver { call: call.id });
-            }
-            for (ordinal, argument) in call.arguments.iter().enumerate() {
-                if bound(argument.value) {
-                    actuals.push(PartialFlowPort::CallArgument {
-                        call: call.id,
-                        ordinal: u32::try_from(ordinal).expect("a call's argument count fits u32"),
-                    });
-                }
-            }
-        }
-        let caller = procedure.durable_key();
-        for actual in actuals {
-            let call = actual_call(&actual);
-            let call_key = (caller.clone(), call);
+            let call_key = (caller.clone(), call.id);
             let dispatch = self.dispatch(&call_key, request)?;
             // A model replaces the body and writes no heap location.
             if self.model(&call_key).is_some() {
                 continue;
             }
             for candidate in &dispatch.candidates {
-                let formals = candidate
-                    .arguments
-                    .iter()
-                    .filter(|(bound_actual, _)| bound_actual == &actual)
-                    .map(|(_, formal)| formal.clone())
-                    .collect::<Vec<_>>();
-                for formal in formals {
+                for binding in &candidate.writeback {
+                    let may_reach_read = binding.storage.iter().any(|storage| {
+                        matches!(storage.path().root(), AccessPathRoot::Value(root) if Some(root.id()) == wanted)
+                    });
+                    if !may_reach_read {
+                        if wanted.is_none()
+                            || (!binding.complete
+                                && heap_sharing(binding, selectors, tail)
+                                    != crate::analyzer::semantic::CallStorageSharing::Isolated)
+                        {
+                            self.note(Incompleteness::Dispatch {
+                                call: call_key.clone(),
+                                reason: "a possible call writer has unmapped storage".into(),
+                            });
+                        }
+                        continue;
+                    }
                     let heap = PartialFlowPort::Heap {
-                        root: Box::new(formal),
+                        root: Box::new(binding.formal.clone()),
                         selectors: selectors.into(),
                         tail,
                     };
-                    self.open_callee_root(id, &call_key, candidate, heap, dispatch.uncertain);
+                    let Some(data) = self.procedure(&candidate.procedure, request)? else {
+                        continue;
+                    };
+                    if !data.into.contains_key(&heap) {
+                        if !data.flows.relations_complete {
+                            self.note(Incompleteness::Dispatch {
+                                call: call_key.clone(),
+                                reason: "a callee writeback output is not fully covered".into(),
+                            });
+                        }
+                        continue;
+                    }
+                    match heap_sharing(binding, selectors, tail) {
+                        crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
+                        crate::analyzer::semantic::CallStorageSharing::Unknown => {
+                            self.note(Incompleteness::Dispatch {
+                                call: call_key.clone(),
+                                reason: "a possible call writer has unknown storage sharing".into(),
+                            });
+                            continue;
+                        }
+                        crate::analyzer::semantic::CallStorageSharing::Shares => {}
+                    }
+                    if !binding.complete
+                        || !binding.proven
+                        || !binding.conversion_preserves_identity
+                    {
+                        self.note(Incompleteness::Dispatch {
+                            call: call_key.clone(),
+                            reason: "a call writeback has unproven shared storage".into(),
+                        });
+                        continue;
+                    }
+                    for storage in &binding.storage {
+                        let AccessPathRoot::Value(root) = storage.path().root() else {
+                            continue;
+                        };
+                        if Some(root.id()) != wanted {
+                            continue;
+                        }
+                        if !storage.path().selectors().is_empty() {
+                            self.note(Incompleteness::Dispatch {
+                                call: call_key.clone(),
+                                reason: "a projected writeback location cannot be substituted"
+                                    .into(),
+                            });
+                            continue;
+                        }
+                        self.open_callee_root(
+                            id,
+                            &call_key,
+                            candidate,
+                            heap.clone(),
+                            dispatch.uncertain,
+                        );
+                    }
                 }
             }
         }
@@ -1705,7 +2428,12 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
     /// A model replaces the call: link the call's result to the caller-side
     /// inputs its transfers read. A model that covers the call is not a
     /// boundary, so its hops are uncertain only through the model itself.
-    fn apply_model(&mut self, id: usize, call: &DurableCallSiteKey, model: &CallModel) {
+    fn apply_model(
+        &mut self,
+        id: usize,
+        call: &DurableCallSiteKey,
+        model: &CallModel<L::Function>,
+    ) {
         let key = self.items[id].key.clone();
         let item_quality = self.items[id].quality;
         // Model transfers end at the normal return, which is the singular
@@ -1714,23 +2442,20 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         else {
             return;
         };
-        let universe = self.plan.universe();
         for transfer in &model.transfers {
             let actual = transfer.actual.clone();
+            let model_function = transfer.function.clone();
             let hop = Hop::Model {
                 call: call.clone(),
                 actual: actual.clone(),
                 result: result.clone(),
-                moved: transfer
-                    .moved
-                    .as_deref()
-                    .map(|labels| label_classes(universe, labels)),
-                removed: label_classes(universe, &transfer.removed),
+                function: self.functions.intern(model_function),
                 quality: model.quality(),
             };
             let mut hops = vec![hop];
             hops.extend(self.annotations_for(call, Some(&actual), &key.node));
-            let function = hops_function(&hops, universe).compose(&key.function);
+            let along = self.functions.hops(&hops);
+            let function = self.functions.then(along, key.function);
             let quality = Hop::path_quality(&hops).conjoin(item_quality);
             self.add_item(
                 key.procedure.clone(),
@@ -1751,11 +2476,10 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             unreachable!("a summary item is at a formal");
         };
         let formal = formal.clone();
-        let inner_function = inner.key.function.clone();
+        let inner_function = inner.key.function;
         let inner_quality = inner.quality;
         let next = self.items[waiter.item].key.clone();
         let next_quality = self.items[waiter.item].quality;
-        let universe = self.plan.universe();
         for (actual, caller_node) in caller_side(&waiter.candidate, waiter.call.1, &formal) {
             let caller = Hop::Caller {
                 call: waiter.call.clone(),
@@ -1772,9 +2496,9 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                 uncertain: waiter.uncertain,
             };
             let annotations = self.annotations_for(&waiter.call, Some(&actual), &next.node);
-            let function = inner_function
-                .compose(&hops_function(&annotations, universe))
-                .compose(&next.function);
+            let along = self.functions.hops(&annotations);
+            let along = self.functions.then(inner_function, along);
+            let function = self.functions.then(along, next.function);
             let quality = HopQuality::from_uncertain(waiter.uncertain)
                 .conjoin(inner_quality)
                 .conjoin(Hop::path_quality(&annotations))
@@ -1801,7 +2525,7 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
     fn apply_reach(&mut self, waiter: &CallWaiter, reach: usize) {
         let reached = &self.reaches[reach];
         let source = reached.key.source;
-        let reach_function = reached.key.function.clone();
+        let reach_function = reached.key.function;
         let reach_quality = reached.quality;
         let next = self.items[waiter.item].key.clone();
         let next_quality = self.items[waiter.item].quality;
@@ -1814,9 +2538,9 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         };
         let mut hops = vec![callee];
         hops.extend(self.annotations_for(&waiter.call, None, &next.node));
-        let function = reach_function
-            .compose(&hops_function(&hops, self.plan.universe()))
-            .compose(&next.function);
+        let along = self.functions.hops(&hops);
+        let along = self.functions.then(reach_function, along);
+        let function = self.functions.then(along, next.function);
         let quality = reach_quality
             .conjoin(Hop::path_quality(&hops))
             .conjoin(next_quality);
@@ -1881,7 +2605,7 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                         call.0.clone(),
                         key.root.clone(),
                         caller_node,
-                        key.function.clone(),
+                        key.function,
                         HopQuality::from_uncertain(dispatch.uncertain).conjoin(quality),
                         Derivation::Step {
                             hops: vec![hop],
@@ -1952,7 +2676,7 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                 parent,
                 key.root.clone(),
                 Endpoint::Port(binding),
-                key.function.clone(),
+                key.function,
                 quality,
                 Derivation::Step {
                     hops: vec![hop],
@@ -1973,12 +2697,11 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                     hop: hop.clone(),
                 });
         }
-        let identity = self.identity.clone();
         self.add_item(
             parent,
             root.clone(),
             Endpoint::Port(binding),
-            identity,
+            LabelFunctionId::IDENTITY,
             HopQuality::CERTAIN,
             Derivation::Root,
         );
@@ -1992,10 +2715,9 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
     fn apply_capture_reach(&mut self, waiter: &CaptureWaiter, reach: usize) {
         let reached = &self.reaches[reach];
         let source = reached.key.source;
-        let function = reached
-            .key
-            .function
-            .compose(&self.items[waiter.item].key.function);
+        let function = self
+            .functions
+            .then(reached.key.function, self.items[waiter.item].key.function);
         let quality = reached.quality.conjoin(self.items[waiter.item].quality);
         let root = self.items[waiter.item].key.root.clone();
         self.add_reach(
@@ -2022,6 +2744,75 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         for waiter in self.capture_waiters.get(&root).cloned().unwrap_or_default() {
             self.apply_capture_reach(&waiter, id);
         }
+        for waiter in self.store_waiters.get(&root).cloned().unwrap_or_default() {
+            self.apply_store_reach(&waiter, id);
+        }
+    }
+
+    /// A read output demands every may-alias write observation. The root is
+    /// separate from ordinary procedure output roots, so cycles have no
+    /// origin unless a source independently reaches one of their writes.
+    fn open_store_read(&mut self, item: usize, output: &PartialFlowPort) {
+        let procedure = self.items[item].key.procedure.clone();
+        let links = self.provider.store_links(&procedure, output);
+        if let Some(reason) = links.incomplete {
+            self.note(Incompleteness::StoreInventory { procedure, reason });
+        }
+        for link in links.writes {
+            assert!(
+                link.write < self.store_writes.len(),
+                "a store link names a selected write"
+            );
+            let root = Root::StoreWrite(link.write);
+            let waiter = StoreWaiter { item, link };
+            if self.registered_store_waiters.insert((item, root.clone())) {
+                self.store_waiters
+                    .entry(root.clone())
+                    .or_default()
+                    .push(waiter.clone());
+            }
+            let write = &self.store_writes[waiter.link.write];
+            self.add_item(
+                write.procedure.clone(),
+                root.clone(),
+                Endpoint::StoreWrite(waiter.link.write),
+                LabelFunctionId::IDENTITY,
+                HopQuality::CERTAIN,
+                Derivation::Root,
+            );
+            for reach in self.reaches_by_root.get(&root).cloned().unwrap_or_default() {
+                self.apply_store_reach(&waiter, reach);
+            }
+        }
+    }
+
+    /// A reached write grows the linked read with its original source,
+    /// classes, quality, and both sides of the witness path.
+    fn apply_store_reach(&mut self, waiter: &StoreWaiter, reach: usize) {
+        let inner = &self.reaches[reach];
+        let outer = &self.items[waiter.item];
+        let hop = Hop::Store {
+            write_call: waiter.link.write_call.clone(),
+            read_call: waiter.link.read_call.clone(),
+            read_origin: waiter.link.read_origin.clone(),
+            read_phase: waiter.link.read_phase,
+            read_carrier: waiter.link.read_carrier.clone(),
+            uncertain: waiter.link.uncertain,
+        };
+        let function = self.functions.then(inner.key.function, outer.key.function);
+        let inner = &self.reaches[reach];
+        let outer = &self.items[waiter.item];
+        self.add_reach(
+            outer.key.root.clone(),
+            inner.key.source,
+            function,
+            inner.quality.conjoin(hop.quality()).conjoin(outer.quality),
+            ReachDerivation::Through {
+                inner: reach,
+                hops: vec![hop],
+                next: waiter.item,
+            },
+        );
     }
 
     /// The hops of one reach's path, from its source to its root: a certain
@@ -2127,24 +2918,31 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
 }
 
 /// The quality of an endpoint's selector evidence, axis by axis.
-fn evidence_quality(proof: &ProofStatus, completeness: &EvidenceCompleteness) -> HopQuality {
+pub(super) fn evidence_quality(
+    proof: &ProofStatus,
+    completeness: &EvidenceCompleteness,
+) -> HopQuality {
     HopQuality::new(
         matches!(proof, ProofStatus::Proven),
         matches!(completeness, EvidenceCompleteness::Complete),
     )
 }
 
-/// The call of a call input port.
-fn actual_call(port: &PartialFlowPort) -> CallSiteId {
-    match port {
-        PartialFlowPort::CallReceiver { call } | PartialFlowPort::CallArgument { call, .. } => {
-            *call
-        }
-        _ => unreachable!("an actual is a call input port"),
+/// Whether a value enters the procedure's interior at this port.
+fn heap_sharing(
+    binding: &super::provider::WritebackBinding,
+    selectors: &[HeapSelector],
+    tail: AccessPathTail,
+) -> crate::analyzer::semantic::CallStorageSharing {
+    if tail == AccessPathTail::Exact
+        && matches!(selectors, [HeapSelector::Field(field)] if binding.direct_fields.contains(field))
+    {
+        binding.direct_field_sharing
+    } else {
+        binding.shares_storage
     }
 }
 
-/// Whether a value enters the procedure's interior at this port.
 fn is_input_port(port: &PartialFlowPort) -> bool {
     matches!(
         port,
@@ -2152,6 +2950,52 @@ fn is_input_port(port: &PartialFlowPort) -> bool {
             | PartialFlowPort::CallResult { .. }
             | PartialFlowPort::CallThrown { .. }
     ) || is_formal_or_heap_input(port)
+        || matches!(port, PartialFlowPort::Heap { root, .. }
+            if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
+}
+
+/// Match the selected call result to its callee return, preserving the member
+/// path. The return pairing supplies the boundary proof; the path is content,
+/// not an alias certificate for the callee's storage.
+fn returned_member_callee_ports(
+    candidate: &DispatchCandidate,
+    result: &PartialFlowPort,
+    ports: &[PartialFlowPort],
+    mut canonical_field: impl FnMut(
+        &crate::analyzer::semantic::SemanticLocator,
+    ) -> Option<crate::analyzer::semantic::SemanticLocator>,
+) -> Vec<PartialFlowPort> {
+    candidate
+        .returns
+        .iter()
+        .filter_map(|(returned, caller)| match result {
+            PartialFlowPort::Heap {
+                root,
+                selectors,
+                tail,
+            } if root.as_ref() == caller
+                && matches!(
+                    returned,
+                    PartialFlowPort::NormalReturn | PartialFlowPort::IndexedNormalReturn { .. }
+                ) =>
+            {
+                Some(
+                    ports
+                        .iter()
+                        .filter(|port| {
+                            bound_return_member_matches(result, port, caller, returned, |field| {
+                                canonical_field(field)
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ if caller == result => Some(vec![returned.clone()]),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// A formal (receiver or parameter), or a heap input port rooted at one. A

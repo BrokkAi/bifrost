@@ -65,6 +65,7 @@ use brokk_bifrost_core::analyzer::parsed_file::{CSharpSemanticDeclarationKind, P
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
 use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_csharp::graph_support::csharp_enclosing_namespace_path;
 use brokk_bifrost_csharp::structural::first_argument_value;
 use brokk_bifrost_csharp::syntax::{
     csharp_accessor_owner, csharp_has_modifier as has_modifier,
@@ -168,7 +169,8 @@ fn compound_division_can_throw(context: CSharpCompoundContext) -> bool {
 // #8600: tuple literal deconstruction now publishes ordered leaf stores.
 // #8708: publish captured lexical cells in the enclosing procedure.
 // #8717: array initializers record that their elements are not stored.
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v40";
+// #8803: constructed expressions need conversion proofs before preserving identity.
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v41";
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -2008,20 +2010,10 @@ fn primary_declaration_maps(
 }
 
 fn enclosing_namespace_path(source: &str, node: Node<'_>) -> Box<[Box<str>]> {
-    let mut path = Vec::new();
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "namespace_declaration" | "file_scoped_namespace_declaration"
-        ) && let Some(name) = declaration_container_name(source, parent)
-        {
-            path.push(name);
-        }
-        current = parent.parent();
-    }
-    path.reverse();
-    path.into_boxed_slice()
+    csharp_enclosing_namespace_path(source, node)
+        .into_iter()
+        .map(Box::from)
+        .collect()
 }
 
 fn accessor_owner_name(source: &str, owner: Node<'_>) -> Option<Box<str>> {
@@ -2364,6 +2356,12 @@ struct MemoryTarget {
     location: MemoryLocationId,
     kind: MemoryAccessKind,
     resolved: bool,
+}
+
+struct ObjectInitializerStore {
+    memory: MemoryTarget,
+    destination: Option<CSharpTypeIdentity>,
+    declared: Option<Box<str>>,
 }
 
 struct LocalBinding {
@@ -3096,6 +3094,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                                 CSharpPredefinedType::Bool,
                             ));
                         }
+                        let string = CSharpTypeIdentity::Predefined(CSharpPredefinedType::String);
+                        if operator == "+"
+                            && ((left == Some(string)
+                                && self.string_concatenation_operand_identity(right))
+                                || (right == Some(string)
+                                    && self.string_concatenation_operand_identity(left)))
+                        {
+                            return Some(string);
+                        }
                         let (
                             CSharpTypeIdentity::Predefined(left),
                             CSharpTypeIdentity::Predefined(right),
@@ -3137,6 +3144,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             }
                             "boolean_literal" => {
                                 Some(CSharpTypeIdentity::Predefined(CSharpPredefinedType::Bool))
+                            }
+                            "character_literal" => {
+                                Some(CSharpTypeIdentity::Predefined(CSharpPredefinedType::Char))
+                            }
+                            "string_literal" | "verbatim_string_literal" | "raw_string_literal" => {
+                                // In brokk-tree-sitter-c-sharp 0.23.8 the plain
+                                // literal has a string_literal_encoding child,
+                                // while verbatim/raw suffixes are anonymous
+                                // tokens. All three selected nodes include u8.
+                                let literal = node_text(self.prepared.source(), current)?;
+                                (!literal.ends_with("u8") && !literal.ends_with("U8")).then_some(
+                                    CSharpTypeIdentity::Predefined(CSharpPredefinedType::String),
+                                )
                             }
                             "default_expression" if self.default_value_kind(current).is_some() => {
                                 self.literal_type_node(current)
@@ -3976,9 +3996,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// this file proves that no conversion can intervene.
     ///
     /// `declared` is the target's declared type spelling, or `None` when this
-    /// file does not know it. `None` proves nothing on its own; an expression
-    /// that constructs its own value still needs no proof, because there is no
-    /// prior identity for a conversion to replace.
+    /// file does not know it. `None` proves nothing on its own.
     fn identity_is_preserved(&self, declared: Option<&str>, value: Node<'tree>) -> bool {
         // A bare declarator array initializer constructs its declared array.
         // A stackalloc initialized into `var` or a pointer has a built-in
@@ -3993,7 +4011,52 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             return true;
         }
-        if expression_constructs_its_value(value.kind()) {
+        // A var declarator infers its type without an assignment conversion.
+        // #8954: this lowerer has no workspace/external visibility inputs to
+        // distinguish contextual var from a visible type named var. The issue
+        // covers this and the other implicit_type inference sites.
+        // For literal forms, a predefined destination cannot declare a user
+        // operator; for an inferred array, an array destination cannot either
+        // (C# specification 10.5.2). These are source-form-specific proofs.
+        if let Some(destination) = value
+            .parent()
+            .filter(|parent| {
+                parent.kind() == "variable_declarator"
+                    && variable_declarator_initializer(*parent) == Some(value)
+            })
+            .and_then(|declarator| declarator.parent())
+            .filter(|declaration| declaration.kind() == "variable_declaration")
+            .and_then(|declaration| declaration.child_by_field_name("type"))
+            && (destination.kind() == "implicit_type"
+                || (destination.kind() == "predefined_type"
+                    && matches!(
+                        value.kind(),
+                        "integer_literal"
+                            | "real_literal"
+                            | "character_literal"
+                            | "boolean_literal"
+                            | "string_literal"
+                            | "verbatim_string_literal"
+                            | "raw_string_literal"
+                            | "interpolated_string_expression"
+                    ))
+                || (destination.kind() == "array_type"
+                    && value.kind() == "implicit_array_creation_expression"))
+        {
+            return true;
+        }
+        // Anonymous function conversion does not consider user conversion
+        // operators (C# specification 10.2.15). Its delegate or expression
+        // tree is constructed directly for the destination.
+        if matches!(
+            value.kind(),
+            "lambda_expression" | "anonymous_method_expression"
+        ) {
+            return true;
+        }
+        // An anonymous type cannot be named as a conversion-operator source;
+        // no class or struct can declare an operator for it (C# 10.5.2).
+        if value.kind() == "anonymous_object_creation_expression" {
             return true;
         }
         if value.kind() == "null_literal" {
@@ -4019,11 +4082,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if value.kind() == "implicit_object_creation_expression" {
             return true;
         }
-        // A built-in operation computes a fresh value of a predefined type.
-        // There is no prior object identity for a conversion to replace, and
-        // no user-defined conversion can target a predefined type, so
-        // `int computed = (value * 3) + 7;` needs no further proof (#2661).
-        if self.operation_is_builtin(value) {
+        // A built-in operator does not prove the assignment conversion into
+        // a user destination. Only a predefined destination rules out a user
+        // conversion after the operation (#8953).
+        if declared
+            .and_then(CSharpPredefinedType::from_keyword)
+            .is_some()
+            && self.operation_is_builtin(value)
+        {
             return true;
         }
         let source = self.prepared.source();
@@ -4207,9 +4273,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
     fn string_concatenation_operand(&self, node: Node<'tree>) -> bool {
         self.expression_is_predefined(node)
-            || self
-                .expression_type_identity(node)
-                .is_some_and(|identity| self.type_index.has_no_user_defined_add_operator(identity))
+            || self.string_concatenation_operand_identity(self.expression_type_identity(node))
+    }
+
+    fn string_concatenation_operand_identity(&self, identity: Option<CSharpTypeIdentity>) -> bool {
+        identity.is_some_and(|identity| {
+            matches!(identity, CSharpTypeIdentity::Predefined(_))
+                || self.type_index.has_no_user_defined_add_operator(identity)
+        })
     }
 
     fn builtin_operation_can_throw(&self, node: Node<'tree>) -> bool {
@@ -4219,6 +4290,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .is_some_and(|operator| matches!(operator.kind(), "+" | "-" | "*"))
             && let Some(operand @ CSharpTypeIdentity::Predefined(_)) =
                 self.expression_type_identity(node)
+            && operand != CSharpTypeIdentity::Predefined(CSharpPredefinedType::String)
         {
             return compound_arithmetic_can_throw(CSharpCompoundContext {
                 operand: Some(operand),
@@ -5076,16 +5148,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         procedure.memory_location_at(anchor)
     }
 
-    /// Publish an object initializer's member write as a store into the
-    /// object under construction.
-    fn emit_object_initializer_store(
+    /// Prepare an object initializer's member location and declared type.
+    /// The caller emits the store after the initializer's conversion.
+    fn prepare_object_initializer_store(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         point: ProgramPointId,
         creation: Node<'tree>,
         name_node: Node<'tree>,
-        value: ValueId,
-    ) -> Result<Option<Box<str>>, CSharpLoweringError> {
+    ) -> Result<Option<ObjectInitializerStore>, CSharpLoweringError> {
         let Some(name) = nonempty_node_text(self.prepared.source(), name_node) else {
             return Ok(None);
         };
@@ -5101,9 +5172,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             return Ok(None);
         }
-        let declared_type = declaration
+        let declared = declaration
             .as_ref()
             .and_then(|declaration| declaration.type_spelling.clone());
+        let destination = creation
+            .child_by_field_name("type")
+            .and_then(|ty| self.type_node_identity(ty))
+            .and_then(|owner| self.type_index.member(owner, name))
+            .and_then(|member| member.type_identity);
         let base = self.expression_value(
             builder,
             creation,
@@ -5115,17 +5191,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             point,
             MemoryLocationKind::Field { base, member },
         )?;
-        self.emit_memory_store(
-            builder,
-            point,
-            MemoryTarget {
+        Ok(Some(ObjectInitializerStore {
+            memory: MemoryTarget {
                 location,
                 kind: MemoryAccessKind::Field,
                 resolved: declaration.is_some(),
             },
-            value,
-        )?;
-        Ok(declared_type)
+            destination,
+            declared,
+        }))
     }
 
     /// Built-in compound updates follow Go/Rust's operand -> opaque computed
@@ -5265,11 +5339,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .is_none()
                 .then(|| local.or_else(|| self.parameters.get(name).copied()))
                 .flatten();
-            let mut initializer_member_type = None;
-            if let Some(creation) = initializer_member {
-                initializer_member_type =
-                    self.emit_object_initializer_store(builder, terminal, creation, left, value)?;
-            }
+            let initializer_store = initializer_member
+                .map(|creation| {
+                    self.prepare_object_initializer_store(builder, terminal, creation, left)
+                })
+                .transpose()?
+                .flatten();
             // The declared type of the assignment target decides what carrying
             // the value into it does: copy it, share it, or run a user-defined
             // conversion first (#2661, #2847).
@@ -5279,12 +5354,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // name, so its declared type is what answers the conversion
             // question.
             let source_type = self.expression_type_identity(right);
-            let declared = if initializer_member.is_some() {
-                initializer_member_type.as_deref().map(str::to_owned)
-            } else {
-                self.binding_type_at(name, left.start_byte())
-                    .map(str::to_owned)
-            };
+            let declared = self
+                .binding_type_at(name, left.start_byte())
+                .map(str::to_owned);
             let preservation = if initializer_member.is_some() {
                 None
             } else {
@@ -5294,7 +5366,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     _ => None,
                 }
             };
-            if let Some(target) = target {
+            if let Some(store) = initializer_store {
+                let (normal, converted, decision) = self.decide_implicit_conversion(
+                    builder,
+                    terminal,
+                    right,
+                    node,
+                    scope,
+                    value,
+                    result,
+                    store.destination,
+                    store.declared.as_deref(),
+                    None,
+                    Some(result),
+                    stack,
+                )?;
+                if matches!(
+                    decision,
+                    ImplicitConversionDecision::Carry(..) | ImplicitConversionDecision::Preserved
+                ) {
+                    self.publish_implicit_conversion(
+                        builder,
+                        terminal,
+                        value,
+                        converted,
+                        result,
+                        decision,
+                        ValueFlowKind::Local,
+                    )?;
+                }
+                self.emit_memory_store(builder, normal, store.memory, result)?;
+                continuation = normal;
+            } else if let Some(target) = target {
                 let alias = if local.is_some() {
                     ValueFlowKind::Local
                 } else {
@@ -10269,33 +10372,6 @@ fn declared_type_spelling(node: Node<'_>, source: &str) -> Option<Box<str>> {
     .map(String::into_boxed_str)
 }
 
-/// Whether an expression constructs its own value rather than naming one that
-/// already exists.
-///
-/// Such an expression has no prior object identity for a user-defined
-/// conversion to replace, so carrying it into a declared local is always an
-/// identity-preserving initialization. `null` and `default` are deliberately
-/// absent: both already publish their own value-identity gap, and neither can
-/// carry a value worth connecting.
-fn expression_constructs_its_value(kind: &str) -> bool {
-    matches!(
-        kind,
-        "integer_literal"
-            | "real_literal"
-            | "string_literal"
-            | "raw_string_literal"
-            | "verbatim_string_literal"
-            | "character_literal"
-            | "boolean_literal"
-            | "interpolated_string_expression"
-            | "implicit_array_creation_expression"
-            | "collection_expression"
-            | "anonymous_object_creation_expression"
-            | "lambda_expression"
-            | "anonymous_method_expression"
-    )
-}
-
 fn is_intrinsic_object_construction(node: Node<'_>, source: &str) -> bool {
     node.kind() == "object_creation_expression"
         && call_arguments(node).is_empty()
@@ -10414,6 +10490,9 @@ fn array_initializer_value(node: Node<'_>) -> bool {
 }
 
 fn stackalloc_builtin_destination(node: Node<'_>) -> bool {
+    // #8954: implicit_type is treated as contextual var here. The lowerer has
+    // no workspace/external visibility inputs to rule out a type named var;
+    // that issue covers this and the other inference sites.
     let Some(declarator) = node.parent().filter(|parent| {
         parent.kind() == "variable_declarator"
             && variable_declarator_initializer(*parent) == Some(node)

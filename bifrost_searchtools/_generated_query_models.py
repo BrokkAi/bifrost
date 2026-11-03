@@ -554,6 +554,31 @@ class CodeQueryBranchRelation:
 
 
 @dataclass(frozen=True)
+class CodeQueryBuildConfiguration:
+    arch: str | None
+    arch_scope: str
+    arch_source: str | None
+    arch_values: str | None
+    configuration_id: str
+    constraint: str | None
+    file_status: str
+    id: str
+    language: str
+    os: str | None
+    os_scope: str
+    os_source: str | None
+    os_values: str | None
+    path: str
+    target: str | None
+    provenance: list[CodeQueryProvenance]
+    provenance_truncated: bool
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryBuildConfiguration:
+        return _decode_code_query_build_configuration(data, 'CodeQueryBuildConfiguration')
+
+
+@dataclass(frozen=True)
 class CodeQueryBuildTarget:
     build_file: str
     build_project_id: str | None
@@ -1255,7 +1280,7 @@ class CodeQueryCppExpression:
 @dataclass(frozen=True)
 class CodeQueryCrossDomain:
     binding: str | None
-    code: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | None
+    code: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | CodeQueryResultRefVariant87 | None
     code_id: str | None
     code_path: str | None
     configuration: CodeQueryConfigurationFact2 | None
@@ -2676,7 +2701,7 @@ class CodeQueryProgramPointRef:
 @dataclass(frozen=True)
 class CodeQueryProvenance:
     branch: list[int]
-    seed: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86
+    seed: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | CodeQueryResultRefVariant87
     steps: list[CodeQueryProvenanceStep]
 
     @classmethod
@@ -2687,8 +2712,8 @@ class CodeQueryProvenance:
 @dataclass(frozen=True)
 class CodeQueryProvenanceStep:
     op: str
-    result: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86
-    via: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | None
+    result: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | CodeQueryResultRefVariant87
+    via: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | CodeQueryResultRefVariant87 | None
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryProvenanceStep:
@@ -3178,7 +3203,7 @@ class CodeQueryResolutionCandidate:
 @dataclass(frozen=True)
 class CodeQueryResult:
     diagnostics: list[CodeQueryDiagnostic]
-    results: list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain]
+    results: list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryBuildConfiguration | CodeQueryCrossDomain]
     session_subset: SubsetCoverage | None
     truncated: bool
 
@@ -4322,11 +4347,9 @@ class CodeQueryResultRefVariant78:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant79:
-    ast_id: str
+    configuration_id: str
     id: str
     path: str
-    range: CodeQueryRange
-    segment_count: int
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant79:
@@ -4348,12 +4371,11 @@ class CodeQueryResultRefVariant8:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant80:
-    ast_id: str | None
+    ast_id: str
     id: str
-    ordinal: int
     path: str
     range: CodeQueryRange
-    text: str
+    segment_count: int
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant80:
@@ -4364,9 +4386,10 @@ class CodeQueryResultRefVariant80:
 class CodeQueryResultRefVariant81:
     ast_id: str | None
     id: str
-    kind: str
+    ordinal: int
     path: str
     range: CodeQueryRange
+    text: str
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant81:
@@ -4375,9 +4398,9 @@ class CodeQueryResultRefVariant81:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant82:
-    exported_name: str
-    form: str
+    ast_id: str | None
     id: str
+    kind: str
     path: str
     range: CodeQueryRange
 
@@ -4388,10 +4411,11 @@ class CodeQueryResultRefVariant82:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant83:
-    fq_name: str
+    exported_name: str
+    form: str
     id: str
-    origin: str
     path: str
+    range: CodeQueryRange
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant83:
@@ -4400,7 +4424,9 @@ class CodeQueryResultRefVariant83:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant84:
+    fq_name: str
     id: str
+    origin: str
     path: str
 
     @classmethod
@@ -4410,10 +4436,8 @@ class CodeQueryResultRefVariant84:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant85:
-    fact_id: str
     id: str
     path: str
-    range: CodeQueryRange
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant85:
@@ -4422,6 +4446,18 @@ class CodeQueryResultRefVariant85:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant86:
+    fact_id: str
+    id: str
+    path: str
+    range: CodeQueryRange
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryResultRefVariant86:
+        return _decode_code_query_result_ref_variant86(data, 'CodeQueryResultRefVariant86')
+
+
+@dataclass(frozen=True)
+class CodeQueryResultRefVariant87:
     domain: str
     id: str
     operator: str
@@ -4429,8 +4465,8 @@ class CodeQueryResultRefVariant86:
     range: CodeQueryRange | None
 
     @classmethod
-    def from_dict(cls, data: Any) -> CodeQueryResultRefVariant86:
-        return _decode_code_query_result_ref_variant86(data, 'CodeQueryResultRefVariant86')
+    def from_dict(cls, data: Any) -> CodeQueryResultRefVariant87:
+        return _decode_code_query_result_ref_variant87(data, 'CodeQueryResultRefVariant87')
 
 
 @dataclass(frozen=True)
@@ -6047,6 +6083,111 @@ def _decode_code_query_branch_relation(value: Any, prefix: str = 'CodeQueryBranc
         reason=reason_value,
         relation=relation_value,
         verdict=verdict_value,
+        provenance=provenance_value,
+        provenance_truncated=provenance_truncated_value,
+    )
+
+def _decode_code_query_build_configuration(value: Any, prefix: str = 'CodeQueryBuildConfiguration') -> CodeQueryBuildConfiguration:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'arch',
+        'arch_scope',
+        'arch_source',
+        'arch_values',
+        'configuration_id',
+        'constraint',
+        'file_status',
+        'id',
+        'language',
+        'os',
+        'os_scope',
+        'os_source',
+        'os_values',
+        'path',
+        'target',
+        'provenance',
+        'provenance_truncated',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'arch_scope',
+        'configuration_id',
+        'file_status',
+        'id',
+        'language',
+        'os_scope',
+        'path',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'arch' in value:
+        arch_value = _decode_defs_code_query_result_item_union_85_properties_arch(value['arch'], f"{prefix}.arch")
+    else:
+        arch_value = None
+    arch_scope_value = _decode_string(value['arch_scope'], f"{prefix}.arch_scope")
+    if 'arch_source' in value:
+        arch_source_value = _decode_defs_code_query_result_item_union_85_properties_arch_source(value['arch_source'], f"{prefix}.arch_source")
+    else:
+        arch_source_value = None
+    if 'arch_values' in value:
+        arch_values_value = _decode_defs_code_query_result_item_union_85_properties_arch_values(value['arch_values'], f"{prefix}.arch_values")
+    else:
+        arch_values_value = None
+    configuration_id_value = _decode_string(value['configuration_id'], f"{prefix}.configuration_id")
+    if 'constraint' in value:
+        constraint_value = _decode_defs_code_query_result_item_union_85_properties_constraint(value['constraint'], f"{prefix}.constraint")
+    else:
+        constraint_value = None
+    file_status_value = _decode_string(value['file_status'], f"{prefix}.file_status")
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    language_value = _decode_string(value['language'], f"{prefix}.language")
+    if 'os' in value:
+        os_value = _decode_defs_code_query_result_item_union_85_properties_os(value['os'], f"{prefix}.os")
+    else:
+        os_value = None
+    os_scope_value = _decode_string(value['os_scope'], f"{prefix}.os_scope")
+    if 'os_source' in value:
+        os_source_value = _decode_defs_code_query_result_item_union_85_properties_os_source(value['os_source'], f"{prefix}.os_source")
+    else:
+        os_source_value = None
+    if 'os_values' in value:
+        os_values_value = _decode_defs_code_query_result_item_union_85_properties_os_values(value['os_values'], f"{prefix}.os_values")
+    else:
+        os_values_value = None
+    path_value = _decode_string(value['path'], f"{prefix}.path")
+    if 'target' in value:
+        target_value = _decode_defs_code_query_result_item_union_85_properties_target(value['target'], f"{prefix}.target")
+    else:
+        target_value = None
+    if 'provenance' in value:
+        provenance_value = _decode_defs_code_query_result_item_union_85_properties_provenance(value['provenance'], f"{prefix}.provenance")
+    else:
+        provenance_value = _decode_defs_code_query_result_item_union_85_properties_provenance([], f"{prefix}.provenance")
+    if 'provenance_truncated' in value:
+        provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
+    else:
+        provenance_truncated_value = _decode_boolean(False, f"{prefix}.provenance_truncated")
+    return CodeQueryBuildConfiguration(
+        arch=arch_value,
+        arch_scope=arch_scope_value,
+        arch_source=arch_source_value,
+        arch_values=arch_values_value,
+        configuration_id=configuration_id_value,
+        constraint=constraint_value,
+        file_status=file_status_value,
+        id=id_value,
+        language=language_value,
+        os=os_value,
+        os_scope=os_scope_value,
+        os_source=os_source_value,
+        os_values=os_values_value,
+        path=path_value,
+        target=target_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
     )
@@ -8886,77 +9027,77 @@ def _decode_code_query_cross_domain(value: Any, prefix: str = 'CodeQueryCrossDom
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     if 'binding' in value:
-        binding_value = _decode_defs_code_query_result_item_union_85_properties_binding(value['binding'], f"{prefix}.binding")
+        binding_value = _decode_defs_code_query_result_item_union_86_properties_binding(value['binding'], f"{prefix}.binding")
     else:
         binding_value = None
     if 'code' in value:
-        code_value = _decode_defs_code_query_result_item_union_85_properties_code(value['code'], f"{prefix}.code")
+        code_value = _decode_defs_code_query_result_item_union_86_properties_code(value['code'], f"{prefix}.code")
     else:
         code_value = None
     if 'code_id' in value:
-        code_id_value = _decode_defs_code_query_result_item_union_85_properties_code_id(value['code_id'], f"{prefix}.code_id")
+        code_id_value = _decode_defs_code_query_result_item_union_86_properties_code_id(value['code_id'], f"{prefix}.code_id")
     else:
         code_id_value = None
     if 'code_path' in value:
-        code_path_value = _decode_defs_code_query_result_item_union_85_properties_code_path(value['code_path'], f"{prefix}.code_path")
+        code_path_value = _decode_defs_code_query_result_item_union_86_properties_code_path(value['code_path'], f"{prefix}.code_path")
     else:
         code_path_value = None
     if 'configuration' in value:
-        configuration_value = _decode_defs_code_query_result_item_union_85_properties_configuration(value['configuration'], f"{prefix}.configuration")
+        configuration_value = _decode_defs_code_query_result_item_union_86_properties_configuration(value['configuration'], f"{prefix}.configuration")
     else:
         configuration_value = None
     if 'configuration_contributors' in value:
-        configuration_contributors_value = _decode_defs_code_query_result_item_union_85_properties_configuration_contributors(value['configuration_contributors'], f"{prefix}.configuration_contributors")
+        configuration_contributors_value = _decode_defs_code_query_result_item_union_86_properties_configuration_contributors(value['configuration_contributors'], f"{prefix}.configuration_contributors")
     else:
-        configuration_contributors_value = _decode_defs_code_query_result_item_union_85_properties_configuration_contributors([], f"{prefix}.configuration_contributors")
+        configuration_contributors_value = _decode_defs_code_query_result_item_union_86_properties_configuration_contributors([], f"{prefix}.configuration_contributors")
     if 'configuration_id' in value:
-        configuration_id_value = _decode_defs_code_query_result_item_union_85_properties_configuration_id(value['configuration_id'], f"{prefix}.configuration_id")
+        configuration_id_value = _decode_defs_code_query_result_item_union_86_properties_configuration_id(value['configuration_id'], f"{prefix}.configuration_id")
     else:
         configuration_id_value = None
     if 'configuration_path' in value:
-        configuration_path_value = _decode_defs_code_query_result_item_union_85_properties_configuration_path(value['configuration_path'], f"{prefix}.configuration_path")
+        configuration_path_value = _decode_defs_code_query_result_item_union_86_properties_configuration_path(value['configuration_path'], f"{prefix}.configuration_path")
     else:
         configuration_path_value = None
     if 'dependency_id' in value:
-        dependency_id_value = _decode_defs_code_query_result_item_union_85_properties_dependency_id(value['dependency_id'], f"{prefix}.dependency_id")
+        dependency_id_value = _decode_defs_code_query_result_item_union_86_properties_dependency_id(value['dependency_id'], f"{prefix}.dependency_id")
     else:
         dependency_id_value = None
     domain_value = _decode_string(value['domain'], f"{prefix}.domain")
     if 'effective_configuration' in value:
-        effective_configuration_value = _decode_defs_code_query_result_item_union_85_properties_effective_configuration(value['effective_configuration'], f"{prefix}.effective_configuration")
+        effective_configuration_value = _decode_defs_code_query_result_item_union_86_properties_effective_configuration(value['effective_configuration'], f"{prefix}.effective_configuration")
     else:
         effective_configuration_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     if 'key' in value:
-        key_value = _decode_defs_code_query_result_item_union_85_properties_key(value['key'], f"{prefix}.key")
+        key_value = _decode_defs_code_query_result_item_union_86_properties_key(value['key'], f"{prefix}.key")
     else:
         key_value = None
     if 'mapping_id' in value:
-        mapping_id_value = _decode_defs_code_query_result_item_union_85_properties_mapping_id(value['mapping_id'], f"{prefix}.mapping_id")
+        mapping_id_value = _decode_defs_code_query_result_item_union_86_properties_mapping_id(value['mapping_id'], f"{prefix}.mapping_id")
     else:
         mapping_id_value = None
     if 'mitigated' in value:
-        mitigated_value = _decode_defs_code_query_result_item_union_85_properties_mitigated(value['mitigated'], f"{prefix}.mitigated")
+        mitigated_value = _decode_defs_code_query_result_item_union_86_properties_mitigated(value['mitigated'], f"{prefix}.mitigated")
     else:
         mitigated_value = None
     operator_value = _decode_string(value['operator'], f"{prefix}.operator")
     if 'owner' in value:
-        owner_value = _decode_defs_code_query_result_item_union_85_properties_owner(value['owner'], f"{prefix}.owner")
+        owner_value = _decode_defs_code_query_result_item_union_86_properties_owner(value['owner'], f"{prefix}.owner")
     else:
         owner_value = None
     path_value = _decode_string(value['path'], f"{prefix}.path")
     if 'range' in value:
-        range_value = _decode_defs_code_query_result_item_union_85_properties_range(value['range'], f"{prefix}.range")
+        range_value = _decode_defs_code_query_result_item_union_86_properties_range(value['range'], f"{prefix}.range")
     else:
         range_value = None
     if 'relation' in value:
-        relation_value = _decode_defs_code_query_result_item_union_85_properties_relation(value['relation'], f"{prefix}.relation")
+        relation_value = _decode_defs_code_query_result_item_union_86_properties_relation(value['relation'], f"{prefix}.relation")
     else:
         relation_value = None
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_85_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_86_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_85_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_86_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -19454,37 +19595,29 @@ def _decode_code_query_result_ref_variant79(value: Any, prefix: str = 'CodeQuery
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
-        'ast_id',
+        'configuration_id',
         'id',
         'path',
-        'range',
-        'segment_count',
     }
     actual = set(value)
     unexpected = actual - expected
     if unexpected:
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
-        'ast_id',
+        'configuration_id',
         'id',
         'path',
-        'range',
-        'segment_count',
     }
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    ast_id_value = _decode_string(value['ast_id'], f"{prefix}.ast_id")
+    configuration_id_value = _decode_string(value['configuration_id'], f"{prefix}.configuration_id")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
-    range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    segment_count_value = _decode_defs_code_query_result_ref_union_78_properties_segment_count(value['segment_count'], f"{prefix}.segment_count")
     return CodeQueryResultRefVariant79(
-        ast_id=ast_id_value,
+        configuration_id=configuration_id_value,
         id=id_value,
         path=path_value,
-        range=range_value,
-        segment_count=segment_count_value,
     )
 
 def _decode_code_query_result_ref_variant8(value: Any, prefix: str = 'CodeQueryResultRefVariant8') -> CodeQueryResultRefVariant8:
@@ -19532,6 +19665,43 @@ def _decode_code_query_result_ref_variant80(value: Any, prefix: str = 'CodeQuery
     expected = {
         'ast_id',
         'id',
+        'path',
+        'range',
+        'segment_count',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'ast_id',
+        'id',
+        'path',
+        'range',
+        'segment_count',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    ast_id_value = _decode_string(value['ast_id'], f"{prefix}.ast_id")
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    path_value = _decode_string(value['path'], f"{prefix}.path")
+    range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    segment_count_value = _decode_defs_code_query_result_ref_union_79_properties_segment_count(value['segment_count'], f"{prefix}.segment_count")
+    return CodeQueryResultRefVariant80(
+        ast_id=ast_id_value,
+        id=id_value,
+        path=path_value,
+        range=range_value,
+        segment_count=segment_count_value,
+    )
+
+def _decode_code_query_result_ref_variant81(value: Any, prefix: str = 'CodeQueryResultRefVariant81') -> CodeQueryResultRefVariant81:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'ast_id',
+        'id',
         'ordinal',
         'path',
         'range',
@@ -19552,15 +19722,15 @@ def _decode_code_query_result_ref_variant80(value: Any, prefix: str = 'CodeQuery
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     if 'ast_id' in value:
-        ast_id_value = _decode_defs_code_query_result_ref_union_79_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
+        ast_id_value = _decode_defs_code_query_result_ref_union_80_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
     else:
         ast_id_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
-    ordinal_value = _decode_defs_code_query_result_ref_union_79_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
+    ordinal_value = _decode_defs_code_query_result_ref_union_80_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
     text_value = _decode_string(value['text'], f"{prefix}.text")
-    return CodeQueryResultRefVariant80(
+    return CodeQueryResultRefVariant81(
         ast_id=ast_id_value,
         id=id_value,
         ordinal=ordinal_value,
@@ -19569,7 +19739,7 @@ def _decode_code_query_result_ref_variant80(value: Any, prefix: str = 'CodeQuery
         text=text_value,
     )
 
-def _decode_code_query_result_ref_variant81(value: Any, prefix: str = 'CodeQueryResultRefVariant81') -> CodeQueryResultRefVariant81:
+def _decode_code_query_result_ref_variant82(value: Any, prefix: str = 'CodeQueryResultRefVariant82') -> CodeQueryResultRefVariant82:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19593,14 +19763,14 @@ def _decode_code_query_result_ref_variant81(value: Any, prefix: str = 'CodeQuery
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     if 'ast_id' in value:
-        ast_id_value = _decode_defs_code_query_result_ref_union_80_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
+        ast_id_value = _decode_defs_code_query_result_ref_union_81_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
     else:
         ast_id_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     kind_value = _decode_string(value['kind'], f"{prefix}.kind")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    return CodeQueryResultRefVariant81(
+    return CodeQueryResultRefVariant82(
         ast_id=ast_id_value,
         id=id_value,
         kind=kind_value,
@@ -19608,7 +19778,7 @@ def _decode_code_query_result_ref_variant81(value: Any, prefix: str = 'CodeQuery
         range=range_value,
     )
 
-def _decode_code_query_result_ref_variant82(value: Any, prefix: str = 'CodeQueryResultRefVariant82') -> CodeQueryResultRefVariant82:
+def _decode_code_query_result_ref_variant83(value: Any, prefix: str = 'CodeQueryResultRefVariant83') -> CodeQueryResultRefVariant83:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19637,7 +19807,7 @@ def _decode_code_query_result_ref_variant82(value: Any, prefix: str = 'CodeQuery
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    return CodeQueryResultRefVariant82(
+    return CodeQueryResultRefVariant83(
         exported_name=exported_name_value,
         form=form_value,
         id=id_value,
@@ -19645,7 +19815,7 @@ def _decode_code_query_result_ref_variant82(value: Any, prefix: str = 'CodeQuery
         range=range_value,
     )
 
-def _decode_code_query_result_ref_variant83(value: Any, prefix: str = 'CodeQueryResultRefVariant83') -> CodeQueryResultRefVariant83:
+def _decode_code_query_result_ref_variant84(value: Any, prefix: str = 'CodeQueryResultRefVariant84') -> CodeQueryResultRefVariant84:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19671,14 +19841,14 @@ def _decode_code_query_result_ref_variant83(value: Any, prefix: str = 'CodeQuery
     id_value = _decode_string(value['id'], f"{prefix}.id")
     origin_value = _decode_string(value['origin'], f"{prefix}.origin")
     path_value = _decode_string(value['path'], f"{prefix}.path")
-    return CodeQueryResultRefVariant83(
+    return CodeQueryResultRefVariant84(
         fq_name=fq_name_value,
         id=id_value,
         origin=origin_value,
         path=path_value,
     )
 
-def _decode_code_query_result_ref_variant84(value: Any, prefix: str = 'CodeQueryResultRefVariant84') -> CodeQueryResultRefVariant84:
+def _decode_code_query_result_ref_variant85(value: Any, prefix: str = 'CodeQueryResultRefVariant85') -> CodeQueryResultRefVariant85:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19698,12 +19868,12 @@ def _decode_code_query_result_ref_variant84(value: Any, prefix: str = 'CodeQuery
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
-    return CodeQueryResultRefVariant84(
+    return CodeQueryResultRefVariant85(
         id=id_value,
         path=path_value,
     )
 
-def _decode_code_query_result_ref_variant85(value: Any, prefix: str = 'CodeQueryResultRefVariant85') -> CodeQueryResultRefVariant85:
+def _decode_code_query_result_ref_variant86(value: Any, prefix: str = 'CodeQueryResultRefVariant86') -> CodeQueryResultRefVariant86:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19729,14 +19899,14 @@ def _decode_code_query_result_ref_variant85(value: Any, prefix: str = 'CodeQuery
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    return CodeQueryResultRefVariant85(
+    return CodeQueryResultRefVariant86(
         fact_id=fact_id_value,
         id=id_value,
         path=path_value,
         range=range_value,
     )
 
-def _decode_code_query_result_ref_variant86(value: Any, prefix: str = 'CodeQueryResultRefVariant86') -> CodeQueryResultRefVariant86:
+def _decode_code_query_result_ref_variant87(value: Any, prefix: str = 'CodeQueryResultRefVariant87') -> CodeQueryResultRefVariant87:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19764,10 +19934,10 @@ def _decode_code_query_result_ref_variant86(value: Any, prefix: str = 'CodeQuery
     operator_value = _decode_string(value['operator'], f"{prefix}.operator")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     if 'range' in value:
-        range_value = _decode_defs_code_query_result_ref_union_85_properties_range(value['range'], f"{prefix}.range")
+        range_value = _decode_defs_code_query_result_ref_union_86_properties_range(value['range'], f"{prefix}.range")
     else:
         range_value = None
-    return CodeQueryResultRefVariant86(
+    return CodeQueryResultRefVariant87(
         domain=domain_value,
         id=id_value,
         operator=operator_value,
@@ -23566,7 +23736,7 @@ def _decode_defs_code_query_provenance_properties_steps(value: Any, prefix: str 
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_code_query_provenance_step_properties_via(value: Any, prefix: str = "union") -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | None:
+def _decode_defs_code_query_provenance_step_properties_via(value: Any, prefix: str = "union") -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | CodeQueryResultRefVariant87 | None:
     errors = []
     try:
         return _decode_defs_code_query_result_ref(value, prefix)
@@ -23949,7 +24119,7 @@ class CodeQueryResultItem(metaclass=_TaggedUnionMeta):
             raise DecoderError(f"unknown discriminator {tag_value!r}")
         return decoder(data)
 
-def _decode_defs_code_query_result_item(value: Any, prefix: str = 'CodeQueryResultItem') -> CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain:
+def _decode_defs_code_query_result_item(value: Any, prefix: str = 'CodeQueryResultItem') -> CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryBuildConfiguration | CodeQueryCrossDomain:
     return CodeQueryResultItem.from_dict(value)
 
 def _decode_defs_code_query_result_item_union_0_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
@@ -31908,7 +32078,7 @@ def _decode_defs_code_query_result_item_union_84_properties_to_id(value: Any, pr
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_binding(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_arch(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31918,19 +32088,7 @@ def _decode_defs_code_query_result_item_union_85_properties_binding(value: Any, 
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_code(value: Any, prefix: str = "union") -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | None:
-    errors = []
-    try:
-        return _decode_defs_code_query_result_ref(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    try:
-        return _decode_null(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_85_properties_code_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_arch_source(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31940,7 +32098,7 @@ def _decode_defs_code_query_result_item_union_85_properties_code_id(value: Any, 
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_code_path(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_arch_values(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31950,27 +32108,7 @@ def _decode_defs_code_query_result_item_union_85_properties_code_path(value: Any
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_configuration(value: Any, prefix: str = "union") -> CodeQueryConfigurationFact2 | None:
-    errors = []
-    try:
-        return _decode_code_query_configuration_fact2(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    try:
-        return _decode_null(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_85_properties_configuration_contributors(value: Any, prefix: str = "array") -> list[CodeQueryConfigurationFact2]:
-    if not isinstance(value, list):
-        raise TypeDecoderError(f"{prefix}: expected array")
-    return [
-        _decode_code_query_configuration_fact2(item, f"{prefix}[{index}]")
-        for index, item in enumerate(value)
-    ]
-
-def _decode_defs_code_query_result_item_union_85_properties_configuration_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_constraint(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31980,7 +32118,7 @@ def _decode_defs_code_query_result_item_union_85_properties_configuration_id(val
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_configuration_path(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_os(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31990,7 +32128,7 @@ def _decode_defs_code_query_result_item_union_85_properties_configuration_path(v
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_dependency_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_os_source(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -32000,49 +32138,7 @@ def _decode_defs_code_query_result_item_union_85_properties_dependency_id(value:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_effective_configuration(value: Any, prefix: str = "union") -> ConfigurationResolutionResult | None:
-    errors = []
-    try:
-        return _decode_configuration_resolution_result(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    try:
-        return _decode_null(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_85_properties_key(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_85_properties_mapping_id(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_85_properties_mitigated(value: Any, prefix: str = "union") -> bool | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_boolean(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_85_properties_owner(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_os_values(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -32060,7 +32156,175 @@ def _decode_defs_code_query_result_item_union_85_properties_provenance(value: An
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_code_query_result_item_union_85_properties_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
+def _decode_defs_code_query_result_item_union_85_properties_result_type(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'build_configuration'"
+    if value != 'build_configuration':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_result_item_union_85_properties_target(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_binding(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_code(value: Any, prefix: str = "union") -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | CodeQueryResultRefVariant87 | None:
+    errors = []
+    try:
+        return _decode_defs_code_query_result_ref(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_code_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_code_path(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_configuration(value: Any, prefix: str = "union") -> CodeQueryConfigurationFact2 | None:
+    errors = []
+    try:
+        return _decode_code_query_configuration_fact2(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_configuration_contributors(value: Any, prefix: str = "array") -> list[CodeQueryConfigurationFact2]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_configuration_fact2(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_result_item_union_86_properties_configuration_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_configuration_path(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_dependency_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_effective_configuration(value: Any, prefix: str = "union") -> ConfigurationResolutionResult | None:
+    errors = []
+    try:
+        return _decode_configuration_resolution_result(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_key(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_mapping_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_mitigated(value: Any, prefix: str = "union") -> bool | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_boolean(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_owner(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_86_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_provenance(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_result_item_union_86_properties_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
     errors = []
     try:
         return _decode_code_query_range(value, prefix)
@@ -32072,7 +32336,7 @@ def _decode_defs_code_query_result_item_union_85_properties_range(value: Any, pr
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_relation(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_86_properties_relation(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -32082,7 +32346,7 @@ def _decode_defs_code_query_result_item_union_85_properties_relation(value: Any,
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_85_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_item_union_86_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'cross_domain'"
     if value != 'cross_domain':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
@@ -32175,7 +32439,7 @@ class CodeQueryResultRef(metaclass=_TaggedUnionMeta):
             raise DecoderError(f"unknown discriminator {tag_value!r}")
         return decoder(data)
 
-def _decode_defs_code_query_result_ref(value: Any, prefix: str = 'CodeQueryResultRef') -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86:
+def _decode_defs_code_query_result_ref(value: Any, prefix: str = 'CodeQueryResultRef') -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | CodeQueryResultRefVariant87:
     return CodeQueryResultRef.from_dict(value)
 
 def _decode_defs_code_query_result_ref_union_0_properties_end_line(value: Any, prefix: str = 'int') -> int:
@@ -33227,37 +33491,21 @@ def _decode_defs_code_query_result_ref_union_77_properties_result_type(value: An
     return value
 
 def _decode_defs_code_query_result_ref_union_78_properties_result_type(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'build_configuration'"
+    if value != 'build_configuration':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_result_ref_union_79_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'qualified_path'"
     if value != 'qualified_path':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_78_properties_segment_count(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_ref_union_79_properties_segment_count(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_ref_union_79_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_ref_union_79_properties_ordinal(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_ref_union_79_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'path_segment'"
-    if value != 'path_segment':
-        raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
 def _decode_defs_code_query_result_ref_union_7_properties_boundary(value: Any, prefix: str = "union") -> CodeQueryProgramPointBoundary | None:
@@ -33288,37 +33536,59 @@ def _decode_defs_code_query_result_ref_union_80_properties_ast_id(value: Any, pr
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_result_ref_union_80_properties_ordinal(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
 def _decode_defs_code_query_result_ref_union_80_properties_result_type(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'path_segment'"
+    if value != 'path_segment':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_result_ref_union_81_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_ref_union_81_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'generation_site'"
     if value != 'generation_site':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_81_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_82_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'export'"
     if value != 'export':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_82_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_83_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'declaration_state'"
     if value != 'declaration_state':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_83_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_84_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'dependency_evidence'"
     if value != 'dependency_evidence':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_84_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_85_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'configuration_fact'"
     if value != 'configuration_fact':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_85_properties_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
+def _decode_defs_code_query_result_ref_union_86_properties_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
     errors = []
     try:
         return _decode_code_query_range(value, prefix)
@@ -33330,7 +33600,7 @@ def _decode_defs_code_query_result_ref_union_85_properties_range(value: Any, pre
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_ref_union_85_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_86_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'cross_domain'"
     if value != 'cross_domain':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
@@ -34348,7 +34618,7 @@ def _decode_properties_diagnostics(value: Any, prefix: str = "array") -> list[Co
         for index, item in enumerate(value)
     ]
 
-def _decode_properties_results(value: Any, prefix: str = "array") -> list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain]:
+def _decode_properties_results(value: Any, prefix: str = "array") -> list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryBuildConfiguration | CodeQueryCrossDomain]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
@@ -35367,9 +35637,10 @@ _code_query_result_item_decoders = {
     'source_set': lambda data: _decode_tagged_variant(_decode_code_query_source_set, data, 'result_type', 'CodeQuerySourceSet'),
     'build_target': lambda data: _decode_tagged_variant(_decode_code_query_build_target, data, 'result_type', 'CodeQueryBuildTarget'),
     'topology_edge': lambda data: _decode_tagged_variant(_decode_code_query_topology_edge, data, 'result_type', 'CodeQueryTopologyEdge'),
+    'build_configuration': lambda data: _decode_tagged_variant(_decode_code_query_build_configuration, data, 'result_type', 'CodeQueryBuildConfiguration'),
     'cross_domain': lambda data: _decode_tagged_variant(_decode_code_query_cross_domain, data, 'result_type', 'CodeQueryCrossDomain'),
 }
-CodeQueryResultItem._variant_types = (CodeQueryStructuralMatch, CodeQueryDeclaration, CodeQueryProcedure, CodeQueryProgramPoint, CodeQueryControlEdge, CodeQueryTypestateFinding, CodeQueryTypestateWitness, CodeQueryFlowEndpoint, CodeQueryFlowWitness, CodeQueryClassSetRow, CodeQueryAbsentMemberFinding, CodeQueryAbsentMemberWitness, CodeQueryTaintFinding, CodeQueryFile, CodeQueryDependencyEvidence, CodeQueryConfigurationFact, CodeQueryReferenceSite, CodeQueryCallSite, CodeQueryExpressionSite, CodeQueryJsxAttributeValue, CodeQueryReceiverAnalysis, CodeQueryMemberTargetAnalysis, CodeQueryReceiverOutcome, CodeQueryReceiverEvidence, CodeQueryPointsToCandidate, CodeQueryFieldWriteValue, CodeQueryKeyedReadValue, CodeQueryCallShape, CodeQueryCallResult, CodeQueryCallArgumentGroup, CodeQueryCallArgument2, CodeQueryCallBinding, CodeQueryCallEffect, CodeQueryCallResultContract, CodeQueryCallResultObligation, CodeQueryResultSubjectUse, CodeQueryResultContractUse, CodeQueryResultContractFailureUse, CodeQueryNilnessOperation, CodeQuerySwitchCoverage, CodeQueryAssignmentRelation, CodeQueryDetachedTaskTransfer, CodeQueryProcedureEffect, CodeQueryCallableSignature, CodeQueryLiteralOccurrence, CodeQueryCallableMetrics, CodeQuerySignatureParameter, CodeQueryDecoratedParameter, CodeQueryCallableApplicability, CodeQueryOverloadSelection, CodeQueryMemberSelection, CodeQueryDispatchOutcome, CodeQueryDispatchTarget, CodeQueryMemberFamily, CodeQueryMemberFamilyEdge, CodeQueryPythonHierarchyFact, CodeQueryOccurrence, CodeQueryLexicalScope, CodeQueryBinding, CodeQueryResolutionCandidate, CodeQueryCandidateHop, CodeQueryGenerationSite, CodeQueryExport, CodeQueryDeclarationState, CodeQueryReferenceEdge, CodeQueryStateEvent, CodeQueryBindingInitializerCall, CodeQueryFlowRelation, CodeQueryControlRelation, CodeQueryBranchRelation, CodeQueryLoopRelation, CodeQueryCppExpression, CodeQueryFailureHandlerState, CodeQueryStatementReachability, CodeQueryPendingCleanupFlow, CodeQueryPythonRuleFact, CodeQueryRustMarkerImpl, CodeQueryRustPointerFinding, CodeQueryGuard, CodeQueryRewritePath, CodeQueryQualifiedPath, CodeQueryPathSegment, CodeQuerySourceSet, CodeQueryBuildTarget, CodeQueryTopologyEdge, CodeQueryCrossDomain,)
+CodeQueryResultItem._variant_types = (CodeQueryStructuralMatch, CodeQueryDeclaration, CodeQueryProcedure, CodeQueryProgramPoint, CodeQueryControlEdge, CodeQueryTypestateFinding, CodeQueryTypestateWitness, CodeQueryFlowEndpoint, CodeQueryFlowWitness, CodeQueryClassSetRow, CodeQueryAbsentMemberFinding, CodeQueryAbsentMemberWitness, CodeQueryTaintFinding, CodeQueryFile, CodeQueryDependencyEvidence, CodeQueryConfigurationFact, CodeQueryReferenceSite, CodeQueryCallSite, CodeQueryExpressionSite, CodeQueryJsxAttributeValue, CodeQueryReceiverAnalysis, CodeQueryMemberTargetAnalysis, CodeQueryReceiverOutcome, CodeQueryReceiverEvidence, CodeQueryPointsToCandidate, CodeQueryFieldWriteValue, CodeQueryKeyedReadValue, CodeQueryCallShape, CodeQueryCallResult, CodeQueryCallArgumentGroup, CodeQueryCallArgument2, CodeQueryCallBinding, CodeQueryCallEffect, CodeQueryCallResultContract, CodeQueryCallResultObligation, CodeQueryResultSubjectUse, CodeQueryResultContractUse, CodeQueryResultContractFailureUse, CodeQueryNilnessOperation, CodeQuerySwitchCoverage, CodeQueryAssignmentRelation, CodeQueryDetachedTaskTransfer, CodeQueryProcedureEffect, CodeQueryCallableSignature, CodeQueryLiteralOccurrence, CodeQueryCallableMetrics, CodeQuerySignatureParameter, CodeQueryDecoratedParameter, CodeQueryCallableApplicability, CodeQueryOverloadSelection, CodeQueryMemberSelection, CodeQueryDispatchOutcome, CodeQueryDispatchTarget, CodeQueryMemberFamily, CodeQueryMemberFamilyEdge, CodeQueryPythonHierarchyFact, CodeQueryOccurrence, CodeQueryLexicalScope, CodeQueryBinding, CodeQueryResolutionCandidate, CodeQueryCandidateHop, CodeQueryGenerationSite, CodeQueryExport, CodeQueryDeclarationState, CodeQueryReferenceEdge, CodeQueryStateEvent, CodeQueryBindingInitializerCall, CodeQueryFlowRelation, CodeQueryControlRelation, CodeQueryBranchRelation, CodeQueryLoopRelation, CodeQueryCppExpression, CodeQueryFailureHandlerState, CodeQueryStatementReachability, CodeQueryPendingCleanupFlow, CodeQueryPythonRuleFact, CodeQueryRustMarkerImpl, CodeQueryRustPointerFinding, CodeQueryGuard, CodeQueryRewritePath, CodeQueryQualifiedPath, CodeQueryPathSegment, CodeQuerySourceSet, CodeQueryBuildTarget, CodeQueryTopologyEdge, CodeQueryBuildConfiguration, CodeQueryCrossDomain,)
 TAGGED_UNION_VARIANTS['CodeQueryResultItem'] = (
     'result_type',
     {
@@ -35458,6 +35729,7 @@ TAGGED_UNION_VARIANTS['CodeQueryResultItem'] = (
         'source_set': CodeQuerySourceSet,
         'build_target': CodeQueryBuildTarget,
         'topology_edge': CodeQueryTopologyEdge,
+        'build_configuration': CodeQueryBuildConfiguration,
         'cross_domain': CodeQueryCrossDomain,
     },
 )
@@ -35541,16 +35813,17 @@ _code_query_result_ref_decoders = {
     'source_set': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant76, data, 'result_type', 'CodeQueryResultRefVariant76'),
     'build_target': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant77, data, 'result_type', 'CodeQueryResultRefVariant77'),
     'topology_edge': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant78, data, 'result_type', 'CodeQueryResultRefVariant78'),
-    'qualified_path': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant79, data, 'result_type', 'CodeQueryResultRefVariant79'),
-    'path_segment': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant80, data, 'result_type', 'CodeQueryResultRefVariant80'),
-    'generation_site': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant81, data, 'result_type', 'CodeQueryResultRefVariant81'),
-    'export': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant82, data, 'result_type', 'CodeQueryResultRefVariant82'),
-    'declaration_state': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant83, data, 'result_type', 'CodeQueryResultRefVariant83'),
-    'dependency_evidence': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant84, data, 'result_type', 'CodeQueryResultRefVariant84'),
-    'configuration_fact': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant85, data, 'result_type', 'CodeQueryResultRefVariant85'),
-    'cross_domain': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant86, data, 'result_type', 'CodeQueryResultRefVariant86'),
+    'build_configuration': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant79, data, 'result_type', 'CodeQueryResultRefVariant79'),
+    'qualified_path': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant80, data, 'result_type', 'CodeQueryResultRefVariant80'),
+    'path_segment': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant81, data, 'result_type', 'CodeQueryResultRefVariant81'),
+    'generation_site': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant82, data, 'result_type', 'CodeQueryResultRefVariant82'),
+    'export': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant83, data, 'result_type', 'CodeQueryResultRefVariant83'),
+    'declaration_state': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant84, data, 'result_type', 'CodeQueryResultRefVariant84'),
+    'dependency_evidence': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant85, data, 'result_type', 'CodeQueryResultRefVariant85'),
+    'configuration_fact': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant86, data, 'result_type', 'CodeQueryResultRefVariant86'),
+    'cross_domain': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant87, data, 'result_type', 'CodeQueryResultRefVariant87'),
 }
-CodeQueryResultRef._variant_types = (CodeQueryResultRefVariant1, CodeQueryResultRefVariant2, CodeQueryResultRefVariant3, CodeQueryResultRefVariant4, CodeQueryResultRefVariant5, CodeQueryResultRefVariant6, CodeQueryResultRefVariant7, CodeQueryResultRefVariant8, CodeQueryResultRefVariant9, CodeQueryResultRefVariant10, CodeQueryResultRefVariant11, CodeQueryResultRefVariant12, CodeQueryResultRefVariant13, CodeQueryResultRefVariant14, CodeQueryResultRefVariant15, CodeQueryResultRefVariant16, CodeQueryResultRefVariant17, CodeQueryResultRefVariant18, CodeQueryResultRefVariant19, CodeQueryResultRefVariant20, CodeQueryResultRefVariant21, CodeQueryResultRefVariant22, CodeQueryResultRefVariant23, CodeQueryResultRefVariant24, CodeQueryResultRefVariant25, CodeQueryResultRefVariant26, CodeQueryResultRefVariant27, CodeQueryResultRefVariant28, CodeQueryResultRefVariant29, CodeQueryResultRefVariant30, CodeQueryResultRefVariant31, CodeQueryResultRefVariant32, CodeQueryResultRefVariant33, CodeQueryResultRefVariant34, CodeQueryResultRefVariant35, CodeQueryResultRefVariant36, CodeQueryResultRefVariant37, CodeQueryResultRefVariant38, CodeQueryResultRefVariant39, CodeQueryResultRefVariant40, CodeQueryResultRefVariant41, CodeQueryResultRefVariant42, CodeQueryResultRefVariant43, CodeQueryResultRefVariant44, CodeQueryResultRefVariant45, CodeQueryResultRefVariant46, CodeQueryResultRefVariant47, CodeQueryResultRefVariant48, CodeQueryResultRefVariant49, CodeQueryResultRefVariant50, CodeQueryResultRefVariant51, CodeQueryResultRefVariant52, CodeQueryResultRefVariant53, CodeQueryResultRefVariant54, CodeQueryResultRefVariant55, CodeQueryResultRefVariant56, CodeQueryResultRefVariant57, CodeQueryResultRefVariant58, CodeQueryResultRefVariant59, CodeQueryResultRefVariant60, CodeQueryResultRefVariant61, CodeQueryResultRefVariant62, CodeQueryResultRefVariant63, CodeQueryResultRefVariant64, CodeQueryResultRefVariant65, CodeQueryResultRefVariant66, CodeQueryResultRefVariant67, CodeQueryResultRefVariant68, CodeQueryResultRefVariant69, CodeQueryResultRefVariant70, CodeQueryResultRefVariant71, CodeQueryResultRefVariant72, CodeQueryResultRefVariant73, CodeQueryResultRefVariant74, CodeQueryResultRefVariant75, CodeQueryResultRefVariant76, CodeQueryResultRefVariant77, CodeQueryResultRefVariant78, CodeQueryResultRefVariant79, CodeQueryResultRefVariant80, CodeQueryResultRefVariant81, CodeQueryResultRefVariant82, CodeQueryResultRefVariant83, CodeQueryResultRefVariant84, CodeQueryResultRefVariant85, CodeQueryResultRefVariant86,)
+CodeQueryResultRef._variant_types = (CodeQueryResultRefVariant1, CodeQueryResultRefVariant2, CodeQueryResultRefVariant3, CodeQueryResultRefVariant4, CodeQueryResultRefVariant5, CodeQueryResultRefVariant6, CodeQueryResultRefVariant7, CodeQueryResultRefVariant8, CodeQueryResultRefVariant9, CodeQueryResultRefVariant10, CodeQueryResultRefVariant11, CodeQueryResultRefVariant12, CodeQueryResultRefVariant13, CodeQueryResultRefVariant14, CodeQueryResultRefVariant15, CodeQueryResultRefVariant16, CodeQueryResultRefVariant17, CodeQueryResultRefVariant18, CodeQueryResultRefVariant19, CodeQueryResultRefVariant20, CodeQueryResultRefVariant21, CodeQueryResultRefVariant22, CodeQueryResultRefVariant23, CodeQueryResultRefVariant24, CodeQueryResultRefVariant25, CodeQueryResultRefVariant26, CodeQueryResultRefVariant27, CodeQueryResultRefVariant28, CodeQueryResultRefVariant29, CodeQueryResultRefVariant30, CodeQueryResultRefVariant31, CodeQueryResultRefVariant32, CodeQueryResultRefVariant33, CodeQueryResultRefVariant34, CodeQueryResultRefVariant35, CodeQueryResultRefVariant36, CodeQueryResultRefVariant37, CodeQueryResultRefVariant38, CodeQueryResultRefVariant39, CodeQueryResultRefVariant40, CodeQueryResultRefVariant41, CodeQueryResultRefVariant42, CodeQueryResultRefVariant43, CodeQueryResultRefVariant44, CodeQueryResultRefVariant45, CodeQueryResultRefVariant46, CodeQueryResultRefVariant47, CodeQueryResultRefVariant48, CodeQueryResultRefVariant49, CodeQueryResultRefVariant50, CodeQueryResultRefVariant51, CodeQueryResultRefVariant52, CodeQueryResultRefVariant53, CodeQueryResultRefVariant54, CodeQueryResultRefVariant55, CodeQueryResultRefVariant56, CodeQueryResultRefVariant57, CodeQueryResultRefVariant58, CodeQueryResultRefVariant59, CodeQueryResultRefVariant60, CodeQueryResultRefVariant61, CodeQueryResultRefVariant62, CodeQueryResultRefVariant63, CodeQueryResultRefVariant64, CodeQueryResultRefVariant65, CodeQueryResultRefVariant66, CodeQueryResultRefVariant67, CodeQueryResultRefVariant68, CodeQueryResultRefVariant69, CodeQueryResultRefVariant70, CodeQueryResultRefVariant71, CodeQueryResultRefVariant72, CodeQueryResultRefVariant73, CodeQueryResultRefVariant74, CodeQueryResultRefVariant75, CodeQueryResultRefVariant76, CodeQueryResultRefVariant77, CodeQueryResultRefVariant78, CodeQueryResultRefVariant79, CodeQueryResultRefVariant80, CodeQueryResultRefVariant81, CodeQueryResultRefVariant82, CodeQueryResultRefVariant83, CodeQueryResultRefVariant84, CodeQueryResultRefVariant85, CodeQueryResultRefVariant86, CodeQueryResultRefVariant87,)
 TAGGED_UNION_VARIANTS['CodeQueryResultRef'] = (
     'result_type',
     {
@@ -35632,14 +35905,15 @@ TAGGED_UNION_VARIANTS['CodeQueryResultRef'] = (
         'source_set': CodeQueryResultRefVariant76,
         'build_target': CodeQueryResultRefVariant77,
         'topology_edge': CodeQueryResultRefVariant78,
-        'qualified_path': CodeQueryResultRefVariant79,
-        'path_segment': CodeQueryResultRefVariant80,
-        'generation_site': CodeQueryResultRefVariant81,
-        'export': CodeQueryResultRefVariant82,
-        'declaration_state': CodeQueryResultRefVariant83,
-        'dependency_evidence': CodeQueryResultRefVariant84,
-        'configuration_fact': CodeQueryResultRefVariant85,
-        'cross_domain': CodeQueryResultRefVariant86,
+        'build_configuration': CodeQueryResultRefVariant79,
+        'qualified_path': CodeQueryResultRefVariant80,
+        'path_segment': CodeQueryResultRefVariant81,
+        'generation_site': CodeQueryResultRefVariant82,
+        'export': CodeQueryResultRefVariant83,
+        'declaration_state': CodeQueryResultRefVariant84,
+        'dependency_evidence': CodeQueryResultRefVariant85,
+        'configuration_fact': CodeQueryResultRefVariant86,
+        'cross_domain': CodeQueryResultRefVariant87,
     },
 )
 
@@ -35811,6 +36085,7 @@ CODE_QUERY_RESULT_ITEM_TYPES = {
     'source_set': CodeQuerySourceSet,
     'build_target': CodeQueryBuildTarget,
     'topology_edge': CodeQueryTopologyEdge,
+    'build_configuration': CodeQueryBuildConfiguration,
     'cross_domain': CodeQueryCrossDomain,
 }
 

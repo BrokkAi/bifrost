@@ -8,7 +8,7 @@ use crate::analyzer::resolution::{
     ResolutionBatchMetrics, SelectedTypedRow, TypedFactPageVisitor, TypedFactRequest,
 };
 use crate::analyzer::store::resolution::TypedFactRelation;
-use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;
+use brokk_bifrost_core::analyzer::resolution_facts::{ResolutionGapKind, ResolutionMemberKind};
 use rusqlite::{OptionalExtension, params};
 
 #[derive(Debug)]
@@ -63,6 +63,14 @@ impl GoMethodFamilyDirection {
 pub struct GoNativeMethodFamilyAnswer {
     pub implements: GoMethodFamilyDirection,
     pub implemented_by: GoMethodFamilyDirection,
+}
+
+struct GoEmbeddingClosure {
+    answer: GoDirectSubtypeAnswer,
+    completed: std::collections::HashMap<
+        crate::analyzer::resolution::ResolutionTypeRef,
+        crate::analyzer::resolution::fact_resolution::go_methods::GoTypeSatisfaction,
+    >,
 }
 
 struct GoMethodContract {
@@ -276,9 +284,20 @@ impl SelectedResolutionOperation<'_, '_> {
                     .push("interface satisfaction context is unavailable");
                 continue;
             };
+            let mut seeds = Vec::new();
+            let mut interface_methods = Vec::new();
+            let mut direct_satisfies = false;
             for outcome in outcomes {
+                seeds.extend(
+                    outcome
+                        .candidate_receivers
+                        .iter()
+                        .map(|receiver| receiver.identity()),
+                );
+                interface_methods.extend(outcome.methods.iter().copied());
                 match outcome.outcome {
                     GoMethodSatisfaction::Satisfies => {
+                        direct_satisfies = true;
                         answer.implements.methods.extend(outcome.methods)
                     }
                     GoMethodSatisfaction::Inconclusive(reason) => {
@@ -287,9 +306,62 @@ impl SelectedResolutionOperation<'_, '_> {
                     GoMethodSatisfaction::DoesNotSatisfy => {}
                 }
             }
+            seeds.sort_unstable();
+            seeds.dedup();
+            interface_methods.sort_unstable();
+            interface_methods.dedup();
+            // Either a direct proof already selected the queried method, or no
+            // method of this interface matches the lookup.
+            if direct_satisfies || interface_methods.is_empty() {
+                continue;
+            }
+            // A direct owner that does not satisfy the interface on its own can
+            // still implement it through a type that embeds it, so the negative
+            // is complete only after the embedding closure finds no such proof.
+            if seeds.is_empty() {
+                answer
+                    .implements
+                    .open_reasons
+                    .push("method receiver frontier is unavailable");
+            } else {
+                let closure = self.go_close_satisfying_embeddings(
+                    context_id,
+                    source_role,
+                    interface,
+                    None,
+                    &seeds,
+                    &[0, 1],
+                    cancellation,
+                    session,
+                )?;
+                answer
+                    .implements
+                    .read_keys
+                    .names
+                    .extend(closure.answer.read_keys.names);
+                answer
+                    .implements
+                    .open_reasons
+                    .extend(closure.answer.open_reasons);
+                let promoted = closure.completed.into_values().any(|result| {
+                    result.outcome == GoMethodSatisfaction::Satisfies
+                        && result
+                            .selections
+                            .iter()
+                            .any(|&(name, selected)| name == lookup && selected == method)
+                });
+                if promoted {
+                    answer.implements.methods.extend(interface_methods);
+                }
+            }
         }
+
         answer.implements.methods.sort_unstable();
         answer.implements.methods.dedup();
+        answer
+            .implements
+            .methods
+            .retain(|candidate| *candidate != method);
 
         let (Some(ordinal), Some(key)) = (method.ordinal(), method.local_key()) else {
             return Ok(answer);
@@ -313,14 +385,26 @@ impl SelectedResolutionOperation<'_, '_> {
             cancellation,
             session,
         )?;
+        let mut owners = seeds
+            .iter()
+            .map(|receiver| receiver.identity())
+            .collect::<Vec<_>>();
+        owners.sort_unstable();
+        owners.dedup();
         let closure = self.go_close_satisfying_embeddings(
             context_id,
             source_role,
             interface,
-            &seeds,
+            None,
+            &owners,
+            &[0, 1],
             cancellation,
             session,
         )?;
+        let GoEmbeddingClosure {
+            answer: closure,
+            completed,
+        } = closure;
         answer
             .implemented_by
             .read_keys
@@ -339,7 +423,12 @@ impl SelectedResolutionOperation<'_, '_> {
             .implemented_by
             .open_reasons
             .extend(closure.open_reasons);
-        for receiver in satisfaction.edges.into_iter().chain(closure.edges) {
+        // Consume proofs in a fixed order so a budget stop cuts the same
+        // subset on every run.
+        let mut completed = completed.into_iter().collect::<Vec<_>>();
+        completed
+            .sort_unstable_by_key(|(receiver, _)| (receiver.identity(), receiver.indirection()));
+        for (_, result) in completed {
             if cancellation.is_cancelled() || !session.scope_steps(1) {
                 answer
                     .implemented_by
@@ -347,38 +436,20 @@ impl SelectedResolutionOperation<'_, '_> {
                     .push("method selection cancelled or exhausted its budget");
                 break;
             }
-            match self.go_selected_type_satisfaction(
-                context_id,
-                source_role,
-                receiver,
-                interface,
-                cancellation,
-                session,
-            )? {
-                Some(result) if result.outcome == GoMethodSatisfaction::Satisfies => {
-                    answer.implemented_by.methods.extend(
-                        result
-                            .selections
-                            .into_iter()
-                            .filter(|(selected_name, _)| *selected_name == lookup)
-                            .map(|(_, selected)| selected),
-                    );
-                }
-                Some(result) => answer
-                    .implemented_by
-                    .open_reasons
-                    .push(match result.outcome {
-                        GoMethodSatisfaction::Inconclusive(reason) => reason,
-                        _ => "method selection is not proven",
-                    }),
-                None => answer
-                    .implemented_by
-                    .open_reasons
-                    .push("method selection context is unavailable"),
-            }
+            answer.implemented_by.methods.extend(
+                result
+                    .selections
+                    .into_iter()
+                    .filter(|(selected_name, _)| *selected_name == lookup)
+                    .map(|(_, selected)| selected),
+            );
         }
         answer.implemented_by.methods.sort_unstable();
         answer.implemented_by.methods.dedup();
+        answer
+            .implemented_by
+            .methods
+            .retain(|candidate| *candidate != method);
         Ok(answer)
     }
 
@@ -510,7 +581,7 @@ impl SelectedResolutionOperation<'_, '_> {
         &self,
         context_id: i64,
         source_role: &str,
-        receiver: SemanticId,
+        receiver: crate::analyzer::resolution::ResolutionTypeRef,
         interface: SemanticId,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
@@ -519,17 +590,13 @@ impl SelectedResolutionOperation<'_, '_> {
         self.with_go_hierarchy_forward(
             context_id,
             source_role,
-            receiver,
+            receiver.identity(),
             cancellation,
             session,
             |forward| {
-                forward.go_type_satisfaction(
-                    crate::analyzer::resolution::ResolutionTypeRef::new(receiver, 0),
-                    interface,
-                    |candidate| {
-                        self.go_hierarchy_method_identity(context_id, source_role, candidate)
-                    },
-                )
+                forward.go_type_satisfaction(receiver, interface, |candidate| {
+                    self.go_hierarchy_method_identity(context_id, source_role, candidate)
+                })
             },
         )
     }
@@ -542,7 +609,10 @@ impl SelectedResolutionOperation<'_, '_> {
         name: &str,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
-    ) -> Result<(GoDirectSubtypeAnswer, Vec<SemanticId>)> {
+    ) -> Result<(
+        GoDirectSubtypeAnswer,
+        Vec<crate::analyzer::resolution::ResolutionTypeRef>,
+    )> {
         let GoMethodContract { lookup, interface } = contract;
         let mut answer = GoDirectSubtypeAnswer {
             edges: Vec::new(),
@@ -618,18 +688,19 @@ impl SelectedResolutionOperation<'_, '_> {
                     |row| row.get::<_, u32>(0),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let unbound = owners.is_empty();
-            let alias_literal: bool = connection.query_row(
-                GO_UNBOUND_ALIAS_INTERFACE_SQL.as_str(),
-                [nomination.blob_id],
-                |row| row.get(0),
-            )?;
-            candidate_owners.extend(
-                owners
-                    .into_iter()
-                    .map(|key| SemanticId::local(nomination.mount.get(), key)),
-            );
-            if unbound || alias_literal {
+            let unbound = owners.is_empty()
+                || connection.query_row(
+                    GO_UNPROJECTED_INTERFACE_METHOD_SQL.as_str(),
+                    params![nomination.blob_id, name],
+                    |row| row.get::<_, bool>(0),
+                )?;
+            candidate_owners.extend(owners.into_iter().map(|key| {
+                crate::analyzer::resolution::ResolutionTypeRef::new(
+                    SemanticId::local(nomination.mount.get(), key),
+                    0,
+                )
+            }));
+            if unbound {
                 answer
                     .open_reasons
                     .push("interface method has no declaring interface identity");
@@ -702,13 +773,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 continue;
             };
             for outcome in outcomes {
-                candidate_owners.extend(
-                    outcome
-                        .candidate_receivers
-                        .iter()
-                        .filter(|receiver| receiver.indirection() == 0)
-                        .map(|receiver| receiver.identity()),
-                );
+                candidate_owners.extend(outcome.candidate_receivers.iter().copied());
                 match outcome.outcome {
                     GoMethodSatisfaction::Satisfies => {
                         for receiver in outcome.satisfying_receivers {
@@ -744,15 +809,25 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok((answer, candidate_owners))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn go_close_satisfying_embeddings(
         &self,
         context_id: i64,
         source_role: &str,
         interface: SemanticId,
+        strict_target: Option<SemanticId>,
         seeds: &[SemanticId],
+        receiver_forms: &[u32],
         cancellation: &CancellationToken,
         session: &ResolutionSession,
-    ) -> Result<GoDirectSubtypeAnswer> {
+    ) -> Result<GoEmbeddingClosure> {
+        // The largest-form rule below holds for a value receiver and one pointer
+        // level only; deeper indirections are not legal receiver forms.
+        assert!(
+            !receiver_forms.is_empty() && receiver_forms.iter().all(|&form| form <= 1),
+            "Go receiver forms are a nonempty subset of {{0, 1}}: {receiver_forms:?}"
+        );
+        let mut completed = std::collections::HashMap::new();
         let mut answer = GoDirectSubtypeAnswer {
             edges: Vec::new(),
             ambiguous: Vec::new(),
@@ -772,29 +847,89 @@ impl SelectedResolutionOperation<'_, '_> {
                     .push("embedding closure cancelled or exhausted its budget");
                 break;
             }
-            match self.go_selected_type_satisfaction(
-                context_id,
-                source_role,
-                parent,
-                interface,
-                cancellation,
-                session,
-            )? {
-                Some(result) if result.outcome == GoMethodSatisfaction::Satisfies => {
-                    answer.edges.push(parent)
-                }
-                Some(result) if result.outcome == GoMethodSatisfaction::DoesNotSatisfy => {}
-                Some(result) => {
-                    answer.open.push(parent);
-                    if let GoMethodSatisfaction::Inconclusive(reason) = result.outcome {
-                        answer.open_reasons.push(reason);
+            if Some(parent) != strict_target {
+                // Which receiver forms need a proof depends on the parent's proven
+                // declaration category (https://go.dev/ref/spec#Method_sets). For a
+                // struct S, the method set of *S contains S's with the same
+                // selections, so only the largest requested form is proven. A
+                // pointer to an interface has no methods, so an interface is proven
+                // as itself. Any other or unknown category keeps every requested form.
+                let kind = if receiver_forms.iter().any(|&form| form != 0) {
+                    self.ready
+                        .typed_source()
+                        .go_member_declarations(&[parent], cancellation)?
+                        .and_then(|declarations| {
+                            declarations
+                                .into_iter()
+                                .find(|declaration| declaration.definition == parent)
+                                .map(|declaration| declaration.kind)
+                        })
+                } else {
+                    None
+                };
+                let forms = match &kind {
+                    Some(crate::analyzer::resolution::GoMemberDeclarationKind::Struct {
+                        ..
+                    }) => receiver_forms.iter().copied().max().into_iter().collect(),
+                    Some(crate::analyzer::resolution::GoMemberDeclarationKind::Interface {
+                        ..
+                    }) => receiver_forms
+                        .iter()
+                        .copied()
+                        .filter(|&form| form == 0)
+                        .collect(),
+                    _ => receiver_forms.to_vec(),
+                };
+                let mut satisfied = false;
+                for form in forms {
+                    // Each proof charges its own work to the session; this only
+                    // observes a stop between the forms of one parent. The bounded
+                    // session's own token can stop it while the outer token is clear.
+                    if cancellation.is_cancelled() || !session.observe_cancellation() {
+                        answer.open.push(parent);
+                        answer
+                            .open_reasons
+                            .push("embedding proof was cancelled or exhausted its budget");
+                        break;
+                    }
+                    if form != 0 && kind.is_none() {
+                        answer.open.push(parent);
+                        answer
+                            .open_reasons
+                            .push("embedded candidate declaration kind is unavailable");
+                        continue;
+                    }
+                    let receiver =
+                        crate::analyzer::resolution::ResolutionTypeRef::new(parent, form);
+                    match self.go_selected_type_satisfaction(
+                        context_id,
+                        source_role,
+                        receiver,
+                        interface,
+                        cancellation,
+                        session,
+                    )? {
+                        Some(result) if result.outcome == GoMethodSatisfaction::Satisfies => {
+                            satisfied = true;
+                            completed.insert(receiver, result);
+                        }
+                        Some(result) if result.outcome == GoMethodSatisfaction::DoesNotSatisfy => {}
+                        Some(result) => {
+                            answer.open.push(parent);
+                            if let GoMethodSatisfaction::Inconclusive(reason) = result.outcome {
+                                answer.open_reasons.push(reason);
+                            }
+                        }
+                        None => {
+                            answer.open.push(parent);
+                            answer
+                                .open_reasons
+                                .push("embedded candidate satisfaction context is unavailable");
+                        }
                     }
                 }
-                None => {
-                    answer.open.push(parent);
-                    answer
-                        .open_reasons
-                        .push("embedded candidate satisfaction context is unavailable");
+                if satisfied {
+                    answer.edges.push(parent);
                 }
             }
             let descendants =
@@ -812,7 +947,7 @@ impl SelectedResolutionOperation<'_, '_> {
         answer.edges.dedup();
         answer.open.sort_unstable();
         answer.open.dedup();
-        Ok(answer)
+        Ok(GoEmbeddingClosure { answer, completed })
     }
 
     /// Confirm inverse embedding nominations with the forward proof.
@@ -1213,10 +1348,17 @@ impl SelectedResolutionOperation<'_, '_> {
                                     context_id,
                                     source_role,
                                     target,
-                                    &candidate_owners,
+                                    Some(target),
+                                    &candidate_owners
+                                        .iter()
+                                        .filter(|receiver| receiver.indirection() == 0)
+                                        .map(|receiver| receiver.identity())
+                                        .collect::<Vec<_>>(),
+                                    &[0],
                                     cancellation,
                                     session,
                                 )?;
+                                let closure = closure.answer;
                                 answer.edges.extend(satisfaction.edges);
                                 answer.edges.extend(closure.edges);
                                 answer.ambiguous.extend(satisfaction.ambiguous);
@@ -1239,6 +1381,10 @@ impl SelectedResolutionOperation<'_, '_> {
                 .open_reasons
                 .push("interface membership read was cancelled"),
         }
+        // Direct subtypes are strict, even when an embedding points back to its target.
+        answer.edges.retain(|candidate| *candidate != target);
+        answer.ambiguous.retain(|candidate| *candidate != target);
+        answer.open.retain(|candidate| *candidate != target);
         answer.edges.sort_unstable();
         answer.edges.dedup();
         answer.ambiguous.sort_unstable();
@@ -1660,6 +1806,19 @@ impl SelectedResolutionOperation<'_, '_> {
                 )
                 .optional()?;
             if alias.is_some() {
+                let declarations = self
+                    .ready
+                    .typed_source()
+                    .go_member_declarations(&[definition], cancellation)?;
+                if let Some(declarations) = declarations && declarations.iter().any(|declaration| {
+                    declaration.definition == definition
+                        && matches!(
+                            declaration.kind,
+                            crate::analyzer::resolution::GoMemberDeclarationKind::Interface { .. }
+                        )
+                }) {
+                    return Ok(GoTypeSupport::Supported);
+                }
                 return Ok(GoTypeSupport::Open);
             }
         }
@@ -1790,15 +1949,20 @@ pub(crate) fn go_source_type_head_sql(seed: &str, carried_column: Option<&str>) 
     let (extra_column, extra_value) = carried_column
         .map(|column| (format!(",{column}"), format!(",head.{column}")))
         .unwrap_or_default();
+    let extra_seed = carried_column
+        .map(|column| format!(",input.{column}"))
+        .unwrap_or_default();
     format!(
-        r#"WITH RECURSIVE head(blob_id,type_id,depth{extra_column}) AS (
-  {seed}
+        r#"WITH RECURSIVE input(blob_id,type_id,depth{extra_column}) AS ({seed}),
+head(blob_id,type_id,depth,pointer_hops{extra_column}) AS (
+  SELECT input.blob_id,input.type_id,input.depth,0{extra_seed} FROM input
   UNION ALL
-  SELECT head.blob_id,child.child1,head.depth+1{extra_value} FROM head
+  SELECT head.blob_id,child.child1,head.depth+1,
+         head.pointer_hops+(child.kind=1){extra_value} FROM head
   JOIN main.source_go_types child ON child.blob_id=head.blob_id AND child.type_id=head.type_id
   WHERE child.kind IN (1,7) AND child.child1 IS NOT NULL AND head.depth<32
   UNION ALL
-  SELECT head.blob_id,element.child_id,head.depth+1{extra_value} FROM head
+  SELECT head.blob_id,element.child_id,head.depth+1,head.pointer_hops{extra_value} FROM head
   JOIN main.source_go_types wrapper ON wrapper.blob_id=head.blob_id AND wrapper.type_id=head.type_id
    AND wrapper.kind IN (8,9,10)
   JOIN main.source_go_type_children element ON element.blob_id=wrapper.blob_id
@@ -1809,6 +1973,99 @@ pub(crate) fn go_source_type_head_sql(seed: &str, carried_column: Option<&str>) 
 )"#
     )
 }
+
+// The alias identity transfer connects its definition to the synthetic
+// literal definition. The literal retains ownership; readers project its
+// exact method key/name pair onto the selected alias.
+pub(crate) fn go_alias_literal_method_pairs_sql(seed: &str) -> String {
+    format!(
+        r#"{}, alias_method_pairs AS (SELECT DISTINCT head.blob_id, alias_member.definition_key AS alias_key,
+                 owner.definition_semantic_key AS method_key, owner.member_name
+          FROM head
+          JOIN main.source_go_types literal ON literal.blob_id=head.blob_id
+           AND literal.type_id=head.type_id AND literal.kind=13
+           AND head.pointer_hops=0
+          JOIN main.source_go_aliases alias ON alias.blob_id=head.blob_id
+           AND alias.declaration_id=head.alias_declaration_id
+          JOIN main.resolution_package_members alias_member
+           ON alias_member.blob_id=alias.blob_id AND alias_member.namespace='type'
+          JOIN main.resolution_semantic_catalog alias_lookup
+           ON alias_lookup.blob_id=alias_member.blob_id
+           AND alias_lookup.local_key=alias_member.lookup_key
+          JOIN main.resolution_identities alias_identity
+           ON alias_identity.id=alias_lookup.shared_identity
+           AND alias_identity.spelling=alias.name
+          -- A duplicate source alias name cannot identify which target the
+          -- package-member definition denotes.
+          AND NOT EXISTS (SELECT 1 FROM main.source_go_aliases other
+           WHERE other.blob_id=alias.blob_id AND other.name=alias.name
+             AND other.declaration_id<>alias.declaration_id)
+          JOIN main.resolution_declaration_types alias_type
+           ON alias_type.blob_id=alias_member.blob_id
+           AND alias_type.definition=alias_member.definition_key AND alias_type.role=3
+          JOIN main.resolution_type_transfers transfer
+           ON transfer.blob_id=alias_type.blob_id
+           AND transfer.target_slot=alias_type.slot AND transfer.kind=0
+           AND transfer.indirection_delta=0
+          JOIN main.resolution_declaration_types literal_type
+           ON literal_type.blob_id=transfer.blob_id
+           AND literal_type.slot=transfer.source_slot AND literal_type.role=3
+          -- The literal owns embedded edges too; direct methods alone cannot
+          -- close an alias whose literal has an embedded term.
+          AND NOT EXISTS (SELECT 1 FROM main.resolution_supertypes embedded
+           WHERE embedded.blob_id=literal_type.blob_id
+             AND embedded.definition=literal_type.definition)
+          -- Type-set and constraint terms publish this gap on the literal
+          -- site without a supertype row. They cannot close a method set.
+          AND NOT EXISTS (SELECT 1 FROM main.resolution_semantic_sites literal_site
+           JOIN main.resolution_gap_reasons reason ON reason.blob_id=literal_site.blob_id
+            AND reason.site=literal_site.source_site AND reason.origin={}
+           WHERE literal_site.blob_id=literal_type.blob_id
+             AND literal_site.semantic_key=literal_type.definition
+             AND literal_site.semantic_role='definition')
+          JOIN main.resolution_member_owner_properties owner
+           ON owner.blob_id=literal_type.blob_id
+           AND owner.owner_definition_semantic_key=literal_type.definition
+           AND owner.member_kind='method')"#,
+        go_source_type_head_sql(seed, Some("alias_declaration_id")),
+        crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+            crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                ResolutionGapKind::UnsupportedHierarchyTraversal,
+            ),
+        )
+    )
+}
+
+// A relation-42 method owned by an anonymous literal remains open unless the
+// exact alias/method pair was projected. Named interfaces have a source bridge.
+pub(crate) static GO_UNPROJECTED_INTERFACE_METHOD_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"{}
+SELECT EXISTS (
+ SELECT 1 FROM main.resolution_member_owner_properties owner
+ JOIN main.resolution_declaration_types literal_type
+  ON literal_type.blob_id=owner.blob_id
+  AND literal_type.definition=owner.owner_definition_semantic_key
+  AND literal_type.role=3
+ JOIN main.resolution_semantic_sites literal_site
+  ON literal_site.blob_id=owner.blob_id
+  AND literal_site.semantic_key=owner.owner_definition_semantic_key
+  AND literal_site.semantic_role='definition'
+ LEFT JOIN main.source_native_declaration_bridges named
+  ON named.blob_id=literal_site.blob_id
+  AND named.source_site=literal_site.source_site
+ WHERE owner.blob_id=?1 AND owner.member_name=?2
+  AND owner.member_kind='method' AND named.declaration_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM alias_method_pairs pair
+   WHERE pair.blob_id=owner.blob_id
+    AND pair.method_key=owner.definition_semantic_key)
+)"#,
+            go_alias_literal_method_pairs_sql(
+                "SELECT alias.blob_id,alias.target_type_id,0,alias.declaration_id FROM main.source_go_aliases alias WHERE alias.blob_id=?1 AND alias.target_type_id IS NOT NULL"
+            )
+        )
+    });
 
 pub(crate) static GO_EMBEDDED_REFERENCE_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
@@ -1897,28 +2154,11 @@ SELECT COUNT(*) FROM main.resolution_typed_fact_lookups
 WHERE relation=22 AND identity_id=?1
 "#;
 
-pub(crate) static GO_UNBOUND_ALIAS_INTERFACE_SQL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| {
-        format!(
-            "{}{}",
-            go_source_type_head_sql(
-                "SELECT alias.blob_id,alias.target_type_id,0 FROM main.source_go_aliases alias WHERE alias.blob_id=?1 AND alias.target_type_id IS NOT NULL",
-                None,
-            ),
-            r#"
-SELECT EXISTS (
-  SELECT 1 FROM head
-  JOIN main.source_go_types type ON type.blob_id=head.blob_id AND type.type_id=head.type_id
-  WHERE type.kind=13 OR (head.depth=32 AND type.kind IN (1,7,8,9,10))
-)
-"#
-        )
-    });
-
 pub(crate) static GO_METHOD_INTERFACE_OWNERS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
-            r#"SELECT DISTINCT semantic.semantic_key
+            r#"{}
+            SELECT DISTINCT semantic.semantic_key
             FROM temp.selected_resolution_mounts mount
             JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=mount.mount_ordinal
             JOIN main.source_go_type_declarations declaration ON declaration.blob_id=mount.blob_id
@@ -1936,7 +2176,22 @@ pub(crate) static GO_METHOD_INTERFACE_OWNERS_SQL: std::sync::LazyLock<String> =
                WHERE placement.mount_ordinal=mount.mount_ordinal))
              AND file.context_id=?4 AND file.source_role IN ('go',?5)
             WHERE mount.mount_ordinal=?1 AND mount.blob_id=?2 AND mount.storage_language='go'
-            ORDER BY semantic.semantic_key"#,
+            UNION
+            SELECT pair.alias_key
+            FROM alias_method_pairs pair
+            JOIN temp.selected_resolution_mounts mount ON mount.blob_id=pair.blob_id
+             AND mount.mount_ordinal=?1 AND mount.storage_language='go'
+            JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=mount.mount_ordinal
+            JOIN ({}) file ON file.file_version_id=coalesce(mount.file_version_id,
+              (SELECT placement.file_version_id FROM temp.selected_go_transient_placements placement
+               WHERE placement.mount_ordinal=mount.mount_ordinal))
+             AND file.context_id=?4 AND file.source_role IN ('go',?5)
+            WHERE pair.member_name=?3
+            ORDER BY 1"#,
+            go_alias_literal_method_pairs_sql(
+                "SELECT alias.blob_id,alias.target_type_id,0,alias.declaration_id FROM main.source_go_aliases alias WHERE alias.blob_id=?2 AND alias.target_type_id IS NOT NULL"
+            ),
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
             super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
         )
     });
@@ -1944,7 +2199,8 @@ pub(crate) static GO_METHOD_INTERFACE_OWNERS_SQL: std::sync::LazyLock<String> =
 pub(crate) static GO_INTERFACE_OWNER_FOR_METHOD_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
-            r#"SELECT owner_semantic.semantic_key
+            r#"{}
+            SELECT owner_semantic.semantic_key
             FROM temp.selected_resolution_mounts mount
             JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=mount.mount_ordinal
             JOIN main.resolution_semantic_sites method_semantic ON method_semantic.blob_id=mount.blob_id
@@ -1967,7 +2223,22 @@ pub(crate) static GO_INTERFACE_OWNER_FOR_METHOD_SQL: std::sync::LazyLock<String>
                WHERE placement.mount_ordinal=mount.mount_ordinal))
              AND file.context_id=?3 AND file.source_role IN ('go',?4)
             WHERE mount.mount_ordinal=?1 AND mount.storage_language='go'
+            UNION
+            SELECT pair.alias_key
+            FROM alias_method_pairs pair
+            JOIN temp.selected_resolution_mounts mount ON mount.blob_id=pair.blob_id
+             AND mount.mount_ordinal=?1 AND mount.storage_language='go'
+            JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=mount.mount_ordinal
+            JOIN ({}) file ON file.file_version_id=coalesce(mount.file_version_id,
+              (SELECT placement.file_version_id FROM temp.selected_go_transient_placements placement
+               WHERE placement.mount_ordinal=mount.mount_ordinal))
+             AND file.context_id=?3 AND file.source_role IN ('go',?4)
+            WHERE pair.method_key=?2
             LIMIT 1"#,
+            go_alias_literal_method_pairs_sql(
+                "SELECT alias.blob_id,alias.target_type_id,0,alias.declaration_id FROM temp.selected_resolution_mounts seed_mount JOIN main.source_go_aliases alias ON alias.blob_id=seed_mount.blob_id WHERE seed_mount.mount_ordinal=?1 AND alias.target_type_id IS NOT NULL"
+            ),
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
             super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
         )
     });
@@ -1975,7 +2246,8 @@ pub(crate) static GO_INTERFACE_OWNER_FOR_METHOD_SQL: std::sync::LazyLock<String>
 pub(crate) static GO_HIERARCHY_METHOD_IDENTITY_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
-            r#"SELECT callable.name,package.package_id
+            r#"{}
+            SELECT callable.name,package.package_id
             FROM temp.selected_resolution_mounts mount
             JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=mount.mount_ordinal
             JOIN main.resolution_semantic_sites semantic ON semantic.blob_id=mount.blob_id
@@ -1990,7 +2262,25 @@ pub(crate) static GO_HIERARCHY_METHOD_IDENTITY_SQL: std::sync::LazyLock<String> 
              AND file.context_id=?3 AND file.source_role IN ('go',?4)
             JOIN main.go_package_instances package ON package.package_id=file.package_id
              AND package.context_id=?3
-            WHERE mount.mount_ordinal=?1 AND mount.storage_language='go' LIMIT 1"#,
+            WHERE mount.mount_ordinal=?1 AND mount.storage_language='go'
+            UNION
+            SELECT pair.member_name,package.package_id
+            FROM alias_method_pairs pair
+            JOIN temp.selected_resolution_mounts mount ON mount.blob_id=pair.blob_id
+             AND mount.mount_ordinal=?1 AND mount.storage_language='go'
+            JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=mount.mount_ordinal
+            JOIN ({}) file ON file.file_version_id=coalesce(mount.file_version_id,
+              (SELECT placement.file_version_id FROM temp.selected_go_transient_placements placement
+               WHERE placement.mount_ordinal=mount.mount_ordinal))
+             AND file.context_id=?3 AND file.source_role IN ('go',?4)
+            JOIN main.go_package_instances package ON package.package_id=file.package_id
+             AND package.context_id=?3
+            WHERE pair.method_key=?2
+            LIMIT 1"#,
+            go_alias_literal_method_pairs_sql(
+                "SELECT alias.blob_id,alias.target_type_id,0,alias.declaration_id FROM temp.selected_resolution_mounts seed_mount JOIN main.source_go_aliases alias ON alias.blob_id=seed_mount.blob_id WHERE seed_mount.mount_ordinal=?1 AND alias.target_type_id IS NOT NULL"
+            ),
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
             super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
         )
     });

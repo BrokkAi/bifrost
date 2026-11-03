@@ -31,6 +31,7 @@ enum VersionRange {
     Cargo(semver::VersionReq),
     Npm(brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange),
     Nuget(brokk_bifrost_csharp_analysis::dependency_evidence::NugetVersionRange),
+    Go(brokk_bifrost_go_analysis::analyzer::GoVersionRange),
 }
 
 /// Parse one validated range with its ecosystem's own version semantics.
@@ -46,9 +47,16 @@ fn version_range(ecosystem: &str, requirement: &str) -> VersionRange {
             )
             .expect("validated NuGet range"),
         ),
-        "cargo" => VersionRange::Cargo(
-            semver::VersionReq::parse(requirement).expect("validated Cargo range"),
+        brokk_bifrost_go_analysis::analyzer::GO_MODULE_ECOSYSTEM
+        | brokk_bifrost_go_analysis::analyzer::GO_TOOLCHAIN_ECOSYSTEM => VersionRange::Go(
+            brokk_bifrost_go_analysis::analyzer::GoVersionRange::parse(ecosystem, requirement)
+                .expect("validated Go range"),
         ),
+        "cargo" | brokk_bifrost_rust_analysis::analyzer::RUST_TOOLCHAIN_ECOSYSTEM => {
+            VersionRange::Cargo(
+                semver::VersionReq::parse(requirement).expect("validated Cargo range"),
+            )
+        }
         _ => unreachable!("version range ecosystems are validated"),
     }
 }
@@ -66,14 +74,17 @@ pub(super) fn mitigation_version_predicate(
         ecosystems: vec![ecosystem.to_owned()],
         ..Default::default()
     };
-    move |row| matches(row, &filter, &ranges).ok().flatten()
+    move |row| matches(row, &filter, &ranges).ok()
 }
+
+/// Why a row's predicate is unknown: the predicate's name and the reason.
+type Unresolved = (&'static str, String);
 
 fn matches(
     row: &DependencyEvidence,
     filter: &DependencyEvidenceFilter,
     ranges: &[VersionRange],
-) -> Result<Option<bool>, String> {
+) -> Result<bool, Unresolved> {
     if !(axis(&filter.ecosystems, Some(&row.ecosystem))
         && axis(&filter.packages, Some(&row.package))
         && axis(&filter.kinds, Some(row.kind.label()))
@@ -82,10 +93,77 @@ fn matches(
         && axis(&filter.declared_by, row.declared_by.as_deref())
         && axis(&filter.scopes, Some(row.scope.label())))
     {
-        return Ok(Some(false));
+        return Ok(false);
     }
+    // Three-valued AND: a definite false on either predicate wins over the
+    // other's unknown.
+    let features = requests_feature(row, &filter.features).map_err(|e| ("feature", e));
+    if features == Ok(false) {
+        return Ok(false);
+    }
+    let version = version_matches(row, ranges).map_err(|e| ("version", e));
+    match (features, version) {
+        (_, Ok(false)) => Ok(false),
+        (Err(unresolved), _) | (_, Err(unresolved)) => Err(unresolved),
+        (Ok(_), Ok(true)) => Ok(true),
+    }
+}
+
+/// Whether the manifest that owns this Cargo row requests any of `features`
+/// of the row's package. A request is not an enabled build feature, and the
+/// absence of an explicit request is a definite `false` only when nothing in
+/// the owning manifest can request the feature indirectly: the package's
+/// default features (whose list a files-only checkout does not have), a
+/// member-level `default-features` setting, a member `[features]` entry that
+/// forwards to this dependency, or another requested feature that the
+/// package's own feature table may imply. Rows that record no request of
+/// their own (an unowned or transitive lock instance) are unknown.
+fn requests_feature(row: &DependencyEvidence, features: &[String]) -> Result<bool, String> {
+    if features.is_empty() {
+        return Ok(true);
+    }
+    let values = |kind: &'static str| {
+        row.conditions
+            .iter()
+            .filter(move |condition| condition.kind == kind)
+            .map(|condition| condition.value.as_str())
+    };
+    if values("cargo.default_features").next().is_none()
+        || values("cargo.lock_association").any(|value| value == "transitive")
+    {
+        return Err("the row records no feature request of its own".into());
+    }
+    let requested = values("cargo.requested_feature").collect::<Vec<_>>();
+    if requested
+        .iter()
+        .any(|feature| features.iter().any(|wanted| wanted == feature))
+    {
+        return Ok(true);
+    }
+    if values("cargo.default_features")
+        .chain(values("cargo.member_default_features"))
+        .any(|value| value == "true")
+    {
+        return Err("default features are enabled and their list is unknown".into());
+    }
+    let conditional = values("cargo.conditional_requested_feature").collect::<Vec<_>>();
+    if !conditional.is_empty() {
+        return Err(format!(
+            "member feature tables request {conditional:?} when enabled"
+        ));
+    }
+    if !requested.is_empty() {
+        return Err(format!(
+            "the package's own feature table may imply a requested feature from {requested:?}"
+        ));
+    }
+    Ok(false)
+}
+
+fn version_matches(row: &DependencyEvidence, ranges: &[VersionRange]) -> Result<bool, String> {
+    const NO_EXACT: &str = "no complete exact version evidence";
     if ranges.is_empty() {
-        return Ok(Some(true));
+        return Ok(true);
     }
     use brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidenceKind;
     if !row.complete
@@ -94,36 +172,32 @@ fn matches(
             DependencyEvidenceKind::Locked | DependencyEvidenceKind::Installed
         )
     {
-        return Ok(None);
+        return Err(NO_EXACT.into());
     }
     let mut matched = false;
     for range in ranges {
         matched |= match range {
             VersionRange::Npm(range) => {
-                let value = brokk_bifrost_js_ts_analysis::dependency_evidence::npm_dependency_version_matches(row, range)
-                    .map_err(|e| e.to_string())?;
-                let Some(value) = value else {
-                    return Ok(None);
-                };
-                value
+                brokk_bifrost_js_ts_analysis::dependency_evidence::npm_dependency_version_matches(row, range)
+                    .map_err(|e| e.to_string())?
+                    .ok_or(NO_EXACT)?
             }
             VersionRange::Nuget(range) => {
-                let value = brokk_bifrost_csharp_analysis::dependency_evidence::nuget_dependency_version_matches(row, range)?;
-                let Some(value) = value else {
-                    return Ok(None);
-                };
-                value
+                brokk_bifrost_csharp_analysis::dependency_evidence::nuget_dependency_version_matches(row, range)?
+                    .ok_or(NO_EXACT)?
+            }
+            VersionRange::Go(range) => {
+                brokk_bifrost_go_analysis::analyzer::go_dependency_version_matches(row, range)?
+                    .ok_or(NO_EXACT)?
             }
             VersionRange::Cargo(range) => {
-                let Some(raw) = row.exact_version.as_deref() else {
-                    return Ok(None);
-                };
+                let raw = row.exact_version.as_deref().ok_or(NO_EXACT)?;
                 let version = semver::Version::parse(raw).map_err(|e| e.to_string())?;
                 range.matches(&version)
             }
         };
     }
-    Ok(Some(matched))
+    Ok(matched)
 }
 pub(super) fn execute_dependency_evidence_seed(
     seed: &DependencyEvidenceSeed,
@@ -249,9 +323,9 @@ pub(super) fn execute_dependency_evidence_seed(
             continue;
         }
         match matches(&row, &seed.filter, &ranges) {
-            Ok(Some(true)) => {}
-            Ok(Some(false)) => continue,
-            unknown => {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err((predicate, reason)) => {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
                     incompleteness: Incompleteness::Content,
@@ -262,12 +336,9 @@ pub(super) fn execute_dependency_evidence_seed(
                     branch: Vec::new(),
                     language: "workspace",
                     message: format!(
-                        "dependency version predicate unresolved for {} at {}: {}",
+                        "dependency {predicate} predicate unresolved for {} at {}: {reason}",
                         row.id(),
                         crate::path_utils::workspace_relative_slash_path(&row.build_file),
-                        unknown
-                            .err()
-                            .unwrap_or_else(|| "no complete exact version evidence".into())
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,

@@ -301,7 +301,7 @@ WHERE member.namespace IN ('value','callable')
 ORDER BY package_file.mount_ordinal,definition.semantic_key
 "#;
 
-const GO_POINT_TYPE_NAME: &str = r#"
+pub(crate) const GO_POINT_TYPE_NAME: &str = r#"
 SELECT type.name
 FROM temp.selected_resolution_mounts mounted
 JOIN main.resolution_semantic_sites semantic
@@ -311,6 +311,17 @@ JOIN main.source_native_declaration_bridges bridge
   ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
 JOIN main.source_go_type_declarations type
   ON type.blob_id=bridge.blob_id AND type.declaration_id=bridge.declaration_id
+WHERE mounted.mount_ordinal=?1 AND mounted.storage_language='go'
+UNION
+SELECT alias.name
+FROM temp.selected_resolution_mounts mounted
+JOIN main.resolution_package_members member INDEXED BY resolution_package_members_definition
+ ON member.blob_id=mounted.blob_id AND member.definition_key=?2 AND member.namespace='type'
+JOIN main.resolution_semantic_catalog catalog ON catalog.blob_id=member.blob_id
+ AND catalog.local_key=member.lookup_key
+JOIN main.resolution_identities identity ON identity.id=catalog.shared_identity
+JOIN main.source_go_aliases alias ON alias.blob_id=member.blob_id
+ AND alias.name=identity.spelling
 WHERE mounted.mount_ordinal=?1 AND mounted.storage_language='go'
 "#;
 

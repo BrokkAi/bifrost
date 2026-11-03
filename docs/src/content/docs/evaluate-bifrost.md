@@ -192,10 +192,10 @@ If the first call is impossible because `query_code` is missing, the agent has n
 The VS Code extension and its language server come from the separate
 `bifrost-lsp` project, not from the `bifrost` binary. The `bifrost` command no
 longer serves LSP. This journey therefore depends on the extension's own
-release and on the Bifrost binary it downloads; see [LSP Server](/lsp/) for
+release and on the standalone server it downloads; see [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md) for
 the current status.
 
-Install the [Bifrost VS Code extension](/vscode/), then open the fixture directory as the workspace:
+Install the [Bifrost VS Code extension](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/vscode.md), then open the fixture directory as the workspace:
 
 ```bash
 code docs/fixtures/ten-minute-evaluation

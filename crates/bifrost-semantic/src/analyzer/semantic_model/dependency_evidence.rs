@@ -5,6 +5,7 @@
 //! the selected workspace store. Versions retain ecosystem syntax, never a
 //! lossy conversion to the semantic pack catalog's semver coordinates.
 
+use std::cmp::Ordering;
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -180,4 +181,75 @@ pub struct DependencyEvidenceLocation {
     pub end_line: usize,
     pub end_column: usize,
     pub slice_sha256: [u8; 32],
+}
+
+/// One authored bound of an affected-version range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionComparator {
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+    Equal,
+}
+
+impl VersionComparator {
+    /// Whether a version ordered `ordering` against the bound satisfies it.
+    pub fn admits(self, ordering: Ordering) -> bool {
+        match self {
+            Self::Less => ordering == Ordering::Less,
+            Self::LessOrEqual => ordering != Ordering::Greater,
+            Self::Greater => ordering == Ordering::Greater,
+            Self::GreaterOrEqual => ordering != Ordering::Less,
+            Self::Equal => ordering == Ordering::Equal,
+        }
+    }
+}
+
+/// Parse whitespace-joined comparators (`>=1.0 <1.11.0`, `>= 1.0`). The
+/// ecosystem supplies `parse_version`, so its own version grammar decides
+/// which bounds are valid.
+pub fn parse_version_comparators<V>(
+    text: &str,
+    parse_version: impl Fn(&str) -> Result<V, String>,
+) -> Result<Vec<(VersionComparator, V)>, String> {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let mut bounds = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        let (comparator, rest) = [
+            (">=", VersionComparator::GreaterOrEqual),
+            ("<=", VersionComparator::LessOrEqual),
+            (">", VersionComparator::Greater),
+            ("<", VersionComparator::Less),
+            ("=", VersionComparator::Equal),
+        ]
+        .into_iter()
+        .find_map(|(prefix, comparator)| token.strip_prefix(prefix).map(|rest| (comparator, rest)))
+        .ok_or_else(|| format!("{token:?} needs a comparator (<, <=, >, >=, =)"))?;
+        let version = if rest.is_empty() {
+            index += 1;
+            *tokens
+                .get(index)
+                .ok_or_else(|| format!("{token:?} has no version"))?
+        } else {
+            rest
+        };
+        bounds.push((comparator, parse_version(version)?));
+        index += 1;
+    }
+    Ok(bounds)
+}
+
+/// Whether `version` satisfies every bound of at least one `||` alternative.
+pub fn version_bounds_admit<V: Ord>(
+    alternatives: &[Vec<(VersionComparator, V)>],
+    version: &V,
+) -> bool {
+    alternatives.iter().any(|bounds| {
+        bounds
+            .iter()
+            .all(|(comparator, bound)| comparator.admits(version.cmp(bound)))
+    })
 }

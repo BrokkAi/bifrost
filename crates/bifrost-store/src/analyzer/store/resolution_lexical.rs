@@ -868,6 +868,112 @@ type ContextPathsMemo = RefCell<
 pub(crate) type ReverseCandidateRowsMemo =
     std::rc::Rc<RefCell<ExactReadMemo<ReverseCandidateReadKey, Vec<Vec<OfferedCandidateRow>>>>>;
 
+type JvmRootPresenceReadKey = (String, [u8; 32], (u64, u64));
+
+pub(crate) struct JvmRootPresenceReadMemo {
+    entries: ExactReadMemo<JvmRootPresenceReadKey, MemoizedRootPresence>,
+    opening_scope: [u8; 32],
+    opening_stage_epoch: (u64, u64),
+}
+
+// A cancelled read returns before memo admission. The only admitted NotReady
+// comes from the selected package-member uncertainty query.
+#[derive(Clone, Copy)]
+enum MemoizedRootPresence {
+    Ready(bool),
+    OpenInventory,
+}
+
+impl MemoizedRootPresence {
+    fn presence(self) -> crate::analyzer::resolution::JvmSelectedRootPresence {
+        match self {
+            Self::Ready(value) => {
+                crate::analyzer::resolution::JvmSelectedRootPresence::Ready(value)
+            }
+            Self::OpenInventory => crate::analyzer::resolution::JvmSelectedRootPresence::NotReady,
+        }
+    }
+
+    fn exported_presence(self) -> crate::analyzer::resolution::JvmSelectedRootPresence {
+        let presence = self.presence();
+        assert!(
+            presence != crate::analyzer::resolution::JvmSelectedRootPresence::NotReady
+                || matches!(self, Self::OpenInventory),
+            "a cancelled root-presence read cannot be exported"
+        );
+        presence
+    }
+}
+
+impl JvmRootPresenceReadMemo {
+    pub(crate) fn new(opening_scope: [u8; 32], opening_stage_epoch: (u64, u64)) -> Self {
+        Self {
+            entries: ExactReadMemo::default(),
+            opening_scope,
+            opening_stage_epoch,
+        }
+    }
+
+    fn get(
+        &self,
+        key: &JvmRootPresenceReadKey,
+    ) -> Option<crate::analyzer::resolution::JvmSelectedRootPresence> {
+        self.entries
+            .get(key)
+            .copied()
+            .map(MemoizedRootPresence::presence)
+    }
+
+    fn insert(&mut self, key: JvmRootPresenceReadKey, value: MemoizedRootPresence) {
+        use brokk_bifrost_core::analyzer::Language;
+        assert!(
+            [Language::Java, Language::Kotlin, Language::Scala]
+                .into_iter()
+                .filter_map(brokk_bifrost_jvm::intrinsics::implicit_superclass_root)
+                .any(|root| root == key.0)
+        );
+        assert_eq!(
+            key.1, self.opening_scope,
+            "JVM root presence requires the whole selected scope"
+        );
+        assert_eq!(
+            key.2, self.opening_stage_epoch,
+            "JVM root presence requires the opening stage epoch"
+        );
+        assert!(
+            self.entries.insert_bounded(key, value),
+            "the finite JVM root presence memo must admit every consumed answer"
+        );
+    }
+
+    pub(crate) fn consumed(
+        &self,
+    ) -> Vec<(String, crate::analyzer::resolution::JvmSelectedRootPresence)> {
+        self.entries
+            .iter()
+            .map(|((root, scope, epoch), presence)| {
+                assert_eq!(*scope, self.opening_scope);
+                assert_eq!(*epoch, self.opening_stage_epoch);
+                (root.clone(), presence.exported_presence())
+            })
+            .collect()
+    }
+
+    pub(crate) fn drain(
+        &mut self,
+    ) -> Vec<(String, crate::analyzer::resolution::JvmSelectedRootPresence)> {
+        let entries = std::mem::take(&mut self.entries);
+        entries
+            .iter()
+            .map(|((root, scope, epoch), presence)| {
+                assert_eq!(*scope, self.opening_scope);
+                assert_eq!(*epoch, self.opening_stage_epoch);
+                (root.clone(), presence.exported_presence())
+            })
+            .collect()
+    }
+}
+
 // Only reverse reads use this memo, hence one SQL shape and decoding direction.
 // Arrays are the exact ordered SQL inputs; fragment also fixes remounted IDs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1088,6 +1194,7 @@ pub struct SelectedResolutionLexicalSource<'selection, 'store> {
     /// point operations of one native point batch (#8166). Fragment decoding,
     /// completion decisions and suppression stay per call.
     candidate_path_read_memo: std::rc::Rc<RefCell<CandidatePathReadMemo>>,
+    jvm_root_presence_memo: std::rc::Rc<RefCell<JvmRootPresenceReadMemo>>,
     #[doc(hidden)]
     pub ordinary_completion_suppression: RefCell<Option<OrdinaryCompletionSuppression>>,
     /// One candidate direction's unconditional completion box, forward then
@@ -2288,6 +2395,14 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         self
     }
 
+    pub(crate) fn with_jvm_root_presence_memo(
+        mut self,
+        memo: std::rc::Rc<RefCell<JvmRootPresenceReadMemo>>,
+    ) -> Self {
+        self.jvm_root_presence_memo = memo;
+        self
+    }
+
     fn with_authority_and_read_memos(
         selection: &'selection SelectedResolutionMountInventory<'store>,
         authority: std::rc::Rc<
@@ -2310,6 +2425,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             forward_reference_fragments: None,
             selected_interiors_validated: OnceCell::new(),
             candidate_path_read_memo: std::rc::Rc::default(),
+            jvm_root_presence_memo: std::rc::Rc::new(RefCell::new(JvmRootPresenceReadMemo::new(
+                selection.scope_identity(),
+                selection.staged_read_epoch(),
+            ))),
             reference_local_path_read_memo: std::rc::Rc::default(),
             ordinary_completion_suppression: RefCell::new(None),
             unconditional_candidate_reasons: [OnceCell::new(), OnceCell::new()],
@@ -5451,8 +5570,11 @@ impl SelectedResolutionLexicalSource<'_, '_> {
                     )));
                 }
             }
-            for (identity, path) in self.hydrate_candidate_paths(page, cancellation)? {
-                match classify_selected_root_path_half(self, identity, &path, cancellation)? {
+            for (identity, row) in self.hydrate_candidate_paths_with_origin(page, cancellation)? {
+                let path = row.path;
+                match classify_selected_root_path_half(self, identity, &path, cancellation)?
+                    .map(|half| half.with_source_origin(row.origin))
+                {
                     Some(
                         half @ (SelectedRootPathHalf::Import { demand, .. }
                         | SelectedRootPathHalf::Reference { demand, .. }),
@@ -5920,6 +6042,116 @@ fn raw_ordered_checkpoint_ancestry(
 }
 
 impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
+    fn jvm_selected_root_presence(
+        &self,
+        root_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::analyzer::resolution::JvmSelectedRootPresence> {
+        use crate::analyzer::resolution::JvmSelectedRootPresence;
+        let key = (
+            root_fqn.to_owned(),
+            self.selection.scope_identity(),
+            self.selection.staged_read_epoch(),
+        );
+        if cancellation.is_cancelled() {
+            return Ok(JvmSelectedRootPresence::NotReady);
+        }
+        if let Some(presence) = self.jvm_root_presence_memo.borrow().get(&key) {
+            return Ok(presence);
+        }
+        let Some((package, simple)) = root_fqn.rsplit_once('.') else {
+            return Err(StoreError::corrupt("JVM intrinsic root has no package"));
+        };
+        if cancellation.is_cancelled() {
+            return Ok(JvmSelectedRootPresence::NotReady);
+        }
+        let names = self.selection.shared_names();
+        let lookups = [
+            brokk_bifrost_core::analyzer::Language::Java,
+            brokk_bifrost_core::analyzer::Language::Kotlin,
+            brokk_bifrost_core::analyzer::Language::Scala,
+        ]
+        .map(|language| {
+            ResolutionLookupSemanticRecipe::new(language, ResolutionNamespace::Type, simple)
+                .semantic(&names)
+        });
+        let persisted = lookups
+            .iter()
+            .filter_map(|lookup| {
+                lookup
+                    .shared_name_id()
+                    .and_then(|name| names.to_persisted(name))
+                    .map(|name| name.get())
+            })
+            .collect::<Vec<_>>();
+        let staged = lookups
+            .iter()
+            .map(|lookup| {
+                lookup
+                    .shared_name_id()
+                    .expect("root lookup is shared")
+                    .get()
+            })
+            .collect::<Vec<_>>();
+        let conn = self.selection.connection();
+        let ordinary = if persisted.is_empty() {
+            false
+        } else {
+            let sql =
+                super::resolution_operation::jvm_context::jvm_named_package_member_targets_sql();
+            let mut statement = conn.prepare_cached(&sql)?;
+            statement.exists(rusqlite::params![
+                package,
+                serde_json::to_string(&persisted).expect("shared IDs serialize"),
+                "java",
+                "kotlin",
+                "scala"
+            ])?
+        };
+        if cancellation.is_cancelled() {
+            return Ok(JvmSelectedRootPresence::NotReady);
+        }
+        let staged_present = if ordinary {
+            false
+        } else {
+            let sql =
+                super::resolution_operation::jvm_context::jvm_staged_root_member_targets_sql();
+            let mut statement = conn.prepare_cached(&sql)?;
+            statement.exists(rusqlite::params![
+                package,
+                serde_json::to_string(&staged).expect("shared IDs serialize"),
+                "java",
+                "kotlin",
+                "scala"
+            ])?
+        };
+        if cancellation.is_cancelled() {
+            return Ok(JvmSelectedRootPresence::NotReady);
+        }
+        // A selected mount with an open package-member inventory cannot prove
+        // that the root declaration is absent, even if no indexed member hit.
+        if !ordinary && !staged_present {
+            let sql = super::resolution_operation::jvm_context::jvm_root_member_uncertainty_sql();
+            let mut statement = conn.prepare_cached(&sql)?;
+            if statement.exists(rusqlite::params![package, "java", "kotlin", "scala"])? {
+                if cancellation.is_cancelled() {
+                    return Ok(JvmSelectedRootPresence::NotReady);
+                }
+                self.jvm_root_presence_memo
+                    .borrow_mut()
+                    .insert(key, MemoizedRootPresence::OpenInventory);
+                return Ok(JvmSelectedRootPresence::NotReady);
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Ok(JvmSelectedRootPresence::NotReady);
+        }
+        let present = JvmSelectedRootPresence::Ready(ordinary || staged_present);
+        self.jvm_root_presence_memo
+            .borrow_mut()
+            .insert(key, MemoizedRootPresence::Ready(ordinary || staged_present));
+        Ok(present)
+    }
     fn identity_content_digest(
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
@@ -6667,14 +6899,39 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         candidates: &[CandidatePathIdentity],
         cancellation: &CancellationToken,
     ) -> StoreResult<Vec<(CandidatePathIdentity, PartialPath)>> {
+        Ok(self
+            .hydrate_candidate_paths_with_origin(candidates, cancellation)?
+            .into_iter()
+            .map(|(id, row)| (id, row.path))
+            .collect())
+    }
+
+    fn hydrate_candidate_paths_with_origin(
+        &self,
+        candidates: &[CandidatePathIdentity],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Vec<(
+            CandidatePathIdentity,
+            crate::analyzer::resolution::HydratedCandidatePath,
+        )>,
+    > {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let Some(mut hydrated) =
-            stage::hydrate_candidate_paths(self.selection, candidates, cancellation)?
+        let Some(hydrated) =
+            stage::hydrate_candidate_paths_with_origin(self.selection, candidates, cancellation)?
         else {
             return Ok(Vec::new());
         };
+        let mut origins = hydrated
+            .iter()
+            .map(|row| row.as_ref().map(|row| row.origin).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let mut hydrated = hydrated
+            .into_iter()
+            .map(|row| row.map(|row| row.path))
+            .collect::<Vec<_>>();
         // Only ordinary candidates use the host's content-local path key.
         // Stage bodies already retained their full runtime and foreign keys.
         let mut groups: Vec<(BindingFragmentId, Vec<(usize, i64)>)> = Vec::new();
@@ -6727,26 +6984,30 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 let Some(fetched) = self.read_statement(cancellation, |conn| {
                     let mut statement = conn.prepare_cached(RESOLUTION_PATHS_BY_KEY_SQL)?;
                     let mut rows = statement.query(params![blob_id, &key_array])?;
-                    let mut bodies: HashMap<i64, (i64, i64, ParsedPathBody, Option<u32>)> =
-                        HashMap::default();
+                    let mut bodies: HashMap<i64, CandidatePathRow> = HashMap::default();
                     while let Some(row) = rows.next()? {
                         let key: i64 = row.get(0)?;
                         let start_node: i64 = row.get(1)?;
                         let end_node: i64 = row.get(2)?;
-                        let body: String = row.get(3)?;
-                        let activation: Option<i64> = row.get(4)?;
+                        let origin = crate::analyzer::resolution::CandidatePathOrigin {
+                            role: row.get(3)?,
+                            site_kind: row.get(4)?,
+                        };
+                        let body: String = row.get(5)?;
+                        let activation: Option<i64> = row.get(6)?;
                         bodies.insert(
                             key,
-                            (
+                            CandidatePathRow {
                                 start_node,
                                 end_node,
-                                parse_path_body(&body),
-                                activation.map(|ordinal| {
+                                body: parse_path_body(&body),
+                                activation: activation.map(|ordinal| {
                                     u32::try_from(ordinal).expect(
                                         "a stored root import activation fits a source offset",
                                     )
                                 }),
-                            ),
+                                origin,
+                            },
                         );
                     }
                     Ok(Some(bodies))
@@ -6756,7 +7017,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 };
                 for (key, row) in fetched {
                     let row = std::rc::Rc::new(row);
-                    let bytes = row.2.estimated_heap_bytes() + CANDIDATE_PATH_ROW_OVERHEAD_BYTES;
+                    let bytes = row.body.estimated_heap_bytes() + CANDIDATE_PATH_ROW_OVERHEAD_BYTES;
                     self.candidate_path_read_memo
                         .borrow_mut()
                         .rows
@@ -6775,10 +7036,16 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 fragment: *fragment,
             };
             for (position, key) in keys {
-                let (start_node, end_node, body, activation) =
-                    bodies.get(key).map(|row| row.as_ref()).unwrap_or_else(|| {
-                        panic!("blob {blob_id} has no path row for candidate key {key}")
-                    });
+                let CandidatePathRow {
+                    start_node,
+                    end_node,
+                    body,
+                    activation,
+                    origin,
+                } = bodies.get(key).map(|row| row.as_ref()).unwrap_or_else(|| {
+                    panic!("blob {blob_id} has no path row for candidate key {key}")
+                });
+                origins[*position] = *origin;
                 hydrated[*position] = Some(decode_path_row(
                     &context,
                     *start_node,
@@ -6812,22 +7079,31 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         let result: Vec<_> = candidates
             .iter()
             .zip(hydrated)
-            .map(|(candidate, path)| {
+            .zip(origins)
+            .map(|((candidate, path), origin)| {
                 let path =
                     path.expect("every requested candidate path hydrates from its blob's rows");
                 (
                     *candidate,
-                    if closed.is_empty() {
-                        path
-                    } else {
-                        path.without_closed_reasons(&closed)
+                    crate::analyzer::resolution::HydratedCandidatePath {
+                        path: if closed.is_empty() {
+                            path
+                        } else {
+                            path.without_closed_reasons(&closed)
+                        },
+                        origin,
                     },
                 )
             })
             .collect();
         #[cfg(any(test, feature = "test-support"))]
         if let Some(observed) = self.candidate_path_read_memo.borrow_mut().observed.as_mut() {
-            observed.push(result.clone());
+            observed.push(
+                result
+                    .iter()
+                    .map(|(id, row)| (*id, row.path.clone()))
+                    .collect(),
+            );
         }
         Ok(result)
     }
@@ -10220,9 +10496,15 @@ impl SelectedResolutionLexicalSource<'_, '_> {
 }
 
 // Parsed rows only: fragment decoding and completion decisions remain per call.
-type CandidatePathRow = (i64, i64, ParsedPathBody, Option<u32>);
+struct CandidatePathRow {
+    start_node: i64,
+    end_node: i64,
+    body: ParsedPathBody,
+    activation: Option<u32>,
+    origin: crate::analyzer::resolution::CandidatePathOrigin,
+}
 // The key, the row tuple, the Rc and the hash-table slot, beyond the body.
-const CANDIDATE_PATH_ROW_OVERHEAD_BYTES: usize = 128;
+const CANDIDATE_PATH_ROW_OVERHEAD_BYTES: usize = 160;
 // A path key is a position in one blob row's catalog. One OID can own several
 // blob rows (lang, parse_variant) whose path rows differ, so the key names the
 // blob row as well; the OID still guards a blob id reused across selections.

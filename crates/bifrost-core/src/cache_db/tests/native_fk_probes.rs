@@ -24,6 +24,46 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
         [source],
     )
     .unwrap();
+    // These three child relations reference the rebuilt policy_units table.
+    for child in [
+        "policy_unit_reads",
+        "policy_unit_snapshots",
+        "policy_evaluation_units",
+    ] {
+        let references = string_column(
+            &conn,
+            r#"SELECT "table" FROM pragma_foreign_key_list(?1) WHERE "table" = 'policy_units'"#,
+            child,
+        );
+        assert_eq!(
+            references,
+            ["policy_units"],
+            "{child} must retain its unit FK"
+        );
+    }
+    for child in [
+        "policy_unit_reads",
+        "policy_unit_snapshots",
+        "policy_evaluation_units",
+    ] {
+        let plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM {child} WHERE unit_id = ?1"
+            ))
+            .unwrap()
+            .query_map([1_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|line| line.contains("SEARCH")),
+            "{child}: {plan:?}"
+        );
+    }
+    let unit_blob_fk = conn.prepare(r#"SELECT "from" FROM pragma_foreign_key_list('policy_units') WHERE "table" = 'blobs' ORDER BY "from""#)
+        .unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(unit_blob_fk, ["lang", "seed_blob_id"]);
     let tables = string_column(
         &conn,
         "SELECT name FROM sqlite_schema WHERE type = 'table'

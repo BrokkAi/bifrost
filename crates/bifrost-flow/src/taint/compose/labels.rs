@@ -2,6 +2,10 @@
 //! retained path with the solver's edge-function algebra, and intersect the
 //! reached classes with the sink's accepted classes.
 
+use std::fmt::Debug;
+use std::hash::Hash;
+
+use crate::hash::HashMap;
 use crate::value_flow::ValueFlowSinkId;
 
 use super::graph::{ComposedSourceId, Hop, HopQuality};
@@ -10,6 +14,148 @@ use super::search::SourceSinkPair;
 use crate::taint::{
     SourceClassId, TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction, TaintUniverse,
 };
+
+/// The label algebra a composition client supplies. The search keys every
+/// path by the label function from its node to its root and never looks at
+/// labels otherwise, so it needs only these operations: a `Fact` is a set of
+/// labels a value carries, and a `Function` maps the facts entering a path to
+/// the facts leaving it.
+pub trait ComposeLabels {
+    type Fact: Clone + Eq + Hash + Debug;
+    type Function: Clone + Eq + Hash + Debug;
+
+    fn identity(&self) -> Self::Function;
+    /// `first`, then `second`, in path order.
+    fn then(&self, first: &Self::Function, second: &Self::Function) -> Self::Function;
+    fn apply(&self, function: &Self::Function, fact: &Self::Fact) -> Self::Fact;
+    fn intersects(&self, left: &Self::Fact, right: &Self::Fact) -> bool;
+}
+
+/// The taint label algebra: classes of the plan's universe and the solver's
+/// edge functions.
+#[derive(Debug, Clone, Copy)]
+pub struct TaintLabels<'u> {
+    universe: &'u TaintUniverse,
+}
+
+impl<'u> TaintLabels<'u> {
+    pub const fn new(universe: &'u TaintUniverse) -> Self {
+        Self { universe }
+    }
+}
+
+impl ComposeLabels for TaintLabels<'_> {
+    type Fact = TaintClassSet;
+    type Function = TaintEdgeFunction;
+
+    fn identity(&self) -> TaintEdgeFunction {
+        TaintEdgeFunction::identity(self.universe)
+    }
+
+    fn then(&self, first: &TaintEdgeFunction, second: &TaintEdgeFunction) -> TaintEdgeFunction {
+        first.compose(second)
+    }
+
+    fn apply(&self, function: &TaintEdgeFunction, fact: &TaintClassSet) -> TaintClassSet {
+        function.apply(fact)
+    }
+
+    fn intersects(&self, left: &TaintClassSet, right: &TaintClassSet) -> bool {
+        left.intersects(right)
+    }
+}
+
+/// A label function interned in one search's [`LabelFunctions`]. Equal
+/// functions get equal ids, so an id keys a path exactly as its function
+/// would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LabelFunctionId(u32);
+
+impl LabelFunctionId {
+    /// Every table interns the identity first.
+    pub const IDENTITY: Self = Self(0);
+}
+
+/// The label functions of one search, interned so that path keys and hops
+/// carry a small id instead of a function. It lives as long as the search
+/// that fills it and is handed to the label stage with the search's pairs.
+#[derive(Debug, Clone)]
+pub struct LabelFunctions<L: ComposeLabels> {
+    labels: L,
+    functions: Vec<L::Function>,
+    ids: HashMap<L::Function, LabelFunctionId>,
+    then: HashMap<(LabelFunctionId, LabelFunctionId), LabelFunctionId>,
+}
+
+impl<L: ComposeLabels> LabelFunctions<L> {
+    pub fn new(labels: L) -> Self {
+        let mut table = Self {
+            functions: Vec::new(),
+            ids: HashMap::default(),
+            then: HashMap::default(),
+            labels,
+        };
+        let identity = table.labels.identity();
+        assert_eq!(table.intern(identity), LabelFunctionId::IDENTITY);
+        table
+    }
+
+    pub const fn labels(&self) -> &L {
+        &self.labels
+    }
+
+    pub fn intern(&mut self, function: L::Function) -> LabelFunctionId {
+        if let Some(&id) = self.ids.get(&function) {
+            return id;
+        }
+        let id = LabelFunctionId(
+            u32::try_from(self.functions.len()).expect("a search's label functions fit u32"),
+        );
+        self.functions.push(function.clone());
+        self.ids.insert(function, id);
+        id
+    }
+
+    pub fn function(&self, id: LabelFunctionId) -> &L::Function {
+        &self.functions[usize::try_from(id.0).expect("a label function id fits usize")]
+    }
+
+    /// `first`, then `second`.
+    pub fn then(&mut self, first: LabelFunctionId, second: LabelFunctionId) -> LabelFunctionId {
+        if first == LabelFunctionId::IDENTITY {
+            return second;
+        }
+        if second == LabelFunctionId::IDENTITY {
+            return first;
+        }
+        if let Some(&id) = self.then.get(&(first, second)) {
+            return id;
+        }
+        let composed = self
+            .labels
+            .then(self.function(first), self.function(second));
+        let id = self.intern(composed);
+        self.then.insert((first, second), id);
+        id
+    }
+
+    /// The label function of a run of hops, in path order.
+    pub fn hops(&mut self, hops: &[Hop]) -> LabelFunctionId {
+        hops.iter()
+            .fold(LabelFunctionId::IDENTITY, |function, hop| {
+                self.then(function, hop_function(hop))
+            })
+    }
+
+    /// The same, for a reader that cannot intern: the label stage evaluates
+    /// retained paths after the search has finished.
+    pub fn hops_value(&self, hops: &[Hop]) -> L::Function {
+        hops.iter().fold(self.labels.identity(), |function, hop| {
+            self.labels
+                .then(&function, self.function(hop_function(hop)))
+        })
+    }
+}
 
 /// The classes named by stable policy labels. A label absent from the run's
 /// universe cannot appear in any fact, so it is skipped.
@@ -26,42 +172,22 @@ pub(super) fn label_classes(universe: &TaintUniverse, labels: &[Box<str>]) -> Ta
 }
 
 /// The label function of one hop. Only models, proven sanitizers and
-/// transforms change labels; every other hop, the unmodeled-call fallback
-/// included, is the identity.
-pub(super) fn hop_function(hop: &Hop, universe: &TaintUniverse) -> TaintEdgeFunction {
+/// transforms and projected procedure flows can change labels; all other hops,
+/// including the unmodeled-call fallback, are the identity.
+pub(super) const fn hop_function(hop: &Hop) -> LabelFunctionId {
     match hop {
-        Hop::Model { moved, removed, .. } => {
-            let mut function = TaintEdgeFunction::identity(universe);
-            if let Some(moved) = moved {
-                let every = universe
-                    .class_set(universe.classes())
-                    .expect("a universe's own classes form a set");
-                function = function.compose(&TaintEdgeFunction::kill(&every.subtract(moved)));
-            }
-            function.compose(&TaintEdgeFunction::kill(removed))
-        }
-        Hop::Sanitizer {
-            removed,
-            proven: true,
-            ..
-        } => TaintEdgeFunction::kill(removed),
-        Hop::Transform { function, .. } => function.clone(),
-        Hop::Sanitizer { proven: false, .. }
-        | Hop::Interior { .. }
-        | Hop::Stored { .. }
-        | Hop::Callee { .. }
+        Hop::Invocation { function, .. }
+        | Hop::Interior { function, .. }
+        | Hop::Stored { function, .. }
+        | Hop::Model { function, .. }
+        | Hop::Sanitizer { function, .. }
+        | Hop::Transform { function, .. } => *function,
+        Hop::Callee { .. }
         | Hop::Caller { .. }
         | Hop::Closure { .. }
-        | Hop::Unmodeled { .. } => TaintEdgeFunction::identity(universe),
+        | Hop::Unmodeled { .. }
+        | Hop::Store { .. } => LabelFunctionId::IDENTITY,
     }
-}
-
-/// The label function of a run of hops, in path order.
-pub(super) fn hops_function(hops: &[Hop], universe: &TaintUniverse) -> TaintEdgeFunction {
-    hops.iter()
-        .fold(TaintEdgeFunction::identity(universe), |function, hop| {
-            function.compose(&hop_function(hop, universe))
-        })
 }
 
 /// One retained path whose reached classes meet the sink's accepted classes.
@@ -83,6 +209,7 @@ pub(super) struct LabeledPath {
 /// source table.
 pub(super) fn evaluate_pairs(
     plan: &TaintAnalysisPlan,
+    functions: &LabelFunctions<TaintLabels<'_>>,
     sources: &[BoundSource],
     pairs: &[SourceSinkPair],
 ) -> Vec<LabeledPath> {
@@ -95,7 +222,7 @@ pub(super) fn evaluate_pairs(
             .expect("a pair names a sink of its plan")
             .accepted();
         for (hops, quality) in &pair.paths {
-            let function = hops_function(hops, universe);
+            let function = functions.hops_value(hops);
             let reached = function.apply(classes).intersection(accepted);
             if reached.is_empty() {
                 continue;

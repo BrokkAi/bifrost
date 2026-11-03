@@ -770,7 +770,7 @@ pub(super) fn inverse_edge_expansions(
 /// every row still leaves the reason the answer is partial on the response.
 pub(super) fn state_event_expansions(
     workspace: &WorkspaceAnalyzer,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'_>,
     procedure: &SemanticProcedureValue,
     filter: &StateEventFilter,
     cancellation: Option<&CancellationToken>,
@@ -811,7 +811,7 @@ pub(super) fn state_event_expansions(
 /// The flow relations of one seed procedure.
 pub(super) fn flow_relation_expansions(
     workspace: &WorkspaceAnalyzer,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'_>,
     procedure: &SemanticProcedureValue,
     filter: &FlowRelationFilter,
     cancellation: Option<&CancellationToken>,
@@ -842,10 +842,10 @@ pub(super) fn flow_relation_expansions(
 /// selected by the caller. Completeness comes from the scoped derivation, and
 /// its full typed reasons are retained in one diagnostic rather than folded
 /// into the aggregate flow-state summary.
-pub(super) fn selected_property_relation_expansions(
-    workspace: &WorkspaceAnalyzer,
+pub(super) fn selected_property_relation_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     point: &SemanticProgramPointValue,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -1003,7 +1003,7 @@ pub(super) fn flow_relations_of_event(
     analyzer: &dyn IAnalyzer,
     value: &StateEventValue,
     filter: &FlowRelationFilter,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'_>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     if value.selected_property_origin.is_some() {
@@ -1417,7 +1417,7 @@ fn binding_initializer_incomplete(
 /// procedures at all -- which the reported diagnostics already explain.
 pub(super) fn seed_derivation(
     workspace: &WorkspaceAnalyzer,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'_>,
     procedure: &SemanticProcedureValue,
     axes: &[brokk_bifrost_core::analyzer::structural::flow_state::FlowStateAxis],
     cancellation: Option<&CancellationToken>,
@@ -1585,6 +1585,26 @@ pub(super) fn source_set_expansions(
         .into_iter()
         .map(|value| pipeline_expansion(PipelineValue::SourceSet(Box::new(value))))
         .collect()
+}
+
+/// The build configuration one file is analyzed under (#9048).
+pub(super) fn build_configuration_expansions(
+    topology_cache: &mut TopologyTraversalCache,
+    analyzer: &dyn IAnalyzer,
+    token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    file: &ProjectFile,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    super::build_configuration_rows::build_configurations_of_file(
+        topology_cache,
+        analyzer,
+        token,
+        file,
+        diagnostics,
+    )
+    .into_iter()
+    .map(|value| pipeline_expansion(PipelineValue::BuildConfiguration(Box::new(value))))
+    .collect()
 }
 
 /// The dependencies one build target declares on other targets of the same

@@ -14,6 +14,7 @@ use brokk_bifrost_analysis::analyzer::native_points::NativeExpressionValueTypeLo
 
 use brokk_bifrost_analysis::analyzer::native_points::NativePointContext;
 
+use brokk_bifrost_analysis::analyzer::native_points::resolve_native_definition_answer_bounded_in_batch;
 #[cfg(test)]
 use brokk_bifrost_analysis::analyzer::native_points::resolve_native_definition_bounded;
 
@@ -94,6 +95,85 @@ pub fn resolve_java_definition_bounded(
 pub(crate) struct JavaNativeDefinitionResolution {
     pub(crate) outcome: DefinitionLookupOutcome,
     pub(crate) evidence: CallEvidence,
+    // Only call-local scope/applicability obligations escape to a proved
+    // receiver consumer. Result-only generic gaps remain on that result (#7667).
+    pub(crate) call_binding_reason_digests: Vec<[u8; 32]>,
+}
+
+#[derive(Debug)]
+struct NativeExternalArgumentBinding {
+    completion: brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion,
+    members: Vec<brokk_bifrost_analysis::analyzer::resolution::ExternalMemberIdentity>,
+    reason_digests: Vec<(
+        brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+        [u8; 32],
+    )>,
+    call_binding_reason_digests: Vec<[u8; 32]>,
+    constructor_hierarchy_reason_digests: Vec<(std::sync::Arc<str>, [u8; 32])>,
+    static_type_qualifier_reason_digests: Vec<(
+        brokk_bifrost_analysis::analyzer::resolution::ExternalOwnerIdentity,
+        [u8; 32],
+    )>,
+}
+
+impl NativeExternalArgumentBinding {
+    fn extend_static_type_qualifier_reasons(
+        &self,
+        proof: &ExactExternalCallProof,
+        reasons: &mut Vec<[u8; 32]>,
+    ) {
+        let Some(identity) = proof.external_member_identity() else {
+            return;
+        };
+        reasons.extend(
+            self.static_type_qualifier_reason_digests
+                .iter()
+                .filter(|(owner, _)| owner == &identity.owner)
+                .map(|(_, digest)| *digest),
+        );
+    }
+
+    fn admits(
+        &self,
+        proof: &ExactExternalCallProof,
+        owner: &str,
+        member: &str,
+        receiver_calls: &[[u8; 32]],
+    ) -> bool {
+        // The Java prover selected one declaration using every actual conversion.
+        // Its inventory_identity_for_argument_types compares the selected formal
+        // list (including arity); the identity below is published unchanged as
+        // the binding target by with_native_java_external_call.
+        let Some(identity) = proof.external_member_identity() else {
+            return false;
+        };
+        // The receiver owner is the shared route's nominal FQN, including an
+        // intrinsic Object. Comparing it does not map or replace root identities.
+        if identity.owner.owner_fqn.as_ref() != owner
+            || proof.canonical_callee().rsplit_once('.') != Some((owner, member))
+            || (!self.members.is_empty() && !self.members.contains(identity))
+        {
+            return false;
+        }
+        match &self.completion {
+            brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete => true,
+            brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(reasons) => reasons.iter().all(|reason| {
+                let reason = match reason {
+                    brokk_bifrost_analysis::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(reason)
+                    | brokk_bifrost_analysis::analyzer::resolution::ResolutionIncompleteReason::OpenBoundary {
+                        semantic: reason,
+                        status: brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus::ExternalDeclaredUnindexed,
+                    } => reason,
+                    _ => return false,
+                };
+                self.reason_digests.iter().any(|(candidate, digest)| {
+                    candidate == reason
+                        && (receiver_calls.contains(digest)
+                            || self.call_binding_reason_digests.contains(digest))
+                })
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -131,12 +211,15 @@ pub(crate) fn resolve_java_definition_with_evidence_in_batch(
             let resolved = batch.definition(&java.inner, query, || map_bounded(
                 resolve_java_definition_with_evidence_uncached(query, Some(batch), after_open),
                 |value| brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution {
-                    outcome: value.outcome, evidence: value.evidence,
+                    outcome: value.outcome,
+                    evidence: value.evidence,
+                    call_binding_discharge_digests: value.call_binding_reason_digests,
                 },
             ));
             map_bounded(resolved, |value| JavaNativeDefinitionResolution {
                 outcome: value.outcome,
                 evidence: value.evidence,
+                call_binding_reason_digests: value.call_binding_discharge_digests,
             })
         }
         None => resolve_java_definition_with_evidence_uncached(query, None, after_open),
@@ -158,6 +241,7 @@ fn resolve_java_definition_with_evidence_uncached(
                     "Java analyzer is unavailable".into(),
                 ),
                 evidence: CallEvidence::default(),
+                call_binding_reason_digests: Vec::new(),
             },
             work: ReceiverAnalysisWork::default(),
         };
@@ -171,36 +255,71 @@ fn resolve_java_definition_with_evidence_uncached(
     let reference_namespace = java_constructor_reference_namespace(&query);
     let mut external_static_imports = Vec::new();
     let mut open_jvm_alias_imports = Vec::new();
-    let resolution =
-        brokk_bifrost_analysis::analyzer::native_points::resolve_native_definition_bounded_in_batch(
-            &java.inner,
-            query,
-            reference_namespace,
-            batch,
-            |operation, path, cancellation| {
-                Ok(
-                    match java_import_context(java, query.analyzer, operation, path, cancellation)?
-                    {
-                        JavaImportContext::Ready {
+
+    let resolution = resolve_native_definition_answer_bounded_in_batch(
+        &java.inner,
+        query,
+        reference_namespace,
+        batch,
+        |operation, path, cancellation| {
+            Ok(
+                match java_import_context(java, query.analyzer, operation, path, cancellation)? {
+                    JavaImportContext::Ready {
+                        context,
+                        external_static_imports: boundaries,
+                        open_jvm_alias_imports: open_aliases,
+                        ..
+                    } => {
+                        external_static_imports = boundaries;
+                        open_jvm_alias_imports = open_aliases;
+                        NativePointContext::Ready {
                             context,
-                            external_static_imports: boundaries,
-                            open_jvm_alias_imports: open_aliases,
-                            ..
-                        } => {
-                            external_static_imports = boundaries;
-                            open_jvm_alias_imports = open_aliases;
-                            NativePointContext::Ready {
-                                context,
-                                selected_import_model: None,
-                            }
+                            selected_import_model: None,
                         }
-                        JavaImportContext::Unavailable => NativePointContext::Unavailable,
-                        JavaImportContext::Cancelled => NativePointContext::Cancelled,
-                    },
-                )
+                    }
+                    JavaImportContext::Unavailable => NativePointContext::Unavailable,
+                    JavaImportContext::Cancelled => NativePointContext::Cancelled,
+                },
+            )
+        },
+        after_open,
+        |answer| {
+            let binding = answer.argument_binding.as_ref()?;
+            Some(NativeExternalArgumentBinding {
+                completion: binding.completion().clone(),
+                reason_digests: answer.argument_reason_digests.clone(),
+                static_type_qualifier_reason_digests: answer
+                    .static_type_qualifier_reason_digests
+                    .clone(),
+                call_binding_reason_digests: answer.call_binding_reason_digests.clone(),
+                constructor_hierarchy_reason_digests: answer
+                    .constructor_hierarchy_reason_digests
+                    .clone(),
+                members: answer
+                    .external_members
+                    .iter()
+                    .map(|member| member.identity.clone())
+                    .collect(),
+            })
+        },
+    );
+    let (resolution, argument_binding) = match resolution {
+        BoundedResolution::Complete {
+            value: (outcome, binding),
+            work,
+        } => (
+            BoundedResolution::Complete {
+                value: outcome,
+                work,
             },
-            after_open,
-        );
+            binding.flatten(),
+        ),
+        BoundedResolution::Cancelled { work } => return BoundedResolution::Cancelled { work },
+        BoundedResolution::Exceeded { limit, work } => {
+            return BoundedResolution::Exceeded { limit, work };
+        }
+    };
+
     let resolution =
         crate::analyzer::jvm::native_points::project_jvm_declaration_site(query, resolution);
     let resolution = apply_static_import_boundary(&site_text, &external_static_imports, resolution);
@@ -208,11 +327,14 @@ fn resolve_java_definition_with_evidence_uncached(
         apply_explicit_type_import_boundary(java, query, &open_jvm_alias_imports, resolution);
     match resolution {
         BoundedResolution::Complete { mut value, work } => {
+            let mut call_binding_reason_digests = Vec::new();
             let evidence = match java_native_call_evidence(
                 java,
                 query,
                 &mut value,
                 &external_static_imports,
+                argument_binding.as_ref(),
+                &mut call_binding_reason_digests,
                 batch,
             ) {
                 Ok(evidence) => evidence,
@@ -226,10 +348,12 @@ fn resolve_java_definition_with_evidence_uncached(
                     return BoundedResolution::Cancelled { work: nested_work };
                 }
             };
+
             BoundedResolution::Complete {
                 value: JavaNativeDefinitionResolution {
                     outcome: value,
                     evidence,
+                    call_binding_reason_digests,
                 },
                 work,
             }
@@ -599,6 +723,8 @@ fn java_native_call_evidence(
     query: BoundedReceiverQuery<'_>,
     outcome: &mut DefinitionLookupOutcome,
     external_static_imports: &[JavaExternalStaticImportBoundary],
+    argument_binding: Option<&NativeExternalArgumentBinding>,
+    call_binding_reason_digests: &mut Vec<[u8; 32]>,
     batch: Option<&NativePointBatch>,
 ) -> Result<CallEvidence, JavaNativePointStop> {
     if outcome.status == DefinitionLookupStatus::Unavailable {
@@ -648,7 +774,28 @@ fn java_native_call_evidence(
                 actual_types.as_deref(),
             )
         }) {
-            if let Some(proof) = proof {
+            // Constructor-only exception: the exact constructed owner's
+            // unread hierarchy cannot hide a constructor, which is not inherited.
+            // Do not export these identities to a later member receiver.
+            let constructor_reasons = argument_binding
+                .map(|binding| {
+                    binding
+                        .constructor_hierarchy_reason_digests
+                        .iter()
+                        .filter(|(candidate, _)| candidate.as_ref() == owner)
+                        .map(|(_, digest)| *digest)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Some(proof) = proof
+                && argument_binding.is_some_and(|binding| {
+                    binding.admits(&proof, &owner, &member, &constructor_reasons)
+                })
+            {
+                if let Some(binding) = argument_binding {
+                    call_binding_reason_digests
+                        .extend_from_slice(&binding.call_binding_reason_digests);
+                }
                 publish_java_external_call_boundary(query, outcome, &proof, &owner, &member);
                 return Ok(evidence.with_native_java_external_call(proof, &owner, &member, false));
             }
@@ -694,24 +841,36 @@ fn java_native_call_evidence(
             else {
                 return Ok(evidence);
             };
+
+            let mut receiver_call_reasons = Vec::new();
             let receiver_type = receiver
                 .map(|receiver| {
-                    java_native_external_receiver(java, query, token, receiver, invocation, batch)
+                    java_native_external_receiver(
+                        java,
+                        query,
+                        token,
+                        receiver,
+                        invocation,
+                        &mut receiver_call_reasons,
+                        batch,
+                    )
                 })
                 .transpose()?;
+
             let external_call = if receiver.is_some() {
                 match receiver_type.as_ref() {
-                    Some(JavaNativeReceiverResolution::External { owner, form }) => {
-                        java_native_external_method_resolution(
-                            java,
-                            query,
-                            token,
-                            owner,
-                            member_name,
-                            &actual_types,
-                            *form,
-                        )
-                    }
+                    Some(
+                        JavaNativeReceiverResolution::External { owner, form }
+                        | JavaNativeReceiverResolution::ParameterizedCallResult { owner, form },
+                    ) => java_native_external_method_resolution(
+                        java,
+                        query,
+                        token,
+                        owner,
+                        member_name,
+                        &actual_types,
+                        *form,
+                    ),
                     Some(
                         JavaNativeReceiverResolution::Typed | JavaNativeReceiverResolution::Untyped,
                     )
@@ -787,6 +946,65 @@ fn java_native_call_evidence(
                         proof,
                         dispatch_closed,
                     } => {
+                        if matches!(
+                            receiver_type.as_ref(),
+                            Some(JavaNativeReceiverResolution::External {
+                                form: JavaNativeReceiverForm::TypeQualifier,
+                                ..
+                            })
+                        ) && let Some(binding) = argument_binding
+                        {
+                            // The qualifier is a type, not a value whose declared
+                            // type may be a supertype of the actual member owner.
+                            // Only the exact declaring model identity can close it.
+                            binding.extend_static_type_qualifier_reasons(
+                                &proof,
+                                &mut receiver_call_reasons,
+                            );
+                        }
+                        // #7619: strict and loose invocation applicability do
+                        // not depend on the return type (JLS 15.12.2). A type
+                        // parameter anywhere in a parameter already makes the
+                        // Java conversion prover return Unknown. Thus a proven
+                        // conversion for every argument permits the registered
+                        // result-only generic obligation to remain on the result
+                        // type without contaminating the actual-to-formal binding.
+                        // Never bypass any other shared receiver obligation.
+                        let needs_owner_discharge = matches!(
+                            receiver_type.as_ref(),
+                            Some(JavaNativeReceiverResolution::ParameterizedCallResult { .. })
+                        ) || (matches!(
+                            receiver_type.as_ref(),
+                            Some(JavaNativeReceiverResolution::External {
+                                form: JavaNativeReceiverForm::BoundValue,
+                                ..
+                            })
+                        ) && argument_binding.is_some_and(
+                            |binding| !binding.static_type_qualifier_reason_digests.is_empty(),
+                        ));
+                        // A value receiver must not reuse a type qualifier's
+                        // owner discharge, even when the member is selected.
+                        if needs_owner_discharge
+                            && !argument_binding.is_some_and(|binding| {
+                                binding.admits(&proof, &owner, &member, &receiver_call_reasons)
+                            })
+                        {
+                            publish_java_external_incomplete_member_identity(
+                                query, outcome, &owner, &member,
+                            );
+                            return Ok(
+                                evidence.with_native_java_external_member_identity(&owner, &member)
+                            );
+                        }
+                        // Each inherited call-local identity is accepted only
+                        // after that receiver call independently proved the same
+                        // selected member and all conversions. Owner uncertainty
+                        // and inherited generic-result reasons are never exported.
+                        call_binding_reason_digests.extend_from_slice(&receiver_call_reasons);
+                        if let Some(binding) = argument_binding {
+                            call_binding_reason_digests
+                                .extend_from_slice(&binding.call_binding_reason_digests);
+                        }
                         publish_java_external_call_boundary(
                             query, outcome, &proof, &owner, &member,
                         );
@@ -1060,6 +1278,7 @@ fn java_native_external_receiver(
     token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
     receiver: Node<'_>,
     enclosing_call: Node<'_>,
+    receiver_call_reasons: &mut Vec<[u8; 32]>,
     batch: Option<&NativePointBatch>,
 ) -> Result<JavaNativeReceiverResolution, JavaNativePointStop> {
     let from_site_type = java_native_external_receiver_from_site_type(
@@ -1068,8 +1287,10 @@ fn java_native_external_receiver(
         token,
         receiver,
         enclosing_call,
+        receiver_call_reasons,
         batch,
     )?;
+
     if !matches!(from_site_type, JavaNativeReceiverResolution::Untyped) {
         return Ok(from_site_type);
     }
@@ -1163,22 +1384,35 @@ fn java_native_external_receiver_from_site_type(
     token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
     receiver: Node<'_>,
     _enclosing_call: Node<'_>,
+
+    receiver_call_reasons: &mut Vec<[u8; 32]>,
     batch: Option<&NativePointBatch>,
 ) -> Result<JavaNativeReceiverResolution, JavaNativePointStop> {
     if receiver.kind() == "method_invocation" {
         return Ok(
-            match java_native_argument_type(java, query, token, receiver, batch)? {
+            match java_native_argument_type_with_call_reasons(
+                java,
+                query,
+                token,
+                receiver,
+                receiver_call_reasons,
+                batch,
+            )? {
                 Some(TypeRef::Named {
                     name, arguments, ..
-                }) if arguments.is_empty() => {
-                    match java_native_static_external_type(java, query, &name) {
-                        Some(owner) => JavaNativeReceiverResolution::External {
+                }) => match java_native_static_external_type(java, query, &name) {
+                    Some(owner) if !arguments.is_empty() => {
+                        JavaNativeReceiverResolution::ParameterizedCallResult {
                             owner: owner.fqn().to_owned(),
                             form: JavaNativeReceiverForm::BoundValue,
-                        },
-                        None => JavaNativeReceiverResolution::Typed,
+                        }
                     }
-                }
+                    Some(owner) => JavaNativeReceiverResolution::External {
+                        owner: owner.fqn().to_owned(),
+                        form: JavaNativeReceiverForm::BoundValue,
+                    },
+                    None => JavaNativeReceiverResolution::Typed,
+                },
                 Some(TypeRef::Declared { .. }) => JavaNativeReceiverResolution::Typed,
                 _ => JavaNativeReceiverResolution::Untyped,
             },
@@ -1190,6 +1424,7 @@ fn java_native_external_receiver_from_site_type(
     let Some(site_node) = java_native_receiver_type_site_node(receiver) else {
         return Ok(JavaNativeReceiverResolution::Untyped);
     };
+
     let Some(value) = java_native_expression_value_type_at_node_in_batch(query, site_node, batch)?
     else {
         return Ok(JavaNativeReceiverResolution::Untyped);
@@ -1208,19 +1443,13 @@ fn java_native_external_receiver_from_site_type(
         );
         let receiver_target_kind = value.value_types.target_kind.clone();
         let static_type = value.static_type;
-        let Some(TypeRef::Named {
-            name, arguments, ..
-        }) = static_type
-        else {
+        let Some(TypeRef::Named { name, .. }) = static_type else {
             return if matches!(static_type, Some(TypeRef::Declared { .. })) {
                 JavaNativeReceiverResolution::Typed
             } else {
                 JavaNativeReceiverResolution::Untyped
             };
         };
-        if !arguments.is_empty() {
-            return JavaNativeReceiverResolution::Typed;
-        }
         let Some(owner) = java_native_static_external_type(java, query, &name) else {
             return JavaNativeReceiverResolution::Typed;
         };
@@ -1325,6 +1554,10 @@ fn java_native_receiver_type_site_node(mut receiver: Node<'_>) -> Option<Node<'_
 
 enum JavaNativeReceiverResolution {
     External {
+        owner: String,
+        form: JavaNativeReceiverForm,
+    },
+    ParameterizedCallResult {
         owner: String,
         form: JavaNativeReceiverForm,
     },
@@ -1609,7 +1842,25 @@ fn java_native_argument_type(
     _java: &JavaAnalyzer,
     query: BoundedReceiverQuery<'_>,
     _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    expression: Node<'_>,
+    batch: Option<&NativePointBatch>,
+) -> Result<Option<TypeRef>, JavaNativePointStop> {
+    java_native_argument_type_with_call_reasons(
+        _java,
+        query,
+        _token,
+        expression,
+        &mut Vec::new(),
+        batch,
+    )
+}
+
+fn java_native_argument_type_with_call_reasons(
+    _java: &JavaAnalyzer,
+    query: BoundedReceiverQuery<'_>,
+    _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
     mut expression: Node<'_>,
+    call_binding_reason_digests: &mut Vec<[u8; 32]>,
     batch: Option<&NativePointBatch>,
 ) -> Result<Option<TypeRef>, JavaNativePointStop> {
     let mut stopped = None;
@@ -1649,6 +1900,7 @@ fn java_native_argument_type(
                 }
                 ancestor = node.parent();
             }
+
             let member = if expression.kind() == "object_creation_expression" {
                 let type_node = expression.child_by_field_name("type")?;
                 // The existing proof transports a nominal owner, not substituted
@@ -1673,6 +1925,8 @@ fn java_native_argument_type(
             match resolve_java_definition_with_evidence_in_batch(call_query, batch, || {}) {
                 BoundedResolution::Complete { value, .. } => {
                     if let Some(proof) = value.evidence.exact_external_call() {
+                        call_binding_reason_digests
+                            .extend_from_slice(&value.call_binding_reason_digests);
                         if expression.kind() == "object_creation_expression" {
                             // Nominal identity alone cannot validate a nested call.
                             // The existing constructor proof has independently
@@ -1905,6 +2159,10 @@ fn publish_java_external_call_boundary(
     owner: &str,
     member: &str,
 ) {
+    // Both callers publish only after admission matches the owner/member
+    // inventory identity, discharges call-local obligations, and proves every
+    // remaining receiver obligation and argument conversion. This certifies
+    // the callee binding; result-type completeness is independent.
     outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
     let reference = outcome.reference.get_or_insert_with(|| query.site.clone());
     reference.text = proof.canonical_callee().to_owned();

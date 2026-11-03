@@ -142,7 +142,13 @@ use brokk_bifrost_core::hash::HashSet;
 // macro_invocation_is_locally_bound) but does not reach, so it kept v51.
 // #6844: standard-path proofs use lexical identity, including for ? residuals.
 // #8306: .await binds its operand and result values in the shared scaffold.
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v53";
+// #8991: a by-value let of a declared struct publishes an Allocation for its own storage.
+// #8978: if, match, and block values join their branch or tail results.
+// Batch e0f30858 combined #8991 (v56) and #8978 (v55) and took max+1.
+// #9013: direct-call boolean guards now publish the call result as their subject;
+// coordinator-assigned v58 above master's v57.
+// #8929: by-value declared-struct arguments publish their ownership transfer.
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v59";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
@@ -3629,7 +3635,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         expression_source: ValueId,
         target: ValueId,
         target_type: Option<RustValueType<'tree>>,
-    ) -> Result<(), RustLoweringError> {
+    ) -> Result<Option<TransferKind>, RustLoweringError> {
         let metadata = self.metadata(point)?;
         self.register_pointer_fact_target(expression_source, target, point, metadata);
         if let Some(leaf) = rust_transparent_value_leaf(source_node) {
@@ -3749,7 +3755,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         target,
                         ValueFlowKind::Local,
                     )?;
-                    return Ok(());
+                    return Ok(None);
                 }
                 self.append_assignment_value_flow(
                     builder,
@@ -3766,7 +3772,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unknown,
                     ownership_gap_detail(reason),
                 )?;
-                return Ok(());
+                return Ok(None);
             }
         };
         self.append_assignment_value_flow(
@@ -3817,7 +3823,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 );
             }
         }
-        Ok(())
+        Ok(kind)
     }
 
     /// Establish a binding from its selected value and the caller's flow proof.
@@ -4151,32 +4157,95 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn canonical_field_member_locator(&self, member_key: &str) -> SemanticLocator {
-        let procedure = self.session.locator();
-        let position = SourcePosition::new(0, 0, 0);
-        let span = SourceSpan::new(position, position)
-            .expect("zero-width canonical member anchor is valid");
-        let anchor = SourceAnchor::new(span, 0);
-        let member = DeclarationSegment::named(
-            DeclarationSegmentKind::Namespace,
-            format!("rust-field:{member_key}"),
-            anchor,
-            0,
-        )
-        .expect("structured Rust member keys are non-empty");
-        let declaration = DeclarationLocator::new(vec![member])
-            .expect("a canonical Rust member locator has one segment");
-        let path = WorkspaceRelativePath::new(crate::analyzer::semantic::RUST_FIELD_MEMBER_PATH)
-            .expect("canonical Rust member path is portable");
-        SemanticLocator::new(
-            procedure.mount(),
-            path,
-            procedure.language(),
-            declaration,
-            SemanticRole::MemoryLocation,
-            anchor,
-        )
+        canonical_field_member_locator(self.session.locator(), member_key)
     }
+}
 
+/// The canonical member of a declared field, only when the callee's own
+/// declared return type is the field's declaring struct. A field reached by
+/// auto-deref belongs to the referent and cannot name a slot of that return.
+pub fn canonical_returned_field_member(
+    source: &str,
+    procedure: &SemanticLocator,
+    field: &SemanticLocator,
+) -> Option<SemanticLocator> {
+    if field.path() != procedure.path() || field.mount() != procedure.mount() {
+        return None;
+    }
+    let owner = field.declaration().segments().last()?;
+    if owner.kind() != DeclarationSegmentKind::Type {
+        return None;
+    }
+    let owner_name = owner.name()?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    let field_span = field.anchor().span();
+    let member = root.descendant_for_byte_range(
+        field_span.start_byte() as usize,
+        field_span.end_byte() as usize,
+    )?;
+    let declaration = member.parent()?;
+    if declaration.kind() != "field_declaration"
+        || declaration.child_by_field_name("name")? != member
+    {
+        return None;
+    }
+    let structure = declaration.parent()?.parent()?;
+    if structure.kind() != "struct_item"
+        || node_text(source, structure.child_by_field_name("name")?)? != owner_name
+    {
+        return None;
+    }
+    let procedure_span = procedure.anchor().span();
+    let mut function = root.descendant_for_byte_range(
+        procedure_span.start_byte() as usize,
+        procedure_span.end_byte() as usize,
+    )?;
+    while function.kind() != "function_item" {
+        function = function.parent()?;
+    }
+    let return_type = function.child_by_field_name("return_type")?;
+    if return_type.kind() != "type_identifier" || node_text(source, return_type)? != owner_name {
+        return None;
+    }
+    let member_key = rust_field_member_key(source, member)?;
+    Some(canonical_field_member_locator(procedure, &member_key))
+}
+
+fn canonical_field_member_locator(
+    procedure: &SemanticLocator,
+    member_key: &str,
+) -> SemanticLocator {
+    let position = SourcePosition::new(0, 0, 0);
+    let span =
+        SourceSpan::new(position, position).expect("zero-width canonical member anchor is valid");
+    let anchor = SourceAnchor::new(span, 0);
+    let member = DeclarationSegment::named(
+        DeclarationSegmentKind::Namespace,
+        format!("rust-field:{member_key}"),
+        anchor,
+        0,
+    )
+    .expect("structured Rust member keys are non-empty");
+    let declaration = DeclarationLocator::new(vec![member])
+        .expect("a canonical Rust member locator has one segment");
+    let path = WorkspaceRelativePath::new(crate::analyzer::semantic::RUST_FIELD_MEMBER_PATH)
+        .expect("canonical Rust member path is portable");
+    SemanticLocator::new(
+        procedure.mount(),
+        path,
+        procedure.language(),
+        declaration,
+        SemanticRole::MemoryLocation,
+        anchor,
+    )
+}
+
+impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn add_field_identity_gap(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -4834,7 +4903,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 predicate_true_on_condition_true: true,
             }));
         }
-        if let Some((_, DeclaredScalarType::Boolean)) = self.scalar_binding_operand(node) {
+        if node.kind() == "call_expression"
+            || matches!(
+                self.scalar_binding_operand(node),
+                Some((_, DeclaredScalarType::Boolean))
+            )
+        {
             let subject = self.expression_value(builder, node, expression_value_kind(node))?;
             return Ok(Some(RustNormalizedGuard {
                 predicate: GuardPredicate::Truthy { value: subject },
@@ -5233,7 +5307,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             None
         };
-        let effective_next = scope_exit.map(EdgeTarget::normal).unwrap_or(next);
+        let block_result = self.point(builder, node, Vec::new())?;
+        if let Some(tail) = block_tail_expression(node) {
+            let source = self.expression_value(builder, tail, expression_value_kind(tail))?;
+            let target = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.session.append_assignment_value_flow(
+                builder,
+                block_result,
+                ValueFlowKind::Local,
+                source,
+                target,
+            )?;
+        } else {
+            let source = self.value(builder, block_result, SemanticValueKind::Constant)?;
+            let target = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.session.append_assignment_value_flow(
+                builder,
+                block_result,
+                ValueFlowKind::Local,
+                source,
+                target,
+            )?;
+        }
+        let effective_next = EdgeTarget::normal(block_result);
+        self.session.add_target_edge(
+            builder,
+            block_result,
+            scope_exit.map(EdgeTarget::normal).unwrap_or(next),
+        )?;
         let cleanup_target = if next.kind == ControlEdgeKind::Normal {
             next.point
         } else if scope_exit.is_some() {
@@ -5555,7 +5656,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         )
                     })?;
                 let source = self.expression_value(builder, value, expression_value_kind(value))?;
-                self.append_ownership_transfer(
+                let copied_struct = self.declared_struct_fields(value).is_some();
+                let transfer = self.append_ownership_transfer(
                     builder,
                     binding,
                     value,
@@ -5564,6 +5666,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     node.child_by_field_name("type")
                         .map(RustValueType::Declared),
                 )?;
+                if copied_struct
+                    && matches!(
+                        transfer,
+                        Some(TransferKind::AggregateCopy | TransferKind::Move { .. })
+                    )
+                {
+                    // This let owns new inline field storage. A later assignment
+                    // to the binding retains this allocation and its aliases.
+                    self.session.add_allocation(
+                        builder,
+                        binding,
+                        target,
+                        AllocationKind::Object,
+                    )?;
+                }
             } else if let Some(proof) = self.tuple_lets.remove(&node.id()) {
                 match proof {
                     Ok(proof) => initialized = self.append_tuple_let(builder, binding, proof)?,
@@ -6306,6 +6423,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     target,
                     target_type,
                 )
+                .map(|_| ())
             }
             RustAssignmentTarget::Memory { kind, location } => self.append_effect(
                 builder,
@@ -6952,6 +7070,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let alternative = node
             .child_by_field_name("alternative")
             .and_then(first_named_child);
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let consequence_has_bindings = self.condition_needs_pattern_cleanup(condition);
         let consequence_scope = if consequence_has_bindings {
@@ -6959,8 +7078,67 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             scope
         };
-        let consequence_entry =
-            self.schedule_branch(builder, consequence, next, consequence_scope, stack)?;
+        if alternative.is_none() {
+            // An if without else has unit type. Publish its value without
+            // adding a control point to the condition's false successor.
+            let unit = self.value(builder, entry, SemanticValueKind::Constant)?;
+            self.session.append_assignment_value_flow(
+                builder,
+                entry,
+                ValueFlowKind::Local,
+                unit,
+                result,
+            )?;
+            let consequence_entry =
+                self.schedule_branch(builder, consequence, next, consequence_scope, stack)?;
+            if consequence_has_bindings {
+                self.add_drop_omission_gaps(
+                    builder,
+                    consequence_entry.expect("scheduled branch has an entry"),
+                    "values introduced by an if-let condition may require implicit Drop when the consequence completes",
+                    SemanticGapDischarge::None,
+                )?;
+            }
+            stack.push(Work::Condition {
+                node: condition,
+                entry: condition_entry,
+                when_true: EdgeTarget {
+                    point: consequence_entry.unwrap_or(next.point),
+                    kind: ControlEdgeKind::ConditionalTrue,
+                },
+                when_false: EdgeTarget {
+                    point: next.point,
+                    kind: ControlEdgeKind::ConditionalFalse,
+                },
+                scope,
+            });
+            return self.session.add_target_edge(
+                builder,
+                entry,
+                EdgeTarget::normal(condition_entry),
+            );
+        }
+        let merge = self.point(builder, node, Vec::new())?;
+        self.session.add_target_edge(builder, merge, next)?;
+        let consequence_exit = self.point(builder, consequence, Vec::new())?;
+        let consequence_value =
+            self.expression_value(builder, consequence, expression_value_kind(consequence))?;
+        self.session.append_assignment_value_flow(
+            builder,
+            consequence_exit,
+            ValueFlowKind::Local,
+            consequence_value,
+            result,
+        )?;
+        self.session
+            .add_target_edge(builder, consequence_exit, EdgeTarget::normal(merge))?;
+        let consequence_entry = self.schedule_branch(
+            builder,
+            consequence,
+            EdgeTarget::normal(consequence_exit),
+            consequence_scope,
+            stack,
+        )?;
         if consequence_has_bindings {
             self.add_drop_omission_gaps(
                 builder,
@@ -6969,19 +7147,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapDischarge::None,
             )?;
         }
-        let alternative_entry = alternative
-            .map(|alternative| self.schedule_branch(builder, alternative, next, scope, stack))
-            .transpose()?
-            .flatten();
+        let alternative = alternative.expect("an if without else returned above");
+        let exit = self.point(builder, alternative, Vec::new())?;
+        let value =
+            self.expression_value(builder, alternative, expression_value_kind(alternative))?;
+        self.session.append_assignment_value_flow(
+            builder,
+            exit,
+            ValueFlowKind::Local,
+            value,
+            result,
+        )?;
+        self.session
+            .add_target_edge(builder, exit, EdgeTarget::normal(merge))?;
+        let alternative_entry =
+            self.schedule_branch(builder, alternative, EdgeTarget::normal(exit), scope, stack)?;
         stack.push(Work::Condition {
             node: condition,
             entry: condition_entry,
             when_true: EdgeTarget {
-                point: consequence_entry.unwrap_or(next.point),
+                point: consequence_entry.unwrap_or(merge),
                 kind: ControlEdgeKind::ConditionalTrue,
             },
             when_false: EdgeTarget {
-                point: alternative_entry.unwrap_or(next.point),
+                point: alternative_entry.unwrap_or(merge),
                 kind: ControlEdgeKind::ConditionalFalse,
             },
             scope,
@@ -7034,13 +7223,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .filter(|child| child.kind() == "match_arm")
             .collect::<Vec<_>>();
         let decision = self.point(builder, node, Vec::new())?;
+        let merge = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.session.add_target_edge(builder, merge, next)?;
         // No point-wide control-flow gap: every arm gets a case edge below and
         // the last arm's guard-false edge continues past the match, so the
         // represented successor set is a superset of the real one. What a
         // selected pattern *binds* is still unknown, and that is published per
         // arm, on the value it binds.
         if arms.is_empty() {
-            self.session.add_target_edge(builder, decision, next)?;
+            self.session
+                .add_target_edge(builder, decision, EdgeTarget::normal(merge))?;
         } else {
             let candidates = arms
                 .iter()
@@ -7089,10 +7282,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let arm = arms[index];
                 let arm_value = required_field(arm, "value")?;
                 let arm_entry = self.point(builder, arm_value, Vec::new())?;
+                let arm_exit = self.point(builder, arm_value, Vec::new())?;
+                let value =
+                    self.expression_value(builder, arm_value, expression_value_kind(arm_value))?;
+                self.session.append_assignment_value_flow(
+                    builder,
+                    arm_exit,
+                    ValueFlowKind::Local,
+                    value,
+                    result,
+                )?;
+                self.session
+                    .add_target_edge(builder, arm_exit, EdgeTarget::normal(merge))?;
                 stack.push(Work::Expression {
                     node: arm_value,
                     entry: arm_entry,
-                    next,
+                    next: EdgeTarget::normal(arm_exit),
                     scope: arm_scopes[index],
                 });
                 let pattern = required_field(arm, "pattern")?;
@@ -7105,7 +7310,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: ControlEdgeKind::ConditionalTrue,
                         },
                         when_false: EdgeTarget {
-                            point: candidates.get(index + 1).copied().unwrap_or(next.point),
+                            point: candidates.get(index + 1).copied().unwrap_or(merge),
                             kind: ControlEdgeKind::ConditionalFalse,
                         },
                         scope: arm_scopes[index],
@@ -8783,10 +8988,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             normal,
             result,
         )?;
-        let argument_values = call_argument_values
-            .iter()
-            .map(|value| SemanticCallArgument::direct(*value, ArgumentDomain::Positional))
-            .collect::<Vec<_>>();
+        let mut argument_values = Vec::with_capacity(arguments.len());
+        for (argument, source) in arguments.iter().zip(&call_argument_values) {
+            let source_binding = self.transfer_source_value(*argument);
+            let value = if source_binding.is_some()
+                && matches!(
+                    self.compatible_transfer_ownership(*argument, source_binding, None),
+                    RustOwnershipClass::AggregateCopy | RustOwnershipClass::Move
+                )
+                && self.declared_struct_fields(*argument).is_some()
+            {
+                // A by-value struct argument owns its direct cells just as a
+                // by-value let does. Preserve the ownership transfer at the
+                // call boundary so the member oracle can prove the copy.
+                let transferred =
+                    self.source_value(builder, *argument, SemanticValueKind::Temporary)?;
+                let copy_source = source_binding.unwrap_or(*source);
+                self.append_ownership_transfer(
+                    builder,
+                    invoke,
+                    *argument,
+                    copy_source,
+                    transferred,
+                    None,
+                )?;
+                transferred
+            } else {
+                *source
+            };
+            argument_values.push(SemanticCallArgument::direct(
+                value,
+                ArgumentDomain::Positional,
+            ));
+        }
         let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
@@ -10381,6 +10615,9 @@ fn rust_expression_has_direct_value_evidence(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "call_expression"
+            | "if_expression"
+            | "match_expression"
+            | "block"
             | "struct_expression"
             | "array_expression"
             | "parenthesized_expression"

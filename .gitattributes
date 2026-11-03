@@ -38,9 +38,11 @@ schemas/semantic-model-pack-v18.schema.json text eol=lf
 schemas/semantic-model-pack-v19.schema.json text eol=lf
 schemas/semantic-model-pack-v20.schema.json text eol=lf
 schemas/semantic-model-pack-v21.schema.json text eol=lf
+schemas/semantic-model-pack-v22.schema.json text eol=lf
 schemas/semantic-model-compiled-manifest-v19.schema.json text eol=lf
 schemas/semantic-model-compiled-manifest-v20.schema.json text eol=lf
 schemas/semantic-model-compiled-manifest-v21.schema.json text eol=lf
+schemas/semantic-model-compiled-manifest-v22.schema.json text eol=lf
 crates/bifrost-jvm-analysis/src/analyzer/jvm/fixtures/enclosing-signature/enclosing/*.class binary
 crates/bifrost-semantic/tests/fixtures/extraction-contract.json text eol=lf
 crates/bifrost-semantic/src/analyzer/semantic_model/csmi/profiles/runtime-values.fixture.json text eol=lf
@@ -225,3 +227,5 @@ crates/bifrost-policy/tests/fixtures/loaded-canonical/*.json text eol=lf
 tests/fixtures/golden/jvm-import-context/equality/expected.txt text eol=lf
 
 crates/bifrost-core/migrations/cache/0229-csharp-undecided-chains.sql text eol=lf
+crates/bifrost-core/migrations/cache/0231-policy-evaluation-replay-evidence.sql text eol=lf
+crates/bifrost-core/migrations/cache/0233-policy-unit-typed-partition.sql text eol=lf

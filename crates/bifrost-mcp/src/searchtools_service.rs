@@ -1818,6 +1818,10 @@ impl SemanticPackWarm {
             match &*state {
                 PackWarmState::Settled(state) => return state.clone(),
                 _ => {
+                    #[cfg(test)]
+                    if let Some(hold) = &self.hold {
+                        hold.mark_final_wait_entered();
+                    }
                     state = self
                         .settled
                         .wait(state)
@@ -1942,6 +1946,8 @@ struct PackWarmHold {
     worker_parked_changed: Condvar,
     teardown_waiting: Mutex<bool>,
     teardown_waiting_changed: Condvar,
+    final_wait_entered: Mutex<bool>,
+    final_wait_entered_changed: Condvar,
     panic_after_release: bool,
     /// When set, parks the warm again between its installed stage and the
     /// expensive acquisition stage, so a test can observe a query answered
@@ -2010,6 +2016,8 @@ impl PackWarmHold {
             worker_parked_changed: Condvar::new(),
             teardown_waiting: Mutex::new(false),
             teardown_waiting_changed: Condvar::new(),
+            final_wait_entered: Mutex::new(false),
+            final_wait_entered_changed: Condvar::new(),
             panic_after_release: false,
             expensive_stage: None,
         }
@@ -2083,6 +2091,26 @@ impl PackWarmHold {
             .wait_timeout_while(state, Duration::from_secs(30), |state| !*state)
             .expect("pack warm parked mutex poisoned while waiting");
         assert!(*state, "semantic-pack warm worker did not reach its hold");
+    }
+
+    fn mark_final_wait_entered(&self) {
+        *self
+            .final_wait_entered
+            .lock()
+            .expect("final wait mutex poisoned") = true;
+        self.final_wait_entered_changed.notify_all();
+    }
+
+    fn wait_for_final_wait_entered(&self) {
+        let state = self
+            .final_wait_entered
+            .lock()
+            .expect("final wait mutex poisoned");
+        let (state, _) = self
+            .final_wait_entered_changed
+            .wait_timeout_while(state, Duration::from_secs(30), |state| !*state)
+            .expect("final wait mutex poisoned while waiting");
+        assert!(*state, "refresh did not reach final semantic-pack wait");
     }
 
     fn wait_for_teardown_waiting(&self) {
@@ -2648,6 +2676,98 @@ mod explain_policy_tests {
             "{}",
             stale.message
         );
+    }
+
+    #[test]
+    fn stale_explanation_pin_does_not_reload_workspace() {
+        let (_temp, service) = service();
+        let generation = service.workspace_generation();
+        let error = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "candidate": { "path": "Widget.java", "byte_start": byte_offset("Widget") },
+                    "workspace_generation": "0".repeat(64)
+                }),
+            )
+            .expect_err("a stale pin must fail");
+        assert!(matches!(
+            error.code,
+            SearchToolsServiceErrorCode::StaleWorkspaceGeneration { .. }
+        ));
+        assert_eq!(service.workspace_generation(), generation);
+    }
+
+    #[test]
+    fn query_code_projects_registered_taint_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        std::fs::write(
+            root.join("Foo.java"),
+            "class Foo { static String userInput() { return \"input\"; } static String relay(String value) { return value; } static void eval(String code) {} static void unsafe() { eval(relay(userInput())); } }\n",
+        )
+        .unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        let input = [PolicyEvaluationInput::embedded(
+            crate::policy::PolicySourceIdentity::new("test:registered-taint.rqlp"),
+            r#"(policy
+              :schema-version 1
+              :id "test.registered.taint"
+              :name "Registered taint"
+              :message "untrusted input reaches eval"
+              :severity warning
+              :analysis (analysis
+                :type taint
+                :mode may
+                :call-modeling (call-modeling :unmodeled optimistic)
+                :sources (endpoint-set :entries [
+                  (source :id input :display-name "user input" :categories [input.user]
+                    :selector (rql :schema-version 1
+                      (language java (call :callee (name "userInput"))))
+                    :bind return-value :labels [untrusted])])
+                :sinks (endpoint-set :entries [
+                  (sink :id eval :display-name "eval sink" :categories [code.execution]
+                    :selector (rql :schema-version 1
+                      (language java (call :callee (name "eval"))))
+                    :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+              :classification (classification
+                :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#,
+        )];
+        let options =
+            PolicyEvaluationOptions::new(PolicyEvaluationDate::from_ymd(2026, 9, 3).unwrap());
+        let outcome = service
+            .evaluate_policy_inputs(&root, &input, &options)
+            .unwrap();
+        assert_eq!(
+            outcome.taint_findings().len(),
+            1,
+            "{:?}",
+            outcome.report().diagnostics()
+        );
+        let taint_ref = crate::rql::TaintResultRef::new("test", "registered").unwrap();
+        service
+            .register_query_taint_results(taint_ref, outcome.taint_analysis_results().to_vec())
+            .unwrap();
+        let answer = service
+            .call_tool_value(
+                "query_code",
+                json!({
+                    "schema_version": 1,
+                    "match": {"kind": "method", "name": "unsafe"},
+                    "steps": [
+                        {"op": "procedure_of"},
+                        {"op": "taint", "taint_ref": "test:registered"}
+                    ]
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            answer["results"].as_array().map(Vec::len),
+            Some(1),
+            "{answer}"
+        );
+        assert_eq!(answer["results"][0]["result_type"], "taint_finding");
     }
 
     /// A malformed pin is a stated parameter error, never a silent no-op.
@@ -3528,6 +3648,107 @@ fn changed_files_invalidate_pack_activation(changed_files: &BTreeSet<ProjectFile
 #[cfg(test)]
 mod pack_input_change_tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn package_manifest_edit_replaces_dependency_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        std::fs::write(
+            root.join("app.ts"),
+            "import { x } from 'lodash';\nexport { x };\n",
+        )
+        .unwrap();
+        for name in ["lodash", "underscore"] {
+            std::fs::create_dir_all(root.join("node_modules").join(name)).unwrap();
+            std::fs::write(
+                root.join("node_modules").join(name).join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0","main":"index.js"}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("node_modules").join(name).join("index.js"),
+                "module.exports = {};\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("node_modules").join(name).join("index.d.ts"),
+                "export declare const x: number;\n",
+            )
+            .unwrap();
+        }
+        let manifest = |name: &str| {
+            format!(r#"{{"name":"app","version":"1.0.0","dependencies":{{"{name}":"1.0.0"}}}}"#)
+        };
+        let lock = |name: &str| {
+            format!(
+                r#"{{"name":"app","version":"1.0.0","lockfileVersion":3,"packages":{{"":{{"name":"app","version":"1.0.0","dependencies":{{"{name}":"1.0.0"}}}},"node_modules/{name}":{{"version":"1.0.0"}}}}}}"#
+            )
+        };
+        std::fs::write(root.join("package.json"), manifest("lodash")).unwrap();
+        std::fs::write(root.join("package-lock.json"), lock("lodash")).unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        let evidence = || {
+            let guard = service.session.read().unwrap();
+            guard
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .analyzer()
+                .dependency_discovery_evidence(Language::TypeScript)
+        };
+        let before = evidence().expect("initial npm dependency proof is published");
+        assert!(before.declares_module_path("lodash"), "{before:?}");
+        std::fs::write(root.join("package.json"), manifest("underscore")).unwrap();
+        std::fs::write(root.join("package-lock.json"), lock("underscore")).unwrap();
+        service
+            .call_tool_value(
+                "update_paths",
+                json!({"paths": ["package.json", "package-lock.json"]}),
+            )
+            .expect("refresh dependency inputs");
+        let after = evidence().expect("edited npm dependency proof is published");
+        assert!(after.declares_module_path("underscore"), "{after:?}");
+        assert!(!after.declares_module_path("lodash"), "{after:?}");
+        std::fs::create_dir_all(root.join(".bifrost")).unwrap();
+        std::fs::write(root.join(".bifrost/packs.json"), "{").unwrap();
+        service
+            .call_tool_value("update_paths", json!({"paths": [".bifrost/packs.json"]}))
+            .expect("publish failed replacement activation");
+        assert!(
+            evidence().is_none(),
+            "failed replacement must withdraw the prior dependency proof: {:?}",
+            evidence()
+        );
+    }
+
+    #[test]
+    fn new_language_refreshes_settled_pack_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        std::fs::write(root.join("app.js"), "const value = 1;\n").unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        let ecosystems = || {
+            let guard = service.session.read().unwrap();
+            guard
+                .as_ref()
+                .unwrap()
+                .semantic_packs
+                .best_known_state()
+                .expect("settled pack activation has a scope")
+                .ecosystems
+                .clone()
+        };
+        assert!(ecosystems().contains(&crate::analyzer::DependencyPackEcosystem::Npm));
+        std::fs::write(root.join("app.py"), "value = 1\n").unwrap();
+        service
+            .call_tool_value("update_paths", json!({"paths": ["app.py"]}))
+            .expect("publish new language");
+        assert!(
+            ecosystems().contains(&crate::analyzer::DependencyPackEcosystem::Python),
+            "the activated pack scope must include the newly introduced language"
+        );
+    }
 
     /// `Cargo.lock` and `rust-toolchain.toml` reach Rust analysis only through
     /// dependency and standard-library packs, so this refresh is what keeps
@@ -4568,11 +4789,7 @@ impl SearchToolsService {
         let arguments =
             self.normalize_arguments_for_current_workspace(name, arguments, cancellation)?;
         if name == "get_symbol_sources" {
-            return self.handle_get_symbol_sources(
-                strip_legacy_kind_filter(arguments),
-                render_options,
-                cancellation,
-            );
+            return self.handle_get_symbol_sources(arguments, render_options, cancellation);
         }
         let snapshot = {
             let _scope = profiling::scope("SearchToolsService::snapshot_for_query");
@@ -4617,7 +4834,7 @@ impl SearchToolsService {
             ),
             "get_symbol_locations" => Self::decode_render_and_run(
                 &snapshot,
-                strip_legacy_kind_filter(arguments),
+                arguments,
                 render_options,
                 |workspace, params| {
                     get_symbol_locations_with_cancellation(
@@ -4629,7 +4846,7 @@ impl SearchToolsService {
             ),
             "get_symbol_ancestors" => Self::decode_render_and_run(
                 &snapshot,
-                strip_legacy_kind_filter(arguments),
+                arguments,
                 render_options,
                 |workspace, params| get_symbol_ancestors(workspace.analyzer(), params),
             ),
@@ -6659,15 +6876,13 @@ impl SearchToolsService {
     {
         let params = Self::decode_tool_params(arguments)?;
         let result = handler(workspace, params);
-        match serde_json::to_value(result).map_err(|err| {
+        let structured = serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
-        })? {
-            Value::String(text) => Ok(ToolOutput::Text(text)),
-            structured => Ok(ToolOutput::Structured {
-                structured,
-                rendered_text: None,
-            }),
-        }
+        })?;
+        Ok(ToolOutput::Structured {
+            structured,
+            rendered_text: None,
+        })
     }
 
     fn validate_scan_usages_by_reference_arguments(
@@ -7287,13 +7502,6 @@ impl Drop for SearchToolsService {
     }
 }
 
-fn strip_legacy_kind_filter(mut arguments: Value) -> Value {
-    if let Some(object) = arguments.as_object_mut() {
-        object.remove("kind_filter");
-    }
-    arguments
-}
-
 /// The shared workspace file listing cache for a root about to be bound, or
 /// `None` under `Manual`: manual sessions have no watcher to invalidate a
 /// cache, so they keep answering listing-backed tools from a fresh walk.
@@ -7776,6 +7984,241 @@ mod watcher_startup_tests {
     fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
         let (temp, root) = super::test_workspace(file, source);
         (temp, root.normalize())
+    }
+
+    #[test]
+    fn semantic_pack_readiness_is_independent_of_usage_warm() {
+        let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
+        let hold = Arc::new(PackWarmHold::new());
+        let service = service_with_held_warm(root, Arc::clone(&hold));
+        let _release = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        service.ensure_ready().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let result = service
+                .call_tool_value("get_active_workspace", json!({}))
+                .unwrap();
+            assert_eq!(result["semantic_packs_ready"], false, "{result}");
+            if result["usage_index_ready"] == true {
+                break;
+            }
+            assert!(Instant::now() < deadline, "usage warm did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn active_workspace_reports_selected_root() {
+        let (_first, first_root) = workspace("First.rs", "pub fn first() {}\n");
+        let (_second, second_root) = workspace("Second.rs", "pub fn second() {}\n");
+        let service = SearchToolsService::new_manual_ephemeral(first_root).unwrap();
+        service
+            .call_tool_value("activate_workspace", json!({"workspace_path": second_root}))
+            .unwrap();
+        let result = service
+            .call_tool_value("get_active_workspace", json!({}))
+            .unwrap();
+        assert_eq!(result["workspace_path"], second_root.display().to_string());
+    }
+
+    #[test]
+    fn regular_file_cannot_be_a_workspace_root() {
+        let (temp, _) = workspace("lib.rs", "pub fn value() {}\n");
+        let file = temp.path().join("lib.rs");
+        let error = SearchToolsService::new_deferred_manual(file).err().unwrap();
+        assert!(error.contains("not a directory"), "{error}");
+    }
+
+    #[test]
+    fn cyclomatic_complexity_returns_rendered_text_with_structured_result() {
+        fn commit(repo: &git2::Repository) {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("lib.rs")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents = parent.iter().collect::<Vec<_>>();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "fixture",
+                &tree,
+                &parents,
+            )
+            .unwrap();
+        }
+
+        let (_temp, root) = workspace("lib.rs", "pub fn answer() -> i32 { 1 }\n");
+        let repo = git2::Repository::init(&root).unwrap();
+        commit(&repo);
+        std::fs::write(root.join("lib.rs"), "pub fn answer() -> i32 { 2 }\n").unwrap();
+        commit(&repo);
+        let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
+        let output = service
+            .call_tool_output(
+                "cyclomatic_complexity",
+                json!({"target": "HEAD"}),
+                RenderOptions::default(),
+            )
+            .unwrap();
+        let ToolOutput::Structured {
+            structured,
+            rendered_text,
+        } = output
+        else {
+            panic!("expected structured complexity output");
+        };
+        assert_eq!(structured["summary"]["edited"], 1, "{structured}");
+        assert!(
+            rendered_text
+                .as_deref()
+                .is_some_and(|text| text.contains("answer")),
+            "{rendered_text:?}"
+        );
+    }
+
+    #[test]
+    fn rootless_binding_warms_usage_index_without_navigation() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "pub fn value() {}\npub fn caller() { value(); }\n",
+        );
+        let service = SearchToolsService::new_unbound_manual();
+        service.bind_client_workspace(root).unwrap();
+        service.ensure_ready().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let result = service
+                .call_tool_value("get_active_workspace", json!({}))
+                .unwrap();
+            let facts_warm = {
+                let guard = service.session.read().unwrap();
+                guard.as_ref().unwrap().snapshot.rust_usage_facts_warm()
+            };
+            if result["usage_index_ready"] == true && facts_warm {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup usage warm did not settle: {result}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn git_head_refresh_discovers_file_created_before_watcher_registration() {
+        let (_temp, root) = workspace("Base.java", "class Base {}\n");
+        let repo = git2::Repository::init(&root).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
+            started_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .expect("release watcher startup");
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
+        });
+        let service = unbound_watching_service(starter);
+        service.bind_client_workspace(root.clone()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        std::fs::write(root.join("Later.java"), "class Later {}\n").unwrap();
+        release_tx.send(()).unwrap();
+        service.ensure_ready().unwrap();
+
+        let before = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Later"], "include_tests": true, "limit": 40}),
+            )
+            .unwrap();
+        assert_eq!(before["total_files"], 0, "{before}");
+
+        repo.set_head("refs/heads/refresh").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = {
+                let guard = service.session.read().unwrap();
+                let session = guard.as_ref().unwrap();
+                matches!(&session.watcher, SessionWatcher::Active(watcher) if watcher.has_pending())
+            };
+            if pending {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "HEAD change did not reach watcher"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let first_delta = {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            let SessionWatcher::Active(watcher) = &session.watcher else {
+                panic!("expected active watcher");
+            };
+            watcher.take_changed_files()
+        };
+        assert!(first_delta.requires_full_refresh);
+        assert!(first_delta.files.is_empty(), "{first_delta:?}");
+
+        repo.set_head("refs/heads/refresh-again").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = {
+                let guard = service.session.read().unwrap();
+                let session = guard.as_ref().unwrap();
+                matches!(&session.watcher, SessionWatcher::Active(watcher) if watcher.has_pending())
+            };
+            if pending {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second HEAD change did not reach watcher"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Later"], "include_tests": true, "limit": 40}),
+            )
+            .unwrap();
+        assert_eq!(after["files"][0]["path"], "Later.java", "{after}");
+    }
+
+    #[test]
+    fn finished_workspace_build_is_not_pending_before_installation() {
+        let (_temp, root) = workspace("lib.rs", "pub fn value() {}\n");
+        let service = SearchToolsService::new_unbound_manual();
+        service.bind_client_workspace(root).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while service.workspace_build_pending() {
+            assert!(Instant::now() < deadline, "workspace build never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(service.initial_workspace_build_uninstalled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rootless_binding_reuses_canonical_workspace() {
+        let (_temp, root) = workspace("lib.rs", "pub fn value() {}\n");
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("alias");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let service = SearchToolsService::new_unbound_manual();
+        service.bind_client_workspace(root.clone()).unwrap();
+        service.ensure_ready().unwrap();
+        let generation = service.workspace_generation();
+        service.bind_client_workspace(link).unwrap();
+        assert_eq!(service.workspace_generation(), generation);
     }
 
     fn failing_starter(calls: Arc<AtomicUsize>) -> WatcherStarter {
@@ -8293,6 +8736,58 @@ mod watcher_startup_tests {
         assert_eq!(observed.len(), 1);
     }
 
+    #[test]
+    fn policy_observer_receives_every_selected_run() {
+        let (_temp, root) = workspace("Observed.js", "eval(userInput);\n");
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        let catalog = built_in_policy_catalog().unwrap();
+        let selected = catalog
+            .select(&BuiltInPolicySelection {
+                policy_ids: vec![
+                    "bifrost.correctness.dynamic-evaluation".to_owned(),
+                    "bifrost.correctness.repeated-branch-condition".to_owned(),
+                ],
+                ..BuiltInPolicySelection::default()
+            })
+            .unwrap();
+        let inputs = selected
+            .into_iter()
+            .map(PolicyEvaluationInput::selected_builtin)
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 2);
+        let options =
+            PolicyEvaluationOptions::new(PolicyEvaluationDate::from_ymd(2026, 9, 3).unwrap());
+        let mut observed = Vec::new();
+        let outcome = service
+            .evaluate_policy_inputs_with_observer(&root, &inputs, &options, |run| {
+                observed.push(run.clone());
+            })
+            .unwrap();
+        assert_eq!(outcome.report().runs().len(), 2);
+        assert_eq!(observed, outcome.report().runs());
+    }
+
+    #[test]
+    fn policy_file_count_admits_the_documented_maximum() {
+        let (_temp, root) = workspace("Observed.js", "eval(userInput);\n");
+        let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
+        let maximum = crate::policy::PolicyBatchBudget::default().max_policies();
+        let policy_files = (0..maximum)
+            .map(|index| format!("policies/missing-{index}.rqlp"))
+            .collect::<Vec<_>>();
+        let result = service
+            .call_tool_value(
+                "run_policy",
+                json!({"policy_files": policy_files, "evaluation_date": "2026-09-03"}),
+            )
+            .expect("exactly the documented maximum passes argument validation");
+        assert_eq!(result["status"], "unreliable");
+        assert_eq!(
+            result["report"]["diagnostics"][0]["code"],
+            "policy-load-failed"
+        );
+    }
+
     /// #2923: naming a pack and one policy id must evaluate that one policy.
     /// The selectors intersect, so the report carries a single run instead of
     /// the whole pack's runs filtered afterwards.
@@ -8781,6 +9276,113 @@ mod watcher_startup_tests {
             .expect("a later request should publish and query the built snapshot");
         assert_eq!(output["total_files"], 1, "{output:#}");
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancelled_workspace_readiness_wait_stops_without_a_deadline() {
+        let (_temp, root) = workspace("Cold.java", "class Cold {}\n");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
+            started_tx.send(()).expect("report watcher startup");
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .expect("release startup");
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
+        });
+        let service = unbound_watching_service(starter);
+        service.bind_client_workspace(root).expect("bind workspace");
+        started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("build reached watcher startup");
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            release_tx.send(()).expect("release build");
+        });
+        let cancelled = service.wait_workspace_ready(&|| true);
+        release.join().expect("release thread");
+        assert_eq!(
+            cancelled.expect_err("cancelled waiter must stop").code,
+            SearchToolsServiceErrorCode::Internal
+        );
+        service
+            .wait_workspace_ready(&|| false)
+            .expect("uncancelled waiter continues after build");
+    }
+
+    #[test]
+    fn watcher_registration_drops_a_listing_filled_before_registration() {
+        let (_temp, root) = workspace("Old.java", "class Old {}\n");
+        let new_file = root.join("New.java");
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
+            std::fs::write(&new_file, "class New { String newmarker; }\n")
+                .expect("change tree before watcher registration");
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
+        });
+        let service = SearchToolsService::new_lazy_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::WatchFiles,
+            starter,
+        )
+        .unwrap();
+        let listing = service.file_listing.read().unwrap().clone().unwrap();
+        assert_eq!(listing.files().unwrap().len(), 1);
+        let result = service
+            .call_tool_value("find_files_containing", json!({"patterns": ["newmarker"]}))
+            .expect("file search after watcher registration");
+        assert!(result.to_string().contains("New.java"), "{result:#}");
+    }
+
+    #[test]
+    fn expired_query_keeps_pending_pack_stage_visible() {
+        let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
+        let hold = Arc::new(PackWarmHold::new());
+        let service = service_with_held_warm(root, Arc::clone(&hold));
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        service.ensure_ready().expect("publish workspace");
+        hold.wait_for_worker_parked();
+        let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
+        assert!(cancellation.is_cancelled());
+        assert!(cancellation.is_timed_out());
+        let release = std::thread::spawn({
+            let hold = Arc::clone(&hold);
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                hold.release();
+            }
+        });
+        let phase = service
+            .snapshot_for_query_with_cancellation(Some(&cancellation))
+            .expect("expired query can inspect pending stage")
+            .pack_activation
+            .clone();
+        release.join().expect("release pack warm");
+        assert!(matches!(phase, SessionPackActivation::WarmPending));
+    }
+
+    #[test]
+    fn refresh_replaces_semantic_pack_activation_after_configuration_changes() {
+        let (_temp, root) = workspace("lib.rs", "pub fn item() {}\n");
+        let service = SearchToolsService::new_manual_persisted(root.clone()).unwrap();
+        let before = service
+            .call_tool_value("get_active_workspace", json!({}))
+            .unwrap();
+        assert_ne!(before["semantic_model_overlay"]["state"], "unavailable");
+
+        std::fs::create_dir_all(root.join(".bifrost")).unwrap();
+        std::fs::write(root.join(".bifrost/packs.json"), "not JSON").unwrap();
+        service.call_tool_value("refresh", json!({})).unwrap();
+        let after = service
+            .call_tool_value("get_active_workspace", json!({}))
+            .unwrap();
+        assert_eq!(
+            after["semantic_model_overlay"]["state"], "unavailable",
+            "{after:#}"
+        );
     }
 
     #[test]
@@ -9586,6 +10188,32 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    fn installed_pack_stage_publishes_its_settled_overlay() {
+        let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
+        let hold = Arc::new(PackWarmHold::new());
+        let service = service_with_held_warm(root, Arc::clone(&hold));
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        service.ensure_ready().expect("workspace is ready");
+        hold.wait_for_worker_parked();
+        hold.release();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !pack_warm_ready(&service) {
+            assert!(
+                Instant::now() < deadline,
+                "semantic-pack warm never settled"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let active = service
+            .call_tool_value("get_active_workspace", json!({}))
+            .expect("workspace status");
+        assert_eq!(
+            active["semantic_model_overlay"]["state"], "no_models",
+            "{active}"
+        );
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "501b6d4e2c67: semantic-pack workers must finish before a closing workspace releases its store"
     )]
@@ -9732,7 +10360,38 @@ mod watcher_startup_tests {
             "export declare function trim(value: string): string;\n",
         )
         .unwrap();
+        std::fs::write(
+            root.join("flow.py"),
+            "def source_one():\n    return 'input'\ndef sink_one(value):\n    pass\ndef run():\n    sink_one(source_one())\n",
+        )
+        .unwrap();
         let root = root.canonicalize().unwrap().normalize();
+
+        let policy = PolicyEvaluationInput::embedded(
+            crate::policy::PolicySourceIdentity::new("test:pending-flow.rqlp"),
+            r#"(policy
+                  :schema-version 1
+                  :id "test.pending.flow"
+                  :name "Pending flow"
+                  :message "source reaches sink"
+                  :severity warning
+                  :analysis (analysis
+                    :type taint
+                    :mode may
+                    :call-modeling (call-modeling :unmodeled optimistic)
+                    :sources (endpoint-set :entries [
+                      (source :id input :display-name "input" :categories [input.user]
+                        :selector (rql :schema-version 1
+                          (language python (call :callee (name "source_one"))))
+                        :bind return-value :labels [untrusted])])
+                    :sinks (endpoint-set :entries [
+                      (sink :id output :display-name "output" :categories [data.sensitive]
+                        :selector (rql :schema-version 1
+                          (language python (call :callee (name "sink_one"))))
+                        :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+                  :classification (classification
+                    :fallback (classification-id :taxonomy "Test" :id "PENDING-FLOW")))"#,
+        );
 
         let query = || {
             json!({
@@ -9743,10 +10402,35 @@ mod watcher_startup_tests {
         };
         let (hold, expensive_stage) = PackWarmHold::new_holding_expensive_stage();
         let hold = Arc::new(hold);
-        let service = service_with_held_warm(root, Arc::clone(&hold));
+        let service = service_with_held_warm(root.clone(), Arc::clone(&hold));
         let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
 
         hold.release();
+        let options =
+            PolicyEvaluationOptions::new(PolicyEvaluationDate::from_ymd(2026, 9, 3).unwrap());
+        let outcome = service
+            .evaluate_policy_inputs(&root, &[policy], &options)
+            .unwrap();
+        assert_eq!(outcome.taint_findings().len(), 1);
+        let flow_plan = Arc::new(
+            outcome.taint_analysis_results()[0]
+                .plan()
+                .value_flow()
+                .clone(),
+        );
+        service
+            .register_query_value_flow_plan("test:pending-flow".parse().unwrap(), flow_plan)
+            .unwrap();
+        let flow_query = || {
+            json!({
+                "schema_version": 1,
+                "match": {"kind": "function", "name": "run"},
+                "steps": [
+                    {"op": "procedure_of"},
+                    {"op": "value_flow", "plan_ref": "test:pending-flow"}
+                ]
+            })
+        };
         // Preparation waits for the installed stage, so when it returns the
         // session has published its interim activation while the expensive
         // stage is still parked. The query returning at all, rather than
@@ -9800,6 +10484,25 @@ mod watcher_startup_tests {
             "the interim answer names its pending acquisition: {structured:#}"
         );
 
+        let pending_flow = service.call_tool_value("query_code", flow_query()).unwrap();
+        let pending_rows = pending_flow["results"].as_array().unwrap();
+        assert!(!pending_rows.is_empty());
+        assert!(
+            pending_rows
+                .iter()
+                .all(|row| { row["result_type"] == "flow_endpoint" && row["status"] == "partial" })
+        );
+        assert!(
+            pending_flow["diagnostics"]
+                .as_array()
+                .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                    diagnostic["code"] == "semantic_pack_acquisition_pending"
+                        && diagnostic["impact"] == "incomplete"
+                })),
+            "flow answer must name the pending dependency: {:?}",
+            pending_flow["diagnostics"]
+        );
+
         expensive_stage.release();
         let deadline = Instant::now() + Duration::from_secs(60);
         while !pack_warm_ready(&service) {
@@ -9829,6 +10532,146 @@ mod watcher_startup_tests {
             !still_marked,
             "the settled answer carries no pending marker: {structured:#}"
         );
+        let settled_flow = service.call_tool_value("query_code", flow_query()).unwrap();
+        let settled_rows = settled_flow["results"].as_array().unwrap();
+        assert!(!settled_rows.is_empty());
+        assert!(
+            settled_rows.iter().all(|row| {
+                row["result_type"] == "flow_endpoint" && row["status"] == "complete"
+            }),
+            "settled flow statuses: {:?}",
+            settled_rows
+                .iter()
+                .map(|row| &row["status"])
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            settled_flow["diagnostics"]
+                .as_array()
+                .is_none_or(|diagnostics| diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic["code"] != "semantic_pack_acquisition_pending"))
+        );
+    }
+
+    fn service_with_pending_npm_pack() -> (
+        tempfile::TempDir,
+        Arc<SearchToolsService>,
+        Arc<PackWarmHold>,
+        Arc<ExpensiveStageHold>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("node_modules/lodash")).unwrap();
+        std::fs::write(
+            root.join("app.js"),
+            "const _ = require('lodash');\n_.trim(' x ');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"app","version":"1.0.0","dependencies":{"lodash":"4.17.21"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{"name":"app","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"app","version":"1.0.0","dependencies":{"lodash":"4.17.21"}},"node_modules/lodash":{"version":"4.17.21"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("node_modules/lodash/package.json"),
+            r#"{"name":"lodash","version":"4.17.21","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("node_modules/lodash/index.js"),
+            "exports.trim = value => value.trim();\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("node_modules/lodash/index.d.ts"),
+            "export declare function trim(value: string): string;\n",
+        )
+        .unwrap();
+        let (hold, expensive_stage) = PackWarmHold::new_holding_expensive_stage();
+        let hold = Arc::new(hold);
+        let service = Arc::new(service_with_held_warm(
+            root.canonicalize().unwrap().normalize(),
+            Arc::clone(&hold),
+        ));
+        (temp, service, hold, expensive_stage)
+    }
+
+    fn wait_for_pending_npm_pack(service: &SearchToolsService, hold: &PackWarmHold) {
+        hold.release();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let active = service
+                .call_tool_value("get_active_workspace", json!({}))
+                .expect("workspace status");
+            if active["semantic_model_overlay"]["stage"] == "acquisition_pending" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pack acquisition never became pending: {active}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn pending_pack_acquisition_publishes_final_outcome() {
+        let (_temp, service, hold, expensive_stage) = service_with_pending_npm_pack();
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        wait_for_pending_npm_pack(&service, &hold);
+        expensive_stage.release();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let active = service
+                .call_tool_value("get_active_workspace", json!({}))
+                .expect("workspace status");
+            if active["semantic_packs_ready"] == true {
+                assert_ne!(
+                    active["semantic_model_overlay"]["state"], "unavailable",
+                    "{active}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pack acquisition never settled: {active}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn refresh_waits_for_final_pack_activation() {
+        let (_temp, service, hold, expensive_stage) = service_with_pending_npm_pack();
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        wait_for_pending_npm_pack(&service, &hold);
+        let (sender, receiver) = mpsc::channel();
+        let refresh_service = Arc::clone(&service);
+        let refresh = std::thread::spawn(move || {
+            sender
+                .send(refresh_service.call_tool_value("refresh", json!({})))
+                .unwrap();
+        });
+        hold.wait_for_final_wait_entered();
+        assert!(
+            matches!(
+                receiver.recv_timeout(Duration::from_secs(2)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "refresh returned before final semantic-pack activation"
+        );
+        expensive_stage.release();
+        receiver
+            .recv_timeout(Duration::from_secs(60))
+            .expect("refresh did not finish after pack activation")
+            .expect("refresh succeeds");
+        refresh.join().expect("refresh thread");
     }
 
     /// A service whose deferred build assembles its session with the pack
@@ -10176,6 +11019,76 @@ mod analyzer_failure_boundary_tests {
     }
 
     #[test]
+    fn non_stale_internal_failure_does_not_reload_workspace() {
+        let (_temp, _root, service) = multi_language_service();
+        let generation = service.workspace_generation();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = service.query_taint_results.write().unwrap();
+                    panic!("poison the query registration lock");
+                })
+                .join()
+                .expect_err("lock poisoning thread should panic");
+        });
+
+        let error = service
+            .call_tool_value(
+                "query_code",
+                json!({"schema_version": 1, "match": {"kind": "class", "name": "Model"}}),
+            )
+            .expect_err("poisoned registration lock must fail the query");
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(error.message.contains("lock poisoned"), "{error:?}");
+        assert_eq!(service.workspace_generation(), generation);
+    }
+
+    #[test]
+    fn manual_persisted_constructor_retains_workspace_projection_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
+        git2::Repository::init(&root).unwrap();
+        let project = || -> Arc<dyn Project> {
+            Arc::new(TestProject::with_languages(
+                root.clone(),
+                BTreeSet::from([Language::Java]),
+            ))
+        };
+        let first = SearchToolsService::new_manual_persisted_for_project(
+            project(),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let first_answer = first
+            .call_tool_value("get_symbol_locations", json!({"symbols": ["Model"]}))
+            .unwrap();
+        assert_eq!(first_answer["locations"][0]["symbol"], "Model");
+        drop(first);
+
+        let connection = rusqlite::Connection::open(analyzer_db_path(&root)).unwrap();
+        let retained: i64 = connection
+            .query_row("SELECT count(*) FROM workspace_file_versions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            retained > 0,
+            "a persisted workspace keeps its projection after close"
+        );
+
+        let second = SearchToolsService::new_manual_persisted_for_project(
+            project(),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let second_answer = second
+            .call_tool_value("get_symbol_locations", json!({"symbols": ["Model"]}))
+            .unwrap();
+        assert_eq!(second_answer["locations"], first_answer["locations"]);
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "fecfeafc7647: stale analyzer generations must reload the service snapshot before retry"
     )]
@@ -10201,6 +11114,37 @@ mod analyzer_failure_boundary_tests {
             )
             .unwrap();
         assert_eq!(recovered["total_files"], 1);
+    }
+
+    #[test]
+    fn query_code_retries_as_a_query_after_generation_cutover() {
+        let (_temp, root, service) = multi_language_service();
+        let query = json!({
+            "schema_version": 1,
+            "languages": ["java"],
+            "match": {"kind": "class", "name": "Model"}
+        });
+        let run_query = |query| {
+            service
+                .call_tool_output_with_transport_timings_and_preflight(
+                    "query_code",
+                    query,
+                    RenderOptions::default(),
+                    None,
+                    TransportTimings::default(),
+                    None,
+                )
+                .map(ToolOutput::into_value)
+        };
+        let baseline = run_query(query.clone()).unwrap();
+        assert_eq!(baseline["results"].as_array().unwrap().len(), 1);
+        make_java_store_stale(&root);
+        let recovered = run_query(query).unwrap();
+        assert_eq!(recovered["results"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            recovered["results"][0]["name"],
+            baseline["results"][0]["name"]
+        );
     }
 
     #[test]
@@ -10401,6 +11345,67 @@ mod analyzer_failure_boundary_tests {
     }
 
     #[test]
+    fn scaled_query_materializes_every_file_past_the_interactive_cap() {
+        const FILES: usize = 257;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for index in 0..FILES {
+            std::fs::write(
+                root.join(format!("module_{index}.py")),
+                format!("def function_{index}():\n    return {index}\n"),
+            )
+            .unwrap();
+        }
+        let query = json!({
+            "schema_version": 1,
+            "languages": ["python"],
+            "match": {"kind": "function"},
+            "steps": [{"op": "procedure_of"}, {"op": "cfg_entry"}],
+            "limit": FILES + 1
+        });
+        let interactive = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        let cut = interactive
+            .call_tool_value("query_code", query.clone())
+            .unwrap();
+        assert!(
+            cut["diagnostics"]
+                .as_array()
+                .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                    diagnostic["code"] == "semantic_budget_exhausted"
+                        && diagnostic["impact"] == "incomplete"
+                })),
+            "interactive execution must report its semantic file cap: {:?}",
+            cut["diagnostics"]
+        );
+        drop(interactive);
+
+        let scaled = SearchToolsService::new_manual_ephemeral(root)
+            .unwrap()
+            .with_workspace_scaled_query_limits();
+        let answer = scaled.call_tool_value("query_code", query).unwrap();
+        assert_eq!(answer["truncated"], false);
+        assert!(
+            answer["diagnostics"]
+                .as_array()
+                .is_none_or(|diagnostics| diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic["impact"] != "incomplete")),
+            "scaled execution must be complete: {:?}",
+            answer["diagnostics"]
+        );
+        let paths = answer["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["path"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        let expected = (0..FILES)
+            .map(|index| format!("module_{index}.py"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paths, expected);
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#847: a handler error must retain precedence over a recorded store failure"
     )]
@@ -10434,6 +11439,31 @@ mod source_generation_tests {
     use super::*;
     use serde_json::Value;
     use std::fs;
+
+    #[test]
+    fn rename_uses_edited_named_source_before_watcher_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("app.py"), "def alpha():\n    pass\n\nalpha()\n").unwrap();
+        let service = watching_service_without_watcher(root.clone());
+        fs::write(root.join("app.py"), "def beta():\n    pass\n\nbeta()\n").unwrap();
+
+        let result = service
+            .call_tool_value(
+                "rename_symbol",
+                serde_json::json!({"path": "app.py", "line": 1, "column": 5, "new_name": "gamma"}),
+            )
+            .unwrap();
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["old_name"], "beta", "{result}");
+        assert_eq!(result["target"]["symbol"], "app.beta", "{result}");
+        let edits = result["edits"][0]["edits"].as_array().unwrap();
+        assert!(edits.len() >= 2, "{result}");
+        assert!(
+            edits.iter().all(|edit| edit["old_text"] == "beta"),
+            "{result}"
+        );
+    }
 
     const INITIAL_SOURCE: &str = r#"namespace MudBlazor;
 

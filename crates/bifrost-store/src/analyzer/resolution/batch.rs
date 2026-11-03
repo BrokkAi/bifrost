@@ -973,6 +973,12 @@ pub struct BatchCandidateRequest {
     kind: BatchCandidateRequestKind,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OwnedBatchCandidateRequest<'a> {
+    pub owner: SemanticId,
+    pub request: &'a BatchCandidateRequest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BatchCandidateRequestKind {
     Endpoint,
@@ -2670,6 +2676,41 @@ impl BatchCandidateMatch {
     }
 }
 
+/// Exhaustive selected-source declaration presence for one JVM language root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JvmSelectedRootPresence {
+    Ready(bool),
+    NotReady,
+}
+
+impl JvmSelectedRootPresence {
+    pub fn read_digest(self) -> brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+        let mut hash = CanonicalHasher::new(b"bifrost-jvm-selected-root-presence:v1");
+        let state = match self {
+            Self::Ready(true) => b"present".as_slice(),
+            Self::Ready(false) => b"absent".as_slice(),
+            Self::NotReady => b"undecided".as_slice(),
+        };
+        hash.field("state", state);
+        brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest::from_array(hash.finish())
+    }
+}
+
+/// Source-site provenance hydrated with one candidate row, never inferred
+/// from route spelling, anchoring, or cache admission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CandidatePathOrigin {
+    pub role: Option<i64>,
+    pub site_kind: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HydratedCandidatePath {
+    pub path: PartialPath,
+    pub origin: CandidatePathOrigin,
+}
+
 /// Batch read side for immutable resolution facts.
 ///
 /// A source is the closed-world authority for one exact selected context. Seed
@@ -2691,6 +2732,14 @@ impl BatchCandidateMatch {
 /// direction flag: forward and reverse candidate indexes have different SQL
 /// shapes.
 pub trait BatchResolutionFragmentSource {
+    /// Whether a selected source declares the root. A source without an
+    /// exhaustive selected inventory returns `NotReady`, which keeps the
+    /// ordinary reference route.
+    fn jvm_selected_root_presence(
+        &self,
+        root_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<JvmSelectedRootPresence>;
     /// Session supplied by an engine source wrapper to inventory consumers.
     /// Plain readers have none and never charge admission themselves.
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
@@ -3162,6 +3211,26 @@ pub trait BatchResolutionFragmentSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<Vec<(CandidatePathIdentity, PartialPath)>>;
 
+    fn hydrate_candidate_paths_with_origin(
+        &self,
+        candidates: &[CandidatePathIdentity],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<(CandidatePathIdentity, HydratedCandidatePath)>> {
+        Ok(self
+            .hydrate_candidate_paths(candidates, cancellation)?
+            .into_iter()
+            .map(|(identity, path)| {
+                (
+                    identity,
+                    HydratedCandidatePath {
+                        path,
+                        origin: CandidatePathOrigin::default(),
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Visit normalized immutable copy rules for one typed source slot.
     ///
     /// The returned completion describes semantic coverage of the selected
@@ -3347,6 +3416,13 @@ impl<'a> SelectedContextPathFragmentSource<'a> {
 }
 
 impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
+    fn jvm_selected_root_presence(
+        &self,
+        root_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<JvmSelectedRootPresence> {
+        self.base.jvm_selected_root_presence(root_fqn, cancellation)
+    }
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
         self.session
             .or_else(|| self.base.candidate_admission_session())
@@ -3772,6 +3848,18 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
         candidates: &[CandidatePathIdentity],
         cancellation: &CancellationToken,
     ) -> StoreResult<Vec<(CandidatePathIdentity, PartialPath)>> {
+        Ok(self
+            .hydrate_candidate_paths_with_origin(candidates, cancellation)?
+            .into_iter()
+            .map(|(id, row)| (id, row.path))
+            .collect())
+    }
+
+    fn hydrate_candidate_paths_with_origin(
+        &self,
+        candidates: &[CandidatePathIdentity],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<(CandidatePathIdentity, HydratedCandidatePath)>> {
         assert!(candidates.len() <= MAX_SOURCE_ROWS_PER_BATCH);
         let requested = candidates.iter().copied().collect::<HashSet<_>>();
         if requested.len() != candidates.len() {
@@ -3787,6 +3875,10 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
         };
         let mut rows = BTreeMap::new();
         for (candidate, path) in context_rows {
+            let path = HydratedCandidatePath {
+                path,
+                origin: CandidatePathOrigin::default(),
+            };
             if !requested.contains(&candidate) || rows.insert(candidate, path).is_some() {
                 return Err(StoreError::new(format!(
                     "context hydration returned foreign or duplicate identity {candidate:?}"
@@ -3801,7 +3893,7 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
         if !remaining.is_empty() {
             for (candidate, path) in self
                 .base
-                .hydrate_candidate_paths(&remaining, cancellation)?
+                .hydrate_candidate_paths_with_origin(&remaining, cancellation)?
             {
                 if !requested.contains(&candidate) || rows.insert(candidate, path).is_some() {
                     return Err(StoreError::new(format!(
@@ -5104,6 +5196,13 @@ impl SelectedContextOverlayFragmentSource<'_> {
 }
 
 impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> {
+    fn jvm_selected_root_presence(
+        &self,
+        root_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<JvmSelectedRootPresence> {
+        self.base.jvm_selected_root_presence(root_fqn, cancellation)
+    }
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
         self.resolution_session
             .or_else(|| self.base.candidate_admission_session())
@@ -5413,6 +5512,18 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
         candidates: &[CandidatePathIdentity],
         cancellation: &CancellationToken,
     ) -> StoreResult<Vec<(CandidatePathIdentity, PartialPath)>> {
+        Ok(self
+            .hydrate_candidate_paths_with_origin(candidates, cancellation)?
+            .into_iter()
+            .map(|(id, row)| (id, row.path))
+            .collect())
+    }
+
+    fn hydrate_candidate_paths_with_origin(
+        &self,
+        candidates: &[CandidatePathIdentity],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<(CandidatePathIdentity, HydratedCandidatePath)>> {
         assert!(
             candidates.len() <= MAX_SOURCE_ROWS_PER_BATCH,
             "candidate hydration page has {} entries; maximum is {MAX_SOURCE_ROWS_PER_BATCH}",
@@ -5453,7 +5564,15 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
                 return Ok(hydrated.into_iter().collect());
             };
             assert!(
-                hydrated.insert(candidate, cloned).is_none(),
+                hydrated
+                    .insert(
+                        candidate,
+                        HydratedCandidatePath {
+                            path: cloned,
+                            origin: CandidatePathOrigin::default()
+                        }
+                    )
+                    .is_none(),
                 "one selected-context candidate is hydrated once per request page"
             );
             if cancellation.is_cancelled() {
@@ -5465,7 +5584,7 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
             Vec::new()
         } else {
             self.base
-                .hydrate_candidate_paths(&delegated, cancellation)?
+                .hydrate_candidate_paths_with_origin(&delegated, cancellation)?
         };
         let delegated: HashSet<_> = delegated.into_iter().collect();
         for (candidate, path) in base_rows {
@@ -6173,7 +6292,9 @@ impl DemandForwardBatchFrame {
         artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
         candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandForwardBatchPoll> {
         self.poll_with_selection_access(
             engine,
@@ -6192,7 +6313,9 @@ impl DemandForwardBatchFrame {
         candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
         read_provider: Option<&mut dyn BatchOperationReadProvider>,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandForwardBatchPoll> {
         assert!(!self.terminal, "a terminal forward frame cannot be resumed");
         let result = self.poll_active(
@@ -6213,7 +6336,9 @@ impl DemandForwardBatchFrame {
         candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
         mut read_provider: Option<&mut dyn BatchOperationReadProvider>,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandForwardBatchPoll> {
         if self.initialized.cancelled || cancellation.is_cancelled() {
             self.initialized.cancelled = true;
@@ -6251,7 +6376,15 @@ impl DemandForwardBatchFrame {
         let round = self.round.as_ref().expect("the round is active");
         // This gate precedes the ENTIRE artifact read, including cache-hit
         // evidence replay and exhausted-negative endpoint-cache publication.
-        let ready = readiness(&round.request_page)?;
+        let owned = round
+            .request_page
+            .iter()
+            .map(|request| OwnedBatchCandidateRequest {
+                owner: self.pending_request_reference(request),
+                request,
+            })
+            .collect::<Vec<_>>();
+        let ready = readiness(&owned)?;
         if cancellation.is_cancelled() {
             self.initialized.cancelled = true;
             return self.finish(engine, cancellation, read_provider, candidate_paths);
@@ -13638,6 +13771,13 @@ mod tests {
     }
 
     impl BatchResolutionFragmentSource for FaultingSource<'_> {
+        fn jvm_selected_root_presence(
+            &self,
+            _root_fqn: &str,
+            _cancellation: &CancellationToken,
+        ) -> StoreResult<JvmSelectedRootPresence> {
+            Ok(JvmSelectedRootPresence::NotReady)
+        }
         fn selected_universe_entry(
             &self,
             _reference: SemanticId,
@@ -14238,6 +14378,13 @@ mod tests {
     }
 
     impl BatchResolutionFragmentSource for RepeatingUnconditionalSource<'_> {
+        fn jvm_selected_root_presence(
+            &self,
+            _root_fqn: &str,
+            _cancellation: &CancellationToken,
+        ) -> StoreResult<JvmSelectedRootPresence> {
+            Ok(JvmSelectedRootPresence::NotReady)
+        }
         fn selection_authority(&self) -> Option<SeedReadAuthority> {
             None
         }
@@ -14505,7 +14652,13 @@ mod tests {
                         candidate_paths,
                         cancellation,
                         &mut |requests| {
-                            assert_eq!(requests, pending);
+                            assert_eq!(
+                                requests
+                                    .iter()
+                                    .map(|owned| owned.request)
+                                    .collect::<Vec<_>>(),
+                                pending.iter().collect::<Vec<_>>()
+                            );
                             Ok(DemandForwardReadiness::AwaitingDependencies)
                         }
                     )?,
@@ -14528,7 +14681,13 @@ mod tests {
                 candidate_paths,
                 cancellation,
                 &mut |requests| {
-                    assert_eq!(requests, pending);
+                    assert_eq!(
+                        requests
+                            .iter()
+                            .map(|owned| owned.request)
+                            .collect::<Vec<_>>(),
+                        pending.iter().collect::<Vec<_>>()
+                    );
                     Ok(DemandForwardReadiness::Ready)
                 },
             )? {
@@ -15169,6 +15328,13 @@ mod tests {
     }
 
     impl BatchResolutionFragmentSource for JavaOverlayLawSource {
+        fn jvm_selected_root_presence(
+            &self,
+            _root_fqn: &str,
+            _cancellation: &CancellationToken,
+        ) -> StoreResult<JvmSelectedRootPresence> {
+            Ok(JvmSelectedRootPresence::NotReady)
+        }
         fn selection_authority(&self) -> Option<SeedReadAuthority> {
             None
         }

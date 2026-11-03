@@ -24,6 +24,7 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
 
+use crate::graph_support::csharp_enclosing_namespace_path;
 use crate::imports::csharp_import_info_from_using_directive;
 use crate::syntax::{
     csharp_attribute_type_names, csharp_constant_pattern_type_candidate,
@@ -368,7 +369,6 @@ impl CSharpVisitor<'_, '_, '_> {
         };
         let mut current = self.ancestry.parent(node);
         let mut owner = None;
-        let mut namespace = Vec::new();
         let mut nested_type = false;
         while let Some(parent) = current {
             if matches!(
@@ -386,13 +386,6 @@ impl CSharpVisitor<'_, '_, '_> {
                     nested_type = true;
                 }
             }
-            if matches!(
-                parent.kind(),
-                "namespace_declaration" | "file_scoped_namespace_declaration"
-            ) && let Some(name) = parent.child_by_field_name("name")
-            {
-                namespace.push(cs_node_text(name, self.source).to_owned());
-            }
             current = self.ancestry.parent(parent);
         }
         let Some(owner) = owner else {
@@ -402,7 +395,7 @@ impl CSharpVisitor<'_, '_, '_> {
             return;
         }
         let owner = cs_node_text(owner, self.source).to_owned();
-        namespace.reverse();
+        let namespace = csharp_enclosing_namespace_path(self.source, node);
         let declarations = if matches!(node.kind(), "field_declaration" | "event_field_declaration")
         {
             first_named_child_of_kind(node, "variable_declaration")

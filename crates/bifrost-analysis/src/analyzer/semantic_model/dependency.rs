@@ -1238,7 +1238,12 @@ pub(crate) fn compatible_installed_pack_evaluation(
     catalog: &SemanticPackCatalog,
     dependency: &ResolvedDependency,
 ) -> Result<Option<(PreparedInstalledDependencyPack, Vec<String>, bool)>, CatalogError> {
-    let candidates = compatible_installed_pack_candidates(catalog, dependency)?;
+    let mut candidates = compatible_installed_pack_candidates(catalog, dependency)?;
+    // This route acquires a pack when no installation serves the coordinate.
+    // A reviewed workspace model is not an installation, so it neither stands
+    // in for that acquisition nor answers as the coordinate's pack here.
+    candidates
+        .retain(|candidate| candidate.source_kind != CatalogPackSourceKind::EphemeralWorkspace);
     let has_complete_candidate = candidates
         .iter()
         .any(|candidate| candidate.completeness == Completeness::Complete);
@@ -1252,7 +1257,9 @@ pub(crate) fn compatible_installed_pack_evaluation(
 }
 
 /// Curated partial declaration subsets are trusted only when Bifrost shipped
-/// them. A locally installed partial pack still needs the ordinary extraction
+/// them or the repository checked them in as reviewed workspace models (whose
+/// presence is the opt-in, and whose review gate still applies at activation).
+/// A locally installed partial pack still needs the ordinary extraction
 /// accounting that makes it activation-ready; curated evidence must not turn
 /// an arbitrary partial installation into trusted semantics.
 pub(crate) fn compatible_curated_installed_pack(
@@ -1269,7 +1276,9 @@ pub(crate) fn compatible_curated_installed_pack(
         candidate.activation_ready
             || matches!(
                 candidate.source_kind,
-                CatalogPackSourceKind::PreShipped | CatalogPackSourceKind::Embedded
+                CatalogPackSourceKind::PreShipped
+                    | CatalogPackSourceKind::Embedded
+                    | CatalogPackSourceKind::EphemeralWorkspace
             )
     });
     Ok(prepared_installed_pack(dependency, &candidates))
@@ -1300,6 +1309,7 @@ pub(crate) fn compatible_installed_pack_candidates(
             CatalogPackSourceKind::Installed
                 | CatalogPackSourceKind::PreShipped
                 | CatalogPackSourceKind::Embedded
+                | CatalogPackSourceKind::EphemeralWorkspace
         ) {
             continue;
         }

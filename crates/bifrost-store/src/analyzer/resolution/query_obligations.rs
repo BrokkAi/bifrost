@@ -62,6 +62,10 @@ impl QueryObligations {
         self.0.extend(other.0.iter().cloned());
     }
 
+    pub(crate) fn contains(&self, obligation: &QueryObligation) -> bool {
+        self.0.contains(obligation)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &QueryObligation> {
         self.0.iter()
     }

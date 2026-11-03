@@ -1972,6 +1972,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::FlowTarget
         | RqlForm::TargetOf
         | RqlForm::SourceSetOf
+        | RqlForm::BuildConfigurationOf
         | RqlForm::TopologyEdgesOf
         | RqlForm::GuardsOf
         | RqlForm::FailureHandlerState
@@ -3196,6 +3197,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::FlowSource
         | RqlForm::TargetOf
         | RqlForm::SourceSetOf
+        | RqlForm::BuildConfigurationOf
         | RqlForm::TopologyEdgesOf
         | RqlForm::GuardsOf
         | RqlForm::FailureHandlerState

@@ -4464,6 +4464,11 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
             1,
         ),
         (
+            "rust_unit_summary_cargo_file_owners",
+            super::super::rust_unit_summaries::CARGO_FILE_OWNER_ROWS_SQL,
+            0,
+        ),
+        (
             "rust_unit_summary_cargo_routes",
             super::super::rust_unit_summaries::CARGO_ROUTE_ROWS_SQL,
             1,

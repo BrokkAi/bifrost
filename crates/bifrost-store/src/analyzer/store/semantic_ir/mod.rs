@@ -49,7 +49,14 @@ use codes::RowCode;
 /// propagation has a facts-visited traversal cap.
 /// Version 9: call rows retain deferred member selection, its receiver place
 /// and static pointer depth, instead of requiring a pre-resolved member kind.
-const SEMANTIC_IR_ROWS_VERSION: u32 = 9;
+/// Version 10: normal-return member content is published as Heap output ports,
+/// and relation completeness also certifies boundary member port coverage.
+/// Version 11 (#8940): post-call heap input ports and indirect formal-store
+/// incompleteness alter the persisted partial-flow rows.
+/// Version 13 (#9162): every builtin seed of one port shares one seed key, so
+/// two relations naming one post-call or entry heap port publish one flow row
+/// per (from, to). Version 12 is retired (coordinator ruling, 2026-11-02).
+const SEMANTIC_IR_ROWS_VERSION: u32 = 13;
 
 /// What a parse-time lowerer produced for one blob.
 #[derive(Debug)]

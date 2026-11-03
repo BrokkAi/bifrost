@@ -91,14 +91,14 @@ pub enum PolicyUnitPartitionRow {
     /// declared in, the blob that path resolved to, and the root's own
     /// checkout-independent semantic locator. The locator is part of the key
     /// because one file declares many procedures and a typestate policy solves
-    /// each of them separately: two roots keyed by the file alone would be one
-    /// key, and the second root's findings would be served from the first
-    /// root's unit.
+    /// each of them separately. Compilation also changes the question at one
+    /// locator, so both values are independent key columns.
     Root {
         rel_path: String,
         blob: Oid,
         language: Language,
         locator: String,
+        compilation: String,
     },
     /// One seed file of one selector of a policy that compiles selectors: the
     /// file, the blob that path resolved to, and the digest of the selector's
@@ -110,6 +110,20 @@ pub enum PolicyUnitPartitionRow {
         blob: Oid,
         language: Language,
         selector: String,
+    },
+    Prefix {
+        rel_path: String,
+        blob: Oid,
+        language: Language,
+        cut: String,
+        input: String,
+    },
+    Output {
+        rel_path: String,
+        blob: Oid,
+        language: Language,
+        anchor: String,
+        compilation: String,
     },
     /// The whole policy, which is what a widened evaluation publishes.
     Whole,
@@ -123,46 +137,79 @@ impl PolicyUnitPartitionRow {
             Self::AssertFile { .. } => "assert_file",
             Self::Root { .. } => "root",
             Self::Selector { .. } => "selector",
+            Self::Prefix { .. } => "prefix",
+            Self::Output { .. } => "output",
             Self::Whole => "whole",
         }
     }
 
-    /// The three key columns, with the empty string where a partition has no
-    /// seed or no narrowing digest. An absent component is spelled as a value
-    /// rather than as NULL because SQLite treats NULLs in a unique index as
-    /// distinct, which would let one policy publish an unbounded number of
-    /// whole units.
-    fn key_columns(&self) -> (String, String, String) {
-        match self {
-            Self::Seed { rel_path, blob, .. } => {
-                (rel_path.clone(), blob.to_string(), String::new())
-            }
+    fn key_columns(&self) -> (String, String, [String; 9]) {
+        let mut digests: [String; 9] = std::array::from_fn(|_| String::new());
+        let (rel_path, blob) = match self {
+            Self::Whole => return (String::new(), String::new(), digests),
+            Self::Seed { rel_path, blob, .. } => (rel_path, blob),
             Self::Binding {
                 rel_path,
                 blob,
                 binding,
                 ..
-            } => (rel_path.clone(), blob.to_string(), binding.clone()),
+            } => {
+                digests[0] = binding.clone();
+                (rel_path, blob)
+            }
             Self::AssertFile {
                 rel_path,
                 blob,
                 subjects,
                 ..
-            } => (rel_path.clone(), blob.to_string(), subjects.clone()),
+            } => {
+                digests[1] = subjects.clone();
+                (rel_path, blob)
+            }
             Self::Root {
                 rel_path,
                 blob,
                 locator,
+                compilation,
                 ..
-            } => (rel_path.clone(), blob.to_string(), locator.clone()),
+            } => {
+                digests[2] = locator.clone();
+                digests[3] = compilation.clone();
+                (rel_path, blob)
+            }
             Self::Selector {
                 rel_path,
                 blob,
                 selector,
                 ..
-            } => (rel_path.clone(), blob.to_string(), selector.clone()),
-            Self::Whole => (String::new(), String::new(), String::new()),
-        }
+            } => {
+                digests[4] = selector.clone();
+                (rel_path, blob)
+            }
+            Self::Prefix {
+                rel_path,
+                blob,
+                cut,
+                input,
+                ..
+            } => {
+                digests[5] = cut.clone();
+                digests[6] = input.clone();
+                (rel_path, blob)
+            }
+            Self::Output {
+                rel_path,
+                blob,
+                anchor,
+                compilation,
+                ..
+            } => {
+                digests[7] = anchor.clone();
+                digests[8] = compilation.clone();
+                (rel_path, blob)
+            }
+        };
+        (rel_path.clone(), blob.to_string(), digests)
     }
 
     /// The blob this partition hangs off, when it covers one file.
@@ -172,7 +219,9 @@ impl PolicyUnitPartitionRow {
             | Self::Binding { blob, language, .. }
             | Self::AssertFile { blob, language, .. }
             | Self::Root { blob, language, .. }
-            | Self::Selector { blob, language, .. } => Some((blob, language)),
+            | Self::Selector { blob, language, .. }
+            | Self::Prefix { blob, language, .. }
+            | Self::Output { blob, language, .. } => Some((blob, language)),
             Self::Whole => None,
         }
     }
@@ -252,6 +301,15 @@ pub struct PolicyEvaluationRowKey {
     pub engine_epoch: String,
 }
 
+/// The effective limits and certified source volume of one evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyReplayEvidence {
+    /// Named-field JSON supplied by the policy executor.
+    pub effective_grant: String,
+    pub census_files: u64,
+    pub census_bytes: u64,
+}
+
 /// One policy result under a shared base-evaluation context.
 ///
 /// The policy row records its completion tier and diagnostics. Only a
@@ -259,6 +317,7 @@ pub struct PolicyEvaluationRowKey {
 /// identity vector on such a row is a complete answer with no findings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluationPolicyRow {
+    pub evidence: Option<PolicyReplayEvidence>,
     pub policy_id: String,
     /// The authored source identity, as lowercase hex.
     pub source_hash: String,
@@ -286,6 +345,8 @@ pub struct PolicyEvaluationPolicyRow {
 /// Completed policy answers published under one base-evaluation context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluationRow {
+    pub evidence: Option<PolicyReplayEvidence>,
+    pub evidence_complete: Option<bool>,
     pub key: PolicyEvaluationRowKey,
     /// The commit the requested revision resolved to, as lowercase hex.
     pub resolved_commit: String,
@@ -316,6 +377,8 @@ pub struct PolicyEvaluationRow {
 /// asks about them, so they are not loaded here.
 #[derive(Debug, Clone)]
 pub struct LoadedPolicyEvaluation {
+    pub evidence: Option<PolicyReplayEvidence>,
+    pub evidence_complete: Option<bool>,
     pub resolved_commit: String,
     pub policy_set_digest: String,
     pub unreliable_detail: Option<String>,
@@ -328,6 +391,7 @@ pub struct LoadedPolicyEvaluation {
 /// One loaded, exhaustively completed policy answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedPolicyEvaluationPolicy {
+    pub evidence: Option<PolicyReplayEvidence>,
     pub policy_id: String,
     pub source_hash: String,
     pub semantic_hash: String,
@@ -339,10 +403,22 @@ pub struct LoadedPolicyEvaluationPolicy {
     pub identities: Vec<[u8; 32]>,
 }
 
+fn replay_evidence(
+    effective_grant: Option<String>,
+    census_files: Option<u64>,
+    census_bytes: Option<u64>,
+) -> Option<PolicyReplayEvidence> {
+    Some(PolicyReplayEvidence {
+        effective_grant: effective_grant?,
+        census_files: census_files?,
+        census_bytes: census_bytes?,
+    })
+}
+
 /// The columns of `policy_units` a load needs, in one place so the reader and
 /// the row decoder cannot disagree about their order.
 const UNIT_COLUMNS: &str = "units.unit_id, units.policy_semantic_hash, units.family, \
-     units.partition_kind, units.seed_rel_path, units.seed_blob_oid, units.partition_digest, \
+     units.partition_kind, units.seed_rel_path, units.seed_blob_oid, units.binding_digest, units.subjects_digest, units.root_locator, units.root_compilation, units.selector_digest, units.prefix_cut_digest, units.prefix_input_digest, units.anchor_locator, units.compilation_digest, \
      units.lang, units.configuration_fingerprint, units.active_model_set_hash, \
      units.engine_epoch, units.product_kind, json(units.product), units.read_set_digest";
 
@@ -461,15 +537,15 @@ impl AnalyzerStore {
                 ),
                 "one unit lookup asks about one policy under one engine"
             );
-            let (rel_path, blob_oid, partition_digest) = key.partition.key_columns();
+            let (rel_path, blob_oid, digests) = key.partition.key_columns();
             parameters.push(key.partition.kind().to_string());
             parameters.push(rel_path);
             parameters.push(blob_oid);
-            parameters.push(partition_digest);
+            parameters.extend(digests);
             if index > 0 {
                 values.push(',');
             }
-            values.push_str("(?,?,?,?)");
+            values.push_str("(?,?,?,?,?,?,?,?,?,?,?,?)");
         }
         let sql = policy_unit_batch_sql(&values);
         let mut statement = conn.prepare_cached(&sql)?;
@@ -534,8 +610,10 @@ impl AnalyzerStore {
                    base_tree_oid, options_digest, configuration_fingerprint,
                    active_model_set_hash, engine_epoch, policy_set_digest,
                    unreliable_detail, aggregate_unreliable, resolved_commit, published_at,
-                   base_content_identity
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                   base_content_identity, effective_grant, census_files,
+                   census_bytes, evidence_complete
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                          ?12, ?13, ?14, ?15)
                  ON CONFLICT(base_tree_oid, options_digest, configuration_fingerprint,
                              active_model_set_hash, engine_epoch)
                  DO UPDATE SET resolved_commit = excluded.resolved_commit,
@@ -543,7 +621,11 @@ impl AnalyzerStore {
                                unreliable_detail = excluded.unreliable_detail,
                                aggregate_unreliable = excluded.aggregate_unreliable,
                                published_at = excluded.published_at,
-                               base_content_identity = excluded.base_content_identity",
+                               base_content_identity = excluded.base_content_identity,
+                               effective_grant = excluded.effective_grant,
+                               census_files = excluded.census_files,
+                               census_bytes = excluded.census_bytes,
+                               evidence_complete = excluded.evidence_complete",
                 params![
                     key.base_tree_oid,
                     key.options_digest,
@@ -556,6 +638,13 @@ impl AnalyzerStore {
                     evaluation.resolved_commit,
                     published_at,
                     evaluation.base_content_identity.as_slice(),
+                    evaluation
+                        .evidence
+                        .as_ref()
+                        .map(|e| e.effective_grant.as_str()),
+                    evaluation.evidence.as_ref().map(|e| e.census_files),
+                    evaluation.evidence.as_ref().map(|e| e.census_bytes),
+                    evaluation.evidence_complete,
                 ],
             )?;
             let evaluation_id = tx.query_row(
@@ -589,8 +678,9 @@ impl AnalyzerStore {
                     "INSERT INTO policy_evaluation_policies(
                        evaluation_id, policy_id, source_hash, semantic_hash,
                        completion, completion_detail, qualified,
-                       qualification_detail, diagnostics
-                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                       qualification_detail, diagnostics, effective_grant,
+                       census_files, census_bytes
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         evaluation_id,
                         policy.policy_id,
@@ -602,6 +692,9 @@ impl AnalyzerStore {
                         policy.qualification_detail,
                         serde_json::to_string(&policy.diagnostics)
                             .expect("policy diagnostic strings serialize"),
+                        policy.evidence.as_ref().map(|e| e.effective_grant.as_str()),
+                        policy.evidence.as_ref().map(|e| e.census_files),
+                        policy.evidence.as_ref().map(|e| e.census_bytes),
                     ],
                 )?;
                 for finding_id in &policy.identities {
@@ -654,6 +747,10 @@ impl AnalyzerStore {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, bool>(4)?,
                         row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<u64>>(7)?,
+                        row.get::<_, Option<u64>>(8)?,
+                        row.get::<_, Option<bool>>(9)?,
                     ))
                 },
             )
@@ -665,10 +762,15 @@ impl AnalyzerStore {
             unreliable_detail,
             aggregate_unreliable,
             base_content_identity,
+            effective_grant,
+            census_files,
+            census_bytes,
+            evidence_complete,
         )) = row
         else {
             return Ok(None);
         };
+        let evidence = replay_evidence(effective_grant, census_files, census_bytes);
         let base_content_identity = <[u8; 32]>::try_from(base_content_identity.as_slice())
             .map_err(|_| {
                 StoreError::new(format!(
@@ -690,10 +792,16 @@ impl AnalyzerStore {
             let qualified = row.get::<_, bool>(5)?;
             let qualification_detail = row.get::<_, String>(6)?;
             let diagnostics_json = row.get::<_, String>(7)?;
+            let evidence = replay_evidence(
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<u64>>(10)?,
+                row.get::<_, Option<u64>>(11)?,
+            );
             match policies.last() {
                 Some(last) if last.policy_id == policy_id => {}
                 _ => policies.push(LoadedPolicyEvaluationPolicy {
                     policy_id,
+                    evidence,
                     source_hash,
                     semantic_hash,
                     completion,
@@ -723,6 +831,8 @@ impl AnalyzerStore {
             }
         }
         Ok(Some(LoadedPolicyEvaluation {
+            evidence,
+            evidence_complete,
             resolved_commit,
             policy_set_digest,
             unreliable_detail,
@@ -733,7 +843,7 @@ impl AnalyzerStore {
     }
 }
 
-/// The batched unit lookup, with `values` holding one `(?,?,?)` row per
+/// The batched unit lookup, with `values` holding one 12-column row per
 /// requested partition.
 ///
 /// Shared with the query-plan pin, which asserts that this exact statement
@@ -744,7 +854,7 @@ pub(crate) fn policy_unit_batch_sql(values: &str) -> String {
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5
-           AND (partition_kind, seed_rel_path, seed_blob_oid, partition_digest)
+           AND (partition_kind, seed_rel_path, seed_blob_oid, binding_digest, subjects_digest, root_locator, root_compilation, selector_digest, prefix_cut_digest, prefix_input_digest, anchor_locator, compilation_digest)
                IN (VALUES {values})"
     )
 }
@@ -760,7 +870,8 @@ pub(crate) const POLICY_UNIT_SNAPSHOTS_SQL: &str = "SELECT unit_id, content_iden
 
 /// The evaluation lookup, shared with its query-plan pin.
 pub(crate) const POLICY_EVALUATION_LOOKUP_SQL: &str = "SELECT evaluation_id, resolved_commit,
-            policy_set_digest, unreliable_detail, aggregate_unreliable, base_content_identity
+            policy_set_digest, unreliable_detail, aggregate_unreliable, base_content_identity,
+            effective_grant, census_files, census_bytes, evidence_complete
      FROM policy_evaluations
      WHERE base_tree_oid = ?1 AND options_digest = ?2
        AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
@@ -774,7 +885,8 @@ pub(crate) const POLICY_EVALUATION_IDENTITY_SQL: &str =
     "SELECT policies.policy_id, policies.source_hash, policies.semantic_hash,
             policies.completion, policies.completion_detail, policies.qualified,
             policies.qualification_detail, policies.diagnostics,
-            identities.finding_id
+            identities.finding_id, policies.effective_grant,
+            policies.census_files, policies.census_bytes
      FROM policy_evaluation_policies AS policies
      LEFT JOIN policy_evaluation_identities AS identities
        ON identities.evaluation_id = policies.evaluation_id
@@ -787,13 +899,13 @@ fn unit_id_for_key(
     conn: &rusqlite::Connection,
     key: &PolicyUnitRowKey,
 ) -> rusqlite::Result<Option<i64>> {
-    let (rel_path, blob_oid, partition_digest) = key.partition.key_columns();
+    let (rel_path, blob_oid, digests) = key.partition.key_columns();
     conn.query_row(
         "SELECT unit_id FROM policy_units
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5 AND partition_kind = ?6
-           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND partition_digest = ?9",
+           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND binding_digest = ?9 AND subjects_digest = ?10 AND root_locator = ?11 AND root_compilation = ?12 AND selector_digest = ?13 AND prefix_cut_digest = ?14 AND prefix_input_digest = ?15 AND anchor_locator = ?16 AND compilation_digest = ?17",
         params![
             key.policy_semantic_hash,
             key.family,
@@ -803,7 +915,7 @@ fn unit_id_for_key(
             key.partition.kind(),
             rel_path,
             blob_oid,
-            partition_digest,
+            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8],
         ],
         |row| row.get::<_, i64>(0),
     )
@@ -817,7 +929,7 @@ fn write_unit(
     published_at: i64,
 ) -> rusqlite::Result<()> {
     let key = &unit.key;
-    let (rel_path, blob_oid, partition_digest) = key.partition.key_columns();
+    let (rel_path, blob_oid, digests) = key.partition.key_columns();
     let (blob_id, lang) = match key.partition.blob() {
         Some((blob, language)) => {
             let lang = language.config_label();
@@ -855,7 +967,7 @@ fn write_unit(
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5 AND partition_kind = ?6
-           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND partition_digest = ?9",
+           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND binding_digest = ?9 AND subjects_digest = ?10 AND root_locator = ?11 AND root_compilation = ?12 AND selector_digest = ?13 AND prefix_cut_digest = ?14 AND prefix_input_digest = ?15 AND anchor_locator = ?16 AND compilation_digest = ?17",
         params![
             key.policy_semantic_hash,
             key.family,
@@ -865,19 +977,19 @@ fn write_unit(
             key.partition.kind(),
             rel_path,
             blob_oid,
-            partition_digest,
+            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8],
         ],
     )?;
     conn.execute(
         "INSERT INTO policy_units(
            policy_semantic_hash, family, partition_kind, seed_rel_path,
-           seed_blob_oid, partition_digest, seed_blob_id, lang,
+           seed_blob_oid, binding_digest, subjects_digest, root_locator, root_compilation, selector_digest, prefix_cut_digest, prefix_input_digest, anchor_locator, compilation_digest, seed_blob_id, lang,
            configuration_fingerprint, active_model_set_hash, engine_epoch,
            completion, budget_mode, product_kind, product, read_set_digest,
            published_at
          ) VALUES(
-           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'complete',
-           'exhaustive', ?12, jsonb(?13), ?14, ?15
+           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 'complete',
+           'exhaustive', ?20, jsonb(?21), ?22, ?23
          )",
         params![
             key.policy_semantic_hash,
@@ -885,7 +997,7 @@ fn write_unit(
             key.partition.kind(),
             rel_path,
             blob_oid,
-            partition_digest,
+            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8],
             blob_id,
             lang,
             key.configuration_fingerprint,
@@ -1025,16 +1137,26 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
     let partition_kind = row.get::<_, String>(3)?;
     let seed_rel_path = row.get::<_, String>(4)?;
     let seed_blob_oid = row.get::<_, String>(5)?;
-    let partition_digest = row.get::<_, String>(6)?;
-    let lang = row.get::<_, Option<String>>(7)?;
-    let configuration_fingerprint = row.get::<_, String>(8)?;
-    let active_model_set_hash = row.get::<_, String>(9)?;
-    let engine_epoch = row.get::<_, String>(10)?;
-    let product_kind = row.get::<_, String>(11)?;
-    let product = row.get::<_, String>(12)?;
-    let read_set_digest = row.get::<_, Vec<u8>>(13)?;
+    let digests: [String; 9] = [
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+    ];
+    let lang = row.get::<_, Option<String>>(15)?;
+    let configuration_fingerprint = row.get::<_, String>(16)?;
+    let active_model_set_hash = row.get::<_, String>(17)?;
+    let engine_epoch = row.get::<_, String>(18)?;
+    let product_kind = row.get::<_, String>(19)?;
+    let product = row.get::<_, String>(20)?;
+    let read_set_digest = row.get::<_, Vec<u8>>(21)?;
     let partition = match partition_kind.as_str() {
-        "seed" | "binding" | "assert_file" | "root" | "selector" => {
+        "seed" | "binding" | "assert_file" | "root" | "selector" | "prefix" | "output" => {
             let blob = Oid::from_str(&seed_blob_oid).map_err(|error| {
                 StoreError::new(format!(
                     "policy unit {unit_id} names an unreadable seed blob `{seed_blob_oid}`: {error}"
@@ -1057,26 +1179,42 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
                     rel_path: seed_rel_path,
                     blob,
                     language,
-                    binding: partition_digest,
+                    binding: digests[0].clone(),
                 },
                 "assert_file" => PolicyUnitPartitionRow::AssertFile {
                     rel_path: seed_rel_path,
                     blob,
                     language,
-                    subjects: partition_digest,
+                    subjects: digests[1].clone(),
                 },
                 "root" => PolicyUnitPartitionRow::Root {
                     rel_path: seed_rel_path,
                     blob,
                     language,
-                    locator: partition_digest,
+                    locator: digests[2].clone(),
+                    compilation: digests[3].clone(),
                 },
-                _ => PolicyUnitPartitionRow::Selector {
+                "selector" => PolicyUnitPartitionRow::Selector {
                     rel_path: seed_rel_path,
                     blob,
                     language,
-                    selector: partition_digest,
+                    selector: digests[4].clone(),
                 },
+                "prefix" => PolicyUnitPartitionRow::Prefix {
+                    rel_path: seed_rel_path,
+                    blob,
+                    language,
+                    cut: digests[5].clone(),
+                    input: digests[6].clone(),
+                },
+                "output" => PolicyUnitPartitionRow::Output {
+                    rel_path: seed_rel_path,
+                    blob,
+                    language,
+                    anchor: digests[7].clone(),
+                    compilation: digests[8].clone(),
+                },
+                _ => unreachable!(),
             }
         }
         "whole" => PolicyUnitPartitionRow::Whole,
@@ -1686,6 +1824,7 @@ mod tests {
 
     fn policy_result(policy_id: &str, findings: &[&str]) -> PolicyEvaluationPolicyRow {
         PolicyEvaluationPolicyRow {
+            evidence: None,
             policy_id: policy_id.to_string(),
             source_hash: POLICY_HASH.to_string(),
             semantic_hash: POLICY_HASH.to_string(),
@@ -1710,6 +1849,8 @@ mod tests {
         let key = evaluation_key();
         store
             .publish_policy_evaluation(PolicyEvaluationRow {
+                evidence: None,
+                evidence_complete: None,
                 key: key.clone(),
                 resolved_commit: COMMIT.to_string(),
                 policy_set_digest: POLICY_HASH.to_string(),
@@ -1727,6 +1868,9 @@ mod tests {
             .policy_evaluation_for_key(&key)
             .unwrap()
             .expect("the shared evaluation exists");
+        assert_eq!(loaded.evidence, None);
+        assert_eq!(loaded.evidence_complete, None);
+        assert_eq!(loaded.policies[0].evidence, None);
         assert_eq!(loaded.policies.len(), 1);
         assert_eq!(loaded.policies[0].policy_id, "test.clean");
         assert_eq!(loaded.policies[0].completion, "complete");
@@ -1771,6 +1915,8 @@ mod tests {
         let key = evaluation_key();
         store
             .publish_policy_evaluation(PolicyEvaluationRow {
+                evidence: None,
+                evidence_complete: None,
                 key: key.clone(),
                 resolved_commit: COMMIT.to_string(),
                 policy_set_digest: POLICY_HASH.to_string(),
@@ -1778,6 +1924,7 @@ mod tests {
                 aggregate_unreliable: false,
                 base_content_identity: SNAPSHOT,
                 policies: vec![PolicyEvaluationPolicyRow {
+                    evidence: None,
                     units: vec![seed_key("src/Gone.java")],
                     ..policy_result("test.policy", &["only"])
                 }],
@@ -1808,30 +1955,47 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let key = evaluation_key();
         let (first, second) = ("first", "second");
+        let high = PolicyReplayEvidence {
+            effective_grant: r#"{"limit":100}"#.to_string(),
+            census_files: 3,
+            census_bytes: 300,
+        };
+        let low = PolicyReplayEvidence {
+            effective_grant: r#"{"limit":10}"#.to_string(),
+            census_files: 2,
+            census_bytes: 200,
+        };
+        let mut first_policy = policy_result("test.policy", &[first]);
+        first_policy.evidence = Some(high.clone());
+        let mut retained_policy = policy_result("test.other", &["other"]);
+        retained_policy.evidence = Some(high.clone());
         store
             .publish_policy_evaluation(PolicyEvaluationRow {
+                evidence: Some(high.clone()),
+                evidence_complete: Some(true),
                 key: key.clone(),
                 resolved_commit: COMMIT.to_string(),
                 policy_set_digest: POLICY_HASH.to_string(),
                 unreliable_detail: None,
                 aggregate_unreliable: false,
                 base_content_identity: SNAPSHOT,
-                policies: vec![
-                    policy_result("test.policy", &[first]),
-                    policy_result("test.other", &["other"]),
-                ],
+                policies: vec![first_policy, retained_policy],
                 unqualified_policy_ids: Vec::new(),
             })
             .unwrap();
+        let mut replacement = policy_result("test.policy", &[second]);
+        replacement.evidence = Some(low.clone());
         store
             .publish_policy_evaluation(PolicyEvaluationRow {
+                evidence: Some(low.clone()),
+                evidence_complete: Some(false),
                 key: key.clone(),
                 resolved_commit: COMMIT.to_string(),
                 policy_set_digest: POLICY_HASH.to_string(),
                 unreliable_detail: None,
                 aggregate_unreliable: false,
                 base_content_identity: SNAPSHOT,
-                policies: vec![policy_result("test.policy", &[second])],
+                policies: vec![replacement],
                 unqualified_policy_ids: Vec::new(),
             })
             .unwrap();
@@ -1850,6 +2014,10 @@ mod tests {
         );
         assert_eq!(loaded.policies[0].identities, vec![finding_id("other")]);
         assert_eq!(loaded.policies[1].identities, vec![finding_id("second")]);
+        assert_eq!(loaded.evidence, Some(low.clone()));
+        assert_eq!(loaded.evidence_complete, Some(false));
+        assert_eq!(loaded.policies[0].evidence, Some(high));
+        assert_eq!(loaded.policies[1].evidence, Some(low));
         let conn = store.conn.lock().expect("store mutex");
         let rows: i64 = conn
             .query_row(

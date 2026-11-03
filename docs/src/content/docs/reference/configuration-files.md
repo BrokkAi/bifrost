@@ -111,7 +111,7 @@ See [Semantic Packs Reference](/reference/semantic-packs/).
 
 The VS Code extension can offer to replace a `.gitignore` line that ignores
 all of `.bifrost` with `.bifrost/cache/`. Its suppression command writes
-records to a suppression file in `.bifrost/`. See [VS Code](/vscode/).
+records to a suppression file in `.bifrost/`. See [VS Code](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/vscode.md).
 
 ## Machine-Level Files
 

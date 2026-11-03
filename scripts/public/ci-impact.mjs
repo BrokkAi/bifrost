@@ -36,7 +36,6 @@ const RQL_COMPONENTS = new Set([
 const FLOW_COMPONENTS = new Set([...RQL_COMPONENTS, "rust"]);
 const MCP_COMPONENTS = new Set(["rql_runtime", "mcp_contract"]);
 const RUNTIME_COMPONENTS = new Set(["rql_runtime", "mcp_contract", "lsp_contract"]);
-const ZED_EDITOR_COMPONENTS = new Set(["rust"]);
 const PLUGIN_COMPONENTS = new Set(["pi_package", "agent_plugin"]);
 const RUST_COMPONENTS = new Set(["rust"]);
 const PYTHON_COMPONENTS = new Set(["python"]);
@@ -351,9 +350,6 @@ function classifyPath(path) {
       components: EXTERNAL_FIXTURE_COMPONENTS,
       reason: "external fixture provenance surface",
     };
-  }
-  if (startsWithAny(path, ["editors/zed/"])) {
-    return { components: ZED_EDITOR_COMPONENTS, reason: "Zed extension Rust source" };
   }
   if (isPluginPath(path)) {
     return { components: PLUGIN_COMPONENTS, reason: "agent-plugin surface" };

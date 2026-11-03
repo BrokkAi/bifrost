@@ -8,6 +8,23 @@ use crate::analyzer::resolution::{LoweredDeclarationTypeProperty, NamedArgumentL
 use brokk_bifrost_core::analyzer::model::DeclarationKind;
 use brokk_bifrost_core::analyzer::resolution_facts::DeclarationTypeRole;
 
+pub(in crate::analyzer::store) const NATIVE_ARGUMENT_REASON_IDENTITY_DIGEST_SQL: &str =
+    "SELECT CAST(input.key AS INTEGER), catalog.identity_digest
+     FROM json_each(?1) AS input
+     LEFT JOIN main.resolution_semantic_catalog AS catalog
+       ON catalog.blob_id=CAST(input.value->>0 AS INTEGER)
+      AND catalog.local_key=CAST(input.value->>1 AS INTEGER)
+      AND catalog.identity_digest IS NOT NULL
+     ORDER BY CAST(input.key AS INTEGER)";
+
+pub(in crate::analyzer::store) const NATIVE_ARGUMENT_REASON_GAP_REASONS_SQL: &str =
+    "SELECT CAST(input.key AS INTEGER), gap.site, gap.origin
+     FROM json_each(?1) AS input
+     LEFT JOIN main.resolution_gap_reasons AS gap
+       ON gap.blob_id=CAST(input.value->>0 AS INTEGER)
+      AND gap.reason=CAST(input.value->>1 AS INTEGER)
+     ORDER BY CAST(input.key AS INTEGER)";
+
 pub(in crate::analyzer::store) const GO_DEFINITION_PACKAGE_ANCHOR: &str =
     "SELECT package_name FROM main.workspace_file_anchor_rows AS anchors
      WHERE file_version_id=?1 AND anchor_kind='own_module' AND anchor_pop=0";
@@ -24,6 +41,7 @@ pub enum SelectedNativeDefinition {
 }
 
 #[doc(hidden)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum SelectedNativeDefinitions {
     Ready(Vec<(SemanticId, SelectedNativeDefinition)>),
     Unavailable,
@@ -99,6 +117,7 @@ fn record_native_completion_reason_ownership(
 }
 
 #[doc(hidden)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ProjectedNativeExternalMember {
     #[doc(hidden)]
     pub coordinate: crate::analyzer::resolution::ExternalMemberCoordinate,
@@ -258,10 +277,26 @@ pub fn project_native_model_member_selection(
 }
 
 #[doc(hidden)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct SelectedNativeReferenceUnits {
     pub query_obligations: crate::analyzer::resolution::QueryObligations,
     #[doc(hidden)]
     pub answer: FactResolutionAnswer,
+    /// Binding after a separately proven exact argument conversion. The
+    /// original answer and every result-type frontier keep their obligations.
+    #[doc(hidden)]
+    pub argument_binding: Option<crate::analyzer::resolution::ResolutionAnswer>,
+    /// Canonical identities let a proved nested call discharge only its own
+    /// call-local obligations in another selected point operation.
+    #[doc(hidden)]
+    pub argument_reason_digests: Vec<(crate::analyzer::resolution::SemanticId, [u8; 32])>,
+    #[doc(hidden)]
+    pub call_binding_reason_digests: Vec<[u8; 32]>,
+    #[doc(hidden)]
+    pub constructor_hierarchy_reason_digests: Vec<(std::sync::Arc<str>, [u8; 32])>,
+    #[doc(hidden)]
+    pub static_type_qualifier_reason_digests:
+        Vec<(crate::analyzer::resolution::ExternalOwnerIdentity, [u8; 32])>,
     #[doc(hidden)]
     pub definitions: SelectedNativeDefinitions,
     #[doc(hidden)]
@@ -292,7 +327,15 @@ pub struct SelectedNativeReferenceUnits {
     pub diagnostic_identities: Vec<(SemanticId, String)>,
 }
 
+/// Query-local projection reader that runs before the selected fact operation ends.
+pub type SelectedNativeReferenceReader<'a> = dyn FnMut(
+        &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        &SelectedNativeReferenceUnits,
+    ) -> Result<()>
+    + 'a;
+
 #[doc(hidden)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum SelectedNativeNamedArgument {
     Resolved(SelectedNativeDefinition),
     Incomplete(String),
@@ -672,7 +715,7 @@ impl SelectedResolutionOperation<'_, '_> {
             },
             |operation, answer, ready, mounts, session, cancellation| {
                 let types = match project_rust_reference_types(
-                    operation, answer, ready, mounts, session, cancellation, locator,
+                    operation, answer, ready, mounts, session, cancellation,
                 )? {
                     SelectedResolutionOperationOutcome::Native(types) => types,
                     SelectedResolutionOperationOutcome::Unavailable(reason) => {
@@ -1212,19 +1255,22 @@ impl SelectedResolutionOperation<'_, '_> {
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
     ) -> Result<NativeReferenceUnitsOutcome> {
-        self.resolve_native_reference_units_in_session(super::NativeReferenceQuery {
-            context,
-            locator,
-            cancellation,
-            context_metrics,
-            session: &ResolutionSession::unbounded(),
-            artifacts: None,
-            go_demand: None,
-            selected_import_gap: None,
-            go_receiver_overlay: None,
-            query_result_slot: None,
-            point_metrics: None,
-        })
+        self.resolve_native_reference_units_in_session(
+            super::NativeReferenceQuery {
+                context,
+                locator,
+                cancellation,
+                context_metrics,
+                session: &ResolutionSession::unbounded(),
+                artifacts: None,
+                go_demand: None,
+                selected_import_gap: None,
+                go_receiver_overlay: None,
+                query_result_slot: None,
+                point_metrics: None,
+            },
+            None,
+        )
     }
 
     #[doc(hidden)]
@@ -1257,8 +1303,8 @@ impl SelectedResolutionOperation<'_, '_> {
         selected_import_gap: Option<(SemanticId, SemanticId)>,
     ) -> Result<BoundedResolution<NativeReferenceUnitsOutcome>> {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
-        let outcome =
-            self.resolve_native_reference_units_in_session(super::NativeReferenceQuery {
+        let outcome = self.resolve_native_reference_units_in_session(
+            super::NativeReferenceQuery {
                 context,
                 locator,
                 cancellation,
@@ -1270,7 +1316,9 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_receiver_overlay: None,
                 query_result_slot: None,
                 point_metrics: None,
-            })?;
+            },
+            None,
+        )?;
         Ok(session.finish(outcome))
     }
 
@@ -1287,9 +1335,36 @@ impl SelectedResolutionOperation<'_, '_> {
         artifacts: &mut crate::analyzer::resolution::ForwardCandidateArtifactCache,
         point_metrics: &mut crate::analyzer::resolution::ResolutionBatchMetrics,
     ) -> Result<BoundedResolution<NativeReferenceUnitsOutcome>> {
+        self.resolve_native_reference_units_bounded_for_go_request_with_reader(
+            prepared,
+            go_receiver_overlay,
+            locator,
+            budget,
+            cancellation,
+            context_metrics,
+            artifacts,
+            point_metrics,
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn resolve_native_reference_units_bounded_for_go_request_with_reader(
+        &mut self,
+        prepared: super::GoPreparedImportContext,
+        go_receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+        context_metrics: &mut SelectedResolutionContextMetrics,
+        artifacts: &mut crate::analyzer::resolution::ForwardCandidateArtifactCache,
+        point_metrics: &mut crate::analyzer::resolution::ResolutionBatchMetrics,
+        selected_reader: &mut SelectedNativeReferenceReader<'_>,
+    ) -> Result<BoundedResolution<NativeReferenceUnitsOutcome>> {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
-        let outcome =
-            self.resolve_native_reference_units_in_session(super::NativeReferenceQuery {
+        let outcome = self.resolve_native_reference_units_in_session(
+            super::NativeReferenceQuery {
                 context: prepared.context,
                 locator,
                 cancellation,
@@ -1301,13 +1376,143 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_receiver_overlay,
                 query_result_slot: None,
                 point_metrics: Some(point_metrics),
-            })?;
+            },
+            Some(selected_reader),
+        )?;
         Ok(session.finish(outcome))
+    }
+
+    /// #7314 6b: full native query and post-query oracle evidence, deleted with the oracle.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn jvm_model_observation_for_test(
+        mut self,
+        language: Language,
+        path: &str,
+        start: usize,
+        end: usize,
+        subject: super::jvm_context::JvmOracleSourceSubject<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+        let super::JvmImportContext::Ready { context, .. } =
+            self.jvm_import_context(language, path, cancellation)?
+        else {
+            panic!("model oracle context unavailable")
+        };
+        let locator =
+            SelectedSemanticLocator::for_reference_range(language.config_label(), path, start, end);
+        let session = ResolutionSession::unbounded();
+        let outcome = self.resolve_native_reference_units_in_session(
+            super::NativeReferenceQuery {
+                context: (*context).clone(),
+                locator: &locator,
+                cancellation,
+                context_metrics: &mut SelectedResolutionContextMetrics,
+                session: &session,
+                artifacts: None,
+                go_demand: None,
+                selected_import_gap: None,
+                go_receiver_overlay: None,
+                query_result_slot: None,
+                point_metrics: None,
+            },
+            None,
+        )?;
+        let mut fields = std::collections::BTreeMap::new();
+        let lexical = self.ready.lexical_source();
+        let sites = match lexical.lookup_semantic_sites(&locator, cancellation, &session)? {
+            crate::analyzer::store::resolution_lexical::SelectedSemanticLookupOutcome::Found(
+                sites,
+            ) => sites,
+            _ => Vec::new(),
+        };
+        let mut associations = Vec::new();
+        for site in sites {
+            let reference = site.semantic();
+            associations.push(self.java_oracle_reference_observation_for_test(
+                language,
+                path,
+                reference,
+                subject,
+                cancellation,
+            )?);
+        }
+        fields.insert(
+            "reference_association".into(),
+            serde_json::json!(associations),
+        );
+        // #7314 6b: compact Debug keeps typed aliases recognizable by the shared
+        // canonical renderer. Validate native portable reason receipts against
+        // the operation's retained canonical demand identities.
+        let mut rendered = format!("{outcome:?}");
+        if let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
+            answer,
+        )) = &outcome
+        {
+            for (alias, digest) in &answer.argument_reason_digests {
+                if alias.shared_name_id().is_none() && alias.ordinal().is_none() {
+                    assert_eq!(
+                        self.ready
+                            .identity_content_digest((*alias).into(), cancellation)?,
+                        *digest,
+                        "native reason receipt must denote the same canonical content"
+                    );
+                }
+            }
+            // These are typed canonical digest fields, not arbitrary numeric arrays.
+            let digests = answer
+                .argument_reason_digests
+                .iter()
+                .map(|(_, digest)| digest)
+                .chain(answer.call_binding_reason_digests.iter())
+                .chain(
+                    answer
+                        .constructor_hierarchy_reason_digests
+                        .iter()
+                        .map(|(_, digest)| digest),
+                )
+                .chain(
+                    answer
+                        .static_type_qualifier_reason_digests
+                        .iter()
+                        .map(|(_, digest)| digest),
+                );
+            for digest in digests {
+                rendered = rendered.replace(
+                    &format!("{digest:?}"),
+                    &format!(
+                        "digest:{}",
+                        brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(digest)
+                    ),
+                );
+            }
+        }
+        fields.insert(
+            "answer".into(),
+            serde_json::json!(self.canonical_java_snapshot(rendered)),
+        );
+        // Canonicalize the complete event collection once, preserving every event.
+        let provenance = serde_json::to_string(
+            &self
+                .ready
+                .context_identities
+                .java_oracle_registration_trace(),
+        )
+        .unwrap();
+        fields.insert(
+            "registration_provenance".into(),
+            serde_json::from_str(&self.canonical_java_snapshot(provenance)).unwrap(),
+        );
+        fields.insert(
+            "route_visits".into(),
+            serde_json::json!(self.java_oracle_visits_for_test()),
+        );
+        Ok(fields)
     }
 
     fn resolve_native_reference_units_in_session(
         &mut self,
         query: super::NativeReferenceQuery<'_>,
+        mut selected_reader: Option<&mut SelectedNativeReferenceReader<'_>>,
     ) -> Result<NativeReferenceUnitsOutcome> {
         let super::NativeReferenceQuery {
             context,
@@ -1337,6 +1542,22 @@ impl SelectedResolutionOperation<'_, '_> {
                 point_metrics,
             },
             |ready, operation, reference, answer| {
+                let argument_binding = operation.binding_after_argument_proof(&answer);
+                let call_binding_reason_digests = operation.external_call_binding_reason_digests(&answer)?;
+                let constructor_hierarchy_reason_digests = operation.constructor_hierarchy_reason_digests(&answer)?;
+                let static_type_qualifier_reason_digests = operation.static_type_qualifier_reason_digests(&answer)?;
+                let mut argument_reason_ids = Vec::new();
+                if let Some(binding) = &argument_binding
+                    && let crate::analyzer::resolution::ResolutionCompletion::Incomplete(reasons) = binding.completion()
+                {
+                    for reason in reasons.iter() {
+                        if let crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(reason)
+                            | crate::analyzer::resolution::ResolutionIncompleteReason::OpenBoundary { semantic: reason, status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed } = reason {
+                            argument_reason_ids.push(*reason);
+                        }
+                    }
+                }
+                let argument_reason_digests = ready.argument_reason_digests_batch(operation, &argument_reason_ids)?;
                 let named_reasons = native_reference_reason_details(ready, operation, reference, answer.binding().completion())?;
                 let named_argument = resolve_named_argument_parameter(
                     ready,
@@ -1477,9 +1698,14 @@ impl SelectedResolutionOperation<'_, '_> {
                     };
                     Ok((semantic, identity))
                 }).collect::<Result<Vec<_>>>()?;
-                Ok(SelectedNativeReferenceUnits {
+                let selected = SelectedNativeReferenceUnits {
                     query_obligations: answer.query_obligations.clone(),
                     answer,
+                    argument_binding,
+                    argument_reason_digests,
+                    call_binding_reason_digests,
+                    constructor_hierarchy_reason_digests,
+                    static_type_qualifier_reason_digests,
                     definitions,
                     external_members,
                     model_member_selection,
@@ -1493,7 +1719,11 @@ impl SelectedResolutionOperation<'_, '_> {
                     absent_member_owners,
                     named_reasons,
                     diagnostic_identities,
-                })
+                };
+                if let Some(reader) = selected_reader.as_mut() {
+                    reader(operation, &selected)?;
+                }
+                Ok(selected)
             },
         )
     }
@@ -1886,6 +2116,16 @@ fn project_fragment_definition(
 }
 
 impl ReadySelectedResolution<'_, '_> {
+    fn argument_reason_digests_batch(
+        &self,
+        operation: &crate::analyzer::resolution::FactResolutionOperation<'_>,
+        reasons: &[SemanticId],
+    ) -> Result<Vec<(SemanticId, [u8; 32])>> {
+        selected_argument_reason_digests_batch(&self.inventory, reasons, |reason| {
+            operation.identity_content_digest(reason.into())
+        })
+    }
+
     pub(crate) fn definition_module_anchor(
         &self,
         ordinal: SelectedResolutionMountOrdinal,
@@ -1902,6 +2142,211 @@ impl ReadySelectedResolution<'_, '_> {
             .borrow_mut()
             .insert(ordinal, anchor.clone());
         Ok(anchor)
+    }
+}
+
+fn selected_argument_reason_digests_batch(
+    inventory: &SelectedResolutionMountInventory<'_>,
+    reasons: &[SemanticId],
+    mut identity_content_digest: impl FnMut(SemanticId) -> Result<[u8; 32]>,
+) -> Result<Vec<(SemanticId, [u8; 32])>> {
+    use crate::analyzer::resolution::{gap_reason_semantic_identity, mounted_identity_digest};
+    use rusqlite::params;
+
+    let authority =
+        super::super::resolution_authority::SelectedResolutionAuthority::from_selection(inventory);
+    let mut checked_mounts = crate::hash::HashSet::default();
+    let mut interrupted_mounts = crate::hash::HashSet::default();
+    let mut inputs = Vec::new();
+    let mut mounts = Vec::new();
+    for &reason in reasons {
+        let (Some(ordinal), Some(local_key)) = (reason.ordinal(), reason.local_key()) else {
+            mounts.push(None);
+            continue;
+        };
+        if !super::super::resolution_stage::allocation::is_ordinary_key(local_key) {
+            mounts.push(None);
+            continue;
+        }
+        let ordinal = SelectedResolutionMountOrdinal::new(ordinal);
+        let mount = inventory.mount_record_by_ordinal(ordinal)?;
+        if checked_mounts.insert(ordinal) {
+            // A content lookup has its own finite cancellation token. The
+            // selected authority memo avoids a second publication query
+            // when this operation already checked the mount.
+            let content_lookup = CancellationToken::new();
+            if authority
+                .ensure_authority(&mount, &content_lookup)?
+                .is_none()
+            {
+                interrupted_mounts.insert(ordinal);
+            }
+        }
+        if interrupted_mounts.contains(&ordinal) {
+            mounts.push(None);
+            continue;
+        }
+        inputs.push((mount.blob_id(), local_key));
+        mounts.push(Some(mount.fragment_digest().as_bytes()));
+    }
+    let (catalog, gaps) = if inputs.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let keys =
+            serde_json::to_string(&inputs).map_err(|error| StoreError::new(error.to_string()))?;
+        let content_lookup = CancellationToken::new();
+        let batch = super::super::resolution::read_resolution_statement(
+            inventory.connection(),
+            &content_lookup,
+            |conn| {
+                let mut catalog = vec![None; inputs.len()];
+                let mut gaps = vec![None; inputs.len()];
+                let mut statement =
+                    conn.prepare_cached(NATIVE_ARGUMENT_REASON_IDENTITY_DIGEST_SQL)?;
+                let rows = statement.query_map(params![keys], |row| {
+                    Ok((row.get::<_, usize>(0)?, row.get::<_, Option<[u8; 32]>>(1)?))
+                })?;
+                for row in rows {
+                    let (index, digest) = row?;
+                    catalog[index] = digest;
+                }
+                let mut statement = conn.prepare_cached(NATIVE_ARGUMENT_REASON_GAP_REASONS_SQL)?;
+                let rows = statement.query_map(params![keys], |row| {
+                    Ok((
+                        row.get::<_, usize>(0)?,
+                        row.get::<_, Option<u32>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (index, site, origin) = row?;
+                    gaps[index] = site.zip(origin);
+                }
+                Ok(Some((catalog, gaps)))
+            },
+        )?;
+        let Some(batch) = batch else {
+            return reasons
+                .iter()
+                .copied()
+                .map(|reason| Ok((reason, identity_content_digest(reason)?)))
+                .collect();
+        };
+        batch
+    };
+    let mut next_input = 0;
+    let mut result = Vec::with_capacity(reasons.len());
+    for (&reason, mount) in reasons.iter().zip(mounts) {
+        let digest = if let Some(mount) = mount {
+            let index = next_input;
+            next_input += 1;
+            if let Some(identity) = catalog[index] {
+                mounted_identity_digest(b"semantic", mount, identity)
+            } else if let Some((site, origin)) = gaps[index] {
+                let identity = gap_reason_semantic_identity(
+                    ResolutionSiteId::new(site),
+                    super::super::resolution_prepare::resolution_rows::gap_origin_from_code(origin),
+                );
+                mounted_identity_digest(b"semantic", mount, identity.fragment_local_digest())
+            } else {
+                identity_content_digest(reason)?
+            }
+        } else {
+            identity_content_digest(reason)?
+        };
+        result.push((reason, digest));
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod argument_reason_digest_tests {
+    use super::*;
+
+    #[test]
+    fn batched_reason_digests_check_mount_before_catalog_or_gap_rows() {
+        let (store, workspace, snapshots) =
+            super::super::super::resolution_selection::tests::qualifier_completion_gap_fixture();
+        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
+        let cancellation = CancellationToken::new();
+        let open = || {
+            let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+                .open_selected_resolution_mount_inventory(
+                    &workspace,
+                    &snapshots,
+                    &languages,
+                    &[],
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("published fixture must open a selected inventory");
+            };
+            selection
+        };
+
+        let catalog = SemanticId::local(0, 0);
+        let gap = SemanticId::local(0, 2);
+        let missing = SemanticId::local(0, 1);
+        let staged = SemanticId::local(0, 1 << 31);
+        let selection = open();
+        let mount = selection
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(0))
+            .unwrap();
+        let mut fallbacks = Vec::new();
+        let ordered = [catalog, gap, catalog, missing, staged, gap];
+        let actual = selected_argument_reason_digests_batch(&selection, &ordered, |reason| {
+            fallbacks.push(reason);
+            Ok([9; 32])
+        })
+        .unwrap();
+        let mounted = mount.fragment_digest().as_bytes();
+        let expected_catalog =
+            crate::analyzer::resolution::mounted_identity_digest(b"semantic", mounted, [1; 32]);
+        let gap_identity = crate::analyzer::resolution::gap_reason_semantic_identity(
+            ResolutionSiteId::new(0),
+            super::super::super::resolution_prepare::resolution_rows::gap_origin_from_code(0),
+        );
+        let expected_gap = crate::analyzer::resolution::mounted_identity_digest(
+            b"semantic",
+            mounted,
+            gap_identity.fragment_local_digest(),
+        );
+        assert_eq!(
+            actual,
+            [
+                (catalog, expected_catalog),
+                (gap, expected_gap),
+                (catalog, expected_catalog),
+                (missing, [9; 32]),
+                (staged, [9; 32]),
+                (gap, expected_gap),
+            ]
+        );
+        assert_eq!(fallbacks, [missing, staged]);
+        drop(selection);
+
+        let stale_selection = open();
+        let blob_id = stale_selection
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(0))
+            .unwrap()
+            .blob_id();
+        store.conn.execute(move |conn| {
+            assert_eq!(
+                conn.execute(
+                    "UPDATE resolution_fragment_interiors SET producer_epoch='stale' WHERE blob_id=?1",
+                    [blob_id],
+                )
+                .unwrap(),
+                1
+            );
+        });
+        let failure =
+            selected_argument_reason_digests_batch(&stale_selection, &[catalog, gap], |_| {
+                panic!("published rows must not fall back when their mount is stale")
+            })
+            .unwrap_err();
+        assert!(failure.is_stale_resolution(), "{failure:?}");
     }
 }
 
@@ -2825,6 +3270,7 @@ fn project_native_declared_visibilities(
 /// Query-owned projection of the selection's actual routes and outcomes.
 #[derive(Default)]
 #[doc(hidden)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ProjectedNativeTraceProvenance {
     #[doc(hidden)]
     pub rows: Vec<crate::analyzer::resolution::trace_vocabulary::TraceCandidate>,

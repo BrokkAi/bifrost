@@ -246,6 +246,7 @@ use topology_rows::{
     TopologyEdgeKey, TopologyEdgeValue, TopologyEntityKey, TopologyEntityValue,
     TopologyTraversalCache,
 };
+mod build_configuration_rows;
 mod results;
 mod rewrite_paths;
 mod row_relations;
@@ -259,6 +260,10 @@ mod type_flow;
 mod typestate;
 mod units;
 mod value_flow;
+#[cfg(any(test, feature = "test-support"))]
+pub use value_flow::with_fresh_icfg_value_flow_results_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use value_flow::with_icfg_value_flow_engine_for_test;
 mod witness_projection;
 mod xml_relations;
 
@@ -544,14 +549,16 @@ use type_flow::{AbsentMemberFindingValue, AbsentMemberWitnessValue, ClassSetRowV
 use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
 use units::unit_row_key;
 pub use units::{
-    CodeQueryExecutionScope, MergedLimit, MergedUnitRows, SelectorUnitExecution,
+    CodeQueryExecutionScope, CorruptIntersectProduct, IntersectContinuationResult,
+    IntersectPrefixProduct, MergedLimit, MergedUnitRows, SelectorUnitExecution,
     UnitExecutionResult, UnitRow, UnitRowCapture, UnitRowDependencyMitigation, UnitRowEvidence,
     UnitRowField, UnitRowIdentities, UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance,
     UnitRowItemProvenanceStep, UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal,
     UnitRowKey, UnitRowProvenance, UnitRowProvenanceRef, UnitRowProvenanceStep, UnitRowScalar,
-    UnitRowUnknownField, execute_code_query_selector_unit, execute_code_query_unit,
-    merge_unit_rows, plan_seed_files, push_skipped_unit_diagnostic, remaining_unit_limits,
-    seed_file_order, structural_seed_file_order, unit_plan_node_count,
+    UnitRowUnknownField, continue_intersect_prefix, execute_code_query_selector_unit,
+    execute_code_query_unit, execute_intersect_prefix, merge_unit_rows, plan_seed_files,
+    push_skipped_unit_diagnostic, remaining_unit_limits, seed_file_order,
+    structural_seed_file_order, unit_plan_node_count,
 };
 pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
@@ -619,6 +626,7 @@ pub use results::CodeQueryDiagnosticCode;
 pub use results::CodeQueryDiagnosticImpact;
 pub use results::CodeQueryDispatchOutcome;
 pub use results::CodeQueryDispatchTarget;
+pub use results::CodeQueryEffectWork;
 pub use results::CodeQueryEnumDomain;
 pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
@@ -1422,6 +1430,7 @@ enum PipelineValue {
     SourceSet(Box<TopologyEntityValue>),
     BuildTarget(Box<TopologyEntityValue>),
     TopologyEdge(Box<TopologyEdgeValue>),
+    BuildConfiguration(Box<build_configuration_rows::BuildConfigurationValue>),
     RewritePath(Box<RewritePathValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
@@ -1615,6 +1624,7 @@ enum PipelineKey {
     SourceSet(TopologyEntityKey),
     BuildTarget(TopologyEntityKey),
     TopologyEdge(TopologyEdgeKey),
+    BuildConfiguration(String),
     RewritePath(RewritePathKey),
     QualifiedPath(PathKey),
     PathSegment(SegmentKey),
@@ -1648,6 +1658,12 @@ impl PipelineValue {
     /// the evidence here to keep whole and sliced queries consistent.
     fn merge_evidence(&mut self, other: Self) {
         match (self, other) {
+            (
+                Self::Semantic(SemanticPipelineValue::FlowEndpoint(value)),
+                Self::Semantic(SemanticPipelineValue::FlowEndpoint(other)),
+            ) => {
+                value.merge_evidence(*other);
+            }
             (Self::AbsentMemberFinding(value), Self::AbsentMemberFinding(other)) => {
                 value.merge_evidence(*other);
             }
@@ -1670,6 +1686,15 @@ impl PipelineValue {
     /// falls back to the ordinary set merge.
     fn merge_intersect_evidence(&mut self, other: Self) {
         let other = match (&mut *self, other) {
+            (
+                Self::Semantic(SemanticPipelineValue::FlowEndpoint(value)),
+                Self::Semantic(SemanticPipelineValue::FlowEndpoint(other)),
+            ) => {
+                // Both branches established the same existential pair. Their
+                // paths are alternatives, not a conjunctive witness.
+                value.merge_evidence(*other);
+                return;
+            }
             (Self::Declaration(value), Self::Declaration(other)) => {
                 value.merge_structural_kind(other);
                 return;
@@ -1810,6 +1835,7 @@ impl PipelineValue {
             Self::SourceSet(value) => PipelineKey::SourceSet(value.key()),
             Self::BuildTarget(value) => PipelineKey::BuildTarget(value.key()),
             Self::TopologyEdge(value) => PipelineKey::TopologyEdge(value.key()),
+            Self::BuildConfiguration(value) => PipelineKey::BuildConfiguration(value.key()),
             Self::RewritePath(value) => PipelineKey::RewritePath(value.key()),
             Self::QualifiedPath(value) => PipelineKey::QualifiedPath(value.key()),
             Self::PathSegment(value) => PipelineKey::PathSegment(value.key()),
@@ -2310,6 +2336,7 @@ enum PipelineTraceValue {
     SourceSet(Box<TopologyEntityValue>),
     BuildTarget(Box<TopologyEntityValue>),
     TopologyEdge(Box<TopologyEdgeValue>),
+    BuildConfiguration(Box<build_configuration_rows::BuildConfigurationValue>),
     RewritePath(Box<RewritePathValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
@@ -3171,7 +3198,7 @@ struct QueryExecutionState<'a> {
     environment_cache: EnvironmentTraversalCache,
     materialization_cache: materialization::MaterializationTraversalCache,
     edge_cache: EdgeTraversalCache,
-    flow_state_cache: FlowStateTraversalCache,
+    flow_state_cache: FlowStateTraversalCache<'a>,
     control_relation_cache: ControlRelationTraversalCache,
     branch_relation_cache: BranchRelationTraversalCache,
     cpp_expression_cache: HashMap<
@@ -3955,6 +3982,7 @@ pub fn execute_code_query_detailed_eager_index_in_scope(
         None,
         execution_scope,
         None,
+        None,
     )
 }
 
@@ -3994,6 +4022,7 @@ pub fn execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
         None,
         None,
         execution_scope,
+        None,
         None,
         EdgeTraversalCache::default(),
     )
@@ -4055,6 +4084,7 @@ pub fn execute_code_query_detailed_eager_index_workspace_in_scope(
         None,
         None,
         execution_scope,
+        None,
         None,
     )
 }
@@ -4195,6 +4225,7 @@ fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
         None,
         execution_scope,
         None,
+        None,
         EdgeTraversalCache::default(),
     )
 }
@@ -4251,6 +4282,7 @@ pub(crate) fn execute_code_query_with_union_strategy(
         None,
         CodeQueryExecutionScope::whole_workspace(),
         None,
+        None,
     )
 }
 
@@ -4284,6 +4316,7 @@ pub(crate) fn execute_code_query_with_access_mode(
         None,
         Some(&mut failure),
         CodeQueryExecutionScope::whole_workspace(),
+        None,
         None,
     );
     match failure {
@@ -4380,6 +4413,7 @@ fn execute_internal_with_analysis(
         None,
         CodeQueryExecutionScope::whole_workspace(),
         None,
+        None,
     )
 }
 
@@ -4456,6 +4490,7 @@ fn execute_internal_with_analysis_strategy(
     access_failure_out: Option<&mut Option<String>>,
     scope: CodeQueryExecutionScope<'_>,
     row_keys_out: Option<&mut Vec<UnitRowKey>>,
+    native_rows_out: Option<&mut Vec<PipelineRow>>,
 ) -> DetailedCodeQueryResult {
     execute_internal_with_analysis_strategy_and_row_family_session(
         analyzer,
@@ -4478,6 +4513,7 @@ fn execute_internal_with_analysis_strategy(
         access_failure_out,
         scope,
         row_keys_out,
+        native_rows_out,
         EdgeTraversalCache::default(),
     )
 }
@@ -4524,6 +4560,7 @@ fn execute_internal_with_analysis_strategy_and_edge_cache(
         access_failure_out,
         CodeQueryExecutionScope::whole_workspace(),
         None,
+        None,
         edge_cache,
     )
 }
@@ -4550,6 +4587,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     access_failure_out: Option<&mut Option<String>>,
     scope: CodeQueryExecutionScope<'_>,
     mut row_keys_out: Option<&mut Vec<UnitRowKey>>,
+    native_rows_out: Option<&mut Vec<PipelineRow>>,
     edge_cache: EdgeTraversalCache,
 ) -> DetailedCodeQueryResult {
     let value_flow_cache = semantic_flow_resources
@@ -4743,6 +4781,12 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                     type_flow_summaries,
                     CodeQueryRootAllotment::from_execution_limits(&limits),
                 ),
+            })
+            .map(|mut semantic| {
+                semantic.set_value_flow_witness_demand(pipeline::query_plan_requests_witnesses(
+                    &query.plan,
+                ));
+                semantic
             }),
         import_graph: None,
         import_graph_content: None,
@@ -4873,6 +4917,9 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     // the authored path through every projection. The ordinary root query
     // retains its historical plain-structural response shape, which omits
     // seed-only traces.
+    if let Some(native_rows) = native_rows_out {
+        native_rows.extend(execution.rows.iter().cloned());
+    }
     if !scope.branch_path().is_empty() {
         let branch_path = scope.branch_path();
         for row in &mut execution.rows {
@@ -6328,6 +6375,19 @@ fn detailed_evidence_for_pipeline_value(
             decorated_parameter: None,
             runtime_keyed_read: None,
         },
+        PipelineValue::BuildConfiguration(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::BuildConfiguration,
+            key: value.detailed_key(),
+            file: value.file().clone(),
+            byte_span: Some(results::BUILD_FILE_ANCHOR_SPAN),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            source_slice_sha256: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+            runtime_keyed_read: None,
+        },
         PipelineValue::ControlRelation(value) => {
             let (file, range) = control_relations::anchor(value);
             let byte_span = range.start_byte..range.end_byte;
@@ -6954,6 +7014,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::Guard(value) => Some(value.procedure.file()),
         PipelineValue::SourceSet(value) | PipelineValue::BuildTarget(value) => Some(value.file()),
         PipelineValue::TopologyEdge(value) => Some(value.file()),
+        PipelineValue::BuildConfiguration(value) => Some(value.file()),
         PipelineValue::RewritePath(value) => Some(value.file()),
         PipelineValue::ReceiverOutcome(value) => Some(&value.report.site.file),
         PipelineValue::ReceiverEvidence(value) => Some(&value.receiver.report.site.file),
@@ -7296,6 +7357,9 @@ macro_rules! collect_pipeline_source_files {
                 files.insert(value.file().clone());
             }
             $value_type::TopologyEdge(value) => {
+                files.insert(value.file().clone());
+            }
+            $value_type::BuildConfiguration(value) => {
                 files.insert(value.file().clone());
             }
             $value_type::RewritePath(value) => {
@@ -8209,6 +8273,15 @@ fn detailed_trace_provenance_ref(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             source_slice_sha256: None,
         },
+        PipelineTraceValue::BuildConfiguration(value) => DetailedCodeQueryProvenanceRefEvidence {
+            domain: DetailedCodeQueryDomain::BuildConfiguration,
+            key: value.detailed_key(),
+            file: value.file().clone(),
+            byte_span: Some(results::BUILD_FILE_ANCHOR_SPAN),
+            display_range: Some(results::BUILD_FILE_ANCHOR_RANGE),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            source_slice_sha256: None,
+        },
         PipelineTraceValue::ControlRelation(value) => {
             let (file, range) = control_relations::anchor(value);
             detailed_provenance_ref_no_identity(
@@ -9070,6 +9143,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::SourceSet(value) => Some(PipelineTraceValue::SourceSet(value.clone())),
         PipelineValue::BuildTarget(value) => Some(PipelineTraceValue::BuildTarget(value.clone())),
         PipelineValue::TopologyEdge(value) => Some(PipelineTraceValue::TopologyEdge(value.clone())),
+        PipelineValue::BuildConfiguration(value) => {
+            Some(PipelineTraceValue::BuildConfiguration(value.clone()))
+        }
         PipelineValue::RewritePath(value) => Some(PipelineTraceValue::RewritePath(value.clone())),
         PipelineValue::ReferenceEdge(value) => {
             Some(PipelineTraceValue::ReferenceEdge(value.clone()))

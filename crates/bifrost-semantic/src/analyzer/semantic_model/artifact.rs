@@ -5,11 +5,12 @@ use crate::analyzer::semantic_model::model::*;
 
 use crate::analyzer::semantic_model::validate::Diagnostic;
 
+use crate::analyzer::semantic_model::validate::ValidationCensus;
 use crate::analyzer::semantic_model::validate::ValidationLimits;
 
 use crate::analyzer::semantic_model::validate::is_canonical_relative_path;
 
-use crate::analyzer::semantic_model::validate::validate_pack_locally;
+use crate::analyzer::semantic_model::validate::validate_pack_locally_with_census;
 
 use brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes;
 
@@ -663,6 +664,14 @@ pub fn decode_manifest(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<CompiledPackManifest, ArtifactError> {
+    decode_manifest_with_census(bytes, limits).map(|(manifest, _)| manifest)
+}
+
+pub fn decode_manifest_with_census(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<(CompiledPackManifest, ValidationCensus), ArtifactError> {
+    let mut census = ValidationCensus::default();
     if bytes.len() > limits.max_manifest_bytes {
         return Err(ArtifactError::LimitExceeded("manifest byte limit"));
     }
@@ -691,23 +700,49 @@ pub fn decode_manifest(
             "manifest pack id is invalid".to_owned(),
         ));
     }
-    validate_text(&manifest.version, limits, "manifest version")?;
-    validate_text(&manifest.producer.name, limits, "manifest producer name")?;
+    validate_text(&manifest.version, limits, &mut census, "manifest version")?;
+    validate_text(
+        &manifest.producer.name,
+        limits,
+        &mut census,
+        "manifest producer name",
+    )?;
     validate_text(
         &manifest.producer.version,
         limits,
+        &mut census,
         "manifest producer version",
     )?;
-    validate_text(&manifest.language, limits, "manifest language")?;
-    validate_text(&manifest.ecosystem, limits, "manifest ecosystem")?;
+    validate_text(&manifest.language, limits, &mut census, "manifest language")?;
+    validate_text(
+        &manifest.ecosystem,
+        limits,
+        &mut census,
+        "manifest ecosystem",
+    )?;
     if let Some(requirement) = &manifest.compatibility.bifrost {
-        validate_text(requirement, limits, "manifest Bifrost compatibility")?;
+        validate_text(
+            requirement,
+            limits,
+            &mut census,
+            "manifest Bifrost compatibility",
+        )?;
     }
-    validate_text(&manifest.provenance.source, limits, "manifest provenance")?;
+    validate_text(
+        &manifest.provenance.source,
+        limits,
+        &mut census,
+        "manifest provenance",
+    )?;
     if let Some(revision) = &manifest.provenance.revision {
-        validate_text(revision, limits, "manifest provenance revision")?;
+        validate_text(
+            revision,
+            limits,
+            &mut census,
+            "manifest provenance revision",
+        )?;
     }
-    validate_text(&manifest.license, limits, "manifest license")?;
+    validate_text(&manifest.license, limits, &mut census, "manifest license")?;
     if semver::Version::parse(&manifest.version).is_err()
         || semver::Version::parse(&manifest.producer.version).is_err()
     {
@@ -736,8 +771,13 @@ pub fn decode_manifest(
         ));
     }
     for toolchain in &manifest.compatibility.toolchains {
-        validate_text(&toolchain.name, limits, "toolchain name")?;
-        validate_text(&toolchain.requirement, limits, "toolchain requirement")?;
+        validate_text(&toolchain.name, limits, &mut census, "toolchain name")?;
+        validate_text(
+            &toolchain.requirement,
+            limits,
+            &mut census,
+            "toolchain requirement",
+        )?;
         if semver::VersionReq::parse(&toolchain.requirement).is_err() {
             return Err(ArtifactError::InvalidDescriptor(
                 "toolchain requirements must be semantic-version requirements".to_owned(),
@@ -754,7 +794,7 @@ pub fn decode_manifest(
         ));
     }
     for path in &manifest.carried_sources {
-        validate_text(path, limits, "carried source path")?;
+        validate_text(path, limits, &mut census, "carried source path")?;
         if !is_canonical_relative_path(path) {
             return Err(ArtifactError::InvalidDescriptor(
                 "carried sources must be relative canonical slash-separated paths".to_owned(),
@@ -774,7 +814,7 @@ pub fn decode_manifest(
             ));
         }
         for file in &inputs.files {
-            validate_text(&file.path, limits, "source input path")?;
+            validate_text(&file.path, limits, &mut census, "source input path")?;
             if !is_canonical_relative_path(&file.path) || !is_lower_sha256(&file.sha256) {
                 return Err(ArtifactError::InvalidDescriptor(
                     "source inputs require canonical relative paths and lowercase SHA-256 digests"
@@ -815,7 +855,7 @@ pub fn decode_manifest(
     if manifest_content_digest(&manifest)? != manifest.content_sha256 {
         return Err(ArtifactError::DigestMismatch("manifest content"));
     }
-    Ok(manifest)
+    Ok((manifest, census))
 }
 
 pub fn decode_shard(
@@ -823,13 +863,21 @@ pub fn decode_shard(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<CompiledShard, ArtifactError> {
+    decode_shard_with_census(descriptor, bytes, limits).map(|(shard, _)| shard)
+}
+
+pub fn decode_shard_with_census(
+    descriptor: &CompiledShardDescriptor,
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<(CompiledShard, ValidationCensus), ArtifactError> {
     let (wire, raw) = read_shard_wire(descriptor, bytes, limits)?;
     if canonical_json(&wire)? != raw {
         return Err(ArtifactError::NonCanonical);
     }
     let shard = compiled_from_wire(wire);
     let authored = authored_pack_from_compiled_shard(&shard);
-    let diagnostics = validate_pack_locally(
+    let (diagnostics, census) = validate_pack_locally_with_census(
         &authored,
         ValidationLimits {
             max_shards: 1,
@@ -875,7 +923,7 @@ pub fn decode_shard(
     if semantic_digest(&shard)? != descriptor.semantic_sha256 {
         return Err(ArtifactError::DigestMismatch("semantic"));
     }
-    Ok(shard)
+    Ok((shard, census))
 }
 
 static SHARD_WIRE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -950,7 +998,8 @@ pub fn read_shard_wire(
 }
 
 /// Hydrate bytes with a current catalog validation certificate. The catalog
-/// must bind that certificate to this exact manifest, descriptor, and limits.
+/// must bind that certificate to this exact manifest and descriptor, and admit
+/// its measured text and depth thresholds against the request's limits.
 /// Content digests and the manifest envelope are checked on every read.
 #[doc(hidden)]
 pub fn hydrate_certified_shard(
@@ -1060,6 +1109,17 @@ pub fn decode_validated_shard_for_manifest(
     limits: &DecodeLimits,
 ) -> Result<CompiledShard, ArtifactError> {
     decode_present_shard_for_manifest(manifest, descriptor, bytes, limits)
+}
+
+pub fn decode_validated_shard_for_manifest_with_census(
+    manifest: &CompiledPackManifest,
+    descriptor: &CompiledShardDescriptor,
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<(CompiledShard, ValidationCensus), ArtifactError> {
+    let (shard, census) = decode_shard_with_census(descriptor, bytes, limits)?;
+    validate_shard_envelope(manifest, descriptor, &shard)?;
+    Ok((shard, census))
 }
 
 fn decode_present_shard_for_manifest(
@@ -1883,8 +1943,10 @@ pub fn validate_manifest_inventory(manifest: &CompiledPackManifest) -> Result<()
 fn validate_text(
     value: &str,
     limits: &DecodeLimits,
+    census: &mut ValidationCensus,
     field: &'static str,
 ) -> Result<(), ArtifactError> {
+    census.max_text_bytes = census.max_text_bytes.max(value.len());
     if value.is_empty() || value.len() > limits.max_text_bytes || value.contains('\0') {
         return Err(ArtifactError::InvalidDescriptor(format!(
             "{field} is empty, too long, or contains NUL"

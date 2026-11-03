@@ -641,6 +641,19 @@ fn decode_partial_flows(
                     .unwrap_or_else(|| {
                         cells.fail_row("is a heap port whose root is not an earlier port")
                     });
+                if !matches!(
+                    ports[root],
+                    PartialFlowPort::Receiver
+                        | PartialFlowPort::Parameter { .. }
+                        | PartialFlowPort::Capture { .. }
+                        | PartialFlowPort::CallReceiver { .. }
+                        | PartialFlowPort::CallArgument { .. }
+                        | PartialFlowPort::NormalReturn
+                        | PartialFlowPort::IndexedNormalReturn { .. }
+                        | PartialFlowPort::CallResult { .. }
+                ) {
+                    cells.fail_row("is a heap port with an invalid root kind");
+                }
                 let text =
                     selectors.unwrap_or_else(|| cells.fail_row("is a heap port without selectors"));
                 let tail = match tail {

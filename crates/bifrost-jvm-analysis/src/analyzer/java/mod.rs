@@ -1922,6 +1922,35 @@ impl LanguageSupport for JavaSupport {
         language: Language,
         subject: &brokk_bifrost_analysis::analyzer::FactSubject,
     ) -> Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest> {
+        if family == brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JvmSelectedRootPresence
+        {
+            let brokk_bifrost_analysis::analyzer::FactSubject::Named { name } = subject else {
+                return None;
+            };
+            if language != Language::None {
+                return None;
+            }
+            use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+            if let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) {
+                return crate::analyzer::jvm::selected_operation::replay_root_presence(
+                    java.inner(),
+                    name,
+                );
+            }
+            if let Some(kotlin) =
+                resolve_analyzer::<crate::analyzer::kotlin::KotlinAnalyzer>(analyzer)
+            {
+                return crate::analyzer::jvm::selected_operation::replay_root_presence(
+                    kotlin.tree_sitter_analyzer(),
+                    name,
+                );
+            }
+            let scala = resolve_analyzer::<crate::analyzer::scala::ScalaAnalyzer>(analyzer)?;
+            return crate::analyzer::jvm::selected_operation::replay_root_presence(
+                scala.tree_sitter_analyzer(),
+                name,
+            );
+        }
         workspace_facts::answer(analyzer, family, language, subject)
     }
 
@@ -2117,7 +2146,7 @@ impl LanguageSupport for JavaSupport {
 
     fn build_model_provider(
         &self,
-    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::topology::BuildModelProvider> {
+    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::languages::BuildModelProvider> {
         Some(&crate::analyzer::jvm::topology::JVM_BUILD_MODEL)
     }
 

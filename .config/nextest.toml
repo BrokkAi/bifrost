@@ -36,12 +36,6 @@ path = "junit.xml"
 filter = 'test(java_indexed_jdk_closes_unacquired_default_provider_boundary) | test(java_indexed_jdk_on_demand_import_candidates) | test(java_indexed_jdk_scala_implicit_root_navigation)'
 threads-required = "num-cpus"
 
-# #6018 owns the genuine single-connection reverse deadlocks. If explicitly
-# requested with --run-ignored, stop them instead of wedging the test run.
-[[profile.default.overrides]]
-filter = 'test(reverse_macro_generated_callers_equal_across_worker_counts_writer_only) | test(incoming_call_recheck_keeps_budget_stopped_sites_unproven_writer_only)'
-slow-timeout = { period = "30s", terminate-after = 1 }
-
 # Start the real-process repository corpus checks before the short unit tests
 # so their analyzer/server setup overlaps the rest of the run instead of
 # becoming a serial tail. They still reserve only the default single slot.

@@ -85,6 +85,72 @@ fn nested_union_query() -> CodeQuery {
     .expect("nested union query")
 }
 
+#[test]
+#[hardwon("#8925: reused occurrence prefixes dropped their resolved target payload")]
+fn derived_occurrence_intersect_prefix_is_not_cacheable() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp("(result-detail full (intersect (filter :where ((role eq (enum value_reference)) (target_kind eq (enum resolved))) (occurrences-in :class reference :role value_reference (language rust (call :callee (name \"target\"))))) (occurrences-in :class reference :role value_reference (language rust (call :callee (name \"target\"))))))")
+        .expect("reviewer occurrence intersect");
+    let whole = whole_execution(&workspace, &query);
+    assert_eq!(
+        whole.result.results.len(),
+        1,
+        "{}",
+        whole.result.render_text()
+    );
+    assert!(!whole.result.render_text().is_empty());
+    let CodeQueryResultValue::Occurrence { value } = &whole.result.results[0].value else {
+        panic!("intersect must retain an occurrence");
+    };
+    let crate::structural::search::CodeQueryOccurrenceTarget::Resolved { units } = &value.target
+    else {
+        panic!("target must be resolved: {:?}", value.target);
+    };
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].path, "src/lib.rs");
+    assert_eq!(units[0].start_line, 1);
+    assert_eq!(units[0].fq_name, "target");
+    let files = seed_files_of(&workspace);
+    let prefixes: Vec<_> = files
+        .iter()
+        .map(|seed| {
+            crate::structural::search::execute_intersect_prefix(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                Some(&workspace),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+            )
+        })
+        .collect();
+    assert!(
+        prefixes
+            .iter()
+            .any(|prefix| prefix.encode_product_json(&query.plan).is_err()),
+        "derived occurrence payload must not be persisted"
+    );
+    let cold = crate::structural::search::continue_intersect_prefix(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        Some(&workspace),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &files,
+        prefixes,
+    );
+    let detailed = cold.detailed.expect("cold continuation");
+    assert_eq!(detailed.result.render_text(), whole.result.render_text());
+}
+
 /// The whole execution's rows in the projection a unit product carries.
 ///
 /// A unit merges projected rows, not rendered ones, so the partition property
@@ -101,6 +167,49 @@ fn whole_execution(workspace: &WorkspaceAnalyzer, query: &CodeQuery) -> Detailed
         query,
         CodeQueryExecutionLimits::default(),
         None,
+    )
+}
+
+fn decoded_intersect_execution(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+) -> crate::structural::search::IntersectContinuationResult {
+    let files = seed_files_of(workspace);
+    let prefixes = files
+        .iter()
+        .map(|seed| {
+            let prefix = crate::structural::search::execute_intersect_prefix(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                Some(workspace),
+                query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+            );
+            let product = prefix
+                .encode_product_json(&query.plan)
+                .expect("complete typed prefix product");
+            crate::structural::search::IntersectPrefixProduct::decode_product_json_with_workspace(
+                workspace.analyzer(),
+                Some(workspace),
+                &query.plan,
+                seed.clone(),
+                prefix.reads.clone(),
+                product,
+            )
+            .expect("hydrate typed prefix")
+        })
+        .collect();
+    crate::structural::search::continue_intersect_prefix(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        Some(workspace),
+        query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &files,
+        prefixes,
     )
 }
 
@@ -765,6 +874,615 @@ fn two_file_project() -> BuiltInlineTestProject {
             "import { target } from './callee';\nexport function caller() {\n  return target();\n}\n",
         )
         .build()
+}
+
+#[test]
+fn intersect_prefix_records_seed_inventory_and_keeps_typed_operands() {
+    let project = two_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "intersect": [
+            { "match": { "kind": "function" } },
+            { "match": { "kind": "function" } }
+        ],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("intersect query");
+    let prefix = crate::structural::search::execute_intersect_prefix(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        None,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        CodeQueryExecutionScope::for_seed_files(&files[..1], &files),
+    );
+    assert_eq!(prefix.completion, CodeQueryCompletion::Complete);
+    assert_eq!(prefix.operand_row_counts().count(), 2);
+    assert!(prefix.reads_closed);
+    assert!(
+        prefix.reads.contains(
+            &workspace
+                .analyzer()
+                .workspace_scope_read_key(&Language::ALL)
+        )
+    );
+}
+
+#[test]
+fn intersect_prefix_codec_properties() {
+    let project = two_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "intersect": [
+            { "match": { "kind": "function" } },
+            { "match": { "kind": "function" } }
+        ],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("raw structural intersect");
+    for seed in &files {
+        let run = || {
+            crate::structural::search::execute_intersect_prefix(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                None,
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+            )
+        };
+        let mut prefix = run();
+        let identity = |product: &crate::structural::search::IntersectPrefixProduct| {
+            product
+                .operands
+                .iter()
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| {
+                            assert!(row.row_projection.is_empty());
+                            (
+                                row.value.key(),
+                                row.traces
+                                    .iter()
+                                    .map(|trace| (trace.branch.clone(), trace.seed.fact_match.node))
+                                    .collect::<Vec<_>>(),
+                                row.provenance_truncated,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = identity(&prefix);
+        let product_json = prefix
+            .encode_product_json(&query.plan)
+            .expect("complete product");
+        let decoded = crate::structural::search::IntersectPrefixProduct::decode_product_json(
+            workspace.analyzer(),
+            &query.plan,
+            seed.clone(),
+            prefix.reads.clone(),
+            product_json.clone(),
+        )
+        .expect("hydrate complete product");
+        assert_eq!(identity(&decoded), before);
+        assert_eq!(decoded.work, prefix.work);
+        assert_eq!(decoded.budgeted_work, prefix.budgeted_work);
+        assert_eq!(decoded.completion, prefix.completion);
+        assert_eq!(decoded.reads, prefix.reads);
+        assert_eq!(
+            decoded.encode_product_json(&query.plan).unwrap(),
+            product_json
+        );
+        let different_plan = CodeQuery::from_json(&json!({
+            "schema_version": 1,
+            "intersect": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "function" } }
+            ],
+            "limit": 500
+        }))
+        .expect("different authored cut");
+        assert!(
+            crate::structural::search::IntersectPrefixProduct::decode_product_json(
+                workspace.analyzer(),
+                &different_plan.plan,
+                seed.clone(),
+                prefix.reads.clone(),
+                product_json.clone(),
+            )
+            .is_err(),
+            "operand slots must resolve against the authored cut"
+        );
+        let mut corrupt_product = product_json.clone();
+        corrupt_product["read_set_digest"] = json!("wrong receipt");
+        assert!(
+            crate::structural::search::IntersectPrefixProduct::decode_product_json(
+                workspace.analyzer(),
+                &query.plan,
+                seed.clone(),
+                prefix.reads.clone(),
+                corrupt_product,
+            )
+            .is_err()
+        );
+        let encoded = prefix
+            .encode_rows_json(&query.plan)
+            .expect("encode raw rows");
+        prefix.operands.iter_mut().for_each(Vec::clear);
+        prefix
+            .decode_rows_json(workspace.analyzer(), &query.plan, encoded.clone())
+            .expect("hydrate exact seed blob");
+        assert_eq!(identity(&prefix), before);
+        assert_eq!(
+            prefix.encode_rows_json(&query.plan).expect("re-encode"),
+            encoded
+        );
+
+        let reads = std::mem::take(&mut prefix.reads);
+        assert!(
+            prefix
+                .decode_rows_json(workspace.analyzer(), &query.plan, encoded.clone())
+                .is_err(),
+            "hydration without the file receipt cannot authorize reuse"
+        );
+        prefix.reads = reads;
+
+        let mut bad_slot = encoded.clone();
+        bad_slot[0][0]["traces"][0]["steps"] = json!([{
+            "source_path": [0],
+            "index": usize::MAX,
+            "value": { "type": "structural_match", "rel_path": "unused", "node": 0 },
+            "via": null
+        }]);
+        assert!(
+            prefix
+                .decode_rows_json(workspace.analyzer(), &query.plan, bad_slot)
+                .is_err(),
+            "an unresolved authored step slot is corrupt"
+        );
+
+        let mut corrupt = encoded.clone();
+        corrupt[0][0]["node"] = json!(u32::MAX);
+        assert!(
+            prefix
+                .decode_rows_json(workspace.analyzer(), &query.plan, corrupt)
+                .is_err()
+        );
+        let recomputed = run();
+        assert_eq!(
+            recomputed.encode_rows_json(&query.plan).expect("recompute"),
+            encoded
+        );
+    }
+}
+
+#[test]
+fn rust_call_intersect_decoded_prefix_matches_whole() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = CodeQuery::from_sexp(
+        "(result-detail full (intersect (language rust (call :callee (name \"target\"))) (language rust (call))))",
+    )
+    .expect("observed Rust call intersect shape");
+    let prefixes = files
+        .iter()
+        .map(|seed| {
+            let mut prefix = crate::structural::search::execute_intersect_prefix(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                None,
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+            );
+            let encoded = prefix
+                .encode_rows_json(&query.plan)
+                .expect("Rust call identity codec");
+            prefix.operands.iter_mut().for_each(Vec::clear);
+            prefix
+                .decode_rows_json(workspace.analyzer(), &query.plan, encoded)
+                .expect("hydrate call facts");
+            prefix
+        })
+        .collect();
+    let continued = crate::structural::search::continue_intersect_prefix(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        None,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &files,
+        prefixes,
+    );
+    let whole = whole_execution(&workspace, &query);
+    let detailed = continued.detailed.expect("complete decoded prefix");
+    assert_eq!(continued.completion, whole.result.completion());
+    assert_eq!(
+        projected(&detailed.result.results),
+        projected(&whole.result.results)
+    );
+    assert_eq!(detailed.evidence, whole.evidence);
+}
+
+#[test]
+fn xmlreader_intersect_decoded_prefix_matches_whole() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Readers.cs",
+            r#"
+using System.IO;
+using System.Xml;
+class Readers {
+    XmlReader Open(Stream input) {
+        XmlReaderSettings settings = new XmlReaderSettings();
+        settings.DtdProcessing = DtdProcessing.Parse;
+        return XmlReader.Create(input, settings);
+    }
+}
+
+"#,
+        )
+        .file("Other.cs", "class Other { void Run() {} }")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = CodeQuery::from_sexp(
+        r#"
+    (result-detail full
+      (intersect
+        (binding-occurrence
+          (binding-of
+            (occurrences-in :class reference :role receiver_position
+              (language csharp
+                (assignment :left (field_access :name "DtdProcessing")
+                            :right (field_access :name "Parse"))))))
+        (binding-occurrence
+          (binding-of
+            (occurrences-in :class reference :role value_reference
+              (language csharp (call :callee (name "Create"))))))))
+    "#,
+    )
+    .expect("XMLReader selector");
+    assert!(matches!(
+        crate::query::PlanPartitioning::classify_for_prefix(&query.plan),
+        crate::query::PlanPartitioning::Prefix { .. }
+    ));
+    let prefixes: Vec<_> = files
+        .iter()
+        .map(|seed| {
+            let prefix = crate::structural::search::execute_intersect_prefix(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                Some(&workspace),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+            );
+            let product = prefix
+                .encode_product_json(&query.plan)
+                .expect("XMLReader typed product");
+            crate::structural::search::IntersectPrefixProduct::decode_product_json_with_workspace(
+                workspace.analyzer(),
+                Some(&workspace),
+                &query.plan,
+                seed.clone(),
+                prefix.reads.clone(),
+                product,
+            )
+            .expect("XMLReader hydrated product")
+        })
+        .collect();
+    assert!(
+        prefixes
+            .iter()
+            .flat_map(
+                |prefix: &crate::structural::search::IntersectPrefixProduct| prefix
+                    .operands
+                    .iter()
+                    .flatten()
+            )
+            .flat_map(|row| row.traces.iter().flat_map(|trace| &trace.steps))
+            .any(|step| matches!(step.value, PipelineTraceValue::Binding(_)))
+    );
+    let continued = crate::structural::search::continue_intersect_prefix(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        Some(&workspace),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &files,
+        prefixes,
+    );
+    let whole = whole_execution(&workspace, &query);
+    let detailed = continued.detailed.expect("complete XMLReader continuation");
+    assert_eq!(continued.completion, whole.result.completion());
+    assert_eq!(
+        projected(&detailed.result.results),
+        projected(&whole.result.results)
+    );
+    assert_eq!(detailed.evidence, whole.evidence);
+    assert!(!detailed.result.results.is_empty());
+
+    let changed_file = ProjectFile::new(project.root(), "Readers.cs");
+    let changed_source = changed_file
+        .read_to_string()
+        .expect("fixture source")
+        .replace("DtdProcessing.Parse", "DtdProcessing.Prohibit");
+    changed_file.write(&changed_source).expect("edit one seed");
+    let changed = project.workspace_analyzer(AnalyzerConfig::default());
+    let continued = decoded_intersect_execution(&changed, &query);
+    let whole = whole_execution(&changed, &query);
+    let detailed = continued
+        .detailed
+        .expect("complete edited XMLReader continuation");
+    assert_eq!(continued.completion, whole.result.completion());
+    assert_eq!(
+        projected(&detailed.result.results),
+        projected(&whole.result.results)
+    );
+    assert_eq!(detailed.evidence, whole.evidence);
+    assert!(detailed.result.results.is_empty());
+}
+
+#[test]
+fn rust_ctor_intersect_decoded_prefix_matches_whole() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/startup.rs",
+            r#"
+#[ctor::ctor]
+pub fn bad_ctor() { std_helper(); }
+#[ctor::ctor]
+pub fn good_ctor() { libc_helper(); }
+pub fn libc_helper() {}
+pub fn std_helper() { let _ = std::fs::read("startup-state"); }
+"#,
+        )
+        .file("src/other.rs", "pub fn unrelated() {}")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = CodeQuery::from_sexp(
+        r#"
+      (result-detail full
+        (intersect
+          (enclosing-decl
+            (language rust (function :decorators
+              [(name/regex "^(ctor|ctor::ctor|dtor|dtor::dtor)$")])))
+          (union
+            (enclosing-decl
+              (filter :where ((target_fq_name regex "^(std[.]|<std::)"))
+                (language rust (dispatch-targets (call)))))
+            (callers :depth 2 :proof proven
+              (enclosing-decl
+                (filter :where ((target_fq_name regex "^(std[.]|<std::)"))
+                  (language rust (dispatch-targets (call)))))))))
+    "#,
+    )
+    .expect("constructor selector");
+    assert!(matches!(
+        crate::query::PlanPartitioning::classify_for_prefix(&query.plan),
+        crate::query::PlanPartitioning::Prefix { .. }
+    ));
+    let prefixes: Vec<_> = files
+        .iter()
+        .map(|seed| {
+            let prefix = crate::structural::search::execute_intersect_prefix(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                Some(&workspace),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+            );
+            let product = prefix
+                .encode_product_json(&query.plan)
+                .expect("constructor typed product");
+            crate::structural::search::IntersectPrefixProduct::decode_product_json_with_workspace(
+                workspace.analyzer(),
+                Some(&workspace),
+                &query.plan,
+                seed.clone(),
+                prefix.reads.clone(),
+                product,
+            )
+            .expect("constructor hydrated product")
+        })
+        .collect();
+    let steps = prefixes
+        .iter()
+        .flat_map(
+            |prefix: &crate::structural::search::IntersectPrefixProduct| {
+                prefix.operands.iter().flatten()
+            },
+        )
+        .flat_map(|row| row.traces.iter().flat_map(|trace| &trace.steps))
+        .collect::<Vec<_>>();
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step.value, PipelineTraceValue::DispatchTarget(_)))
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step.via, Some(PipelineVia::CallSite(_))))
+    );
+    let continued = crate::structural::search::continue_intersect_prefix(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        Some(&workspace),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &files,
+        prefixes,
+    );
+    let whole = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    let detailed = continued
+        .detailed
+        .expect("complete constructor continuation");
+    assert_eq!(continued.completion, whole.result.completion());
+    assert_eq!(
+        projected(&detailed.result.results),
+        projected(&whole.result.results)
+    );
+    assert_eq!(detailed.evidence, whole.evidence);
+    assert!(!detailed.result.results.is_empty());
+
+    let changed_file = ProjectFile::new(project.root(), "src/startup.rs");
+    let changed_source = changed_file
+        .read_to_string()
+        .expect("fixture source")
+        .replace("std::fs::read(\"startup-state\")", "libc_helper()");
+    changed_file.write(&changed_source).expect("edit one seed");
+    let changed = project.workspace_analyzer(AnalyzerConfig::default());
+    let continued = decoded_intersect_execution(&changed, &query);
+    let whole = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &changed,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    let detailed = continued
+        .detailed
+        .expect("complete edited constructor continuation");
+    assert_eq!(continued.completion, whole.result.completion());
+    assert_eq!(
+        projected(&detailed.result.results),
+        projected(&whole.result.results)
+    );
+    assert_eq!(detailed.evidence, whole.evidence);
+    assert!(detailed.result.results.is_empty());
+}
+
+#[test]
+fn intersect_continuation_matches_whole_before_and_after_one_seed_edit() {
+    let project = two_file_project();
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "intersect": [
+            { "match": { "kind": "function" } },
+            { "union": [
+                { "match": { "kind": "function", "name": { "regex": "^target" } } },
+                { "match": { "kind": "function", "name": { "regex": "^caller" } } }
+            ] }
+        ],
+        "steps": [{ "op": "filter", "where": [{ "field": "name", "op": "is_not_null" }] }],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("intersect query");
+    let run = |workspace: &WorkspaceAnalyzer| {
+        let files = seed_files_of(workspace);
+        let prefixes = files
+            .iter()
+            .map(|seed| {
+                let mut prefix = crate::structural::search::execute_intersect_prefix(
+                    workspace.analyzer(),
+                    &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    None,
+                    &query,
+                    CodeQueryExecutionLimits::default(),
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+                );
+                let encoded = prefix
+                    .encode_rows_json(&query.plan)
+                    .expect("raw structural codec");
+                prefix.operands.iter_mut().for_each(Vec::clear);
+                prefix
+                    .decode_rows_json(workspace.analyzer(), &query.plan, encoded)
+                    .expect("hydrate the seed facts");
+                prefix
+            })
+            .collect();
+        let continued = crate::structural::search::continue_intersect_prefix(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            None,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &files,
+            prefixes,
+        );
+        let whole = whole_execution(workspace, &query);
+        let detailed = continued.detailed.expect("complete prefix continuation");
+        assert_eq!(continued.completion, whole.result.completion());
+        assert_eq!(
+            projected(&detailed.result.results),
+            projected(&whole.result.results)
+        );
+        assert_eq!(detailed.evidence, whole.evidence);
+    };
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    run(&base);
+    let files = seed_files_of(&base);
+    let mut prefixes: Vec<_> = files
+        .iter()
+        .map(|seed| {
+            crate::structural::search::execute_intersect_prefix(
+                base.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                None,
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+            )
+        })
+        .collect();
+    prefixes[0].reads_closed = false;
+    let withheld = crate::structural::search::continue_intersect_prefix(
+        base.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        None,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &files,
+        prefixes,
+    );
+    assert!(withheld.detailed.is_none());
+    assert!(matches!(
+        withheld.completion,
+        CodeQueryCompletion::Incomplete { .. }
+    ));
+    project
+        .file("src/caller.ts")
+        .write("export function changed() { return 2; }\n")
+        .expect("edit one seed");
+    let head = project.workspace_analyzer(AnalyzerConfig::default());
+    run(&head);
 }
 
 /// A unit's seed enumeration depends on the files it opened, not on the
@@ -2030,6 +2748,34 @@ fn projected_set_collisions_keep_the_first_rows_native_field_mapping() {
             expected_rows,
             "first writer must be chosen before filtering"
         );
+    }
+}
+
+#[test]
+#[hardwon("#5310: a union filter must read the first merged native field mapping in each file")]
+fn seed_local_union_filters_match_whole_after_first_writer_merge() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("a.py", "print(\"a\")\n")
+        .file("b.py", "print(\"b\")\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let named = "(project :columns ((name x)) (language python (call)))";
+    let literal = "(project :columns ((string_value x)) (language python (call)))";
+    for (first, second, expected_rows) in [(named, literal, 0), (literal, named, 2)] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(result-detail full (filter :where ((x is-null)) (union {first} {second})))"
+        ))
+        .expect("compatible projection counterexample");
+        assert_eq!(
+            crate::query::PlanPartitioning::classify(&query.plan),
+            crate::query::PlanPartitioning::Whole(
+                crate::query::PlanWidenDetail::UnionNonProjectSuffix
+            )
+        );
+        let whole = whole_execution(&workspace, &query);
+        assert_eq!(whole.result.results.len(), expected_rows);
+        assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
     }
 }
 

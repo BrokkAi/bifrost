@@ -256,6 +256,7 @@ macro_rules! seam_methods {
 }
 
 seam_methods! {
+    JvmSelectedRootPresence => "jvm_selected_root_presence", "BatchResolutionFragmentSource";
     CandidateAdmissionSession => "candidate_admission_session", "BatchResolutionFragmentSource";
     IdentityContentDigest => "identity_content_digest", "BatchResolutionFragmentSource";
     SelectionAuthority => "selection_authority", "BatchResolutionFragmentSource";
@@ -296,6 +297,7 @@ seam_methods! {
     VisitReverseCandidateMatchPagesWithGapExclusionsShared => "visit_reverse_candidate_match_pages_with_gap_exclusions_shared", "BatchResolutionFragmentSource";
     VisitReverseCandidateMatchPagesWithGapExclusions => "visit_reverse_candidate_match_pages_with_gap_exclusions", "BatchResolutionFragmentSource";
     HydrateCandidatePaths => "hydrate_candidate_paths", "BatchResolutionFragmentSource";
+    HydrateCandidatePathsWithOrigin => "hydrate_candidate_paths_with_origin", "BatchResolutionFragmentSource";
     VisitTypeTransferRules => "visit_type_transfer_rules", "BatchResolutionFragmentSource";
     QualifySelectionPath => "qualify_selection_path", "SelectedTypedFactSource";
     RustCrateAccess => "rust_crate_access", "SelectedTypedFactSource";
@@ -307,6 +309,8 @@ seam_methods! {
     SelectionHasJavaSemantics => "selection_has_java_semantics", "SelectedTypedFactSource";
     LookupNamespace => "lookup_namespace", "SelectedTypedFactSource";
     SelectionHasJvmSemantics => "selection_has_jvm_semantics", "SelectedTypedFactSource";
+    ExternalReceiverArgumentReasons => "external_receiver_argument_reasons", "SelectedTypedFactSource";
+    ExternalArgumentProofReasons => "external_argument_proof_reasons", "SelectedTypedFactSource";
     ExternalCallableResultTypeIdentities => "external_callable_result_type_identities", "SelectedTypedFactSource";
     FragmentCallTargetPrecedence => "fragment_call_target_precedence", "SelectedTypedFactSource";
     FragmentLanguage => "fragment_language", "SelectedTypedFactSource";
@@ -1209,6 +1213,15 @@ impl<T: ?Sized> BatchResolutionFragmentSource for SeamProfiled<'_, T>
 where
     T: BatchResolutionFragmentSource,
 {
+    fn jvm_selected_root_presence(
+        &self,
+        root_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::batch::JvmSelectedRootPresence> {
+        record_call(SeamMethod::JvmSelectedRootPresence, 1);
+        self.inner
+            .jvm_selected_root_presence(root_fqn, cancellation)
+    }
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
         record_call(SeamMethod::CandidateAdmissionSession, 0);
         self.inner.candidate_admission_session()
@@ -1610,6 +1623,18 @@ where
         rows = |paths| paths.len()
     );
 
+    counted!(
+        hydrate_candidate_paths_with_origin(
+            candidates: &[CandidatePathIdentity],
+            cancellation: &CancellationToken,
+        ) -> StoreResult<
+            Vec<(CandidatePathIdentity, super::HydratedCandidatePath)>,
+        >,
+        HydrateCandidatePathsWithOrigin,
+        keys = candidates.len(),
+        rows = |paths| paths.len()
+    );
+
     fn visit_type_transfer_rules(
         &self,
         source_slot: SemanticId,
@@ -1927,6 +1952,44 @@ where
     fn selection_has_jvm_semantics(&self) -> bool {
         record_call(SeamMethod::SelectionHasJvmSemantics, 0);
         self.inner.selection_has_jvm_semantics()
+    }
+
+    fn external_receiver_argument_reasons(
+        &self,
+        definitions: &[SemanticId],
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        record_call(
+            SeamMethod::ExternalReceiverArgumentReasons,
+            definitions.len() + reasons.len(),
+        );
+        let outcome =
+            self.inner
+                .external_receiver_argument_reasons(definitions, reasons, cancellation);
+        if let Ok(Some(rows)) = &outcome {
+            record_rows(SeamMethod::ExternalReceiverArgumentReasons, rows.len());
+        }
+        outcome
+    }
+
+    fn external_argument_proof_reasons(
+        &self,
+        definitions: &[SemanticId],
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        record_call(
+            SeamMethod::ExternalArgumentProofReasons,
+            definitions.len() + reasons.len(),
+        );
+        let outcome =
+            self.inner
+                .external_argument_proof_reasons(definitions, reasons, cancellation);
+        if let Ok(Some(rows)) = &outcome {
+            record_rows(SeamMethod::ExternalArgumentProofReasons, rows.len());
+        }
+        outcome
     }
 
     fn external_callable_result_type_identities(
@@ -2637,9 +2700,10 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
+        // #8834: jvm_selected_root_presence is forwarded and counted too.
         // #5671: the root-inventory admission session is forwarded and counted too.
-        assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 96, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(batch.len(), 39, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(typed.len(), 98, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -2667,8 +2731,9 @@ mod tests {
             declared, forwarded,
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
-        // #5671: profile the root-inventory session accessor with the other methods.
-        assert_eq!(METHOD_COUNT, 131);
+        // #8834: the selected-root presence read has its own profile method.
+        // #7619 adds two readers; #5671 profiles the root-inventory session accessor.
+        assert_eq!(METHOD_COUNT, 135);
     }
 
     #[cfg(test)]

@@ -537,6 +537,18 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 229,
         sql: include_str!("../migrations/cache/0229-csharp-undecided-chains.sql"),
     },
+    CacheMigration {
+        version: 231,
+        sql: include_str!("../migrations/cache/0231-policy-evaluation-replay-evidence.sql"),
+    },
+    CacheMigration {
+        version: 233,
+        sql: include_str!("../migrations/cache/0233-policy-unit-typed-partition.sql"),
+    },
+    CacheMigration {
+        version: 236,
+        sql: include_str!("../migrations/cache/0236-policy-unit-prefix-product.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -562,8 +574,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    220, 196, 246, 172, 223, 162, 45, 231, 23, 142, 53, 69, 107, 33, 116, 237, 167, 128, 207, 196,
-    57, 137, 117, 113, 88, 59, 139, 177, 225, 173, 189, 121,
+    130, 125, 123, 137, 226, 97, 165, 108, 51, 14, 105, 29, 40, 182, 161, 112, 52, 175, 9, 186, 1,
+    39, 183, 235, 14, 87, 176, 196, 4, 36, 120, 218,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -5555,6 +5567,278 @@ mod tests {
     }
 
     #[test]
+    fn prefix_product_upgrade_rebuilds_policy_units() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|m| m.version < CURRENT_MIGRATION_VERSION)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let previous = POST_BASELINE_MIGRATIONS[POST_BASELINE_MIGRATIONS.len() - 2].version;
+        conn.pragma_update(None, "user_version", previous).unwrap();
+        conn.execute_batch(
+            "INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at,prefix_cut_digest,prefix_input_digest)
+             VALUES(hex(zeroblob(32)),'match','prefix','a.java','1111111111111111111111111111111111111111',hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'complete','exhaustive','rows',jsonb('{}'),zeroblob(32),1,hex(zeroblob(32)),hex(zeroblob(32)));
+             INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at)
+             VALUES(hex(zeroblob(32)),'match','seed','b.java','2222222222222222222222222222222222222222',hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'complete','exhaustive','rows',jsonb('{\"retained\":true}'),zeroblob(32),1);
+             INSERT INTO policy_read_keys(key_digest,kind,languages,rel_path,blob_oid) VALUES(zeroblob(32),'file','java','a.java','1111111111111111111111111111111111111111');
+             INSERT INTO policy_unit_reads(unit_id,read_id) VALUES(1,1),(2,1);
+             INSERT INTO policy_unit_snapshots(unit_id,content_identity,attestation) VALUES(1,zeroblob(32),1),(2,zeroblob(32),1);
+             INSERT INTO policy_evaluations(base_tree_oid,policy_set_digest,options_digest,configuration_fingerprint,active_model_set_hash,engine_epoch,resolved_commit,published_at,effective_grant,census_files,census_bytes,evidence_complete)
+             VALUES('3333333333333333333333333333333333333333',hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'4444444444444444444444444444444444444444',1,'{\"files\":7}',3,4,1);
+             INSERT INTO policy_evaluation_policies(evaluation_id,policy_id,source_hash,semantic_hash,completion,completion_detail,qualified,qualification_detail,diagnostics,effective_grant,census_files,census_bytes)
+             VALUES(1,'test',hex(zeroblob(32)),hex(zeroblob(32)),'complete','\"complete\"',1,'','[]','{\"files\":5}',2,9);
+             INSERT INTO policy_evaluation_units(evaluation_id,policy_id,unit_id) VALUES(1,'test',1),(1,'test',2);
+             INSERT INTO policy_evaluation_identities(evaluation_id,policy_id,finding_id) VALUES(1,'test',zeroblob(32));"
+        ).unwrap();
+        let original_product: Vec<u8> = conn
+            .query_row(
+                "SELECT product FROM policy_units WHERE unit_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            conn.query_row("SELECT unit_id FROM policy_units", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM policy_units WHERE unit_id = 1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT product FROM policy_units", [], |r| r
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            original_product
+        );
+        for table in [
+            "policy_unit_reads",
+            "policy_unit_snapshots",
+            "policy_evaluation_units",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT unit_id FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "{table}"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM policy_evaluation_identities",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT effective_grant FROM policy_evaluations", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "{\"files\":7}"
+        );
+        conn.execute_batch(
+            "INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at,prefix_cut_digest,prefix_input_digest)
+             VALUES(hex(zeroblob(32)),'match','prefix','a.java','1111111111111111111111111111111111111111',hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'complete','exhaustive','prefix',jsonb('{}'),zeroblob(32),1,hex(zeroblob(32)),hex(zeroblob(32)));"
+        ).unwrap();
+    }
+
+    #[test]
+    fn typed_policy_unit_keys_and_upgrade_clear_dependents() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 233) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 231).unwrap();
+        conn.execute_batch(
+            "INSERT INTO policy_units(policy_semantic_hash, family, partition_kind, seed_rel_path,
+               seed_blob_oid, partition_digest, configuration_fingerprint, active_model_set_hash,
+               engine_epoch, completion, budget_mode, product_kind, product, read_set_digest, published_at)
+             VALUES(hex(zeroblob(32)), 'match', 'seed', 'a.java',
+               '1111111111111111111111111111111111111111', '', hex(zeroblob(32)),
+               hex(zeroblob(32)), hex(zeroblob(32)), 'complete', 'exhaustive', 'rows', jsonb('{}'), zeroblob(32), 1);
+             INSERT INTO policy_read_keys(key_digest, kind, languages, rel_path, blob_oid)
+               VALUES(zeroblob(32), 'file', 'java', 'a.java', '1111111111111111111111111111111111111111');
+             INSERT INTO policy_unit_reads(unit_id, read_id) VALUES(1, 1);
+             INSERT INTO policy_unit_snapshots(unit_id, content_identity, attestation)
+               VALUES(1, zeroblob(32), 1);
+             INSERT INTO policy_evaluations(base_tree_oid, policy_set_digest, options_digest,
+               configuration_fingerprint, active_model_set_hash, engine_epoch, resolved_commit, published_at,
+               effective_grant, census_files, census_bytes, evidence_complete)
+               VALUES('2222222222222222222222222222222222222222', hex(zeroblob(32)),
+               hex(zeroblob(32)), hex(zeroblob(32)), hex(zeroblob(32)), hex(zeroblob(32)),
+               '3333333333333333333333333333333333333333', 1, '{\"files\":7}', 3, 4, 1);
+             INSERT INTO policy_evaluation_policies(evaluation_id, policy_id, source_hash,
+               semantic_hash, completion, completion_detail, qualified, qualification_detail, diagnostics,
+               effective_grant, census_files, census_bytes)
+               VALUES(1, 'test', hex(zeroblob(32)), hex(zeroblob(32)), 'complete',
+                 '\"complete\"', 1, '', '[]', '{\"files\":5}', 2, 9);
+             INSERT INTO policy_evaluation_units(evaluation_id, policy_id, unit_id) VALUES(1, 'test', 1);
+             INSERT INTO policy_evaluation_identities(evaluation_id, policy_id, finding_id)
+               VALUES(1, 'test', zeroblob(32));",
+        ).unwrap();
+        // The production path: a populated 0231 store migrates to the
+        // current schema, which validates foreign keys and the schema hash.
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT effective_grant, census_files, census_bytes, evidence_complete
+                 FROM policy_evaluations",
+                [],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?
+                )),
+            )
+            .unwrap(),
+            ("{\"files\":7}".to_owned(), 3, 4, 1)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT effective_grant, census_files, census_bytes FROM policy_evaluation_policies",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+            )
+            .unwrap(),
+            ("{\"files\":5}".to_owned(), 2, 9)
+        );
+        for table in [
+            "policy_units",
+            "policy_unit_reads",
+            "policy_unit_snapshots",
+            "policy_evaluation_units",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM policy_evaluations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM policy_evaluation_identities",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        for (kind, field1, field2) in [
+            ("root", "root_locator", "root_compilation"),
+            ("prefix", "prefix_cut_digest", "prefix_input_digest"),
+            ("output", "anchor_locator", "compilation_digest"),
+        ] {
+            let sql = format!(
+                "INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at,{field1},{field2}) VALUES(hex(zeroblob(32)),'match',?1,'a.java','1111111111111111111111111111111111111111',hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'complete','exhaustive',?2,jsonb('{{}}'),zeroblob(32),1,?3,?4)"
+            );
+            let product = match kind {
+                "root" => "root",
+                "prefix" => "prefix",
+                _ => "rows",
+            };
+            for value in ["a".repeat(64), "b".repeat(64)] {
+                conn.execute(
+                    &sql,
+                    rusqlite::params![kind, product, "c".repeat(64), value],
+                )
+                .unwrap();
+            }
+            assert!(
+                conn.execute(
+                    &sql,
+                    rusqlite::params![kind, product, "c".repeat(64), "b".repeat(64)]
+                )
+                .is_err()
+            );
+            assert!(
+                conn.execute(&sql, rusqlite::params![kind, product, "", "d".repeat(64)])
+                    .is_err()
+            );
+            assert!(
+                conn.execute(
+                    &sql,
+                    rusqlite::params![kind, product, "C".repeat(64), "d".repeat(64)]
+                )
+                .is_err()
+            );
+        }
+        for (kind, field, product) in [
+            ("seed", "", "rows"),
+            ("binding", "binding_digest", "rows"),
+            ("assert_file", "subjects_digest", "assert_file"),
+            ("selector", "selector_digest", "selector"),
+            ("whole", "", "rows"),
+        ] {
+            let field_sql = if field.is_empty() {
+                String::new()
+            } else {
+                format!(",{field}")
+            };
+            let value_sql = if field.is_empty() {
+                String::new()
+            } else {
+                format!(",'{}'", "a".repeat(64))
+            };
+            let (path, oid) = if kind == "whole" {
+                ("", "")
+            } else {
+                ("other.java", "1111111111111111111111111111111111111111")
+            };
+            let sql = format!(
+                "INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at{field_sql}) VALUES(hex(zeroblob(32)),'match',?1,?2,?3,hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'complete','exhaustive',?4,jsonb('{{}}'),zeroblob(32),1{value_sql})"
+            );
+            conn.execute(&sql, rusqlite::params![kind, path, oid, product])
+                .unwrap();
+            let invalid = if kind == "binding" {
+                "subjects_digest"
+            } else {
+                "binding_digest"
+            };
+            let bad = conn
+                .execute(
+                    &format!(
+                        "UPDATE policy_units SET {invalid} = ?1 WHERE unit_id = last_insert_rowid()"
+                    ),
+                    ["b".repeat(64)],
+                )
+                .unwrap_err();
+            assert!(
+                bad.to_string().contains("CHECK constraint failed"),
+                "{kind}: {bad}"
+            );
+        }
+    }
+
+    #[test]
     fn current_schema_digest_matches_the_baseline_chain() {
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS {
@@ -7170,7 +7454,7 @@ mod tests {
                VALUES('1111111111111111111111111111111111111111', 'java', 7);
              INSERT INTO policy_units(
                policy_semantic_hash, family, partition_kind, seed_rel_path,
-               seed_blob_oid, partition_digest, seed_blob_id, lang,
+               seed_blob_oid, binding_digest, seed_blob_id, lang,
                configuration_fingerprint,
                active_model_set_hash, engine_epoch, completion, budget_mode,
                product_kind, product, read_set_digest, published_at
@@ -7197,7 +7481,7 @@ mod tests {
             .execute(
                 "INSERT INTO policy_units(
                    policy_semantic_hash, family, partition_kind, seed_rel_path,
-                   seed_blob_oid, partition_digest, configuration_fingerprint,
+                   seed_blob_oid, binding_digest, configuration_fingerprint,
                    active_model_set_hash,
                    engine_epoch, completion, budget_mode, product_kind, product,
                    read_set_digest, published_at
@@ -7218,7 +7502,7 @@ mod tests {
         // keyed by the subject rows it asserted over, and a row without that
         // digest would answer a question nobody asked. A file's findings are
         // also not a query's rows, so the two kinds must agree.
-        for (partition_kind, partition_digest, product_kind) in [
+        for (partition_kind, binding_digest, product_kind) in [
             ("assert_file", "", "assert_file"),
             (
                 "assert_file",
@@ -7245,7 +7529,7 @@ mod tests {
                 .execute(
                     "INSERT INTO policy_units(
                        policy_semantic_hash, family, partition_kind, seed_rel_path,
-                       seed_blob_oid, partition_digest, configuration_fingerprint,
+                       seed_blob_oid, binding_digest, configuration_fingerprint,
                        active_model_set_hash,
                        engine_epoch, completion, budget_mode, product_kind, product,
                        read_set_digest, published_at
@@ -7258,7 +7542,7 @@ mod tests {
                        'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                        'complete', 'exhaustive', ?3, jsonb('{}'), zeroblob(32), 100
                      )",
-                    rusqlite::params![partition_kind, partition_digest, product_kind],
+                    rusqlite::params![partition_kind, binding_digest, product_kind],
                 )
                 .unwrap_err();
             assert!(
@@ -7273,7 +7557,7 @@ mod tests {
         conn.execute(
             "INSERT INTO policy_units(
                policy_semantic_hash, family, partition_kind, seed_rel_path,
-               seed_blob_oid, partition_digest, seed_blob_id, lang,
+               seed_blob_oid, binding_digest, seed_blob_id, lang,
                configuration_fingerprint, active_model_set_hash, engine_epoch,
                completion, budget_mode, product_kind, product, read_set_digest,
                published_at

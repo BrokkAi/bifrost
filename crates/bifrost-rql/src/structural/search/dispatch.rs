@@ -209,6 +209,10 @@ impl DispatchSiteAnswer {
 #[derive(Debug, Clone)]
 pub(super) struct DispatchArm {
     pub(super) call_context: usize,
+    /// Exact source-backed target retained without pinning its artifact.
+    pub(super) target_procedure: Option<brokk_bifrost_flow::value_flow::DurableProcedureKey>,
+    /// The oracle's complete typed boundary, independent of its row label.
+    pub(super) boundary: Option<crate::analyzer::semantic::DispatchBoundaryKind>,
     /// Canonical execution timing for this particular target arm. A targeted
     /// deferred boundary can weaken the source call's timing without weakening
     /// ordinary or independently spawned arms at the same source site.
@@ -241,6 +245,11 @@ pub(super) struct DispatchArm {
 
 #[derive(Debug, Clone)]
 pub(super) struct DispatchCallContext {
+    /// Exact semantic occurrence, including cleanup copies at one source span.
+    pub(super) call: Option<brokk_bifrost_flow::value_flow::DurableCallSiteKey>,
+    /// Positive resolver proof that a call-shaped expression is a conversion.
+    pub(super) proven_non_callable: bool,
+    pub(super) residuals: Vec<crate::analyzer::semantic::DispatchBoundaryKind>,
     /// Internal oracle proof; not a public row field.
     pub(super) member_receiver_preparation:
         Option<crate::analyzer::semantic::MemberReceiverPreparation>,
@@ -316,7 +325,7 @@ pub(super) fn dispatch_expansions_for_input(
 /// exact byte range under an operation-specific domain -- so the two site
 /// families are addressable the same way while staying distinct values, and
 /// `site_ast_id` is minted by the exact function the receiver rows use.
-fn dispatch_site_identity(
+pub(super) fn dispatch_site_identity(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     range: Range,

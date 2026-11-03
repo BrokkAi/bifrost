@@ -41,6 +41,8 @@ pub struct CancellationToken {
     #[cfg(any(test, feature = "test-support"))]
     cancel_after_checks: Option<Arc<AtomicUsize>>,
     #[cfg(any(test, feature = "test-support"))]
+    cancel_after_checks_tripped: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
     timeout_after_checks: Option<Arc<AtomicUsize>>,
     #[cfg(any(test, feature = "test-support"))]
     soft_deadline_after_checks: Option<Arc<AtomicUsize>>,
@@ -329,6 +331,8 @@ impl CancellationToken {
                 })
                 .unwrap_or(0);
             if previous <= 1 {
+                self.cancel_after_checks_tripped
+                    .store(true, Ordering::Release);
                 self.cancel();
             }
         }
@@ -365,6 +369,12 @@ impl CancellationToken {
             cancel_after_checks: Some(Arc::new(AtomicUsize::new(checks))),
             ..Self::default()
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn cancel_after_checks_tripped_for_test(&self) -> bool {
+        self.cancel_after_checks_tripped.load(Ordering::Acquire)
     }
 
     #[cfg(any(test, feature = "test-support"))]

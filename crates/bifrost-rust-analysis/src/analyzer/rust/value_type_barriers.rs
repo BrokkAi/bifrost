@@ -16,11 +16,16 @@ use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
 use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionTypeRef;
 
 use crate::analyzer::semantic::{
-    BarrierObservation, SemanticProviderError, SemanticRequest, SemanticWork, SourceMappingKind,
-    ValueHandle, ValueTypeBarrierContext, ValueTypeBarrierDecision, ValueTypeBarrierReason,
-    ValueTypePredicate, prepare_value_type_barrier_source, value_type_barrier_source_matches,
+    BarrierObservation, ObservedValueType, SemanticProviderError, SemanticRequest, SemanticWork,
+    SourceMappingKind, ValueHandle, ValueTypeBarrierContext, ValueTypeBarrierDecision,
+    ValueTypeBarrierReason, ValueTypePredicate, prepare_value_type_barrier_source,
+    value_type_barrier_source_matches,
+};
+use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+    LexicalBindingResolution, resolve_lexical_binding,
 };
 use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
+use brokk_bifrost_core::analyzer::Language;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 
@@ -134,6 +139,229 @@ pub(crate) fn open<'a>(
 }
 
 impl ValueTypeBarrierContext for RustBarrierContext<'_> {
+    fn observed_type(
+        &self,
+        observation: &BarrierObservation,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ObservedValueType, SemanticProviderError> {
+        let undecided = || ObservedValueType::Undecided(UnavailableObservation);
+        if request.cancellation.is_cancelled() {
+            return Ok(ObservedValueType::Undecided(Cancelled));
+        }
+        let procedure = observation.point().procedure();
+        let semantics = procedure.semantics();
+        let value = semantics
+            .value(observation.value())
+            .expect("validated observation value");
+        let mapping = semantics
+            .source_mapping(value.source)
+            .expect("validated source mapping");
+        if mapping.kind != SourceMappingKind::Exact {
+            return Ok(undecided());
+        }
+        let file = ProjectFile::new(
+            self.rust.inner.project().root(),
+            mapping.locator.path().as_path(),
+        );
+        if procedure.artifact().key().mount()
+            != crate::analyzer::semantic::WorkspaceMountId::from_root(file.root())
+        {
+            return Ok(undecided());
+        }
+        let mut state = self.state.borrow_mut();
+        let prepared = match prepare_value_type_barrier_source(
+            &self.rust.inner,
+            &mut state.syntax,
+            &file,
+            request,
+        ) {
+            Ok(prepared) => prepared,
+            Err(reason) => return Ok(ObservedValueType::Undecided(reason)),
+        };
+        if !value_type_barrier_source_matches(observation, &prepared)
+            || !self
+                .rust
+                .inner
+                .source_matches_selected_native_content(&file, prepared.source())
+        {
+            return Ok(undecided());
+        }
+        let span = mapping.locator.anchor().span();
+        let Some(expression) = prepared
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
+        else {
+            return Ok(undecided());
+        };
+        if expression.start_byte() != span.start_byte() as usize
+            || expression.end_byte() != span.end_byte() as usize
+            || expression.has_error()
+            || expression.is_missing()
+        {
+            return Ok(undecided());
+        }
+        let source = prepared.source();
+        let literal = match expression.kind() {
+            "boolean_literal" | "true" | "false" => Some("bool"),
+            "char_literal" => Some("char"),
+            "integer_literal" => super::semantic::rust_integer_literal_parts(source, expression)
+                .and_then(|(_, suffix)| (!suffix.is_empty()).then_some(suffix)),
+            _ => None,
+        };
+        if let Some(canonical) = literal {
+            return Ok(ObservedValueType::Named {
+                canonical: canonical.to_owned(),
+            });
+        }
+        let Some(name) = brokk_bifrost_rust::structural::expression_name_node(expression) else {
+            return Ok(undecided());
+        };
+        let Some(identifier) = source.get(name.start_byte()..name.end_byte()) else {
+            return Ok(undecided());
+        };
+        let Some(binding) = resolve_lexical_binding(
+            Language::Rust,
+            prepared.tree().root_node(),
+            source,
+            name.start_byte(),
+            name.end_byte(),
+            identifier,
+        ) else {
+            return Ok(undecided());
+        };
+        let (LexicalBindingResolution::Parameter(definition)
+        | LexicalBindingResolution::OtherLocal(definition)) = binding;
+        let mut current = prepared.tree().root_node().named_descendant_for_byte_range(
+            definition.declaration_range.start_byte,
+            definition.declaration_range.end_byte,
+        );
+        let declared = loop {
+            let Some(node) = current else {
+                return Ok(undecided());
+            };
+            match node.kind() {
+                "parameter" | "let_declaration" => break node.child_by_field_name("type"),
+                "function_item" | "function_signature_item" | "closure_expression" => {
+                    return Ok(undecided());
+                }
+                _ => current = node.parent(),
+            }
+        };
+        let Some(ty) = declared else {
+            return Ok(undecided());
+        };
+        let primitive = if ty.kind() == "primitive_type" {
+            Some(ty)
+        } else if ty.kind() == "reference_type"
+            && !(0..ty.named_child_count())
+                .filter_map(|index| ty.named_child(index))
+                .any(|child| child.kind() == "mutable_specifier")
+        {
+            ty.child_by_field_name("type")
+                .filter(|inner| inner.kind() == "primitive_type")
+        } else {
+            None
+        };
+        let Some(primitive) = primitive else {
+            return Ok(undecided());
+        };
+        let Some(spelling) = source.get(primitive.start_byte()..primitive.end_byte()) else {
+            return Ok(undecided());
+        };
+        let Some(operation) = state.operation.as_mut() else {
+            return Ok(undecided());
+        };
+        // The Rust resolver replaces primitive intrinsic seeds when lexical
+        // declarations shadow their spelling. Only its selected intrinsic
+        // identity can establish that this occurrence denotes a builtin.
+        let locator = SelectedSemanticLocator::for_reference_range(
+            "rust",
+            mapping.locator.path().as_str(),
+            name.start_byte(),
+            name.end_byte(),
+        );
+        let answer = operation
+            .resolve_rust_type_for_caller_bounded(
+                file.rel_path(),
+                &locator,
+                ReceiverAnalysisBudget::default(),
+                request.cancellation,
+                &mut SelectedResolutionContextMetrics,
+                &mut ResolutionBatchMetrics::default(),
+            )
+            .map_err(|error| SemanticProviderError::source_access(error.to_string()))?;
+        let work = answer.work();
+        request.budget.charge_work(SemanticWork {
+            events: work.scope_nodes,
+            ..Default::default()
+        });
+        if !request.charge_execution_traversal(work.scope_nodes) {
+            return Ok(ObservedValueType::Undecided(BudgetExceeded));
+        }
+        let BoundedResolution::Complete {
+            value:
+                SelectedRustCallerReferenceOutcome::Operation(
+                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
+                        answers,
+                    )),
+                ),
+            ..
+        } = answer
+        else {
+            return Ok(match answer {
+                BoundedResolution::Cancelled { .. } => ObservedValueType::Undecided(Cancelled),
+                BoundedResolution::Exceeded { .. } => ObservedValueType::Undecided(BudgetExceeded),
+                BoundedResolution::Complete { .. } => undecided(),
+            });
+        };
+        if answers.is_empty() {
+            return Ok(undecided());
+        }
+        let mut selection =
+            brokk_bifrost_analysis::analyzer::native_points::BarrierValueTypeSelection::default();
+        let mut proven = true;
+        for answer in &answers {
+            if !answer.macro_expansion_gaps.is_empty()
+                || !answer.generated_surface_gaps.is_empty()
+                || answer.resolution.binding().targets().len() > 1
+            {
+                proven = false;
+                break;
+            }
+            let ty = match selection.observe(&answer.resolution, None) {
+                Ok(Some(ty)) => ty,
+                _ => {
+                    proven = false;
+                    break;
+                }
+            };
+            if !answer.projection.intrinsic_types.iter().any(|intrinsic| {
+                intrinsic.identity() == ty.identity()
+                    && intrinsic.kind() == IntrinsicTypeKind::Primitive
+                    && intrinsic.spelling() == spelling
+            }) {
+                proven = false;
+                break;
+            }
+        }
+        proven &= selection.finish().is_ok();
+        let canonical = if proven {
+            if ty.kind() == "reference_type" {
+                (spelling == "str").then_some("&str")
+            } else {
+                Some(spelling)
+            }
+        } else {
+            None
+        };
+        Ok(
+            canonical.map_or_else(undecided, |canonical| ObservedValueType::Named {
+                canonical: canonical.to_owned(),
+            }),
+        )
+    }
+
     fn classify(
         &self,
         observation: &BarrierObservation,

@@ -44,6 +44,10 @@ pub struct ValueFlowMeeting {
 }
 
 impl ValueFlowMeeting {
+    /// Index of this derivation in its owning summary result.
+    pub const fn reached_index(&self) -> usize {
+        self.reached_index
+    }
     pub const fn source(&self) -> ValueFlowSourceId {
         self.source
     }

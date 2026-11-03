@@ -22,13 +22,19 @@ use crate::analyzer::semantic::partial_flow::ports::heap_selectors;
 
 use crate::analyzer::semantic::partial_flow::ports::port_of_endpoint;
 
-use crate::analyzer::semantic::partial_flow::rules::guard_edge_kills;
+use crate::analyzer::semantic::partial_flow::rules::{GuardEdgeKill, guard_edge_kills};
 
 use crate::analyzer::semantic::partial_flow::rules::invalidates_source;
 
 use crate::analyzer::semantic::partial_flow::rules::kills_target;
 
 use crate::analyzer::semantic::partial_flow::rules::procedure_infeasible_points;
+
+use crate::analyzer::semantic::ir::CallableTarget;
+use crate::analyzer::semantic::oracle::call::{
+    CallArgumentEndpoint, CallPassingMode, CallStorageRelationIndex, CallStorageSharing,
+    CallWrittenMember, argument_shares_storage_with_formal, direct_formal_store_fields,
+};
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -46,7 +52,11 @@ use crate::analyzer::semantic::workspace_oracle::project_procedure_relations;
 
 use crate::analyzer::semantic::AbstractLocation;
 
+use crate::analyzer::semantic::BindingOriginIndex;
+
 use crate::analyzer::semantic::AccessPath;
+
+use crate::analyzer::semantic::AccessPathRoot;
 
 use crate::analyzer::semantic::AccessPathTail;
 
@@ -103,6 +113,8 @@ use crate::analyzer::semantic::SemanticRequest;
 use crate::analyzer::semantic::SemanticValueKind;
 
 use crate::analyzer::semantic::ValueFlowEndpoint;
+
+use crate::analyzer::semantic::ValueFlowKind;
 
 use crate::analyzer::semantic::ValueFlowRelationKind;
 
@@ -211,11 +223,10 @@ pub struct ProcedurePartialFlows {
     pub flows: Vec<PartialFlow>,
     /// Some value-flow gap that is not discharged remains in the procedure.
     pub open: bool,
-    /// Every relation of the procedure's value-flow snapshot is proven
-    /// complete. The ICFG engine treats a procedure with an unproven
+    /// Every present relation is proven and every live boundary member has
+    /// a representable port. The ICFG engine treats a procedure with an unproven
     /// relation as an incomplete snapshot before it looks at any gap, so
-    /// the composition checks this fact first. `false` when the relations
-    /// were not projected.
+    /// composition checks this fact first. `false` when projection failed.
     pub relations_complete: bool,
     pub discharged_gaps: Vec<SemanticGapId>,
 }
@@ -752,6 +763,7 @@ pub fn compare_partial_flows_with_reference<F: ObservationFilter>(
         observations,
         record_witnesses,
         implicit_reads,
+        &[],
         filter,
         &mut reference_request,
     )?;
@@ -764,6 +776,7 @@ pub fn compare_partial_flows_with_reference<F: ObservationFilter>(
         observations,
         record_witnesses,
         implicit_reads,
+        &[],
         filter,
         request,
     )?;
@@ -869,6 +882,9 @@ struct Fixpoint<'a, 'r, F> {
     edge_kills: HashMap<(ProgramPointId, ProgramPointId, ControlEdgeKind), Vec<u32>>,
     infeasible: Vec<bool>,
     in_states: Vec<Facts>,
+    /// The seed keys whose facts changed in each point's entry state, or
+    /// whose seeds the point has not applied yet, since it last transferred.
+    dirty: Vec<Vec<u32>>,
     queued: Vec<bool>,
     heap: BinaryHeap<Reverse<(usize, usize)>>,
     taken_subtree_sizes: Vec<usize>,
@@ -1058,7 +1074,17 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
             PartialFlowPort::NormalReturn
             | PartialFlowPort::IndexedNormalReturn { .. }
             | PartialFlowPort::ExceptionalReturn => true,
-            PartialFlowPort::Heap { .. } => normal_exit,
+            PartialFlowPort::Heap { ref root, .. } => {
+                normal_exit
+                    && matches!(
+                        root.as_ref(),
+                        PartialFlowPort::NormalReturn
+                            | PartialFlowPort::IndexedNormalReturn { .. }
+                            | PartialFlowPort::Receiver
+                            | PartialFlowPort::Parameter { .. }
+                            | PartialFlowPort::Capture { .. }
+                    )
+            }
             _ => false,
         };
         is_output.then(|| self.ports.intern(port))
@@ -1123,10 +1149,18 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
     /// Apply one point: its events in order, each event's relations in relation
     /// order, then the continuation seeds. Rule 6 observations are taken at
     /// the events they name; extra observations at the phase they name.
-    fn transfer(&mut self, point: ProgramPointId, mut live: Facts) -> Result<Facts, F::Error> {
+    fn transfer(
+        &mut self,
+        point: ProgramPointId,
+        mut live: Facts,
+        seeds: &[u32],
+    ) -> Result<Facts, F::Error> {
         let semantics = self.semantics;
         let index = point.index();
         for (seed, carrier, uncertain) in self.before_seeds[index].clone() {
+            if seeds.binary_search(&seed).is_err() {
+                continue;
+            }
             if self.permits(point, ObservationPhase::BeforeEffects, carrier)? {
                 let witness = self.seed_witness(point, carrier, ObservationPhase::BeforeEffects);
                 join(&mut live, (carrier, seed), uncertain, &self.start, || {
@@ -1212,6 +1246,9 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
             self.observe_exit(&mut live, point, false)?;
         }
         for (seed, carrier, uncertain) in self.continuation_seeds[index].clone() {
+            if seeds.binary_search(&seed).is_err() {
+                continue;
+            }
             if !self.permits(point, ObservationPhase::AfterEffects, carrier)? {
                 continue;
             }
@@ -1274,13 +1311,16 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
                 // takes it whether or not it enters the callee.
                 let incoming_crossed = crossed_call.map(|call| fact.crossed.cross(call.index()));
                 let crossed = incoming_crossed.as_ref().unwrap_or(&fact.crossed);
-                changed |= join(
+                if join(
                     &mut self.in_states[target.index()],
                     key,
                     fact.uncertain,
                     crossed,
                     || fact.witness.clone(),
-                );
+                ) {
+                    changed = true;
+                    self.dirty[target.index()].push(key.1);
+                }
             }
             #[cfg(feature = "test-support")]
             if was_empty
@@ -1336,6 +1376,34 @@ fn invoked_call(
             .call_site(call)
             .expect("an Invoke event names a call of its procedure"),
     )
+}
+
+/// The port of each builtin seed key, and the first key that holds each port.
+#[derive(Default)]
+struct BuiltinSeeds {
+    ports: Vec<PortId>,
+    first: HashMap<PortId, u32>,
+}
+
+impl BuiltinSeeds {
+    /// A new seed key for `port`, even when an earlier key holds it.
+    fn push(&mut self, port: PortId) -> u32 {
+        let key = u32::try_from(self.ports.len()).expect("a seed count fits u32");
+        self.ports.push(port);
+        self.first.entry(port).or_insert(key);
+        key
+    }
+
+    /// The first seed key of `port`, adding one when no seed holds it yet.
+    /// Several relations or calls can name one port; a flow row is keyed by
+    /// its (from, to) ports, so they must share one seed key to keep that row
+    /// unique.
+    fn shared(&mut self, port: PortId) -> u32 {
+        match self.first.get(&port) {
+            Some(&key) => key,
+            None => self.push(port),
+        }
+    }
 }
 
 /// Partial flows of one procedure, from its relation snapshot and its IR.
@@ -1425,6 +1493,34 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
         observations,
         record_witnesses,
         implicit_reads,
+        &[],
+        filter,
+        request,
+    )
+}
+
+/// Reproject one procedure with policy-proved CFG edge kills. The extra kills
+/// live only for this invocation; stored partial-flow rows remain policy-free.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_partial_flows_with_edge_kills<F: ObservationFilter>(
+    procedure: &ProcedureHandle,
+    snapshot: &ValueFlowSnapshot,
+    extra_seeds: &[ExtraSeed],
+    observations: &[ExtraObservation],
+    record_witnesses: bool,
+    implicit_reads: &[ImplicitHeapRead],
+    extra_edge_kills: &[GuardEdgeKill],
+    filter: &mut F,
+    request: &mut SemanticRequest<'_>,
+) -> Result<ExtendedPartialFlows, F::Error> {
+    compute_partial_flows_filtered_impl::<F, false>(
+        procedure,
+        snapshot,
+        extra_seeds,
+        observations,
+        record_witnesses,
+        implicit_reads,
+        extra_edge_kills,
         filter,
         request,
     )
@@ -1438,6 +1534,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     observations: &[ExtraObservation],
     record_witnesses: bool,
     implicit_reads: &[ImplicitHeapRead],
+    extra_edge_kills: &[GuardEdgeKill],
     filter: &mut F,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ExtendedPartialFlows, F::Error> {
@@ -1447,6 +1544,62 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     );
     let semantics = procedure.semantics();
     let point_count = semantics.points().len();
+    let traversal = SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS);
+    // Refuse before the uninterruptible CFG ordering and relation indexing.
+    let preflight = point_count.saturating_add(semantics.control_edges().len());
+    if request.cancellation.is_cancelled()
+        || !request.charge_execution_traversal(preflight)
+        || !traversal.charge_traversal(preflight)
+    {
+        return Ok(ExtendedPartialFlows {
+            partial: ProcedurePartialFlows::without_flows(PartialFlowOutcome::ExceededBudget),
+            flows: Vec::new(),
+        });
+    }
+    // Discovery precedes the fixpoint, but shares its traversal allowance.
+    // Index the member reads of a local object by the object's unique binding
+    // origin, in snapshot order: a call that receives that object can change
+    // what a later read observes.
+    let binding_origins = BindingOriginIndex::new(procedure);
+    let mut origin_reads: HashMap<ValueId, Vec<(ProgramPointId, usize)>> = HashMap::new();
+    for (relation_index, relation) in snapshot.relations().iter().enumerate() {
+        if request.cancellation.is_cancelled()
+            || !request.charge_execution_traversal(1)
+            || !traversal.charge_traversal(1)
+        {
+            return Ok(ExtendedPartialFlows {
+                partial: ProcedurePartialFlows::without_flows(PartialFlowOutcome::ExceededBudget),
+                flows: Vec::new(),
+            });
+        }
+        let ValueFlowEndpoint::Location(_) = &relation.source else {
+            continue;
+        };
+        let Some(SemanticEffect::MemoryLoad {
+            location: memory, ..
+        }) = semantics
+            .point(relation.point.id())
+            .and_then(|row| row.events.get(relation.event_index as usize))
+            .map(|event| &event.effect)
+        else {
+            continue;
+        };
+        let Some(memory) = semantics.memory_location(*memory) else {
+            continue;
+        };
+        let base = match memory.kind {
+            MemoryLocationKind::Field { base, .. }
+            | MemoryLocationKind::Property { base, .. }
+            | MemoryLocationKind::Index { base, .. } => base,
+            _ => continue,
+        };
+        if let Some(origin) = binding_origins.unique_binding_origin(base) {
+            origin_reads
+                .entry(origin)
+                .or_default()
+                .push((relation.point.id(), relation_index));
+        }
+    }
     let mut cfg_budget = CfgAlgorithmBudget::default();
     let cancellation = CancellationToken::new();
     let reverse_postorder = depth_first_order(
@@ -1465,6 +1618,22 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     );
     let mut carriers = Carriers::default();
     let mut ports = PortTable::default();
+    // Publish return-backed member content even when no built-in seed reaches
+    // it. The caller can then demand the boundary path; return roots are not
+    // input seeds.
+    for relation in snapshot.relations() {
+        if let ValueFlowEndpoint::Location(location) = &relation.target
+            && let AccessPathRoot::ProcedurePort(root) = location.path().root()
+            && matches!(
+                root.kind(),
+                ProcedurePortKind::NormalReturn | ProcedurePortKind::IndexedNormalReturn { .. }
+            )
+            && !location.path().selectors().is_empty()
+            && let Some(port) = port_of_endpoint(&relation.target)
+        {
+            ports.intern(port);
+        }
+    }
 
     let member_reads = snapshot
         .member_receivers()
@@ -1513,7 +1682,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
 
     // Seeds live before a point's events: `(point, seed, carrier, uncertain)`.
     let mut before_seeds = Vec::new();
-    let mut builtin_seeds = Vec::new();
+    let mut builtin_seeds = BuiltinSeeds::default();
     let mut continuation_seeds = vec![Vec::new(); point_count];
     let entry = semantics.entry_point();
     for value in semantics.values() {
@@ -1528,8 +1697,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
             .expect("a live semantic value has a handle");
         let endpoint = ValueFlowEndpoint::for_value(handle);
         let port = port_of_endpoint(&endpoint).expect("an input value is a procedure port");
-        let seed = u32::try_from(builtin_seeds.len()).expect("a seed count fits u32");
-        builtin_seeds.push(ports.intern(port));
+        let seed = builtin_seeds.push(ports.intern(port));
         before_seeds.push((entry, seed, carriers.intern(&endpoint), false));
     }
     for location in semantics.memory_locations() {
@@ -1542,8 +1710,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         )
         .expect("a capture memory location is a capture port");
         let endpoint = ValueFlowEndpoint::Port(port);
-        let seed = u32::try_from(builtin_seeds.len()).expect("a seed count fits u32");
-        builtin_seeds.push(ports.intern(PartialFlowPort::Capture { slot: location.id }));
+        let seed = builtin_seeds.push(ports.intern(PartialFlowPort::Capture { slot: location.id }));
         before_seeds.push((entry, seed, carriers.intern(&endpoint), false));
     }
 
@@ -1570,35 +1737,242 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         }
         let carrier = carriers.intern(&relation.source);
         if heap_carriers.insert(carrier) {
-            let seed = u32::try_from(builtin_seeds.len()).expect("a seed count fits u32");
-            builtin_seeds.push(ports.intern(port));
+            let seed = builtin_seeds.shared(ports.intern(port));
             before_seeds.push((entry, seed, carrier, false));
         }
     }
 
     let mut calls = HashMap::new();
+    let storage_index = CallStorageRelationIndex::new(snapshot);
+    // Heap reads rooted at each formal, in snapshot order. A call actual bound
+    // to that formal seeds them at the call's continuation.
+    let mut formal_heap_reads: HashMap<PartialFlowPort, Vec<_>> = HashMap::new();
+    for relation in snapshot.relations() {
+        if let Some(PartialFlowPort::Heap {
+            root,
+            selectors,
+            tail,
+        }) = port_of_endpoint(&relation.source)
+        {
+            formal_heap_reads
+                .entry(*root)
+                .or_default()
+                .push((&relation.source, selectors, tail));
+        }
+    }
+    let mut post_call_storage_unknown = false;
     // An open snapshot has open gaps, which the head reports in `open`; only a
     // truncated snapshot is missing relations.
     // A call continuation the IR does not resolve leaves the procedure open.
     let mut continuation_open = false;
     for call in semantics.call_sites() {
         let mut plan = CallPlan::default();
+        // The points reachable from the call's normal continuation, shared by
+        // its arguments.
+        let mut live_after_call: Option<HashSet<ProgramPointId>> = None;
         for (port, value) in call_port_values(call) {
             let handle = procedure
                 .value_handle(value)
                 .expect("a call's value is a live semantic value");
-            let carrier = carriers.intern(&ValueFlowEndpoint::for_value(handle));
+            let carrier = carriers.intern(&ValueFlowEndpoint::for_value(handle.clone()));
             match port {
                 PartialFlowPort::CallReceiver { .. } | PartialFlowPort::CallArgument { .. } => {
-                    plan.observed.push((ports.intern(port), carrier));
+                    plan.observed.push((ports.intern(port.clone()), carrier));
+                    if let ControlContinuation::Target(point) = call.normal_continuation {
+                        let actual = CallArgumentEndpoint::Value(handle.clone());
+                        let formal = binding_origins
+                            .unique_binding_origin(value)
+                            .or_else(|| {
+                                binding_origins
+                                    .addressed_binding_origins(value)
+                                    .unique_binding()
+                            })
+                            .and_then(|origin| procedure.value_handle(origin))
+                            .and_then(|origin| {
+                                port_of_endpoint(&ValueFlowEndpoint::for_value(origin))
+                            });
+                        let callee_formal = match (&call.declared_targets, &port) {
+                            (
+                                crate::analyzer::semantic::ir::CallableTargetResolution::Proven(
+                                    CallableTarget::Local(id),
+                                ),
+                                PartialFlowPort::CallArgument { ordinal, .. },
+                            ) => procedure.artifact().procedure_handle(*id).map(|callee| {
+                                (callee, PartialFlowPort::Parameter { ordinal: *ordinal })
+                            }),
+                            (
+                                crate::analyzer::semantic::ir::CallableTargetResolution::Proven(
+                                    CallableTarget::Local(id),
+                                ),
+                                PartialFlowPort::CallReceiver { .. },
+                            ) => procedure
+                                .artifact()
+                                .procedure_handle(*id)
+                                .map(|callee| (callee, PartialFlowPort::Receiver)),
+                            _ => None,
+                        };
+                        let direct_fields = callee_formal
+                            .as_ref()
+                            .map(|(callee, formal)| direct_formal_store_fields(callee, formal));
+                        let written_member = |selectors: &[HeapSelector], tail| {
+                            if tail == AccessPathTail::Exact
+                                && matches!(selectors, [HeapSelector::Field(field)]
+                                    if direct_fields.as_ref().is_some_and(|fields| fields.contains(field)))
+                            {
+                                CallWrittenMember::DirectField
+                            } else {
+                                CallWrittenMember::MayTraverseReferent
+                            }
+                        };
+                        // The sharing of the actual depends only on the written
+                        // member's class, never on the read that names it.
+                        let mut sharing_by_member = [None; 2];
+                        let mut sharing_of = |member| {
+                            *sharing_by_member
+                                [usize::from(member == CallWrittenMember::DirectField)]
+                            .get_or_insert_with(|| {
+                                argument_shares_storage_with_formal(
+                                    &actual,
+                                    CallPassingMode::Value,
+                                    member,
+                                    snapshot,
+                                    &storage_index,
+                                )
+                            })
+                        };
+                        for (source, selectors, tail) in formal
+                            .as_ref()
+                            .and_then(|formal| formal_heap_reads.get(formal))
+                            .into_iter()
+                            .flatten()
+                        {
+                            let sharing = sharing_of(written_member(selectors, *tail));
+                            if sharing == CallStorageSharing::Isolated {
+                                continue;
+                            }
+                            let heap = PartialFlowPort::Heap {
+                                root: Box::new(port.clone()),
+                                selectors: selectors.clone(),
+                                tail: *tail,
+                            };
+                            let seed = builtin_seeds.shared(ports.intern(heap));
+                            continuation_seeds[point.index()].push((
+                                seed,
+                                carriers.intern(source),
+                                sharing == CallStorageSharing::Unknown,
+                            ));
+                            post_call_storage_unknown |= sharing == CallStorageSharing::Unknown;
+                        }
+                        // A local object's field read has a local-rooted source,
+                        // so the formal-rooted transit loop above cannot seed it.
+                        // Bind its exact read carrier to the call continuation.
+                        let actual_origin = binding_origins.unique_binding_origin(value);
+                        let addressed_origins = binding_origins.addressed_binding_origins(value);
+                        let mut reads = actual_origin
+                            .into_iter()
+                            .chain(
+                                addressed_origins
+                                    .bindings()
+                                    .iter()
+                                    .copied()
+                                    .filter(|origin| Some(*origin) != actual_origin),
+                            )
+                            .flat_map(|origin| {
+                                origin_reads.get(&origin).into_iter().flatten().map(
+                                    move |&(read_point, relation)| (read_point, relation, origin),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if reads.is_empty() {
+                            continue;
+                        }
+                        if live_after_call.is_none() {
+                            let mut live = HashSet::new();
+                            let mut pending = vec![point];
+                            while let Some(next) = pending.pop() {
+                                if request.cancellation.is_cancelled()
+                                    || !request.charge_execution_traversal(1)
+                                    || !traversal.charge_traversal(1)
+                                {
+                                    return Ok(ExtendedPartialFlows {
+                                        partial: ProcedurePartialFlows::without_flows(
+                                            PartialFlowOutcome::ExceededBudget,
+                                        ),
+                                        flows: Vec::new(),
+                                    });
+                                }
+                                if live.insert(next) {
+                                    for (_, edge) in semantics.successor_edges(next) {
+                                        if request.cancellation.is_cancelled()
+                                            || !request.charge_execution_traversal(1)
+                                            || !traversal.charge_traversal(1)
+                                        {
+                                            return Ok(ExtendedPartialFlows {
+                                                partial: ProcedurePartialFlows::without_flows(
+                                                    PartialFlowOutcome::ExceededBudget,
+                                                ),
+                                                flows: Vec::new(),
+                                            });
+                                        }
+                                        pending.push(edge.target_point);
+                                    }
+                                }
+                            }
+                            live_after_call = Some(live);
+                        }
+                        let live = live_after_call.as_ref().expect("computed above");
+                        reads.retain(|(read_point, ..)| live.contains(read_point));
+                        // Points in id order, then relations in snapshot order.
+                        reads.sort_unstable();
+                        for (_, relation_index, read_origin) in reads {
+                            if request.cancellation.is_cancelled()
+                                || !request.charge_execution_traversal(1)
+                                || !traversal.charge_traversal(1)
+                            {
+                                return Ok(ExtendedPartialFlows {
+                                    partial: ProcedurePartialFlows::without_flows(
+                                        PartialFlowOutcome::ExceededBudget,
+                                    ),
+                                    flows: Vec::new(),
+                                });
+                            }
+                            let relation = &snapshot.relations()[relation_index];
+                            let ValueFlowEndpoint::Location(location) = &relation.source else {
+                                unreachable!("an origin read has a location source")
+                            };
+                            let origin_uncertain = Some(read_origin) != actual_origin
+                                && (!addressed_origins.is_complete()
+                                    || addressed_origins.bindings().len() != 1);
+                            let selectors = heap_selectors(location.path().selectors());
+                            if selectors.is_empty() {
+                                continue;
+                            }
+                            let tail = location.path().tail();
+                            let sharing = sharing_of(written_member(&selectors, tail));
+                            if sharing == CallStorageSharing::Isolated {
+                                continue;
+                            }
+                            let heap = PartialFlowPort::Heap {
+                                root: Box::new(port.clone()),
+                                selectors,
+                                tail,
+                            };
+                            let seed = builtin_seeds.shared(ports.intern(heap));
+                            continuation_seeds[point.index()].push((
+                                seed,
+                                carriers.intern(&relation.source),
+                                sharing == CallStorageSharing::Unknown || origin_uncertain,
+                            ));
+                            post_call_storage_unknown |=
+                                sharing == CallStorageSharing::Unknown || origin_uncertain;
+                        }
+                    }
                 }
                 PartialFlowPort::CallResult { .. } => {
                     plan.defined.push(carrier);
                     match call.normal_continuation {
                         ControlContinuation::Target(point) => {
-                            let seed =
-                                u32::try_from(builtin_seeds.len()).expect("a seed count fits u32");
-                            builtin_seeds.push(ports.intern(port));
+                            let seed = builtin_seeds.push(ports.intern(port));
                             continuation_seeds[point.index()].push((seed, carrier, false));
                         }
                         ControlContinuation::Absent => {}
@@ -1609,9 +1983,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                     plan.defined.push(carrier);
                     match call.exceptional_continuation {
                         ControlContinuation::Target(point) => {
-                            let seed =
-                                u32::try_from(builtin_seeds.len()).expect("a seed count fits u32");
-                            builtin_seeds.push(ports.intern(port));
+                            let seed = builtin_seeds.push(ports.intern(port));
                             continuation_seeds[point.index()].push((seed, carrier, false));
                         }
                         ControlContinuation::Absent => {}
@@ -1624,6 +1996,52 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         calls.insert(call.id, plan);
     }
 
+    // A member of a call result becomes live at that call's normal
+    // continuation. It is never an entry seed or an exit output.
+    let mut unbound_result_member = false;
+    let call_results = CallResultIndex::new(semantics);
+    for relation in snapshot.relations() {
+        let ValueFlowEndpoint::Location(_) = &relation.source else {
+            continue;
+        };
+        let port = call_result_member_port(
+            procedure,
+            &call_results,
+            relation.point.id(),
+            relation.event_index,
+            &relation.source,
+        );
+        let Some(port @ PartialFlowPort::Heap { .. }) = port else {
+            unbound_result_member = unbound_result_member
+                || possible_call_result_member(
+                    procedure,
+                    &call_results,
+                    relation.point.id(),
+                    relation.event_index,
+                );
+            continue;
+        };
+        let PartialFlowPort::Heap { root, .. } = &port else {
+            unreachable!()
+        };
+        let PartialFlowPort::CallResult { call, .. } = root.as_ref() else {
+            continue;
+        };
+        let row = semantics
+            .call_site(*call)
+            .expect("a call-result member names a live call");
+        let ControlContinuation::Target(point) = row.normal_continuation else {
+            continuation_open = true;
+            continue;
+        };
+        let carrier = carriers.intern(&relation.source);
+        if heap_carriers.insert(carrier) {
+            // Several projected locations can name one caller member.
+            let seed = builtin_seeds.shared(ports.intern(port));
+            continuation_seeds[point.index()].push((seed, carrier, false));
+        }
+    }
+
     let mut capture_outs = HashMap::new();
     for capture in semantics.captures() {
         let port = ports.intern(PartialFlowPort::CaptureOut {
@@ -1634,7 +2052,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     }
 
     let projected_carriers = carriers.endpoints.len();
-    let builtin_count = builtin_seeds.len();
+    let builtin_count = builtin_seeds.ports.len();
     for (extra_index, seed) in extra_seeds.iter().enumerate() {
         let key = u32::try_from(builtin_count + extra_index).expect("a seed count fits u32");
         let carrier = carriers.intern(&seed.carrier);
@@ -1727,7 +2145,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     }
     let mut edge_kills: HashMap<(ProgramPointId, ProgramPointId, ControlEdgeKind), Vec<u32>> =
         HashMap::new();
-    for kill in guard_edge_kills(procedure) {
+    for kill in guard_edge_kills(procedure).iter().chain(extra_edge_kills) {
         let carrier = carriers.intern(&kill.carrier);
         edge_kills
             .entry((kill.point, kill.target_point, kill.kind))
@@ -1799,7 +2217,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     // historical union; this is the intentional rows-versioned improvement.
     let mut fixpoint = Fixpoint {
         request,
-        traversal: SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS),
+        traversal,
         filter,
         semantics,
         point_ranks,
@@ -1807,7 +2225,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         carriers,
         ports,
         witnesses: record_witnesses,
-        builtin_seeds,
+        builtin_seeds: builtin_seeds.ports,
         flows: BTreeMap::new(),
         steps,
         capture_outs,
@@ -1822,6 +2240,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         observation_only,
         infeasible,
         in_states: vec![Facts::new(); point_count],
+        dirty: vec![Vec::new(); point_count],
         queued: vec![false; point_count],
         heap: BinaryHeap::new(),
         taken_subtree_sizes,
@@ -1832,6 +2251,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
             continue;
         }
         fixpoint.before_seeds[point.index()].push((seed, carrier, uncertain));
+        fixpoint.dirty[point.index()].push(seed);
         if !fixpoint.queued[point.index()] {
             fixpoint.queued[point.index()] = true;
             fixpoint.heap.push(Reverse((
@@ -1844,10 +2264,15 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     // processed only when its entry state changes. A point that no fact
     // reaches would drop its seeds, so every feasible point with one is queued.
     for index in 0..point_count {
-        if !fixpoint.continuation_seeds[index].is_empty()
-            && !fixpoint.infeasible[index]
-            && !fixpoint.queued[index]
-        {
+        if fixpoint.continuation_seeds[index].is_empty() || fixpoint.infeasible[index] {
+            continue;
+        }
+        let seeds = fixpoint.continuation_seeds[index]
+            .iter()
+            .map(|(seed, ..)| *seed)
+            .collect::<Vec<_>>();
+        fixpoint.dirty[index].extend(seeds);
+        if !fixpoint.queued[index] {
             fixpoint.queued[index] = true;
             fixpoint
                 .heap
@@ -1879,12 +2304,32 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                     metrics.pending_taken_maps -= 1;
                 }
             });
+            // Facts of different seeds never meet, so only the seeds whose
+            // entry facts changed since the last transfer can change the
+            // output; the other seeds' facts were already propagated. A
+            // taken entry holds only facts its predecessor just propagated.
+            // Transferring every seed on every visit made a loop with many
+            // post-call heap seeds quadratic (#9246). Re-joining an unchanged
+            // fact could only add classes that reduction had dropped as
+            // dominated to a widened union, so widened crossed sets may be
+            // smaller than with full replay; schedule and other facts agree.
+            let mut seeds = std::mem::take(&mut fixpoint.dirty[index]);
+            seeds.sort_unstable();
+            seeds.dedup();
             let live = if fixpoint.retain_entry[index] {
-                fixpoint.in_states[index].clone()
+                fixpoint.in_states[index]
+                    .iter()
+                    .filter(|((_, seed), _)| seeds.binary_search(seed).is_ok())
+                    .map(|(&key, fact)| (key, fact.clone()))
+                    .collect()
             } else {
                 std::mem::take(&mut fixpoint.in_states[index])
             };
-            let out = fixpoint.transfer(point, live)?;
+            debug_assert!(
+                live.keys()
+                    .all(|(_, seed)| seeds.binary_search(seed).is_ok())
+            );
+            let out = fixpoint.transfer(point, live, &seeds)?;
             if !fixpoint.propagate(point, &out) {
                 brokk_bifrost_core::profiling::note_with(|| {
                     format!(
@@ -1957,6 +2402,12 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         }
     }
     flows.sort_by_key(|flow| (flow.from, flow.to));
+    debug_assert!(
+        flows
+            .windows(2)
+            .all(|pair| (pair[0].from, pair[0].to) != (pair[1].from, pair[1].to)),
+        "one partial flow per (from, to) port pair: {flows:?}"
+    );
 
     let mut open = continuation_open;
     let mut discharged_gaps = Vec::new();
@@ -1971,6 +2422,350 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         }
     }
 
+    // A store through a dereference of a formal's field can mutate storage
+    // shared with the caller even when the formal itself was copied by value.
+    // Until that indirect address has a formal-rooted heap output, the
+    // relation projection cannot certify the procedure as complete.
+    let mut formal_field_addresses = snapshot
+        .relations()
+        .iter()
+        .filter_map(|relation| {
+            let ValueFlowEndpoint::Location(_) = &relation.source else {
+                return None;
+            };
+            let PartialFlowPort::Heap {
+                root, selectors, ..
+            } = port_of_endpoint(&relation.source)?
+            else {
+                return None;
+            };
+            if selectors.is_empty()
+                || !matches!(
+                    *root,
+                    PartialFlowPort::Parameter { .. } | PartialFlowPort::Receiver
+                )
+            {
+                return None;
+            }
+            observation_value(&relation.target)
+        })
+        .collect::<HashSet<_>>();
+    for point in semantics.points() {
+        for event in &point.events {
+            let SemanticEffect::MemoryLoad {
+                location, result, ..
+            } = &event.effect
+            else {
+                continue;
+            };
+            let Some(row) = semantics.memory_location(*location) else {
+                continue;
+            };
+            let base = match row.kind {
+                MemoryLocationKind::Field { base, .. }
+                | MemoryLocationKind::Property { base, .. }
+                | MemoryLocationKind::Index { base, .. } => base,
+                _ => continue,
+            };
+            if semantics.value(base).is_some_and(|value| {
+                matches!(
+                    value.kind,
+                    SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. }
+                )
+            }) {
+                formal_field_addresses.insert(*result);
+            }
+        }
+    }
+    let indirect_formal_store = semantics.points().iter().any(|point| {
+        point.events.iter().any(|event| {
+            let SemanticEffect::MemoryStore { location, .. } = &event.effect else {
+                return false;
+            };
+            semantics.memory_location(*location).is_some_and(|row| {
+                let base = match row.kind {
+                    MemoryLocationKind::Dereference { address } => Some(address),
+                    MemoryLocationKind::Field { base, .. }
+                    | MemoryLocationKind::Property { base, .. }
+                    | MemoryLocationKind::Index { base, .. } => Some(base),
+                    _ => None,
+                };
+                base.is_some_and(|base| formal_field_addresses.contains(&base))
+            })
+        })
+    });
+    let published_ports = fixpoint.ports.into_ports();
+    // A positive member relation can come from one return arm and must not
+    // certify a different arm. Count the return events themselves: an arm
+    // returning a fresh or constant value need not have a value-flow row.
+    let return_alternatives = semantics
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .filter(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::ProcedureReturn { value: Some(_) }
+            )
+        })
+        .count()
+        + semantics
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::IndexedReturn { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+    let has_returned_member_relation = snapshot.relations().iter().any(|relation| {
+        matches!(&relation.target,
+            ValueFlowEndpoint::Location(location)
+            if !location.path().selectors().is_empty()
+                && matches!(location.path().root(), AccessPathRoot::ProcedurePort(root)
+                    if matches!(root.kind(), ProcedurePortKind::NormalReturn | ProcedurePortKind::IndexedNormalReturn { .. })))
+    });
+    // A return-backed relation is a positive publication, not a census.
+    // Walk each return's own value producers so a member that has no projected
+    // relation still prevents the head from certifying a closed boundary.
+    let mut value_sources: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    let mut return_values = Vec::new();
+    for point in semantics.points() {
+        for event in &point.events {
+            match event.effect {
+                SemanticEffect::Assignment { target, value } => {
+                    value_sources.entry(target).or_default().push(value);
+                }
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                } => match kind {
+                    ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. } => {
+                        return_values.push((source, kind));
+                    }
+                    ValueFlowKind::Transfer(transfer) if !transfer.preserves_member_contents() => {}
+                    ValueFlowKind::IntegerOffset { .. } => {}
+                    _ => value_sources.entry(target).or_default().push(source),
+                },
+                _ => {}
+            }
+        }
+    }
+    let mut boundary_census_complete = !unbound_result_member;
+    // The heap ports of the head, by root and first selector: a member of
+    // that root is published.
+    let published_members = published_ports
+        .iter()
+        .filter_map(|port| match port {
+            PartialFlowPort::Heap {
+                root, selectors, ..
+            } => selectors.first().map(|selector| (root.as_ref(), selector)),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    // An address value passed to a call can expose its originating object to
+    // callee writes. A later read of that object's member needs a caller
+    // continuation port; until one is published, the boundary stays open.
+    let mut address_origins: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    // The values each value's identity flows into: the inverse of the
+    // identity sources a member read's base follows back to its origins.
+    let mut identity_targets: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for point in semantics.points() {
+        for event in &point.events {
+            match event.effect {
+                SemanticEffect::Assignment { target, value } => {
+                    identity_targets.entry(value).or_default().push(target);
+                    if semantics
+                        .value(target)
+                        .is_some_and(|row| matches!(row.kind, SemanticValueKind::Address))
+                    {
+                        address_origins.entry(target).or_default().push(value);
+                    }
+                }
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local | ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } => {
+                    identity_targets.entry(source).or_default().push(target);
+                    if semantics
+                        .value(target)
+                        .is_some_and(|row| matches!(row.kind, SemanticValueKind::Address))
+                    {
+                        address_origins.entry(target).or_default().push(source);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let member_loads = if address_origins.is_empty() {
+        Vec::new()
+    } else {
+        semantics
+            .points()
+            .iter()
+            .flat_map(|point| point.events.iter().map(move |event| (point.id, event)))
+            .filter_map(|(point, event)| {
+                let SemanticEffect::MemoryLoad { location, .. } = event.effect else {
+                    return None;
+                };
+                let (base, selector) = match &semantics.memory_location(location)?.kind {
+                    MemoryLocationKind::Field { base, member } => {
+                        (*base, HeapSelector::Field(member.clone()))
+                    }
+                    MemoryLocationKind::Property { base, key } => {
+                        (*base, HeapSelector::Property(key.as_str().into()))
+                    }
+                    MemoryLocationKind::Index {
+                        base,
+                        constant_index,
+                        ..
+                    } => (
+                        *base,
+                        match constant_index {
+                            Some(index) => {
+                                HeapSelector::ConstantIndex(index.to_string().into_boxed_str())
+                            }
+                            None => HeapSelector::AnyIndex,
+                        },
+                    ),
+                    _ => return None,
+                };
+                Some((point, base, selector))
+            })
+            .collect::<Vec<_>>()
+    };
+    'calls: for call in semantics.call_sites() {
+        if !boundary_census_complete {
+            break;
+        }
+        let ControlContinuation::Target(continuation) = call.normal_continuation else {
+            continue;
+        };
+        let mut live_points: Option<HashSet<ProgramPointId>> = None;
+        for (ordinal, argument) in call.arguments.iter().enumerate() {
+            let Some(origins) = address_origins.get(&argument.value) else {
+                continue;
+            };
+            let live_points = live_points.get_or_insert_with(|| {
+                let mut live = HashSet::new();
+                let mut pending = vec![continuation];
+                while let Some(point) = pending.pop() {
+                    if live.insert(point) {
+                        pending.extend(
+                            semantics
+                                .successor_edges(point)
+                                .map(|(_, edge)| edge.target_point),
+                        );
+                    }
+                }
+                live
+            });
+            // The values whose identity derives from an origin: a member
+            // read's base reaches that origin through identity sources
+            // exactly when it is one of them.
+            let mut derived = HashSet::new();
+            let mut values = origins.clone();
+            while let Some(value) = values.pop() {
+                if derived.insert(value)
+                    && let Some(targets) = identity_targets.get(&value)
+                {
+                    values.extend(targets.iter().copied());
+                }
+            }
+            let continuation_port = PartialFlowPort::CallArgument {
+                call: call.id,
+                ordinal: u32::try_from(ordinal).expect("call argument count fits u32"),
+            };
+            if member_loads.iter().any(|(point, base, selector)| {
+                live_points.contains(point)
+                    && derived.contains(base)
+                    && !published_members.contains(&(&continuation_port, selector))
+            }) {
+                boundary_census_complete = false;
+                break 'calls;
+            }
+        }
+    }
+    for (returned, kind) in return_values {
+        if !boundary_census_complete {
+            break;
+        }
+        let root = match kind {
+            ValueFlowKind::Return => PartialFlowPort::NormalReturn,
+            ValueFlowKind::IndexedReturn { ordinal } => {
+                PartialFlowPort::IndexedNormalReturn { ordinal }
+            }
+            _ => unreachable!("return census records only normal returns"),
+        };
+        let mut reached = HashSet::new();
+        let mut pending = vec![returned];
+        while let Some(value) = pending.pop() {
+            if reached.insert(value)
+                && let Some(sources) = value_sources.get(&value)
+            {
+                pending.extend(sources.iter().copied());
+            }
+        }
+        for location in semantics.memory_locations() {
+            let selector = match &location.kind {
+                MemoryLocationKind::Field { base, member } if reached.contains(base) => {
+                    Some(HeapSelector::Field(member.clone()))
+                }
+                MemoryLocationKind::Property { base, key } if reached.contains(base) => {
+                    Some(HeapSelector::Property(key.as_str().into()))
+                }
+                MemoryLocationKind::Index {
+                    base,
+                    constant_index,
+                    ..
+                } if reached.contains(base) => Some(match constant_index {
+                    Some(index) => HeapSelector::ConstantIndex(index.to_string().into_boxed_str()),
+                    None => HeapSelector::AnyIndex,
+                }),
+                // An address with no proven returned object identity cannot
+                // certify the pointee's members from the return value alone.
+                MemoryLocationKind::Dereference { address } if reached.contains(address) => {
+                    boundary_census_complete = false;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(selector) = selector
+                && !published_members.contains(&(&root, &selector))
+            {
+                boundary_census_complete = false;
+            }
+        }
+    }
+    let published = published_ports.iter().collect::<HashSet<_>>();
+    let boundary_ports_complete = boundary_census_complete
+        && !(return_alternatives >= 2 && has_returned_member_relation)
+        && snapshot.relations().iter().all(|relation| {
+            let ValueFlowEndpoint::Location(location) = &relation.target else {
+                return true;
+            };
+            let AccessPathRoot::ProcedurePort(root) = location.path().root() else {
+                return true;
+            };
+            if location.path().selectors().is_empty() {
+                return true;
+            }
+            match root.kind() {
+                ProcedurePortKind::NormalReturn | ProcedurePortKind::IndexedNormalReturn { .. } => {
+                    port_of_endpoint(&relation.target).is_some_and(|port| published.contains(&port))
+                }
+                ProcedurePortKind::ExceptionalReturn => false,
+                _ => true,
+            }
+        });
     let partial = ProcedurePartialFlows {
         detail: None,
         outcome: if snapshot.coverage() == CandidateCoverage::Truncated {
@@ -1978,13 +2773,16 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         } else {
             PartialFlowOutcome::Complete
         },
-        ports: fixpoint.ports.into_ports(),
+        ports: published_ports,
         flows,
         open,
-        relations_complete: snapshot
-            .relations()
-            .iter()
-            .all(|relation| relation.is_proven_complete()),
+        relations_complete: !indirect_formal_store
+            && !post_call_storage_unknown
+            && snapshot
+                .relations()
+                .iter()
+                .all(|relation| relation.is_proven_complete())
+            && boundary_ports_complete,
         discharged_gaps,
     };
     brokk_bifrost_core::profiling::note_with(|| {
@@ -2008,6 +2806,245 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
 /// the call that defines it (call result and thrown value). `None` for a port
 /// that is not an input, and for a heap port no relation of the snapshot
 /// reads or writes: that location carries no value the run can follow.
+fn call_result_member_port(
+    procedure: &ProcedureHandle,
+    call_results: &CallResultIndex,
+    point: ProgramPointId,
+    event_index: u32,
+    source: &ValueFlowEndpoint,
+) -> Option<PartialFlowPort> {
+    let ValueFlowEndpoint::Location(_) = source else {
+        return None;
+    };
+    let direct = port_of_endpoint(source).filter(|port| {
+        matches!(port,
+        PartialFlowPort::Heap { root, .. }
+        if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
+    });
+    let semantics = procedure.semantics();
+    let event = semantics
+        .point(point)?
+        .events
+        .get(usize::try_from(event_index).ok()?)?;
+    let SemanticEffect::MemoryLoad { location, .. } = event.effect else {
+        // A projected call-result location without a read event does not
+        // prove that the caller still observes those contents after writes.
+        return None;
+    };
+    let row = semantics.memory_location(location)?;
+    let (base, selector) = match &row.kind {
+        MemoryLocationKind::Field { base, member } => (*base, HeapSelector::Field(member.clone())),
+        MemoryLocationKind::Property { base, key } => {
+            (*base, HeapSelector::Property(key.as_str().into()))
+        }
+        MemoryLocationKind::Index {
+            base,
+            index,
+            constant_index,
+            ..
+        } => (
+            *base,
+            match constant_index {
+                Some(index) => HeapSelector::ConstantIndex(index.to_string().into_boxed_str()),
+                None => match index {
+                    Some(index) => HeapSelector::ExactIndex(*index),
+                    None => HeapSelector::AnyIndex,
+                },
+            },
+        ),
+        _ => return None,
+    };
+    let root = reaching_call_result(procedure, call_results, point, event_index, base)?;
+    if let Some(port) = direct {
+        let PartialFlowPort::Heap {
+            root: direct_root, ..
+        } = &port
+        else {
+            unreachable!("a direct call-result member is a heap port")
+        };
+        return (**direct_root == root).then_some(port);
+    }
+    Some(PartialFlowPort::Heap {
+        root: Box::new(root),
+        selectors: vec![selector].into_boxed_slice(),
+        tail: AccessPathTail::Exact,
+    })
+}
+
+/// The unique call result whose contents reach one member read. Follow
+/// definitions in execution order, so a later binding write replaces the
+/// earlier call result. Every predecessor path must reach the same normal
+/// continuation; a merge, unknown producer or unsupported transfer declines.
+fn reaching_call_result(
+    procedure: &ProcedureHandle,
+    call_results: &CallResultIndex,
+    point: ProgramPointId,
+    event_index: u32,
+    base: ValueId,
+) -> Option<PartialFlowPort> {
+    let semantics = procedure.semantics();
+    let mut pending = vec![(point, event_index as usize, base)];
+    let mut seen = HashSet::new();
+    let mut result = None;
+    while let Some((point, before, value)) = pending.pop() {
+        if !seen.insert((point, before, value)) {
+            // A cyclic path without a new definition has no unique origin.
+            return None;
+        }
+        let events = &semantics.point(point)?.events;
+        let mut source = None;
+        for (index, event) in events[..before].iter().enumerate().rev() {
+            match event.effect {
+                SemanticEffect::Assignment {
+                    target,
+                    value: input,
+                } if target == value => {
+                    source = Some((index, input));
+                    break;
+                }
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source: input,
+                    target,
+                } if target == value => {
+                    if !matches!(
+                        kind,
+                        ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver
+                    ) && !matches!(kind, ValueFlowKind::Transfer(transfer) if transfer.preserves_member_contents())
+                    {
+                        return None;
+                    }
+                    source = Some((index, input));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some((index, input)) = source {
+            pending.push((point, index, input));
+            continue;
+        }
+        if let Some((_, port)) = call_results
+            .live_at
+            .get(&point)
+            .into_iter()
+            .flatten()
+            .find(|(result, _)| *result == value)
+        {
+            if result.as_ref().is_some_and(|old| old != port) {
+                return None;
+            }
+            result = Some(port.clone());
+            continue;
+        }
+        let before_count = pending.len();
+        pending.extend(semantics.predecessor_edges(point).map(|(_, edge)| {
+            (
+                edge.source_point,
+                semantics
+                    .point(edge.source_point)
+                    .expect("a control predecessor exists")
+                    .events
+                    .len(),
+                value,
+            )
+        }));
+        if pending.len() == before_count {
+            return None;
+        }
+    }
+    result
+}
+
+/// A may-origin only. It cannot bind a port, but a failed exact proof for a
+/// possibly returned member must leave boundary coverage open.
+fn possible_call_result_member(
+    procedure: &ProcedureHandle,
+    call_results: &CallResultIndex,
+    point: ProgramPointId,
+    event_index: u32,
+) -> bool {
+    let semantics = procedure.semantics();
+    let Some(SemanticEffect::MemoryLoad { location, .. }) = semantics
+        .point(point)
+        .and_then(|row| row.events.get(event_index as usize))
+        .map(|event| &event.effect)
+    else {
+        return false;
+    };
+    let Some(base) = semantics
+        .memory_location(*location)
+        .and_then(|row| match row.kind {
+            MemoryLocationKind::Field { base, .. }
+            | MemoryLocationKind::Property { base, .. }
+            | MemoryLocationKind::Index { base, .. } => Some(base),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    let mut pending = vec![base];
+    let mut seen = HashSet::new();
+    while let Some(value) = pending.pop() {
+        if !seen.insert(value) {
+            continue;
+        }
+        if call_results.results.contains(&value) {
+            return true;
+        }
+        pending.extend(call_results.sources.get(&value).into_iter().flatten());
+    }
+    false
+}
+
+/// The call results and value producers of one procedure, built once for the
+/// per-read searches of `reaching_call_result` and
+/// `possible_call_result_member`.
+struct CallResultIndex {
+    /// Call results by the normal continuation where they become live, in
+    /// call and port order.
+    live_at: HashMap<ProgramPointId, Vec<(ValueId, PartialFlowPort)>>,
+    results: HashSet<ValueId>,
+    /// The assignment and value-flow sources of each value.
+    sources: HashMap<ValueId, Vec<ValueId>>,
+}
+
+impl CallResultIndex {
+    fn new(semantics: &ProcedureSemantics) -> Self {
+        let mut live_at = HashMap::<_, Vec<_>>::new();
+        let mut results = HashSet::new();
+        for call in semantics.call_sites() {
+            for (port, value) in call_port_values(call) {
+                if !matches!(port, PartialFlowPort::CallResult { .. }) {
+                    continue;
+                }
+                results.insert(value);
+                if let ControlContinuation::Target(point) = call.normal_continuation {
+                    live_at.entry(point).or_default().push((value, port));
+                }
+            }
+        }
+        let mut sources = HashMap::<_, Vec<_>>::new();
+        for event in semantics.points().iter().flat_map(|point| &point.events) {
+            match event.effect {
+                SemanticEffect::Assignment {
+                    target,
+                    value: source,
+                }
+                | SemanticEffect::ValueFlow { target, source, .. } => {
+                    sources.entry(target).or_default().push(source);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            live_at,
+            results,
+            sources,
+        }
+    }
+}
+
 pub fn input_port_seed(
     procedure: &ProcedureHandle,
     snapshot: &ValueFlowSnapshot,
@@ -2037,19 +3074,72 @@ pub fn input_port_seed(
             phase: ExtraPhase::BeforeEffects,
             carrier: port_endpoint(ProcedurePortKind::Capture { slot: *slot }),
         },
-        PartialFlowPort::Heap { .. } => {
+        PartialFlowPort::Heap {
+            root,
+            selectors,
+            tail,
+        } if !matches!(root.as_ref(), PartialFlowPort::CallResult { .. }) => {
+            let (point, phase, formal) = match &**root {
+                PartialFlowPort::CallReceiver { call }
+                | PartialFlowPort::CallArgument { call, .. } => {
+                    let row = semantics.call_site(*call)?;
+                    let value = crate::analyzer::semantic::partial_flow::ports::call_input_value(
+                        row, root,
+                    )?;
+                    let value = procedure.value_handle(value)?;
+                    let formal = port_of_endpoint(&ValueFlowEndpoint::for_value(value))?;
+                    let ControlContinuation::Target(point) = row.normal_continuation else {
+                        return None;
+                    };
+                    (point, ExtraPhase::AfterEffects, formal)
+                }
+                _ => (entry, ExtraPhase::BeforeEffects, (**root).clone()),
+            };
             let carrier = snapshot
                 .relations()
                 .iter()
                 .flat_map(|relation| [&relation.source, &relation.target])
                 .find(|endpoint| {
                     matches!(endpoint, ValueFlowEndpoint::Location(_))
-                        && port_of_endpoint(endpoint).as_ref() == Some(port)
+                        && matches!(port_of_endpoint(endpoint), Some(PartialFlowPort::Heap {
+                            root, selectors: member, tail: member_tail
+                        }) if *root == formal && member == *selectors && member_tail == *tail)
                 })?
                 .clone();
             ExtraSeed {
-                point: entry,
-                phase: ExtraPhase::BeforeEffects,
+                point,
+                phase,
+                carrier,
+            }
+        }
+        PartialFlowPort::Heap { root, .. }
+            if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }) =>
+        {
+            let call_results = CallResultIndex::new(semantics);
+            let carrier = snapshot.relations().iter().find_map(|relation| {
+                (call_result_member_port(
+                    procedure,
+                    &call_results,
+                    relation.point.id(),
+                    relation.event_index,
+                    &relation.source,
+                )
+                .as_ref()
+                    == Some(port))
+                .then(|| relation.source.clone())
+            })?;
+            let PartialFlowPort::CallResult { call, .. } = root.as_ref() else {
+                unreachable!()
+            };
+            let row = semantics
+                .call_site(*call)
+                .expect("a call-result member names a live call");
+            let ControlContinuation::Target(point) = row.normal_continuation else {
+                return None;
+            };
+            ExtraSeed {
+                point,
+                phase: ExtraPhase::AfterEffects,
                 carrier,
             }
         }
@@ -2107,10 +3197,8 @@ pub fn input_port_seed(
 /// The appended selectors follow the plan's call-location substitution. An
 /// exact index names a value of the callee, so it matches any index of the
 /// caller; an index wildcard, an inexact origin or a summary tail makes the
-/// caller path a summary. A field selector matches when the locators are
-/// equal. A Rust field is declaration-backed, so the callee and the caller
-/// spell it alike; a language whose member locators carry the enclosing
-/// declaration of the use site would need the plan's respelling here.
+/// caller path a summary. Field selectors use the caller's spelling of the
+/// member, since use-site locators can carry different declaration chains.
 pub fn caller_location_carriers(
     snapshot: &ValueFlowSnapshot,
     origin: &AbstractLocation,
@@ -2124,6 +3212,9 @@ pub fn caller_location_carriers(
             HeapSelector::ExactIndex(_) | HeapSelector::AnyIndex => {
                 lossy = true;
                 HeapSelector::AnyIndex
+            }
+            HeapSelector::Field(field) => {
+                HeapSelector::Field(caller_member_locator(field, snapshot.procedure()))
             }
             other => other.clone(),
         });
@@ -2155,6 +3246,55 @@ pub fn caller_location_carriers(
     carriers
 }
 
+/// Spell a member from a callee location with the caller's use-site scope.
+/// The source anchor identifies the member; the enclosing declaration can
+/// differ between procedures that access it.
+fn caller_member_locator(
+    locator: &crate::analyzer::semantic::SemanticLocator,
+    caller: &ProcedureHandle,
+) -> crate::analyzer::semantic::SemanticLocator {
+    let caller_locator = caller.semantics().locator();
+    let use_site_scope = locator
+        .declaration()
+        .segments()
+        .last()
+        .is_some_and(|segment| {
+            matches!(
+                segment.kind(),
+                crate::analyzer::semantic::DeclarationSegmentKind::Function
+                    | crate::analyzer::semantic::DeclarationSegmentKind::Method
+                    | crate::analyzer::semantic::DeclarationSegmentKind::Constructor
+                    | crate::analyzer::semantic::DeclarationSegmentKind::Initializer
+                    | crate::analyzer::semantic::DeclarationSegmentKind::LocalFunction
+                    | crate::analyzer::semantic::DeclarationSegmentKind::Lambda
+                    | crate::analyzer::semantic::DeclarationSegmentKind::Closure
+                    | crate::analyzer::semantic::DeclarationSegmentKind::AnonymousCallable
+            )
+        });
+    if !use_site_scope
+        || locator.mount() != caller_locator.mount()
+        || locator.path() != caller_locator.path()
+    {
+        return locator.clone();
+    }
+    crate::analyzer::semantic::SemanticLocator::new(
+        locator.mount(),
+        locator.path().clone(),
+        locator.language(),
+        caller_locator.declaration().clone(),
+        locator.role(),
+        locator.anchor(),
+    )
+}
+
+/// The spelling of a returned member in a proven caller continuation.
+pub fn caller_returned_member_locator(
+    locator: &crate::analyzer::semantic::SemanticLocator,
+    caller: &ProcedureHandle,
+) -> crate::analyzer::semantic::SemanticLocator {
+    caller_member_locator(locator, caller)
+}
+
 /// Substitute an exact callee read into a caller origin. Inexact selectors
 /// retain the ordinary carrier matching rather than acquiring prefix taint.
 pub fn caller_exact_read_location(
@@ -2170,8 +3310,11 @@ pub fn caller_exact_read_location(
     for selector in selectors {
         path.push(match selector {
             HeapSelector::Field(field) => AccessSelector::Field(
-                ScopedSemanticLocator::new(procedure.artifact().clone(), field.clone())
-                    .expect("a substituted field belongs to the caller's mount"),
+                ScopedSemanticLocator::new(
+                    procedure.artifact().clone(),
+                    caller_member_locator(field, procedure),
+                )
+                .expect("a substituted field belongs to the caller's mount"),
             ),
             HeapSelector::Property(name) => AccessSelector::Property(name.to_string()),
             HeapSelector::ConstantIndex(index) => AccessSelector::Index(IndexSelector::Constant(

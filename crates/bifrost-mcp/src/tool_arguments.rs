@@ -728,13 +728,215 @@ fn slash_separators(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_tool_arguments, normalize_tool_arguments_for_cli};
+    use super::{normalize_tool_arguments, normalize_tool_arguments_for_cli, tool_named_files};
     use brokk_bifrost_test_macros::hardwon;
     use git2::{Repository, Signature};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    #[test]
+    fn location_requests_refresh_the_named_source_file() {
+        let references = json!({"references": [{"path": "src/Caller.java"}]});
+        let targets = json!({"targets": [{"path": "src/Target.java"}]});
+        assert_eq!(
+            tool_named_files("get_definitions_by_location", &references),
+            ["src/Caller.java"]
+        );
+        assert_eq!(
+            tool_named_files("scan_usages_by_location", &targets),
+            ["src/Target.java"]
+        );
+    }
+
+    #[test]
+    fn paths_normalize_for_all_location_and_scope_tools() {
+        let root = TempDir::new().expect("workspace");
+        let src = root.path().join("src");
+        fs::create_dir(&src).expect("src");
+        let file = src.join("Caller.java");
+        fs::write(&file, "class Caller {}\n").expect("source");
+        let absolute = file.to_string_lossy().to_string();
+        let graph =
+            normalize_tool_arguments("usage_graph", json!({"paths": [absolute]}), root.path())
+                .expect("graph");
+        assert_eq!(graph["paths"][0], "src/Caller.java");
+        let refs = normalize_tool_arguments_for_cli(
+            "get_definitions_by_location",
+            json!({"references": [{"path": absolute, "line": 1, "column": 1}]}),
+            root.path(),
+        )
+        .expect("references")
+        .0;
+        assert_eq!(refs["references"][0]["path"], "src/Caller.java");
+        let plan = normalize_tool_arguments("query_code", json!({"union": [{"where": [src.join("*.java").to_string_lossy()]}, {"where": ["other/*.java"]}]}), root.path()).expect("plan");
+        assert_eq!(plan["union"][0]["where"][0], "src/*.java");
+    }
+
+    #[test]
+    fn history_selectors_preserve_revision_and_normalized_path() {
+        let root = TempDir::new().expect("workspace");
+        let repo = Repository::init(root.path()).expect("repo");
+        fs::create_dir(root.path().join("src")).expect("src");
+        fs::write(root.path().join("A.java"), "class Original {}\n").expect("source");
+        fs::write(root.path().join("src/A.java"), "class Other {}\n").expect("source");
+        fs::write(root.path().join("notes.txt"), "original note\n").expect("note");
+        commit_paths(&repo, &["A.java", "src/A.java", "notes.txt"], "initial");
+        fs::write(root.path().join("A.java"), "class Updated {}\n").expect("update");
+        commit_paths(&repo, &["A.java"], "update");
+        let contents = normalize_tool_arguments(
+            "get_file_contents",
+            json!({"file_paths": [" HEAD:src/../A.java "]}),
+            root.path(),
+        )
+        .expect("contents");
+        assert_eq!(contents["file_paths"][0], "HEAD:A.java");
+        let (summaries, overlays) = normalize_tool_arguments_for_cli(
+            "get_summaries",
+            json!({"targets": ["HEAD~1:src/../A.java", "HEAD~1:A.java"]}),
+            root.path(),
+        )
+        .expect("same revision");
+        assert_eq!(summaries["targets"], json!(["A.java", "A.java"]));
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].content, "class Original {}\n");
+        let conflict = normalize_tool_arguments_for_cli(
+            "get_summaries",
+            json!({"targets": ["HEAD:A.java", "HEAD~1:A.java"]}),
+            root.path(),
+        )
+        .expect_err("different revisions");
+        assert!(conflict.contains("multiple git revisions"), "{conflict}");
+        let (search, overlays) = normalize_tool_arguments_for_cli(
+            "search_file_contents",
+            json!({"file_path": "HEAD:notes.txt"}),
+            root.path(),
+        )
+        .expect("history note");
+        assert_eq!(search["file_path"], "notes.txt");
+        assert_eq!(overlays[0].content, "original note\n");
+    }
+
+    #[test]
+    fn general_cli_arrays_reject_missing_historical_non_source_files() {
+        let root = TempDir::new().expect("workspace");
+        let repo = Repository::init(root.path()).expect("repo");
+        fs::write(root.path().join("notes.txt"), "current note\n").expect("note");
+        commit_paths(&repo, &["notes.txt"], "initial");
+
+        assert!(
+            normalize_tool_arguments_for_cli(
+                "get_summaries",
+                json!({"targets": ["HEAD:missing.txt"]}),
+                root.path(),
+            )
+            .is_err()
+        );
+
+        let (_, overlays) = normalize_tool_arguments_for_cli(
+            "get_summaries",
+            json!({"targets": ["HEAD:notes.txt"]}),
+            root.path(),
+        )
+        .expect("existing historical text file");
+        assert_eq!(overlays[0].content, "current note\n");
+    }
+
+    #[test]
+    fn invalid_query_file_and_lexical_paths_are_handled() {
+        let root = TempDir::new().expect("workspace");
+        assert!(
+            normalize_tool_arguments("query_code", json!({"query_file": ""}), root.path())
+                .unwrap_err()
+                .contains("empty")
+        );
+        fs::create_dir(root.path().join("src")).expect("src");
+        let parent_path = root
+            .path()
+            .join("src/../Missing.java")
+            .to_string_lossy()
+            .to_string();
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({"file_paths": [parent_path]}),
+            root.path(),
+        )
+        .expect("parent");
+        assert_eq!(normalized["file_paths"][0], "Missing.java");
+        let dot_path = root
+            .path()
+            .join("./src/*.java")
+            .to_string_lossy()
+            .to_string();
+        let patterns = normalize_tool_arguments(
+            "list_symbols",
+            json!({"file_patterns": [dot_path]}),
+            root.path(),
+        )
+        .expect("dot");
+        assert_eq!(patterns["file_patterns"][0], "src/*.java");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_paths_obey_canonical_workspace_boundaries() {
+        use std::os::unix::fs::symlink;
+        let root = TempDir::new().expect("workspace");
+        let outside = TempDir::new().expect("outside");
+        fs::write(outside.path().join("secret.txt"), "outside").expect("outside file");
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("link.txt"),
+        )
+        .expect("link");
+        let linked_file = root.path().join("link.txt").to_string_lossy().to_string();
+        assert!(
+            normalize_tool_arguments(
+                "get_file_contents",
+                json!({"file_paths": [linked_file]}),
+                root.path()
+            )
+            .is_err()
+        );
+
+        fs::write(root.path().join("inside.txt"), "inside").expect("inside file");
+        let alias = outside.path().join("workspace");
+        symlink(root.path(), &alias).expect("workspace alias");
+        let alias_file = alias.join("inside.txt").to_string_lossy().to_string();
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({"file_paths": [alias_file]}),
+            &alias,
+        )
+        .expect("aliased root");
+        assert_eq!(normalized["file_paths"][0], "inside.txt");
+    }
+
+    #[test]
+    fn mcp_revision_paths_do_not_change_mutating_tool_targets() {
+        let root = TempDir::new().expect("workspace");
+        let normalized = normalize_tool_arguments(
+            "rename_symbol",
+            json!({"path": "HEAD:src/A.java"}),
+            root.path(),
+        )
+        .expect("rename arguments");
+        assert_eq!(normalized["path"], "HEAD:src/A.java");
+    }
+
+    #[test]
+    fn complexity_discovery_uses_the_execution_default() {
+        let descriptors = crate::mcp_slopcop::slopcop_tool_descriptors();
+        let cyclomatic = descriptors
+            .iter()
+            .find(|item| item["name"] == "compute_cyclomatic_complexity")
+            .expect("cyclomatic descriptor");
+        assert_eq!(
+            cyclomatic["inputSchema"]["properties"]["threshold"]["default"],
+            10
+        );
+    }
 
     /// Stages and commits `paths` (already written under `repo`'s workdir),
     /// mirroring `tests/bifrost_tool_cli.rs`'s `commit_paths` helper so unit

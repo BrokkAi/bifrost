@@ -149,8 +149,8 @@ For MCP, record the configured workspace root and the exact `query_code` or
 exclusive with inline query fields; policy files, suppression override, fixed
 evaluation date, and threshold are independent `run_policy` fields. For the VS
 Code extension, which is part of the separate `bifrost-lsp` project (see
-[LSP Server](/lsp/)), record the extension version, the version of the Bifrost
-binary it started, whether the RQL or policy buffer was unsaved, and the UTC
+[LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md)), record the extension version, the version of the standalone
+server it started, whether the RQL or policy buffer was unsaved, and the UTC
 evaluation date reported by the policy run. Unsaved text is an input that must
 be preserved separately.
 

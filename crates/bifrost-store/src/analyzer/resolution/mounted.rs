@@ -635,6 +635,15 @@ impl SpliceMount for PartialPath {
     }
 }
 
+impl SpliceMount for super::HydratedCandidatePath {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            path: self.path.splice(translation),
+            origin: self.origin,
+        }
+    }
+}
+
 impl SpliceMount for ResolutionQuery {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         ResolutionQuery::new(translation.semantic(self.reference()))
@@ -1235,6 +1244,14 @@ where
     S: std::ops::Deref,
     S::Target: BatchResolutionFragmentSource,
 {
+    fn jvm_selected_root_presence(
+        &self,
+        root_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::batch::JvmSelectedRootPresence> {
+        self.inner
+            .jvm_selected_root_presence(root_fqn, cancellation)
+    }
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
         self.inner.candidate_admission_session()
     }
@@ -1440,6 +1457,15 @@ where
         hydrate_candidate_paths(
             candidates: &[CandidatePathIdentity],
         ) -> Vec<(CandidatePathIdentity, PartialPath)>
+    );
+
+    spliced_batch!(
+        hydrate_candidate_paths_with_origin(
+            candidates: &[CandidatePathIdentity],
+        ) -> Vec<(
+            CandidatePathIdentity,
+            super::HydratedCandidatePath
+        )>
     );
 
     fn visit_reference_seed_batches(
@@ -1691,6 +1717,46 @@ where
             .inner
             .callable_parameter_for_label(self.argument(&callable), label, cancellation)?
             .map(|parameter| self.result(&parameter)))
+    }
+
+    fn external_receiver_argument_reasons(
+        &self,
+        definitions: &[SemanticId],
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        Ok(self
+            .inner
+            .external_receiver_argument_reasons(
+                &self.arguments(definitions),
+                &self.arguments(reasons),
+                cancellation,
+            )?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|reason| self.result(&reason))
+                    .collect()
+            }))
+    }
+
+    fn external_argument_proof_reasons(
+        &self,
+        definitions: &[SemanticId],
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        Ok(self
+            .inner
+            .external_argument_proof_reasons(
+                &self.arguments(definitions),
+                &self.arguments(reasons),
+                cancellation,
+            )?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|reason| self.result(&reason))
+                    .collect()
+            }))
     }
 
     fn external_callable_result_type_identities(
@@ -2535,11 +2601,13 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
+        // #8834: jvm_selected_root_presence is forwarded with the other seam methods.
         // #5671: forward the root-inventory admission session with the other seam methods.
-        assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(batch.len(), 39, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
-        assert_eq!(typed.len(), 96, "SelectedTypedFactSource: {typed:?}");
+        // #7619 adds two readers; #5671 adds one.
+        assert_eq!(typed.len(), 98, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

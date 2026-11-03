@@ -43,6 +43,7 @@ pub use crate::analyzer::semantic::partial_flow::fixpoint::WitnessStep;
 pub use crate::analyzer::semantic::partial_flow::fixpoint::caller_exact_read_location;
 
 pub use crate::analyzer::semantic::partial_flow::fixpoint::caller_location_carriers;
+pub use crate::analyzer::semantic::partial_flow::fixpoint::caller_returned_member_locator;
 
 pub use crate::analyzer::semantic::partial_flow::fixpoint::compute_partial_flows;
 
@@ -51,6 +52,8 @@ pub use crate::analyzer::semantic::partial_flow::fixpoint::compute_partial_flows
 pub use crate::analyzer::semantic::partial_flow::fixpoint::compute_partial_flows_with;
 
 pub use crate::analyzer::semantic::partial_flow::fixpoint::compute_partial_flows_with_implicit_reads;
+
+pub use crate::analyzer::semantic::partial_flow::fixpoint::compute_partial_flows_with_edge_kills;
 
 pub use crate::analyzer::semantic::partial_flow::fixpoint::exact_location_covers_read;
 
@@ -121,10 +124,9 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 /// The relation projection's answers from one file alone.
 ///
 /// Every question the file cannot answer gets the conservative answer: no
-/// runtime refinements, no discharge, no refuted catch binding, and no strong
-/// update. A store the heap oracle would prove strong is therefore a weak
-/// update here, so the projected relations keep the overwritten value alive
-/// where the query-time projection would kill it.
+/// runtime refinements, no discharge and no refuted catch binding. It proves
+/// only a closed Rust value object's exact local member overwrite; other
+/// stores remain weak without the workspace heap oracle.
 #[allow(
     dead_code,
     reason = "the parse-time partial-flow writer will construct the host; the tree is \
@@ -219,17 +221,45 @@ impl RelationProjectionHost for FileLocalProjectionHost<'_> {
 
     fn store_holds_strong_update(
         &self,
-        _procedure: &ProcedureHandle,
+        procedure: &ProcedureHandle,
         _context: &OracleCallContext,
-        _point: &ProgramPointHandle,
+        point: &ProgramPointHandle,
         _event_index: usize,
-        _location: MemoryLocationId,
+        location: MemoryLocationId,
         _stored: ValueId,
-        _bases: &LocalStoreBases,
+        bases: &LocalStoreBases,
         _binding_origins: Option<&BindingOriginIndex>,
         _staged: &mut WorkStager,
         _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) -> Result<bool, StrongUpdateStop> {
-        Ok(false)
+        let rust = procedure.semantics().locator().language()
+            == crate::analyzer::semantic::SemanticLanguage::Standard(
+                brokk_bifrost_core::analyzer::model::Language::Rust,
+            );
+        let Some(crate::analyzer::semantic::MemoryLocationKind::Field { base, .. }) = procedure
+            .semantics()
+            .memory_location(location)
+            .map(|row| &row.kind)
+        else {
+            return Ok(false);
+        };
+        // A field of a closed local may still be a DerefMut projection into
+        // shared storage. Rust records that unresolved dispatch at the store
+        // point as Calls or FieldMemory, so only a direct-cell store can kill
+        // the earlier content. #8918: an escaped borrow also stays open.
+        if procedure.semantics().gaps().iter().any(|gap| {
+            gap.point == point.id()
+                && matches!(
+                    gap.capability,
+                    crate::analyzer::semantic::SemanticCapability::Calls
+                        | crate::analyzer::semantic::SemanticCapability::FieldMemory
+                )
+        }) {
+            return Ok(false);
+        }
+        Ok(rust
+            && ((bases.is_closed_local_object(*base)
+                && bases.canonical_base_has_no_secondary_binding_owner(*base))
+                || bases.is_closed_local_aggregate_copy_binding(*base)))
     }
 }

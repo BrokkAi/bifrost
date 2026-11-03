@@ -481,6 +481,9 @@ mod jvm_extraction_tests {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8741: an absent implicit JVM source root must skip reference resolution"
+)]
 fn jvm_direct_supertype_reference_bindings_preserve_alternatives() {
     jvm_supertype_reference_admission_probe("c/Child.java");
 }
@@ -488,6 +491,131 @@ fn jvm_direct_supertype_reference_bindings_preserve_alternatives() {
 #[test]
 fn jvm_direct_supertype_reference_admits_candidate_file_imports() {
     jvm_supertype_reference_admission_probe("a/Base.java");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8741: an open selected root package inventory was completed as intrinsic"
+)]
+fn implicit_root_stays_open_with_selected_package_gap_in_both_orders() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        BatchResolutionFragmentSource, JvmSelectedRootPresence, LoweredSemanticRole,
+        SelectedFactOperationBlueprintConstruction, SelectedResolutionContextValidationOutcome,
+        SelectedSemanticLocator,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
+    for presence_first in [true, false] {
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file(
+                "java/lang/Broken.java",
+                "package java.lang; class Broken {}",
+            )
+            .file("p/Child.java", "package p; class Child {}")
+            .build();
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+        let state = analyzer
+            .fetch_file_state(&fixture.file("p/Child.java"))
+            .unwrap();
+        analyzer
+            .fetch_file_state(&fixture.file("java/lang/Broken.java"))
+            .unwrap();
+        // The selected java.lang mount has an open persisted package-member
+        // inventory before the operation opens; no stage epoch changes later.
+        analyzer.analyzer_store().conn.execute(|connection| {
+            let inserted = connection.execute(
+                "INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) SELECT interior.blob_id,930001,0,2 FROM resolution_fragment_interiors AS interior JOIN blob_meta AS meta ON meta.blob_id=interior.blob_id WHERE interior.lang='java' AND meta.content_package='java.lang'",
+                [],
+            ).unwrap();
+            assert_eq!(inserted, 1);
+            connection.execute(
+                "INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) SELECT interior.blob_id,2,0,0,930001,930001 FROM resolution_fragment_interiors AS interior JOIN blob_meta AS meta ON meta.blob_id=interior.blob_id WHERE interior.lang='java' AND meta.content_package='java.lang'",
+                [],
+            ).unwrap();
+        });
+        let cancellation = CancellationToken::new();
+        let snapshots = analyzer.selected_workspace_snapshots();
+        let languages = [SelectedResolutionLanguage::new("java", Language::Java)];
+        let input = SelectedResolutionOperationInput::new(
+            analyzer.project(),
+            analyzer.workspace_id(),
+            snapshots.as_ref(),
+            &languages,
+            &[],
+        );
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = analyzer
+            .analyzer_store()
+            .open_selected_resolution_operation(input, &cancellation)
+            .unwrap()
+        else {
+            panic!("open operation")
+        };
+        let lexical = operation.ready.lexical_source();
+        if presence_first {
+            assert_eq!(
+                lexical
+                    .jvm_selected_root_presence("java.lang.Object", &cancellation)
+                    .unwrap(),
+                JvmSelectedRootPresence::NotReady
+            );
+        }
+        let jvm_context::JvmImportContext::Ready {
+            context,
+            scoped_gaps: gaps,
+            ..
+        } = operation
+            .java_import_context("p/Child.java", &cancellation)
+            .unwrap()
+        else {
+            panic!("import context")
+        };
+        if !presence_first {
+            assert_eq!(
+                lexical
+                    .jvm_selected_root_presence("java.lang.Object", &cancellation)
+                    .unwrap(),
+                JvmSelectedRootPresence::NotReady
+            );
+        }
+        let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+            .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+            .unwrap()
+        else {
+            panic!("validate context")
+        };
+        let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+            .ready
+            .collect_blueprint(context, &cancellation)
+            .unwrap()
+        else {
+            panic!("blueprint")
+        };
+        let typed = operation.ready.typed_source();
+        let session = ResolutionSession::unbounded();
+        operation.with_jvm_hierarchy_query(JvmForwardOperationContext {
+            storage_language: "java", blueprint: &blueprint, caller_path: "p/Child.java",
+            import_gaps: &gaps, lexical: &lexical, typed: &typed,
+            cancellation: &cancellation, session: &session,
+        }, |query| {
+            let implicit = state.resolution_facts.supertypes.iter()
+                .find(|parent| parent.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind::ImplicitSuperclass)
+                .expect("Child has an implicit Object parent");
+            let locator = SelectedSemanticLocator::new("java", "p/Child.java", implicit.subtype, LoweredSemanticRole::Definition);
+            let LocatedSemantic::Found(definition) = operation.ready.lookup_locator(&lexical, &locator, &cancellation)?
+            else { panic!("locate Child") };
+            let answer = query.jvm_direct_supertype_answer(definition)?;
+            assert_eq!(answer.parents.len(), 1, "{answer:?}");
+            assert!(matches!(answer.parents[0].completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(_)), "{presence_first}: {answer:?}");
+            Ok(())
+        }).unwrap();
+    }
 }
 
 fn jvm_supertype_reference_admission_probe(caller_path: &str) {
@@ -619,6 +747,23 @@ fn jvm_supertype_reference_admission_probe(caller_path: &str) {
                     assert_eq!(*uncached.binding().completion(), brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete, "uncached binding: {uncached:?}");
                     assert_eq!(answer.parents[0].completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete, "repeated parent binding must stay closed: {answer:?}");
                 }
+                let base_state = analyzer.fetch_file_state(&fixture.file("a/Base.java")).unwrap();
+                let implicit = base_state.resolution_facts.supertypes.iter()
+                    .find(|parent| parent.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind::ImplicitSuperclass)
+                    .expect("Base has an implicit Object parent");
+                let locator = SelectedSemanticLocator::new(
+                    "java", "a/Base.java", implicit.subtype, LoweredSemanticRole::Definition,
+                );
+                let LocatedSemantic::Found(base_definition) = operation.ready.lookup_locator(&lexical, &locator, &cancellation)? else {
+                    panic!("locate Base definition");
+                };
+                let before = query.resolved_reference_count_for_test();
+                let implicit_answer = query.jvm_direct_supertype_answer(base_definition)?;
+                assert_eq!(implicit_answer.parents.len(), 1, "{implicit_answer:?}");
+                assert_eq!(implicit_answer.parents[0].targets.len(), 1, "{implicit_answer:?}");
+                assert_eq!(implicit_answer.parents[0].completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete, "{implicit_answer:?}");
+                assert_eq!(query.resolved_reference_count_for_test(), before,
+                    "an absent root takes the intrinsic edge without resolving a reference");
                 let other = analyzer.fetch_file_state(&fixture.file("d/Other.java")).unwrap();
                 let locator = SelectedSemanticLocator::new(
                     "java", "d/Other.java", other.resolution_facts.supertypes[0].subtype,

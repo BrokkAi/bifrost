@@ -142,7 +142,7 @@ path. Remove the temporary declaration after retaining the evidence.
 
 The plugin does not register an LSP server. The language server is the
 separate `bifrost-lsp` program, and the Bifrost binary rejects `--lsp` with
-`the LSP server has moved out of this repository`. See [LSP Server](/lsp/)
+`the LSP server has moved out of this repository`. See [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md)
 for the status of `bifrost-lsp`.
 
 Bifrost MCP tools provide workspace search, summaries, structural queries,

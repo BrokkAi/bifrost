@@ -288,6 +288,21 @@ impl<'a> ModelApplicability<'a> {
         source: &str,
         ty: tree_sitter::Node<'_>,
     ) -> Option<TypeRef> {
+        self.receiver_type_with(source, ty, &mut |node| {
+            super::std_types::rust_nominal_receiver_application_with_operation(
+                analyzer, file, source, node, None, None, None,
+            )
+        })
+    }
+
+    pub(super) fn receiver_type_with<'tree>(
+        &mut self,
+        source: &str,
+        ty: tree_sitter::Node<'tree>,
+        nominal: &mut dyn FnMut(
+            tree_sitter::Node<'tree>,
+        ) -> Option<(String, Vec<tree_sitter::Node<'tree>>)>,
+    ) -> Option<TypeRef> {
         let mut ancestor = Some(ty);
         let mut seen = std::collections::HashSet::new();
         while let Some(node) = ancestor {
@@ -317,16 +332,17 @@ impl<'a> ModelApplicability<'a> {
             }
             ancestor = node.parent();
         }
-        self.source_type(analyzer, file, source, ty, 16)
+        self.source_type(source, ty, 16, nominal)
     }
 
-    fn source_type(
+    fn source_type<'tree>(
         &self,
-        analyzer: &dyn IAnalyzer,
-        file: &ProjectFile,
         source: &str,
-        ty: tree_sitter::Node<'_>,
+        ty: tree_sitter::Node<'tree>,
         depth: u8,
+        nominal: &mut dyn FnMut(
+            tree_sitter::Node<'tree>,
+        ) -> Option<(String, Vec<tree_sitter::Node<'tree>>)>,
     ) -> Option<TypeRef> {
         if depth == 0 {
             return None;
@@ -334,11 +350,10 @@ impl<'a> ModelApplicability<'a> {
         if ty.kind() == "reference_type" {
             return Some(TypeRef::ByRef {
                 element: Box::new(self.source_type(
-                    analyzer,
-                    file,
                     source,
                     ty.child_by_field_name("type")?,
                     depth - 1,
+                    nominal,
                 )?),
                 reference_kind: crate::analyzer::semantic_model::TypeRefReferenceKind::Lvalue,
             });
@@ -357,16 +372,13 @@ impl<'a> ModelApplicability<'a> {
                 name: rust_node_text(ty, source).into(),
             });
         }
-        let (owner, arguments) =
-            super::std_types::rust_nominal_receiver_application_with_operation(
-                analyzer, file, source, ty, None, None, None,
-            )?;
+        let (owner, arguments) = nominal(ty)?;
         let symbol = self.overlay.symbols_named(&owner).unique()?;
         let fact = owner_declaration(self.active, &symbol)?;
         let mut actual = arguments
             .into_iter()
             .map(|argument| {
-                self.source_type(analyzer, file, source, argument, depth - 1)
+                self.source_type(source, argument, depth - 1, nominal)
                     .unwrap_or(TypeRef::Unknown)
             })
             .collect::<Vec<_>>();

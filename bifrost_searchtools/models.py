@@ -6402,6 +6402,47 @@ class CodeQueryTypeFlowWork:
 
 
 @dataclass(frozen=True)
+class CodeQueryEffectWork:
+    acquisitions: int = 0
+    source_acquisitions: int = 0
+    source_bytes: int = 0
+    request_hits: int = 0
+    acquired_procedures: int = 0
+    acquired_edges: int = 0
+    scc_node_visits: int = 0
+    scc_edge_visits: int = 0
+    scc_components: int = 0
+    propagation_rounds: int = 0
+    propagation_node_visits: int = 0
+    propagation_edge_visits: int = 0
+    inherited_effect_candidates: int = 0
+    coverage_rounds: int = 0
+    coverage_edge_visits: int = 0
+    projected_rows: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryEffectWork:
+        return cls(
+            acquisitions=int(data.get("acquisitions", 0)),
+            source_acquisitions=int(data.get("source_acquisitions", 0)),
+            source_bytes=int(data.get("source_bytes", 0)),
+            request_hits=int(data.get("request_hits", 0)),
+            acquired_procedures=int(data.get("acquired_procedures", 0)),
+            acquired_edges=int(data.get("acquired_edges", 0)),
+            scc_node_visits=int(data.get("scc_node_visits", 0)),
+            scc_edge_visits=int(data.get("scc_edge_visits", 0)),
+            scc_components=int(data.get("scc_components", 0)),
+            propagation_rounds=int(data.get("propagation_rounds", 0)),
+            propagation_node_visits=int(data.get("propagation_node_visits", 0)),
+            propagation_edge_visits=int(data.get("propagation_edge_visits", 0)),
+            inherited_effect_candidates=int(data.get("inherited_effect_candidates", 0)),
+            coverage_rounds=int(data.get("coverage_rounds", 0)),
+            coverage_edge_visits=int(data.get("coverage_edge_visits", 0)),
+            projected_rows=int(data.get("projected_rows", 0)),
+        )
+
+
+@dataclass(frozen=True)
 class CodeQuerySemanticWork:
     materialization_attempts: int = 0
     unique_materialized_files: int = 0
@@ -6416,6 +6457,7 @@ class CodeQuerySemanticWork:
     typestate: CodeQueryTypestateWork = field(default_factory=CodeQueryTypestateWork)
     value_flow: CodeQueryValueFlowWork = field(default_factory=CodeQueryValueFlowWork)
     type_flow: CodeQueryTypeFlowWork = field(default_factory=CodeQueryTypeFlowWork)
+    effects: CodeQueryEffectWork = field(default_factory=CodeQueryEffectWork)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQuerySemanticWork:
@@ -6433,6 +6475,7 @@ class CodeQuerySemanticWork:
             typestate=CodeQueryTypestateWork.from_dict(data.get("typestate", {})),
             value_flow=CodeQueryValueFlowWork.from_dict(data.get("value_flow", {})),
             type_flow=CodeQueryTypeFlowWork.from_dict(data.get("type_flow", {})),
+            effects=CodeQueryEffectWork.from_dict(data.get("effects", {})),
         )
 
 

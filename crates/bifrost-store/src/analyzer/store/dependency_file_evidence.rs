@@ -12,11 +12,17 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const PRODUCER: &[u8] = b"bifrost.static-dependency-evidence.v3";
+// Seeds every evidence set's input digest, so a stored set is reused only for
+// the producer that wrote it. v4: Cargo owned lock rows cover each member's
+// transitive lock closure (#9055).
+const PRODUCER: &[u8] = b"bifrost.static-dependency-evidence.v5";
 pub(super) const READ_ROWS_SQL: &str = "SELECT ecosystem,package,kind,version_requirement,exact_version,source,locator,declared_by,scope,conditions,build_file,source_digest,start_byte,end_byte,complete FROM dependency_file_evidence WHERE set_id = ?1 ORDER BY id";
 
 fn supports_language(language: &str) -> bool {
-    matches!(language, "rust" | "javascript" | "typescript:ts" | "csharp")
+    matches!(
+        language,
+        "rust" | "javascript" | "typescript:ts" | "csharp" | "go"
+    )
 }
 
 fn prepare_selected(
@@ -30,6 +36,7 @@ fn prepare_selected(
         "javascript" => crate::analyzer::Language::JavaScript,
         "typescript:ts" => crate::analyzer::Language::TypeScript,
         "csharp" => crate::analyzer::Language::CSharp,
+        "go" => crate::analyzer::Language::Go,
         _ => unreachable!("unsupported dependency evidence language: {language}"),
     };
     crate::analyzer::store::store_language_support_for_hook(
@@ -396,6 +403,10 @@ impl Drop for ScopedDependencyEvidence {
 }
 
 /// Called during analyzer admission/update, never during seed execution.
+///
+/// Publication is admission work, so its overlay and source reads are not
+/// project reads of any query: a request clone built inside an active capture
+/// must not attribute them to the enclosing query (#2445).
 #[doc(hidden)]
 pub fn publish_overlay(
     store: &Arc<AnalyzerStore>,
@@ -403,66 +414,72 @@ pub fn publish_overlay(
     project: &dyn Project,
     language: crate::analyzer::Language,
 ) -> Result<Option<Arc<ScopedDependencyEvidence>>> {
-    let Some(overlay) = project.overlay_content() else {
-        return Ok(None);
-    };
-    let entries = overlay.entries();
-    if !entries.iter().any(|(file, _)| {
-        super::WorkspaceConfigurationInput::is_native_input(language, file.rel_path())
-    }) {
-        return Ok(None);
-    }
-    let key = match language {
-        crate::analyzer::Language::Rust => "rust",
-        crate::analyzer::Language::JavaScript => "javascript",
-        crate::analyzer::Language::TypeScript => "typescript:ts",
-        crate::analyzer::Language::CSharp => "csharp",
-        _ => return Ok(None),
-    };
-    let snapshot = snapshots.get(key).ok_or_else(|| {
-        super::StoreError::new("dependency overlay has no selected input revision")
-    })?;
-    let limits = DependencyFileEvidenceLimits::default();
-    let (selected, gaps) = {
-        let conn = store.read_conn_for_workspace(snapshots)?;
-        selected_inputs(
-            &conn,
-            snapshot,
-            project.root(),
-            &limits,
-            entries
-                .iter()
-                .filter(|(file, _)| {
-                    super::WorkspaceConfigurationInput::is_native_input(language, file.rel_path())
-                })
-                .map(|(file, digest)| (file, digest)),
-            |file, limit| {
-                project
-                    .read_source_snapshot_limited(file, limit)
-                    .map_err(|error| {
-                        super::StoreError::new(format!(
-                            "reading selected dependency overlay {file}: {error}"
-                        ))
+    brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+        let Some(overlay) = project.overlay_content() else {
+            return Ok(None);
+        };
+        let entries = overlay.entries();
+        if !entries.iter().any(|(file, _)| {
+            super::WorkspaceConfigurationInput::is_native_input(language, file.rel_path())
+        }) {
+            return Ok(None);
+        }
+        let key = match language {
+            crate::analyzer::Language::Rust => "rust",
+            crate::analyzer::Language::JavaScript => "javascript",
+            crate::analyzer::Language::TypeScript => "typescript:ts",
+            crate::analyzer::Language::CSharp => "csharp",
+            crate::analyzer::Language::Go => "go",
+            _ => return Ok(None),
+        };
+        let snapshot = snapshots.get(key).ok_or_else(|| {
+            super::StoreError::new("dependency overlay has no selected input revision")
+        })?;
+        let limits = DependencyFileEvidenceLimits::default();
+        let (selected, gaps) = {
+            let conn = store.read_conn_for_workspace(snapshots)?;
+            selected_inputs(
+                &conn,
+                snapshot,
+                project.root(),
+                &limits,
+                entries
+                    .iter()
+                    .filter(|(file, _)| {
+                        super::WorkspaceConfigurationInput::is_native_input(
+                            language,
+                            file.rel_path(),
+                        )
                     })
-            },
-        )?
-    };
-    let mut evidence = prepare_selected(&snapshot.lang, project.root(), &selected, &limits);
-    evidence.gaps.extend(gaps);
-    // A private set has one Arc lease. UUID ownership prevents a drop from
-    // deleting an identical publication still owned by another analyzer.
-    let digest = format!("overlay:{}", uuid::Uuid::new_v4());
-    let snapshot = snapshot.clone();
-    let set_id = store.conn.execute(move |conn| -> Result<i64> {
-        let tx = conn.transaction()?;
-        let id = insert_set(&tx, &snapshot, &digest, &evidence, &selected)?;
-        tx.commit()?;
-        Ok(id)
-    })?;
-    Ok(Some(Arc::new(ScopedDependencyEvidence {
-        store: Arc::clone(store),
-        set_id,
-    })))
+                    .map(|(file, digest)| (file, digest)),
+                |file, limit| {
+                    project
+                        .read_source_snapshot_limited(file, limit)
+                        .map_err(|error| {
+                            super::StoreError::new(format!(
+                                "reading selected dependency overlay {file}: {error}"
+                            ))
+                        })
+                },
+            )?
+        };
+        let mut evidence = prepare_selected(&snapshot.lang, project.root(), &selected, &limits);
+        evidence.gaps.extend(gaps);
+        // A private set has one Arc lease. UUID ownership prevents a drop from
+        // deleting an identical publication still owned by another analyzer.
+        let digest = format!("overlay:{}", uuid::Uuid::new_v4());
+        let snapshot = snapshot.clone();
+        let set_id = store.conn.execute(move |conn| -> Result<i64> {
+            let tx = conn.transaction()?;
+            let id = insert_set(&tx, &snapshot, &digest, &evidence, &selected)?;
+            tx.commit()?;
+            Ok(id)
+        })?;
+        Ok(Some(Arc::new(ScopedDependencyEvidence {
+            store: Arc::clone(store),
+            set_id,
+        })))
+    })
 }
 
 fn read_locations(

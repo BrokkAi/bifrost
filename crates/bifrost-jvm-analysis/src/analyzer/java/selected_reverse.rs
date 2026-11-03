@@ -40,19 +40,11 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_r
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
-
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
-
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse::selected_reverse_reference_file;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse::selected_reverse_reference_owner;
-
-use brokk_bifrost_analysis::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
-
-use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
 
 use brokk_bifrost_analysis::analyzer::store::Result;
 
@@ -205,87 +197,58 @@ fn java_selected_inverse_for_inner<A: LanguageAdapter>(
     // Java-filtered Project. Ask the shared store for every JVM source
     // snapshot at its current generation, then let selected mounts establish
     // whether peer-language source files actually exist.
-    let selected_languages = ["java", "kotlin", "scala"].map(str::to_owned);
-    let snapshots = inner
-        .analyzer_store()
-        .workspace_snapshots_for_current_languages(inner.workspace_id(), &selected_languages)?;
-    let Some(_snapshot) = snapshots.get(language_for_target(target).config_label()) else {
+    let recipe = crate::analyzer::jvm::selected_operation::SelectedJvmRecipe::new(inner)?;
+    if !recipe.has_language(language_for_target(target).config_label()) {
         return Ok(JavaSelectedReverseOutcome::Unavailable(
             "the workspace has no selected Java snapshot".into(),
         ));
-    };
-    let (masks, content_mounts) =
-        match inner.selected_resolution_overlay_inputs(&snapshots, cancellation)? {
-            SelectedResolutionOverlayInputsOutcome::Ready {
-                masks,
-                content_mounts,
-            } => (masks, content_mounts),
-            SelectedResolutionOverlayInputsOutcome::Unavailable(reason) => {
-                return Ok(JavaSelectedReverseOutcome::Unavailable(format!(
-                    "{reason:?}"
-                )));
-            }
-            SelectedResolutionOverlayInputsOutcome::Stale(reason) => {
-                return Ok(JavaSelectedReverseOutcome::Stale(format!("{reason:?}")));
-            }
-            SelectedResolutionOverlayInputsOutcome::Cancelled => {
-                return Ok(JavaSelectedReverseOutcome::Cancelled);
-            }
-        };
-    let mut languages = Vec::new();
-    for (storage_language, language) in [
-        ("java", Language::Java),
-        ("kotlin", Language::Kotlin),
-        ("scala", Language::Scala),
-    ] {
-        if snapshots.contains_key(storage_language) {
-            languages.push(SelectedResolutionLanguage::new(storage_language, language));
-        }
     }
-    let input = SelectedResolutionOperationInput::new(
-        inner.project(),
-        inner.workspace_id(),
-        &snapshots,
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
-    let operation = match inner
-        .analyzer_store()
-        .open_selected_resolution_operation(input, cancellation)?
-    {
-        SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
-        SelectedResolutionOperationOpenOutcome::Unavailable(reason) => {
+    let operation = match recipe.open(cancellation)? {
+        crate::analyzer::jvm::selected_operation::SelectedJvmOperationOutcome::Ready(operation) => {
+            *operation
+        }
+        crate::analyzer::jvm::selected_operation::SelectedJvmOperationOutcome::Unavailable(
+            reason,
+        ) => {
             return Ok(JavaSelectedReverseOutcome::Unavailable(format!(
                 "{reason:?}"
             )));
         }
-        SelectedResolutionOperationOpenOutcome::Stale(reason) => {
+        crate::analyzer::jvm::selected_operation::SelectedJvmOperationOutcome::Stale(reason) => {
             return Ok(JavaSelectedReverseOutcome::Stale(format!("{reason:?}")));
         }
-        SelectedResolutionOperationOpenOutcome::Cancelled => {
+        crate::analyzer::jvm::selected_operation::SelectedJvmOperationOutcome::Cancelled => {
             return Ok(JavaSelectedReverseOutcome::Cancelled);
         }
     };
     let generation = inner.project().analysis_generation();
-    let candidates = match operation.jvm_reverse_candidate_sites(target, cancellation)? {
-        JvmReverseCandidateOutcome::Ready(candidates) => candidates,
-        JvmReverseCandidateOutcome::TargetUncovered(reason) => {
-            return Ok(JavaSelectedReverseOutcome::TargetUncovered(reason));
-        }
-        JvmReverseCandidateOutcome::Unavailable(reason) => {
-            return Ok(JavaSelectedReverseOutcome::Unavailable(reason));
-        }
-        JvmReverseCandidateOutcome::Cancelled => {
-            return Ok(JavaSelectedReverseOutcome::Cancelled);
+    let candidates = {
+        let _root_read_guard =
+            brokk_bifrost_analysis::analyzer::root_presence::RootPresenceExportGuard {
+                analyzer,
+                handle: Some(operation.root_presence_read_handle()),
+            };
+        match operation.jvm_reverse_candidate_sites(target, cancellation)? {
+            JvmReverseCandidateOutcome::Ready(candidates) => candidates,
+            JvmReverseCandidateOutcome::TargetUncovered(reason) => {
+                return Ok(JavaSelectedReverseOutcome::TargetUncovered(reason));
+            }
+            JvmReverseCandidateOutcome::Unavailable(reason) => {
+                return Ok(JavaSelectedReverseOutcome::Unavailable(reason));
+            }
+            JvmReverseCandidateOutcome::Cancelled => {
+                return Ok(JavaSelectedReverseOutcome::Cancelled);
+            }
         }
     };
     let mut context_metrics = SelectedResolutionContextMetrics;
-    let confirmed = match operation.confirm_jvm_reverse_candidates(
-        candidates,
-        cancellation,
-        &mut context_metrics,
-    )? {
+    let (confirmed, root_reads) =
+        operation.confirm_jvm_reverse_candidates(candidates, cancellation, &mut context_metrics)?;
+    brokk_bifrost_analysis::analyzer::root_presence::record_root_presence_entries(
+        analyzer,
+        &root_reads,
+    );
+    let confirmed = match confirmed {
         SelectedResolutionOperationOutcome::Native(confirmed) => confirmed,
         SelectedResolutionOperationOutcome::Unavailable(reason) => {
             return Ok(JavaSelectedReverseOutcome::Unavailable(format!(

@@ -1839,6 +1839,15 @@ impl StructuralSpec for RustStructuralSpec {
                     if let Some(right) = node.child_by_field_name("right") {
                         attach_rust_role(sink, Role::Right, right, expression_name_node);
                     }
+                    // A compound assignment names its operator; a plain one
+                    // spells `=` as an anonymous token.
+                    let operator = node.child_by_field_name("operator").or_else(|| {
+                        let mut cursor = node.walk();
+                        node.children(&mut cursor).find(|child| child.kind() == "=")
+                    });
+                    if let Some(operator) = operator {
+                        sink.role_named(Role::Operator, operator, operator);
+                    }
                 }
                 _ => {}
             },

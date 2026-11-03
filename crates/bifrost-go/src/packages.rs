@@ -45,6 +45,8 @@ pub struct GoModuleRoot {
 pub struct GoWorkspacePathIndex {
     module_roots: Vec<GoModuleRoot>,
     unnamed_module_roots: Vec<PathBuf>,
+    /// Workspace-relative `vendor` directories holding a `modules.txt`.
+    vendor_roots: Vec<PathBuf>,
     representative_by_directory: HashMap<PathBuf, ProjectFile>,
     exact_import_paths: HashSet<String>,
     complete: bool,
@@ -58,13 +60,16 @@ impl GoWorkspacePathIndex {
     pub fn read_answer(&self) -> [u8; 32] {
         use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
         use brokk_bifrost_core::path_utils::{rel_path_string, workspace_relative_slash_path};
-        let mut hash = CanonicalHasher::new(b"go-workspace-paths-v2");
+        let mut hash = CanonicalHasher::new(b"go-workspace-paths-v3");
         hash.value(&[u8::from(self.complete)]);
         for root in &self.module_roots {
             hash.value(root.import_path.as_bytes());
             hash.value(workspace_relative_slash_path(&root.workspace_dir).as_bytes());
         }
         hash.sequence("unnamed", &self.unnamed_module_roots, |hash, root| {
+            hash.value(workspace_relative_slash_path(root).as_bytes())
+        });
+        hash.sequence("vendor", &self.vendor_roots, |hash, root| {
             hash.value(workspace_relative_slash_path(root).as_bytes())
         });
         let mut paths = self.exact_import_paths.iter().collect::<Vec<_>>();
@@ -105,6 +110,11 @@ impl GoWorkspacePathIndex {
         };
         let (module_roots, unnamed_module_roots, module_roots_complete) =
             go_module_roots_from_files(project, &files);
+        let mut vendor_roots = files
+            .iter()
+            .filter_map(|file| go_vendor_root(file.rel_path()).map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        vendor_roots.sort();
         let mut go_files = files
             .into_iter()
             .filter(|file| {
@@ -132,6 +142,7 @@ impl GoWorkspacePathIndex {
         let mut index = Self {
             module_roots,
             unnamed_module_roots,
+            vendor_roots,
             representative_by_directory,
             exact_import_paths: HashSet::default(),
             complete: complete && module_roots_complete,
@@ -262,23 +273,39 @@ impl GoWorkspacePathIndex {
     }
 
     /// The import path of the file's directory under its nearest named
-    /// module, which needs no `package` clause.
+    /// module or vendor tree, which needs no `package` clause. This answers
+    /// as [`canonical_go_package_name`]'s ancestor walk does: the deepest
+    /// `go.mod`, or vendor tree strictly above the directory, wins.
     fn module_import_path(&self, file: &ProjectFile) -> Option<String> {
         if self.is_outside_selected_modules(file) {
             return None;
         }
         let file_dir = file.parent();
-        self.module_roots
+        let module = self
+            .module_roots
             .iter()
             .filter(|module| file_dir.starts_with(&module.workspace_dir))
-            .max_by_key(|module| module.workspace_dir.components().count())
-            .and_then(|module| {
-                let relative = file_dir.strip_prefix(&module.workspace_dir).ok()?;
-                Some(join_import_path(
-                    &module.import_path,
-                    &relative.to_string_lossy().replace('\\', "/"),
-                ))
-            })
+            .max_by_key(|module| module.workspace_dir.components().count());
+        let vendor = self
+            .vendor_roots
+            .iter()
+            .filter(|root| file_dir != **root && file_dir.starts_with(root))
+            .max_by_key(|root| root.components().count());
+        let (root, module_path) = match (module, vendor) {
+            (Some(module), Some(vendor))
+                if module.workspace_dir.components().count() >= vendor.components().count() =>
+            {
+                (&module.workspace_dir, module.import_path.as_str())
+            }
+            (_, Some(vendor)) => (vendor, ""),
+            (Some(module), None) => (&module.workspace_dir, module.import_path.as_str()),
+            (None, None) => return None,
+        };
+        let relative = file_dir.strip_prefix(root).ok()?;
+        Some(join_import_path(
+            module_path,
+            &relative.to_string_lossy().replace('\\', "/"),
+        ))
     }
 
     /// Whether two source files belong to the same nearest Go module. When
@@ -384,75 +411,103 @@ pub fn source_path_has_build_constraints(path: &Path, has_build_directive: bool)
 /// Filename-only build selection. Directive evaluation requires Go-tool evidence.
 pub fn source_filename_matches_target(file: &ProjectFile, goos: &str, goarch: &str) -> bool {
     let (file_os, file_arch) = source_filename_target(file.rel_path());
-    file_os.is_none_or(|os| {
-        os == goos
-            || matches!(
-                (goos, os),
-                ("android", "linux") | ("illumos", "solaris") | ("ios", "darwin")
-            )
-    }) && file_arch.is_none_or(|arch| arch == goarch)
+    file_os.is_none_or(|os| goos_satisfies_tag(goos, os))
+        && file_arch.is_none_or(|arch| arch == goarch)
 }
 
-fn source_filename_target(path: &Path) -> (Option<&str>, Option<&str>) {
+/// Whether building for `goos` satisfies the OS build tag `tag`: Go also
+/// satisfies `linux` for android, `solaris` for illumos and `darwin` for ios.
+pub fn goos_satisfies_tag(goos: &str, tag: &str) -> bool {
+    tag == goos
+        || matches!(
+            (goos, tag),
+            ("android", "linux") | ("illumos", "solaris") | ("ios", "darwin")
+        )
+}
+
+/// The GOOS values Go treats as `unix`.
+pub const UNIX_GOOS: &[&str] = &[
+    "aix",
+    "android",
+    "darwin",
+    "dragonfly",
+    "freebsd",
+    "hurd",
+    "illumos",
+    "ios",
+    "linux",
+    "netbsd",
+    "openbsd",
+    "solaris",
+];
+
+/// The GOOS values a filename suffix or build tag can name.
+pub const KNOWN_GOOS: &[&str] = &[
+    "aix",
+    "android",
+    "darwin",
+    "dragonfly",
+    "freebsd",
+    "illumos",
+    "ios",
+    "js",
+    "linux",
+    "netbsd",
+    "openbsd",
+    "plan9",
+    "solaris",
+    "wasip1",
+    "windows",
+    "zos",
+];
+
+/// The GOARCH values a filename suffix or build tag can name.
+pub const KNOWN_GOARCH: &[&str] = &[
+    "386",
+    "amd64",
+    "amd64p32",
+    "arm",
+    "armbe",
+    "arm64",
+    "arm64be",
+    "loong64",
+    "mips",
+    "mipsle",
+    "mips64",
+    "mips64le",
+    "mips64p32",
+    "mips64p32le",
+    "ppc",
+    "ppc64",
+    "ppc64le",
+    "riscv",
+    "riscv64",
+    "s390",
+    "s390x",
+    "sparc",
+    "sparc64",
+    "wasm",
+];
+
+/// The GOOS and GOARCH a source-relative path's `_GOOS`, `_GOARCH` or
+/// `_GOOS_GOARCH` filename suffix requires.
+pub fn source_filename_target(path: &Path) -> (Option<&'static str>, Option<&'static str>) {
     let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return (None, None);
     };
     let stem = stem.strip_suffix("_test").unwrap_or(stem);
-    const GOOS: &[&str] = &[
-        "aix",
-        "android",
-        "darwin",
-        "dragonfly",
-        "freebsd",
-        "illumos",
-        "ios",
-        "js",
-        "linux",
-        "netbsd",
-        "openbsd",
-        "plan9",
-        "solaris",
-        "wasip1",
-        "windows",
-        "zos",
-    ];
-    const GOARCH: &[&str] = &[
-        "386",
-        "amd64",
-        "amd64p32",
-        "arm",
-        "armbe",
-        "arm64",
-        "arm64be",
-        "loong64",
-        "mips",
-        "mipsle",
-        "mips64",
-        "mips64le",
-        "mips64p32",
-        "mips64p32le",
-        "ppc",
-        "ppc64",
-        "ppc64le",
-        "riscv",
-        "riscv64",
-        "s390",
-        "s390x",
-        "sparc",
-        "sparc64",
-        "wasm",
-    ];
+    let known =
+        |names: &[&'static str], name: &str| names.iter().copied().find(|known| *known == name);
     let Some((prefix, suffix)) = stem.rsplit_once('_') else {
         return (None, None);
     };
-    if GOARCH.contains(&suffix) {
+    if let Some(arch) = known(KNOWN_GOARCH, suffix) {
         let os = prefix
             .rsplit_once('_')
-            .map(|(_, os)| os)
-            .filter(|os| GOOS.contains(os));
-        (os, Some(suffix))
+            .and_then(|(_, os)| known(KNOWN_GOOS, os));
+        (os, Some(arch))
     } else {
-        (GOOS.contains(&suffix).then_some(suffix), None)
+        (known(KNOWN_GOOS, suffix), None)
     }
 }
 
@@ -470,6 +525,23 @@ fn module_relative_import<'a>(module: &str, import_path: &'a str) -> Option<&'a 
             .strip_prefix(module)
             .and_then(|suffix| suffix.strip_prefix('/'))
     }
+}
+
+/// The vendor tree whose listing `path` is: `<dir>/vendor` for
+/// `<dir>/vendor/modules.txt`.
+///
+/// `go mod vendor` (and `go work vendor`) write that listing, and with it the
+/// go command builds every package in `<dir>/vendor/<import path>` under its
+/// own import path, never as a subpackage of the enclosing module (#9052).
+/// The listing's presence, not its content, makes the directory a vendor
+/// tree: a stale or malformed listing is the build's error to report, and the
+/// files below still declare the package Go would name.
+pub fn go_vendor_root(path: &Path) -> Option<&Path> {
+    if path.file_name()? != "modules.txt" {
+        return None;
+    }
+    path.parent()
+        .filter(|vendor| vendor.file_name() == Some("vendor".as_ref()))
 }
 
 pub fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {
@@ -786,46 +858,34 @@ fn nearest_go_module_entry(dir: &Path, root: &Path) -> GoModuleCacheEntry {
                 .entry(root.to_path_buf())
                 .or_default() += 1;
         }
-        let path = cursor.join("go.mod");
-        let rel_path = match path.strip_prefix(root) {
-            Ok(path) => brokk_bifrost_core::path_utils::workspace_relative_slash_path(path),
-            Err(_) => {
-                inputs.push(GoModuleInput::Unavailable);
-                break GoModuleLookup::Invalid;
-            }
+        let contents = match probe_go_module_input(&cursor.join("go.mod"), root, &mut inputs) {
+            Some(contents) => contents,
+            None => break GoModuleLookup::Invalid,
         };
-        match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                let snapshot = brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk(
-                    contents.as_str(),
-                );
-                inputs.push(GoModuleInput::File {
-                    content_digest: brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
-                        contents.as_bytes(),
-                    ),
-                    rel_path,
-                    blob: snapshot.oid().as_bytes().try_into().expect("blob width"),
-                });
-                break match go_module_path_from_source(&contents) {
-                    Some(module_path) => GoModuleLookup::Found((cursor.to_path_buf(), module_path)),
-                    None => GoModuleLookup::Invalid,
-                };
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                inputs.push(GoModuleInput::PathAbsent { rel_path })
-            }
-            Err(_) => {
-                inputs.push(GoModuleInput::Unavailable);
-                break GoModuleLookup::Invalid;
-            }
+        if let Some(contents) = contents {
+            break match go_module_path_from_source(&contents) {
+                Some(module_path) => GoModuleLookup::Found((cursor.to_path_buf(), module_path)),
+                None => GoModuleLookup::Invalid,
+            };
         }
         if cursor == root {
             break GoModuleLookup::Missing;
         }
-        match cursor.parent() {
-            Some(parent) => cursor = parent,
-            None => break GoModuleLookup::Missing,
+        let Some(parent) = cursor.parent() else {
+            break GoModuleLookup::Missing;
+        };
+        // A vendor tree names its packages by the path below it, with no
+        // module prefix; see `go_vendor_root`.
+        if parent.file_name() == Some("vendor".as_ref()) {
+            match probe_go_module_input(&parent.join("modules.txt"), root, &mut inputs) {
+                Some(Some(_)) => {
+                    break GoModuleLookup::Found((parent.to_path_buf(), String::new()));
+                }
+                Some(None) => {}
+                None => break GoModuleLookup::Invalid,
+            }
         }
+        cursor = parent;
     };
     let inputs: std::sync::Arc<[GoModuleInput]> = inputs.into();
     if !visited.is_empty() {
@@ -843,6 +903,44 @@ fn nearest_go_module_entry(dir: &Path, root: &Path) -> GoModuleCacheEntry {
         }
     }
     (result, GoModuleInputs { inputs, offset: 0 })
+}
+
+/// Read one identity input of the nearest-module walk and record it in the
+/// receipt. `None` means the input could not be read (the answer is then
+/// invalid); `Some(None)` is a recorded absence.
+fn probe_go_module_input(
+    path: &Path,
+    root: &Path,
+    inputs: &mut Vec<GoModuleInput>,
+) -> Option<Option<String>> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        inputs.push(GoModuleInput::Unavailable);
+        return None;
+    };
+    let rel_path = brokk_bifrost_core::path_utils::workspace_relative_slash_path(relative);
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let snapshot = brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk(
+                contents.as_str(),
+            );
+            inputs.push(GoModuleInput::File {
+                content_digest: brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
+                    contents.as_bytes(),
+                ),
+                rel_path,
+                blob: snapshot.oid().as_bytes().try_into().expect("blob width"),
+            });
+            Some(Some(contents))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            inputs.push(GoModuleInput::PathAbsent { rel_path });
+            Some(None)
+        }
+        Err(_) => {
+            inputs.push(GoModuleInput::Unavailable);
+            None
+        }
+    }
 }
 
 /// Import path with no `go.mod`: the project-relative parent directory, or the
@@ -863,6 +961,9 @@ fn join_import_path(module_path: &str, rel_dir: &str) -> String {
     let rel_dir = rel_dir.trim_matches('/');
     if rel_dir.is_empty() {
         module_path.to_string()
+    } else if module_path.is_empty() {
+        // A vendor tree root: the directory below it is the import path.
+        rel_dir.to_string()
     } else {
         format!("{module_path}/{rel_dir}")
     }

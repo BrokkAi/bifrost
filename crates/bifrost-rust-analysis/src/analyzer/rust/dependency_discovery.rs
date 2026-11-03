@@ -45,6 +45,8 @@ use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
 use crate::analyzer::semantic_model::StandardLibraryPackExpectation;
 use crate::analyzer::topology::DependencyScope;
 
+use crate::analyzer::rust::file_dependency_evidence::cargo_lock_activation_rows;
+
 use brokk_bifrost_core::analyzer::model::Language;
 
 use brokk_bifrost_core::analyzer::project::Project;
@@ -303,6 +305,19 @@ pub fn resolve_rust_semantic_pack_dependencies(
                     || diagnostic.code == "rust.evidence.cancelled";
                 diagnostics.push(diagnostic);
             }
+        }
+    }
+
+    if !cancelled {
+        let (mut locked, lock_diagnostics, lock_cancelled) =
+            cargo_lock_activation_rows(project, limits, cancellation);
+        dependencies.append(&mut locked);
+        for lock_diagnostic in lock_diagnostics {
+            diagnostics.push(lock_diagnostic);
+        }
+        if lock_cancelled {
+            cancelled = true;
+            diagnostics.push(cancelled_diagnostic(None));
         }
     }
 

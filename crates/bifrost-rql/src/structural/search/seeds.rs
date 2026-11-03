@@ -2077,6 +2077,7 @@ pub(super) fn execute_seed(
                                 &file,
                                 relation_source,
                                 rule,
+                                state.scope.identifier_dictionary(),
                             )
                         }
                         _ => super::language_rules::LanguageRuleMatches::default(),

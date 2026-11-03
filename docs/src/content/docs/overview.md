@@ -5,7 +5,7 @@ description: What Bifrost provides and how it fits into Brokk workflows.
 
 Bifrost is Brokk's Rust-based static analysis engine for AI coding harnesses. It is built around structured repository facts rather than raw text search.
 
-Bifrost can parse mixed-language workspaces, expose code intelligence through MCP, run one-shot queries and policy checks from the command line, and serve Rust or Python callers directly. Editors use the separate `bifrost-lsp` language server; see [LSP Server](/lsp/).
+Bifrost can parse mixed-language workspaces, expose code intelligence through MCP, run one-shot queries and policy checks from the command line, and serve Rust or Python callers directly. Editors use the separate `bifrost-lsp` language server; see [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md).
 
 ## Built for Large Repositories
 
@@ -36,4 +36,4 @@ See [Language and Analysis Capabilities](/capabilities/) for the language-by-cap
 - [MCP server](/mcp/): code-navigation tools for AI agents. The `bifrost` binary serves it.
 - [CLI](/cli/): one-shot tool calls, saved queries, an interactive query prompt, and policy scans from the terminal.
 - [Rust crate](/rust-library/) and [Python wheel](/python-client/): embedded analyzer APIs.
-- [LSP server](/lsp/): code-navigation features for editors. The separate `bifrost-lsp` program serves it, not the `bifrost` binary.
+- [LSP server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md): code-navigation features for editors. The separate `bifrost-lsp` program serves it, not the `bifrost` binary.

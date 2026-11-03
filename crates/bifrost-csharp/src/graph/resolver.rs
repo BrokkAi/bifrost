@@ -1840,17 +1840,29 @@ pub fn with_callable_parameter_type_nodes<R>(
     method: &CodeUnit,
     read: impl FnOnce(&str, &[Option<Node<'_>>]) -> R,
 ) -> Option<R> {
-    let source = csharp.indexed_source(method.source())?;
+    with_declaration_node(csharp, method, |source, declaration| {
+        read(source, &csharp_callable_parameter_type_nodes(declaration))
+    })
+}
+
+/// Run `read` on the declaration node of `unit` in the tree of the file that
+/// declares it, with that file's indexed source text. `None` when the file
+/// cannot be read or parsed, or no recorded range of `unit` is a declaration
+/// in it. A `partial` type has one range per part; this reads the first part
+/// whose range is a declaration.
+pub fn with_declaration_node<R>(
+    csharp: &dyn CSharpSource,
+    unit: &CodeUnit,
+    read: impl FnOnce(&str, Node<'_>) -> R,
+) -> Option<R> {
+    let source = csharp.indexed_source(unit.source())?;
     let tree = crate::preprocessor::parse_csharp(&source)?;
     let root = tree.root_node();
     let declaration = csharp
-        .ranges_of(method)
+        .ranges_of(unit)
         .iter()
         .find_map(|range| node_for_exact_range(root, range))?;
-    Some(read(
-        &source,
-        &csharp_callable_parameter_type_nodes(declaration),
-    ))
+    Some(read(&source, declaration))
 }
 
 /// Resolve a callable's parameter type for the usage scan, in the scope of the

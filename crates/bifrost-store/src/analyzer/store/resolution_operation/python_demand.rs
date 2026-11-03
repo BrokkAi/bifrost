@@ -4957,6 +4957,11 @@ impl SelectedResolutionOperation<'_, '_> {
                         session,
                     )?;
                     Ok(Ok(SelectedNativeReferenceUnits {
+                        argument_binding: None,
+                        argument_reason_digests: Vec::new(),
+                        call_binding_reason_digests: Vec::new(),
+                        constructor_hierarchy_reason_digests: Vec::new(),
+                        static_type_qualifier_reason_digests: Vec::new(),
                         query_obligations: answer.query_obligations.clone(),
                         answer,
                         definitions,

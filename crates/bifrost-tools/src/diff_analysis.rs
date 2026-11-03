@@ -2215,6 +2215,12 @@ impl RevisionSubtree {
         &self.blobs
     }
 
+    /// Length of an indexed blob in this revision's repository, without reading its bytes.
+    pub fn blob_size(&self, oid: Oid) -> Option<usize> {
+        let (size, kind) = self.repository.odb().ok()?.read_header(oid).ok()?;
+        (kind == ObjectType::Blob).then_some(size)
+    }
+
     /// The source text of one committed blob.
     ///
     /// `None` for a blob this repository cannot read or whose bytes are not

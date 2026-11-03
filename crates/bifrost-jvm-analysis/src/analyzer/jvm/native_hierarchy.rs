@@ -7,8 +7,6 @@ use brokk_bifrost_analysis::analyzer::resolution::{
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::JvmDirectSupertypeAnswer;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
-use brokk_bifrost_analysis::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
-use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
 use brokk_bifrost_analysis::analyzer::store::{Result, StoreError};
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use brokk_bifrost_core::analyzer::capabilities::{
@@ -23,32 +21,24 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_jvm::intrinsics::{intrinsic_root_owner, overridable_method_inventory};
 use std::collections::HashMap;
 
-struct HierarchyReadCapture<'a, A: LanguageAdapter>(&'a TreeSitterAnalyzer<A>);
+struct HierarchyReadCapture<'a, A: LanguageAdapter>(&'a TreeSitterAnalyzer<A>, &'a dyn Fn());
 
 impl<A: LanguageAdapter>
     brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::JvmHierarchyReadReceipts
     for HierarchyReadCapture<'_, A>
 {
-    type Receipt = (
-        std::sync::Arc<brokk_bifrost_analysis::analyzer::ReadLedger>,
-        Vec<brokk_bifrost_analysis::analyzer::QueryReadIncomplete>,
-    );
+    type Receipt = brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
 
     fn capture<T>(&mut self, read: impl FnOnce() -> T) -> (T, Self::Receipt) {
-        let ((result, incomplete), reads) =
-            brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(self.0, || {
-                let scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self.0);
-                let result = read();
-                (result, scope.captured_read_incompleteness())
-            });
-        (result, (reads, incomplete))
+        brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt::capture(self.0, || {
+            let result = read();
+            (self.1)();
+            result
+        })
     }
 
-    fn replay(&mut self, (reads, incomplete): &Self::Receipt) {
-        brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(self.0, reads);
-        for reason in incomplete {
-            self.0.record_query_incomplete(reason.clone());
-        }
+    fn replay(&mut self, receipt: &Self::Receipt) {
+        receipt.replay(self.0);
     }
 }
 
@@ -232,19 +222,8 @@ impl HierarchyQuery for NativeQuery<'_> {
         if scope.cancellation().is_cancelled() {
             return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
         }
-        let mut answer = (self.descendants)(unit, scope.cancellation());
-        if scope.cancellation().is_cancelled() {
-            return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
-        }
-        answer.edges.retain(|unit| scope.admits(unit));
-        for group in &mut answer.ambiguous {
-            group.retain(|unit| scope.admits(unit));
-        }
-        answer.ambiguous.retain(|group| !group.is_empty());
-        if scope.cancellation().is_cancelled() {
-            return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
-        }
-        Ok(answer)
+        let answer = (self.descendants)(unit, scope.cancellation());
+        brokk_bifrost_analysis::analyzer::i_analyzer::scope_filter_descendant_answer(answer, scope)
     }
     fn member_family_ancestors(&mut self, unit: &CodeUnit) -> MemberFamilyAncestors {
         let answer = self.direct_ancestors(unit);
@@ -292,39 +271,9 @@ fn open_native_query<A: LanguageAdapter>(
     // snapshots, including dependents. An unselected root or coverage missing
     // from those snapshots is DescendantIndexUnavailable, never a closed
     // negative answer. Unindexed overlay replacements are reported likewise.
-    let selected = ["java", "kotlin", "scala"].map(str::to_owned);
-    let snapshots = inner
-        .analyzer_store()
-        .workspace_snapshots_for_current_languages(inner.workspace_id(), &selected)?;
-    let SelectedResolutionOverlayInputsOutcome::Ready {
-        masks,
-        content_mounts,
-    } = inner.selected_resolution_overlay_inputs(&snapshots, &cancellation)?
-    else {
-        return Err(StoreError::new(
-            "JVM hierarchy overlay selection unavailable",
-        ));
-    };
-    let languages = [
-        ("java", Language::Java),
-        ("kotlin", Language::Kotlin),
-        ("scala", Language::Scala),
-    ]
-    .into_iter()
-    .filter(|(storage, _)| snapshots.contains_key(*storage))
-    .map(|(storage, language)| SelectedResolutionLanguage::new(storage, language))
-    .collect::<Vec<_>>();
-    let input = SelectedResolutionOperationInput::new(
-        inner.project(),
-        inner.workspace_id(),
-        &snapshots,
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
-    let SelectedResolutionOperationOpenOutcome::Ready(operation) = inner
-        .analyzer_store()
-        .open_selected_resolution_operation(input, &cancellation)?
+    let recipe = super::selected_operation::SelectedJvmRecipe::new(inner)?;
+    let super::selected_operation::SelectedJvmOperationOutcome::Ready(operation) =
+        recipe.open(&cancellation)?
     else {
         return Err(StoreError::new(
             "JVM hierarchy selected operation unavailable",
@@ -375,6 +324,11 @@ fn open_native_query<A: LanguageAdapter>(
     let lexical = operation.ready.lexical_source();
     let typed = operation.ready.typed_source();
     let session = ResolutionSession::unbounded();
+    let export_root_reads = || {
+        brokk_bifrost_analysis::analyzer::root_presence::record_consumed_root_presence(
+            inner, &operation,
+        )
+    };
     operation.with_jvm_hierarchy_query_receipts(
         JvmForwardOperationContext {
             storage_language: &storage_language,
@@ -386,7 +340,7 @@ fn open_native_query<A: LanguageAdapter>(
             cancellation: &cancellation,
             session: &session,
         },
-        &mut HierarchyReadCapture(inner),
+        &mut HierarchyReadCapture(inner, &export_root_reads),
         |query| {
             let query = std::cell::RefCell::new(query);
             let mut ancestors = |unit: &CodeUnit| {
@@ -424,7 +378,7 @@ fn open_native_query<A: LanguageAdapter>(
                     // those authorities in the caller's receipt, including empty
                     // membership answers and files not yet nominated as candidates.
                     for language in [Language::Java, Language::Kotlin, Language::Scala] {
-                        if snapshots.contains_key(language.config_label()) {
+                        if recipe.has_language(language.config_label()) {
                             inner.record_read(inner.workspace_scope_read_key(&[language]));
                         }
                     }
@@ -438,7 +392,7 @@ fn open_native_query<A: LanguageAdapter>(
                         return Ok(answer);
                     };
                     for language in [Language::Java, Language::Kotlin, Language::Scala] {
-                        if !snapshots.contains_key(language.config_label()) { continue; }
+                        if !recipe.has_language(language.config_label()) { continue; }
                         let walk = operation.jvm_descendant_walk(&mut query.borrow_mut(), target,
                             unit.identifier(), language, token, &descendant_session)?;
                         let raw = walk.answer;

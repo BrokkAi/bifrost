@@ -896,6 +896,7 @@ pub enum SelectedResolutionFallbackReason {
 }
 
 #[doc(hidden)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum SelectedResolutionOperationOutcome<T> {
     Native(T),
     Unavailable(SelectedResolutionUnavailable),
@@ -1825,6 +1826,9 @@ pub struct ReadySelectedResolution<'store, 'input> {
     pub operation_demand_state: Arc<crate::analyzer::resolution::SelectedDemandState>,
     // Publication identities bound by this query, dropped with the request.
     go_publications: RefCell<HashMap<i64, super::GoContextIdentity>>,
+    /// Current publications witnessed at a main-database data version on this
+    /// operation's read-only connection. Revalidation still runs per answer.
+    go_publication_rechecks: RefCell<ExactReadMemo<(super::GoContextIdentity, i64), ()>>,
     snapshots: WorkspaceSnapshots,
     go_base_profile: std::cell::Cell<Option<[u8; 32]>>,
     // One forward request selects one caller package variant, restored on exit.
@@ -1842,6 +1846,8 @@ pub struct ReadySelectedResolution<'store, 'input> {
     /// Reader memos retained only while one graph-stage unit is active.
     graph_stage_candidate_cache: RefCell<Option<std::rc::Rc<UnconditionalCandidateCache>>>,
     boundary_candidate_read_memo: BoundaryCandidateReadMemo,
+    jvm_root_presence_memo:
+        std::rc::Rc<RefCell<super::resolution_lexical::JvmRootPresenceReadMemo>>,
     pub(crate) point_read_memos: std::rc::Rc<SelectedPointReadMemos>,
     #[doc(hidden)]
     pub jvm_context_profile: RefCell<Option<jvm_context::JvmContextReadProfile>>,
@@ -2008,6 +2014,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
                 std::rc::Rc::clone(cache),
             )
             .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo))
+            .with_jvm_root_presence_memo(std::rc::Rc::clone(&self.jvm_root_presence_memo))
             .with_candidate_path_read_memo(std::rc::Rc::clone(
                 &self.point_read_memos.candidate_paths,
             ))
@@ -2020,6 +2027,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
             std::rc::Rc::clone(&self.operation_candidate_cache),
         )
         .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo))
+        .with_jvm_root_presence_memo(std::rc::Rc::clone(&self.jvm_root_presence_memo))
         .with_candidate_path_read_memo(std::rc::Rc::clone(&self.point_read_memos.candidate_paths))
         .with_reference_read_memo(std::rc::Rc::clone(
             &self.point_read_memos.reference_evidence,
@@ -2598,7 +2606,14 @@ pub struct SelectedResolutionOperation<'store, 'input> {
     /// Declared receiver types demanded by this selected query. Keys include
     /// the exact anchor and staged selection; member names do not affect it.
     go_receiver_anchor_types_memo: RefCell<go_receiver_anchor::GoReceiverAnchorTypesMemo>,
+    /// The selected source role for one mounted Go file at one stage epoch.
+    go_source_roles: RefCell<ExactReadMemo<go_named::GoSourceRoleReadKey, Option<String>>>,
     /// Completed file contexts for distinct inputs over this query's selection.
+    // #7314 6b: temporary oracle selection, confined to this operation.
+    #[cfg(any(test, feature = "test-support"))]
+    java_oracle_selection: Option<jvm_context::JavaOracleSelection>,
+    #[cfg(any(test, feature = "test-support"))]
+    java_oracle_visits: RefCell<Vec<String>>,
     jvm_file_contexts: RefCell<jvm_context::JvmFileContextMemo>,
     jvm_access_policies: RefCell<java_access::JvmAccessPolicyMemo>,
     jvm_context_preparations: jvm_context::JvmContextPreparationMemo,
@@ -7083,7 +7098,6 @@ fn project_rust_reference_types(
     mounts: SelectedMountTable<'_, '_>,
     session: &ResolutionSession,
     cancellation: &CancellationToken,
-    locator: &SelectedSemanticLocator,
 ) -> Result<SelectedResolutionOperationOutcome<SelectedRustTypeProjection>> {
     let mut identities = BTreeSet::new();
     for frontier in resolution.projected_frontiers() {
@@ -7110,16 +7124,36 @@ fn project_rust_reference_types(
         .into_iter()
         .filter(|identity| !intrinsic_identities.contains(identity))
         .collect::<Vec<_>>();
+    // A type identity the source vocabulary cannot project, such as the
+    // file-local binder that stands in for an unindexed external `use`, is a
+    // type without a source definition, not an unavailable operation. It
+    // degrades itself, not its batch: it keeps no nominal definition, and the
+    // caller reports that type as incomplete (#9050).
     let nominal_types =
         match project_rust_source_definitions(ready, mounts, &nominal, cancellation, session)? {
             SelectedRustSourceDefinitionProjection::Complete(rows) => rows,
             SelectedRustSourceDefinitionProjection::Unavailable => {
-                return Ok(SelectedResolutionOperationOutcome::Unavailable(
-                    SelectedResolutionUnavailable::MissingDefinitionUnit {
-                        storage_language: locator.storage_language().to_owned(),
-                        persisted_relative_path: locator.relative_path().to_owned(),
-                    },
-                ));
+                let mut rows = Vec::new();
+                for identity in nominal {
+                    match project_rust_source_definitions(
+                        ready,
+                        mounts,
+                        &[identity],
+                        cancellation,
+                        session,
+                    )? {
+                        SelectedRustSourceDefinitionProjection::Complete(projected) => {
+                            rows.extend(projected);
+                        }
+                        SelectedRustSourceDefinitionProjection::Unavailable => {}
+                        SelectedRustSourceDefinitionProjection::Cancelled => {
+                            return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                cancelled_completion(),
+                            ));
+                        }
+                    }
+                }
+                rows
             }
             SelectedRustSourceDefinitionProjection::Cancelled => {
                 return Ok(SelectedResolutionOperationOutcome::Cancelled(
@@ -8958,6 +8992,11 @@ impl AnalyzerStore {
                             go_prepared_contexts: go_named::GoPreparedContextMemo::default(),
                             go_context_registrations: RefCell::default(),
                             go_receiver_anchor_types_memo: RefCell::default(),
+                            go_source_roles: RefCell::default(),
+                            #[cfg(any(test, feature = "test-support"))]
+                            java_oracle_selection: None,
+                            #[cfg(any(test, feature = "test-support"))]
+                            java_oracle_visits: RefCell::default(),
                             jvm_file_contexts: RefCell::default(),
                             jvm_access_policies: RefCell::default(),
                             jvm_context_preparations: Default::default(),
@@ -9121,6 +9160,12 @@ impl AnalyzerStore {
             ));
         }
         inventory.begin_operation_reads();
+        let root_presence_memo = std::rc::Rc::new(RefCell::new(
+            super::resolution_lexical::JvmRootPresenceReadMemo::new(
+                inventory.scope_identity(),
+                inventory.staged_read_epoch(),
+            ),
+        ));
         Ok(PreparedSelectedResolution::Ready(Box::new(
             ReadySelectedResolution {
                 store: self,
@@ -9136,6 +9181,7 @@ impl AnalyzerStore {
                 context_identities: SelectedContextIdentities::new(),
                 operation_demand_state: Arc::default(),
                 go_publications: RefCell::default(),
+                go_publication_rechecks: RefCell::default(),
                 snapshots: input.snapshots.clone(),
                 go_base_profile: std::cell::Cell::new(None),
                 go_active_package: std::cell::Cell::new(None),
@@ -9147,6 +9193,7 @@ impl AnalyzerStore {
                 ),
                 graph_stage_candidate_cache: RefCell::new(None),
                 boundary_candidate_read_memo: std::rc::Rc::new(RefCell::default()),
+                jvm_root_presence_memo: root_presence_memo,
                 point_read_memos: std::rc::Rc::default(),
                 jvm_context_profile: RefCell::new(
                     crate::analyzer::resolution::seam_profile::enabled()
@@ -10284,7 +10331,6 @@ impl SelectedResolutionOperation<'_, '_> {
                     mounts,
                     session,
                     cancellation,
-                    locator,
                 )
             },
         )?;
@@ -11508,6 +11554,28 @@ struct SelectedContextCellProjection<T> {
     published: Option<crate::analyzer::resolution::SelectedContextPathToken>,
 }
 
+fn recheck_go_publication(
+    memo: &RefCell<ExactReadMemo<(super::GoContextIdentity, i64), ()>>,
+    publication: &super::GoContextIdentity,
+    data_version: Option<i64>,
+    check: impl FnOnce() -> Result<super::GoContextHeadStatus>,
+) -> Result<super::GoContextHeadStatus> {
+    let key = data_version.map(|version| (publication.clone(), version));
+    if key
+        .as_ref()
+        .is_some_and(|key| memo.borrow().get(key).is_some())
+    {
+        return Ok(super::GoContextHeadStatus::Current);
+    }
+    let status = check()?;
+    if status == super::GoContextHeadStatus::Current
+        && let Some(key) = key
+    {
+        memo.borrow_mut().insert_bounded(key, ());
+    }
+    Ok(status)
+}
+
 impl ReadySelectedResolution<'_, '_> {
     /// Compile and publish one descriptor at a time. Request metadata remains
     /// separate from token-specific candidate authority and reverse evidence.
@@ -12239,17 +12307,28 @@ impl ReadySelectedResolution<'_, '_> {
                 },
             ));
         }
+        let publication_data_version = if self.go_publications.borrow().is_empty() {
+            None
+        } else {
+            self.inventory.publication_data_version()?
+        };
         for publication in self.go_publications.borrow().values() {
-            let status = if self.store.uses_single_connection_reads() {
-                super::go_package_context::go_context_status_on(
-                    self.inventory.connection(),
-                    publication,
-                    cancellation,
-                )?
-            } else {
-                self.store
-                    .go_context_head_status(publication, cancellation)?
-            };
+            let status = recheck_go_publication(
+                &self.go_publication_rechecks,
+                publication,
+                publication_data_version,
+                || {
+                    if self.store.uses_single_connection_reads() {
+                        super::go_package_context::go_context_status_on(
+                            self.inventory.connection(),
+                            publication,
+                            cancellation,
+                        )
+                    } else {
+                        self.store.go_context_head_status(publication, cancellation)
+                    }
+                },
+            )?;
             match status {
                 super::GoContextHeadStatus::Current => {}
                 super::GoContextHeadStatus::Withdrawn => {
@@ -12281,6 +12360,33 @@ impl ReadySelectedResolution<'_, '_> {
             }
             SelectedResolutionRevalidationOutcome::Stale(reason) => {
                 return Ok(SelectedResolutionOperationOutcome::Stale(reason));
+            }
+        }
+        // A publisher may commit after the first data_version read but before
+        // a memo hit. Mount-inventory revalidation can still find identical
+        // mounts, so repeat the full publication check if that race occurred.
+        if let Some(before) = publication_data_version
+            && self.inventory.publication_data_version()? != Some(before)
+        {
+            for publication in self.go_publications.borrow().values() {
+                match self
+                    .store
+                    .go_context_head_status(publication, cancellation)?
+                {
+                    super::GoContextHeadStatus::Current => {}
+                    super::GoContextHeadStatus::Withdrawn => {
+                        return Ok(SelectedResolutionOperationOutcome::Stale(
+                            SelectedResolutionStale::NativeContextPublication {
+                                storage_language: "go".to_owned(),
+                            },
+                        ));
+                    }
+                    super::GoContextHeadStatus::Cancelled => {
+                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                            completion.combine(&cancelled_completion()),
+                        ));
+                    }
+                }
             }
         }
         let current_generation = self.project.analysis_generation();
@@ -12685,7 +12791,43 @@ pub mod heap_pin;
 #[doc(hidden)]
 pub use heap_pin::heap_pin_bytes;
 
+/// Root-presence decisions consumed by one selected JVM operation.
+#[doc(hidden)]
+pub type ConsumedJvmRootPresence =
+    Vec<(String, crate::analyzer::resolution::JvmSelectedRootPresence)>;
+
+/// A query-scoped view of the selected operation's finite JVM root decisions.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct JvmRootPresenceReadHandle {
+    memo: std::rc::Rc<RefCell<super::resolution_lexical::JvmRootPresenceReadMemo>>,
+}
+
+impl JvmRootPresenceReadHandle {
+    pub fn consumed(&self) -> ConsumedJvmRootPresence {
+        self.memo.borrow().consumed()
+    }
+}
+
 impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
+    #[doc(hidden)]
+    pub fn root_presence_read_handle(&self) -> JvmRootPresenceReadHandle {
+        JvmRootPresenceReadHandle {
+            memo: std::rc::Rc::clone(&self.ready.jvm_root_presence_memo),
+        }
+    }
+    /// Root presence decisions actually consumed by this selected operation.
+    #[doc(hidden)]
+    pub fn consumed_root_presence(&self) -> ConsumedJvmRootPresence {
+        self.ready.jvm_root_presence_memo.borrow().consumed()
+    }
+
+    /// Transfer consumed root decisions to an analyzer before this operation finishes.
+    #[doc(hidden)]
+    pub fn drain_consumed_root_presence(&self) -> ConsumedJvmRootPresence {
+        self.ready.jvm_root_presence_memo.borrow_mut().drain()
+    }
+
     #[doc(hidden)]
     pub fn ready(&self) -> &ReadySelectedResolution<'store, 'input> {
         &self.ready
@@ -12729,6 +12871,96 @@ impl super::cache_budget::RetainedBytes for PreparedMacroIncludeOverlay {
             }
         }
         heap.total()
+    }
+}
+
+#[cfg(test)]
+mod go_publication_recheck_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#9015: a publication between retained Go sites must force a full recheck")]
+    fn publication_commit_invalidates_recheck_memo() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let writer = rusqlite::Connection::open(file.path()).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL;
+            CREATE TABLE go_context_publications(selection_id INTEGER, context_id INTEGER, publication_digest BLOB, revision INTEGER, valid_from INTEGER, valid_until INTEGER, workspace_id TEXT, lang TEXT, generation INTEGER);
+            CREATE TABLE go_package_instances(package_id INTEGER, context_id INTEGER);
+            CREATE TABLE go_package_files(package_id INTEGER, rel_path TEXT);
+            CREATE TABLE workspace_file_versions(workspace_id TEXT, lang TEXT, generation INTEGER, input_kind TEXT, rel_path TEXT, valid_from INTEGER, valid_until INTEGER);")
+            .unwrap();
+        let publication = crate::analyzer::store::GoContextIdentity {
+            selection_id: 1,
+            context_id: 2,
+            publication_digest: [7; 32],
+            revision: 1,
+        };
+        writer
+            .execute(
+                "INSERT INTO go_context_publications VALUES(1,2,?1,1,1,NULL,'w','go',1)",
+                [publication.publication_digest.as_slice()],
+            )
+            .unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            file.path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let memo = RefCell::new(ExactReadMemo::default());
+        let checks = std::cell::Cell::new(0);
+        let cancellation = CancellationToken::new();
+        let stamp =
+            || super::super::resolution_selection::publication_data_version_on(&reader).unwrap();
+        let check = || {
+            checks.set(checks.get() + 1);
+            crate::analyzer::store::go_package_context::go_context_status_on(
+                &reader,
+                &publication,
+                &cancellation,
+            )
+        };
+        let first_stamp = stamp();
+        assert_eq!(
+            recheck_go_publication(&memo, &publication, first_stamp, check).unwrap(),
+            super::super::GoContextHeadStatus::Current
+        );
+        assert_eq!(
+            recheck_go_publication(&memo, &publication, stamp(), check).unwrap(),
+            super::super::GoContextHeadStatus::Current
+        );
+        assert_eq!(checks.get(), 1);
+
+        reader.execute_batch("BEGIN DEFERRED").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM go_context_publications", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(stamp(), None);
+        writer
+            .execute(
+                "UPDATE go_context_publications SET valid_until=1 WHERE context_id=2",
+                [],
+            )
+            .unwrap();
+        // The reader still sees its old snapshot. Its Current result must
+        // never be reused or inserted into the operation memo.
+        assert_eq!(
+            recheck_go_publication(&memo, &publication, stamp(), check).unwrap(),
+            super::super::GoContextHeadStatus::Current
+        );
+        assert_eq!(checks.get(), 2);
+        reader.execute_batch("ROLLBACK").unwrap();
+        assert_ne!(stamp(), first_stamp);
+        assert_eq!(
+            recheck_go_publication(&memo, &publication, stamp(), check).unwrap(),
+            super::super::GoContextHeadStatus::Withdrawn
+        );
+        assert_eq!(checks.get(), 3);
     }
 }
 

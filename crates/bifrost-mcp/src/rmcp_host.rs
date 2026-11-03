@@ -3129,6 +3129,16 @@ mod named_workspace_tests {
     }
 
     #[test]
+    fn named_guidance_accepts_exact_character_limit() {
+        let router = schema_router();
+        let suffix_chars = router.instructions("").expect("suffix").chars().count();
+        let base = "x".repeat(MCP_DISCOVERY_TEXT_MAX_CHARS - suffix_chars);
+        let exact = router.instructions(&base).expect("exact maximum allowed");
+        assert_eq!(exact.chars().count(), MCP_DISCOVERY_TEXT_MAX_CHARS);
+        assert!(router.instructions(&(base + "x")).is_err());
+    }
+
+    #[test]
     fn named_tool_schemas_require_a_configured_workspace() {
         let descriptors = crate::mcp_core::symbol_tool_descriptors(true);
         let routed =
@@ -3271,5 +3281,74 @@ mod explanation_generation_tests {
         assert_eq!(wire["data"]["requested"], "0".repeat(64));
         assert_eq!(wire["data"]["current"], "1".repeat(64));
         assert_eq!(wire["data"]["retryable"], true);
+    }
+}
+
+#[cfg(test)]
+mod in_flight_scope_tests {
+    use super::*;
+
+    #[test]
+    fn stale_scope_cancels_only_prior_generation_of_same_workspace() {
+        let requests = Arc::new(InFlightRequests::default());
+        let old = crate::CancellationToken::new();
+        let current = crate::CancellationToken::new();
+        let other = crate::CancellationToken::new();
+        let _old_guard = requests.register(
+            WorkspaceRequestScope {
+                workspace_id: 1,
+                generation: 4,
+            },
+            old.clone(),
+        );
+        let _current_guard = requests.register(
+            WorkspaceRequestScope {
+                workspace_id: 1,
+                generation: 5,
+            },
+            current.clone(),
+        );
+        let _other_guard = requests.register(
+            WorkspaceRequestScope {
+                workspace_id: 2,
+                generation: 4,
+            },
+            other.clone(),
+        );
+        requests.cancel_stale(WorkspaceRequestScope {
+            workspace_id: 1,
+            generation: 5,
+        });
+        assert!(old.is_cancelled());
+        assert!(!current.is_cancelled());
+        assert!(!other.is_cancelled());
+    }
+
+    #[test]
+    fn completed_request_does_not_remove_neighboring_cancellation() {
+        let requests = Arc::new(InFlightRequests::default());
+        let first = crate::CancellationToken::new();
+        let second = crate::CancellationToken::new();
+        let first_guard = requests.register(
+            WorkspaceRequestScope {
+                workspace_id: 1,
+                generation: 4,
+            },
+            first.clone(),
+        );
+        let _second_guard = requests.register(
+            WorkspaceRequestScope {
+                workspace_id: 1,
+                generation: 4,
+            },
+            second.clone(),
+        );
+        drop(first_guard);
+        requests.cancel_stale(WorkspaceRequestScope {
+            workspace_id: 1,
+            generation: 5,
+        });
+        assert!(!first.is_cancelled());
+        assert!(second.is_cancelled());
     }
 }

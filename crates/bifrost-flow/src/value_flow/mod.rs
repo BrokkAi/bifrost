@@ -66,10 +66,11 @@ pub use model::{
 };
 pub use plan::{
     AuthoredArmClosure, CallerContentLocation, CallerContentLocations, SummaryCallBinding,
-    ValueFlowCuratedCallModel, ValueFlowEdgeKillSpec, ValueFlowIncompleteCause, ValueFlowInput,
-    ValueFlowLocalRuleSpec, ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits,
-    ValueFlowReturnedCallable, ValueFlowSummaryLocationBinding, actual_argument_index_for_formal,
-    authored_call_closures, caller_content_locations, closes_as_resolved_constructor,
+    ValueFlowCompositionExclusion, ValueFlowCuratedCallModel, ValueFlowEdgeKillSpec,
+    ValueFlowIncompleteCause, ValueFlowInput, ValueFlowLocalRuleSpec, ValueFlowPlan,
+    ValueFlowPlanError, ValueFlowPlanLimits, ValueFlowReturnedCallable,
+    ValueFlowSummaryLocationBinding, actual_argument_index_for_formal, authored_call_closures,
+    caller_content_locations, closes_as_resolved_constructor,
 };
 pub(crate) use plan::{ValueFlowCarrierSummaryIdentity, ValueFlowSourceBehaviorIdentity};
 pub use planned::{
@@ -154,3 +155,36 @@ fn sink_meeting_outcome<'result, Meeting>(
 }
 
 pub(crate) use plan::LocalRuleView;
+
+/// Caller storage shared with an actual at a call boundary. Copies are
+/// excluded by the storage-origin walk used by the value-flow plan.
+pub fn caller_storage_locations(
+    actual: &crate::analyzer::semantic::CallArgumentEndpoint,
+    snapshot: &crate::analyzer::semantic::ValueFlowSnapshot,
+    limits: ValueFlowPlanLimits,
+) -> CallerContentLocations {
+    assert!(
+        actual.value().procedure() == snapshot.procedure(),
+        "a caller's storage origins are read from the caller's own snapshot"
+    );
+    let search = plan::caller_storage_origins(
+        actual,
+        Some(snapshot),
+        limits.max_carriers,
+        plan::call_location_oracle_limits(limits.max_access_path),
+        &mut plan::CallerOriginIndexes::default(),
+    );
+    CallerContentLocations {
+        locations: search
+            .origins
+            .into_iter()
+            .map(|origin| CallerContentLocation {
+                proven_complete: origin.proof == crate::analyzer::semantic::ProofStatus::Proven
+                    && origin.completeness
+                        == crate::analyzer::semantic::EvidenceCompleteness::Complete,
+                location: origin.location,
+            })
+            .collect(),
+        complete: !search.incomplete,
+    }
+}

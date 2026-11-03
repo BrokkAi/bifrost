@@ -178,7 +178,11 @@ pub(crate) fn resolve_definition_dispatch<'a: 'selection, 'factory, 'selection, 
         }
         outcome
     };
-    std::ops::ControlFlow::Continue(DefinitionResolution { outcome, evidence })
+    std::ops::ControlFlow::Continue(DefinitionResolution {
+        outcome,
+        evidence,
+        call_binding_discharge_digests: Vec::new(),
+    })
 }
 
 enum RustBatchFactory<'a, 'factory> {

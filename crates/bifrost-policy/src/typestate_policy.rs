@@ -4,6 +4,7 @@
 //! the closed [`ResolvedTypestatePolicySpec`] boundary and lowers only typed,
 //! source-backed values into the diagnostic-neutral typestate engine.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range as ByteRange;
@@ -47,7 +48,9 @@ use crate::resolved::{
 use crate::selector_compiler::{
     PolicySemanticPeaks, ReceiverBindingApplicability, parameter_names_match,
 };
-use crate::unit_execution::{UnitAttempt, UnitReuse};
+use crate::unit_execution::{
+    UnitAttempt, UnitDecodeError, UnitReuse, UnitSlice, evaluate_reusable_slice,
+};
 use crate::units::{
     PolicyIncrementalContext, PolicyUnitKey, PolicyUnitProduct, RootProduct, RootWork,
     UnitPartition, WidenReason,
@@ -55,7 +58,6 @@ use crate::units::{
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
-use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
 use brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, forward_reachability_avoiding,
 };
@@ -71,11 +73,11 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     IcfgExitProfile, IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot, IcfgSnapshotLimits,
     ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle, ProcedurePortHandle,
     ProcedurePortKind, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
-    SemanticArtifactCollector, SemanticArtifactLeaseError, SemanticBudget, SemanticBudgetDimension,
-    SemanticBudgetScopeSnapshot, SemanticExecutionBudget, SemanticExecutionWork, SemanticLocator,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    ValueAtPoint, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind, ValueHandle,
-    WorkspaceIcfgProvider,
+    SemanticArtifactCollector, SemanticArtifactLeaseChild, SemanticArtifactLeaseError,
+    SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticExecutionBudget,
+    SemanticExecutionWork, SemanticLocator, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticValueKind, SemanticWork, ValueAtPoint, ValueFlowEndpoint,
+    ValueFlowOracle, ValueFlowRelationKind, ValueHandle, WorkspaceIcfgProvider,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
@@ -84,7 +86,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticModelMatchDisposition,
 };
 use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
-use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, ReadKey, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_flow::dataflow::{
     DataflowRequest, SolverBudget, SolverTermination, SummaryReadRecorder, SummaryWitnessStepKind,
@@ -109,6 +111,7 @@ use brokk_bifrost_flow::typestate::{
     collect_summary_findings_with_limits, direct_scalar_source,
     solve_typestate_with_production_summaries,
 };
+use brokk_bifrost_rql::structural::CodeQueryTypestateLimits;
 use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
@@ -1246,11 +1249,8 @@ struct RootUnits<'a> {
     /// a projection minted under any other compile.
     compilation: StableDigest,
     attempt: UnitAttempt,
-    /// Whether every root this attempt decided about is in the store, either
-    /// because it was reused from there or because its solve was published to
-    /// it. A run's unit list is what another run replays instead of evaluating
-    /// the policy, so a list naming a root that was never published would name
-    /// work no run did.
+    /// Whether the selector compile published all its units. Root publication
+    /// is tracked by `attempt.all_recomputed_published()` in `into_parts`.
     all_published: bool,
 }
 
@@ -1324,138 +1324,28 @@ impl<'a> RootUnits<'a> {
         self.reuse.prefetch(&self.keys, None)
     }
 
-    /// The published product for one root, when the head still reads what its
-    /// solve read.
-    fn published(&mut self, root_index: usize) -> Result<Option<RootProduct>, WidenReason> {
-        let key = self.keys[root_index].clone();
-        match self.reuse.published(&key)? {
-            Some(product) => {
-                self.attempt.reused();
-                let Some(product) = product.into_root() else {
-                    // One key names one product shape; anything else is a
-                    // store that answered a different question.
-                    return Err(WidenReason::ProductLoadFailed);
-                };
-                Ok(Some(product))
-            }
-            None => {
-                self.attempt.recomputed();
-                Ok(None)
-            }
-        }
-    }
-
     /// The keys this attempt asked about and what it did with them, with the
     /// keys empty when any root is missing from the store.
     fn into_parts(mut self) -> (Vec<PolicyUnitKey>, UnitAttempt) {
-        if self.all_published {
+        if self.all_published && self.attempt.all_recomputed_published() {
             self.selector_keys.append(&mut self.keys);
             (self.selector_keys, self.attempt)
         } else {
             (Vec::new(), self.attempt)
         }
     }
-
-    /// Publish one solved root under the reads that produced it.
-    ///
-    /// A solve answered from the production result cache is not published: it
-    /// returned before the ICFG provider and the summary funnel were touched,
-    /// so its ledger names none of the inputs its result depends on and a unit
-    /// published under it would verify against a head that changed everything
-    /// it read.
-    fn publish(
-        &mut self,
-        root_index: usize,
-        product: RootProduct,
-        ledger: &ReadLedger,
-        cache_status: TypestateProductionCacheStatus,
-    ) {
-        if cache_status == TypestateProductionCacheStatus::Hit {
-            self.all_published = false;
-            let policy_id = &self.policy.definition().metadata.id;
-            brokk_bifrost_analysis::profiling::note_with(|| {
-                format!(
-                    "policy.units policy={policy_id} partition=root unpublished=result_cache_hit"
-                )
-            });
-            return;
-        }
-        if !ledger.is_bounded() {
-            crate::unit_execution::note_refused_unit(ledger, || {
-                format!(
-                    "policy={} partition={:?}",
-                    self.policy.definition().metadata.id,
-                    self.keys[root_index].partition,
-                )
-            });
-            self.all_published = false;
-            self.attempt.unbounded();
-            return;
-        }
-        self.reuse.publish(
-            self.keys[root_index].clone(),
-            PolicyUnitProduct::Root(product),
-            ledger.keys(),
-        );
-    }
-}
-
-/// Append one root's product to the run's accumulators, exactly as the loop
-/// appends the same values when it solves the root itself.
-#[allow(clippy::too_many_arguments)]
-fn merge_root_product(
-    product: &RootProduct,
-    projections: &mut Vec<TypestateProjectedFinding>,
-    incomplete_reasons: &mut Vec<PolicyIncompleteReason>,
-    reached_rows: &mut u64,
-    subject_rows: &mut u64,
-    terminal_rows: &mut u64,
-    retained_analysis_findings: &mut u64,
-    omitted_analysis_findings: &mut u64,
-    remaining_finding_reached_rows: &mut usize,
-    remaining_finding_candidates: &mut usize,
-    remaining_finding_witness_expansions: &mut usize,
-    remaining_finding_witness_bytes: &mut usize,
-) {
-    let work = product.work;
-    let lane = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
-    *reached_rows = reached_rows.saturating_add(work.reached_rows);
-    *subject_rows = subject_rows.saturating_add(work.subject_rows);
-    *terminal_rows = terminal_rows.saturating_add(work.terminal_rows);
-    *retained_analysis_findings =
-        retained_analysis_findings.saturating_add(work.retained_analysis_findings);
-    *omitted_analysis_findings =
-        omitted_analysis_findings.saturating_add(work.omitted_analysis_findings);
-    // The request-wide finding budget is charged what this root's findings
-    // cost, because the budget is shared: a later root that saw an allowance
-    // no whole evaluation would have given it could report a finding the whole
-    // evaluation omitted.
-    *remaining_finding_reached_rows =
-        remaining_finding_reached_rows.saturating_sub(lane(work.finding_reached_rows));
-    *remaining_finding_candidates =
-        remaining_finding_candidates.saturating_sub(lane(work.finding_candidates));
-    *remaining_finding_witness_expansions =
-        remaining_finding_witness_expansions.saturating_sub(lane(work.finding_witness_expansions));
-    *remaining_finding_witness_bytes =
-        remaining_finding_witness_bytes.saturating_sub(lane(work.finding_witness_bytes));
-    incomplete_reasons.extend(product.incomplete_reasons.iter().copied());
-    projections.extend(product.findings.iter().cloned());
 }
 
 /// Charge every shared ledger one reused root's own solve drew on.
 ///
-/// `merge_root_product` charges the four request-wide finding lanes, which the
-/// loop carries as remaining counters. These four are ledgers the solve itself
-/// holds, so they are charged into the ledger: the solver budget a later root
-/// solves under, the semantic budget it materializes under, the execution
+/// The solver budget a later root solves under, the semantic budget it
+/// materializes under, and the execution
 /// budget's materialized files and traversal steps, and the artifact-lease
 /// capacity its window opens against. A reused root therefore leaves each of
 /// them exactly where its own solve left them, which is what makes the sliced
 /// pass reach a lane at the same root the whole run reaches it at.
 ///
-/// A charge that does not fit means the whole evaluation reaches that lane
-/// here, so the caller evaluates the policy in full rather than reporting a
-/// completion no whole run would have reported.
+/// The caller checks every refusing lane before charging this work.
 ///
 /// The semantic budget's paid-artifact identities are not replayed: they are
 /// process-local digests a stored product never carried, so a later root may
@@ -1488,173 +1378,183 @@ fn charge_reused_root_lanes(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn evaluate_compiled_typestate(
-    authority: &TypestateProjectionAuthority<'_>,
-    policy: &LoadedPolicy,
-    spec: &ResolvedTypestatePolicySpec,
-    workspace: &WorkspaceAnalyzer,
-    cancellation: Option<&CancellationToken>,
-    budget: &PolicyBudget,
-    compiled: &CompiledTypestatePolicy,
-    summaries: &ProductionTypestateSummaryRepository,
+struct RootPassInputs<'a> {
+    authority: &'a TypestateProjectionAuthority<'a>,
+    policy: &'a LoadedPolicy,
+    spec: &'a ResolvedTypestatePolicySpec,
+    workspace: &'a WorkspaceAnalyzer,
+    cancellation: &'a CancellationToken,
+    budget: &'a PolicyBudget,
+    compiled: &'a CompiledTypestatePolicy,
+    summaries: &'a ProductionTypestateSummaryRepository,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-    mut units: Option<&mut RootUnits<'_>>,
-) -> RootsPass {
-    let mut cache_work = ProductionSummaryLifecycleCounters::default();
-    let uncancelled = CancellationToken::default();
-    let cancellation = cancellation.unwrap_or(&uncancelled);
-    let limits = budget.query_limits().typestate;
-    let mut solver_budget = SolverBudget::new(limits.solver_work);
-    let mut semantic_budget = if compiled.roots.is_empty() {
-        None
-    } else {
-        Some(SemanticBudget::new_child(
-            compiled.semantic_remaining,
-            &compiled.semantic_scope,
-        ))
-    };
-    let evaluation_execution_budget = compiled.semantic_execution_budget.clone();
-    let initial_evaluation_execution_work = evaluation_execution_budget.work();
-    let mut evaluation_artifact_leases = compiled
-        .artifact_leases
-        .snapshot()
-        .restrict_to(budget.query_limits().semantic.max_retained_bytes)
-        .into_child();
-    let mut evaluation_artifact_retained_peak = evaluation_artifact_leases.retained_bytes();
-    // What reused roots took out of the shared artifact-lease capacity. The
-    // allocations themselves cannot be reproduced -- they are process-local
-    // artifacts a stored product never carried -- so they are replayed as
-    // anonymous live bytes against the same capacity, exactly as the execution
-    // budget replays a query's materializations as anonymous slots. A later
-    // root therefore sees the headroom a whole evaluation would have left it.
-    let mut replayed_artifact_leases = 0_usize;
-    let mut replayed_artifact_lease_bytes = 0_usize;
-    let mut projections = Vec::new();
-    let mut incomplete_reasons = Vec::new();
-    let mut reached_rows = 0_u64;
-    let mut subject_rows = 0_u64;
-    let mut terminal_rows = 0_u64;
-    let mut retained_analysis_findings = 0_u64;
-    let mut omitted_analysis_findings = 0_u64;
-    let mut remaining_finding_reached_rows = limits.max_reached_rows;
-    let mut remaining_finding_candidates = limits.max_candidates;
-    let mut remaining_finding_witness_expansions = limits.max_total_witness_expansions;
-    let mut remaining_finding_witness_bytes = limits.max_witness_bytes;
+    limits: CodeQueryTypestateLimits,
+}
 
-    let mut evaluation_error = None;
-    // A lane every root shares. Reusing a root consumes none of it, so a
-    // sliced pass that reached one cannot claim to have produced what a whole
-    // evaluation would have produced, and the caller evaluates the policy in
-    // full instead.
-    let mut shared_lane_reached = false;
-    if let Some(units) = units.as_deref_mut()
-        && let Err(reason) = units.enumerate(&compiled.roots)
-    {
-        return RootsPass::Widen(reason);
+struct RootPassState {
+    cache_work: ProductionSummaryLifecycleCounters,
+    solver_budget: SolverBudget,
+    semantic_budget: Option<SemanticBudget>,
+    evaluation_execution_budget: SemanticExecutionBudget,
+    initial_evaluation_execution_work: SemanticExecutionWork,
+    evaluation_artifact_leases: SemanticArtifactLeaseChild,
+    evaluation_artifact_retained_peak: usize,
+    replayed_artifact_leases: usize,
+    replayed_artifact_lease_bytes: usize,
+    projections: Vec<TypestateProjectedFinding>,
+    incomplete_reasons: Vec<PolicyIncompleteReason>,
+    reached_rows: u64,
+    subject_rows: u64,
+    terminal_rows: u64,
+    retained_analysis_findings: u64,
+    omitted_analysis_findings: u64,
+    remaining_finding_reached_rows: usize,
+    remaining_finding_candidates: usize,
+    remaining_finding_witness_expansions: usize,
+    remaining_finding_witness_bytes: usize,
+    evaluation_error: Option<String>,
+    shared_lane_reached: bool,
+}
+
+// Keep the root product inline: this transient result crosses one root boundary.
+#[allow(clippy::large_enum_variant)]
+enum RootStep {
+    Solved {
+        product: RootProduct,
+        cache_status: TypestateProductionCacheStatus,
+        execution_dependent: bool,
+    },
+    Unfinished,
+    Stopped,
+    Failed,
+}
+
+impl RootPassState {
+    fn new(inputs: &RootPassInputs<'_>) -> Self {
+        let cache_work = ProductionSummaryLifecycleCounters::default();
+        let limits = inputs.limits;
+        let solver_budget = SolverBudget::new(limits.solver_work);
+        let semantic_budget = if inputs.compiled.roots.is_empty() {
+            None
+        } else {
+            Some(SemanticBudget::new_child(
+                inputs.compiled.semantic_remaining,
+                &inputs.compiled.semantic_scope,
+            ))
+        };
+        let evaluation_execution_budget = inputs.compiled.semantic_execution_budget.clone();
+        let initial_evaluation_execution_work = evaluation_execution_budget.work();
+        let evaluation_artifact_leases = inputs
+            .compiled
+            .artifact_leases
+            .snapshot()
+            .restrict_to(inputs.budget.query_limits().semantic.max_retained_bytes)
+            .into_child();
+        let evaluation_artifact_retained_peak = evaluation_artifact_leases.retained_bytes();
+        // What reused roots took out of the shared artifact-lease capacity. The
+        // allocations themselves cannot be reproduced -- they are process-local
+        // artifacts a stored product never carried -- so they are replayed as
+        // anonymous live bytes against the same capacity, exactly as the execution
+        // budget replays a query's materializations as anonymous slots. A later
+        // root therefore sees the headroom a whole evaluation would have left it.
+        let replayed_artifact_leases = 0_usize;
+        let replayed_artifact_lease_bytes = 0_usize;
+        let projections = Vec::new();
+        let incomplete_reasons = Vec::new();
+        let reached_rows = 0_u64;
+        let subject_rows = 0_u64;
+        let terminal_rows = 0_u64;
+        let retained_analysis_findings = 0_u64;
+        let omitted_analysis_findings = 0_u64;
+        let remaining_finding_reached_rows = limits.max_reached_rows;
+        let remaining_finding_candidates = limits.max_candidates;
+        let remaining_finding_witness_expansions = limits.max_total_witness_expansions;
+        let remaining_finding_witness_bytes = limits.max_witness_bytes;
+
+        let evaluation_error = None;
+        // A lane every root shares. Reusing a root consumes none of it, so a
+        // sliced pass that reached one cannot claim to have produced what a whole
+        // evaluation would have produced, and the caller evaluates the policy in
+        // full instead.
+        let shared_lane_reached = false;
+        Self {
+            cache_work,
+            solver_budget,
+            semantic_budget,
+            evaluation_execution_budget,
+            initial_evaluation_execution_work,
+            evaluation_artifact_leases,
+            evaluation_artifact_retained_peak,
+            replayed_artifact_leases,
+            replayed_artifact_lease_bytes,
+            projections,
+            incomplete_reasons,
+            reached_rows,
+            subject_rows,
+            terminal_rows,
+            retained_analysis_findings,
+            omitted_analysis_findings,
+            remaining_finding_reached_rows,
+            remaining_finding_candidates,
+            remaining_finding_witness_expansions,
+            remaining_finding_witness_bytes,
+            evaluation_error,
+            shared_lane_reached,
+        }
     }
-    'roots: for (root_index, root) in compiled.roots.iter().enumerate() {
-        if let Some(budget) = &mut semantic_budget {
+
+    fn begin_root(&mut self) {
+        if let Some(budget) = &mut self.semantic_budget {
             budget.begin_root();
         }
+    }
+
+    fn solve_root(&mut self, inputs: &RootPassInputs<'_>, root: &ProcedureHandle) -> RootStep {
         let mut root_work = RootWork::default();
         let mut root_reasons = Vec::new();
-        if let Some(units) = units.as_deref_mut() {
-            // Exactly the check the solved path makes before it projects: a
-            // run whose request-wide finding budget is spent stops here, and a
-            // reused root must not be appended past a stop a whole evaluation
-            // would have made.
-            if remaining_finding_reached_rows == 0
-                || remaining_finding_candidates == 0
-                || remaining_finding_witness_expansions == 0
-                || remaining_finding_witness_bytes == 0
-            {
-                shared_lane_reached = true;
-                incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
-                omitted_analysis_findings = omitted_analysis_findings.saturating_add(1);
-                break;
-            }
-            match units.published(root_index) {
-                Err(reason) => return RootsPass::Widen(reason),
-                Ok(Some(product)) => {
-                    // Every lane this root's own solve moved, moved again, so
-                    // the sliced pass reaches each of them exactly where the
-                    // whole run reaches it.
-                    if let Err(reason) = charge_reused_root_lanes(
-                        &product.work,
-                        &mut solver_budget,
-                        semantic_budget.as_mut(),
-                        &evaluation_execution_budget,
-                        &mut replayed_artifact_leases,
-                        &mut replayed_artifact_lease_bytes,
-                    ) {
-                        return RootsPass::Widen(reason);
-                    }
-                    merge_root_product(
-                        &product,
-                        &mut projections,
-                        &mut incomplete_reasons,
-                        &mut reached_rows,
-                        &mut subject_rows,
-                        &mut terminal_rows,
-                        &mut retained_analysis_findings,
-                        &mut omitted_analysis_findings,
-                        &mut remaining_finding_reached_rows,
-                        &mut remaining_finding_candidates,
-                        &mut remaining_finding_witness_expansions,
-                        &mut remaining_finding_witness_bytes,
-                    );
-                    continue;
-                }
-                Ok(None) => {}
-            }
-        }
         // What this root's own solve takes out of the shared lanes, measured
         // here so the reuse path above can replay exactly it.
-        let solver_refusals_before = solver_budget.refusal_count();
-        let semantic_refusals_before = semantic_budget.as_ref().map(SemanticBudget::refusal_count);
-        let root_generation_before = workspace.analyzer().project().analysis_generation();
-        let solver_before = solver_budget.used();
-        let semantic_before = semantic_budget
+        let solver_refusals_before = self.solver_budget.refusal_count();
+        let semantic_refusals_before = self
+            .semantic_budget
+            .as_ref()
+            .map(SemanticBudget::refusal_count);
+        let root_generation_before = inputs.workspace.analyzer().project().analysis_generation();
+        let solver_before = self.solver_budget.used();
+        let semantic_before = self
+            .semantic_budget
             .as_mut()
             .map(SemanticBudget::replay_snapshot);
-        let execution_before = evaluation_execution_budget.work();
-        let leases_before = evaluation_artifact_leases.len();
-        let lease_bytes_before = evaluation_artifact_leases.retained_bytes();
-        // Every read this root's solve makes, named, so another workspace can
-        // be asked whether it still reads the same thing. The ledger is what
-        // licenses publishing the product below; with no units it is absent
-        // and the solve runs exactly as it always has.
-        let root_ledger = units.is_some().then(|| Arc::new(ReadLedger::new()));
-        let _root_reads = root_ledger.as_ref().map(|ledger| {
-            AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), Arc::clone(ledger))
-        });
-        let artifact_window =
-            evaluation_artifact_leases.begin_window(replayed_artifact_lease_bytes);
+        let execution_before = self.evaluation_execution_budget.work();
+        let leases_before = self.evaluation_artifact_leases.len();
+        let lease_bytes_before = self.evaluation_artifact_leases.retained_bytes();
+        let artifact_window = self
+            .evaluation_artifact_leases
+            .begin_window(self.replayed_artifact_lease_bytes);
         let artifact_collector = artifact_window.collector();
         let icfg_provider = PolicyIcfgProvider::new(
-            workspace,
-            &evaluation_execution_budget,
+            inputs.workspace,
+            &self.evaluation_execution_budget,
             artifact_collector,
-            active_semantic_model_snapshot.clone(),
+            inputs.active_semantic_model_snapshot.clone(),
         );
-        let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
+        let mut request = DataflowRequest::new(&mut self.solver_budget, inputs.cancellation);
         // The summary funnel this root crosses records through the analyzer's
         // open read ledgers, exactly as the ICFG provider's artifact and
         // dispatch reads do; with no ledger attached it costs one relaxed load
         // per lookup.
-        let summary_reads = SummaryReadRecorder::new(workspace.analyzer());
+        let summary_reads = SummaryReadRecorder::new(inputs.workspace.analyzer());
         let production = solve_typestate_with_production_summaries(
-            summaries,
+            inputs.summaries,
             &summary_reads,
             root,
             &[],
             &icfg_provider,
             &icfg_provider,
             ProductionTypestateExecutionContext::Policy(&icfg_provider.execution_budget),
-            &compiled.protocol,
-            &compiled.bindings,
-            semantic_budget
+            &inputs.compiled.protocol,
+            &inputs.compiled.bindings,
+            self.semantic_budget
                 .as_mut()
                 .expect("nonempty roots retain a semantic budget"),
             &mut request,
@@ -1664,20 +1564,22 @@ fn evaluate_compiled_typestate(
             Some(SemanticArtifactLeaseError::RetainedBytesOverflow) => usize::MAX,
             Some(_) | None => artifact_window
                 .retained_bytes()
-                .saturating_add(replayed_artifact_lease_bytes),
+                .saturating_add(self.replayed_artifact_lease_bytes),
         };
-        evaluation_artifact_retained_peak =
-            evaluation_artifact_retained_peak.max(window_retained_peak);
+        self.evaluation_artifact_retained_peak = self
+            .evaluation_artifact_retained_peak
+            .max(window_retained_peak);
         let production = match production {
             Ok(production) => {
-                cache_work.saturating_add_assign(production.lifecycle());
+                self.cache_work
+                    .saturating_add_assign(production.lifecycle());
                 production
             }
             Err(error) => {
-                evaluation_error = Some(error.to_string());
+                self.evaluation_error = Some(error.to_string());
                 drop(icfg_provider);
                 artifact_window.discard();
-                break 'roots;
+                return RootStep::Failed;
             }
         };
         // A result-cache hit returns before the ICFG provider and the summary
@@ -1688,29 +1590,32 @@ fn evaluate_compiled_typestate(
         let fixed_point = match solved.result().termination() {
             SolverTermination::FixedPoint => true,
             SolverTermination::Cancelled => {
-                shared_lane_reached = true;
-                incomplete_reasons.push(PolicyIncompleteReason::Cancelled);
+                self.shared_lane_reached = true;
+                self.incomplete_reasons
+                    .push(PolicyIncompleteReason::Cancelled);
                 false
             }
             SolverTermination::ExceededBudget(_) => {
-                shared_lane_reached = true;
-                incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
+                self.shared_lane_reached = true;
+                self.incomplete_reasons
+                    .push(PolicyIncompleteReason::PartialDiscovery);
                 false
             }
         };
         root_work.reached_rows = u64::try_from(solved.result().reached().len()).unwrap_or(u64::MAX);
-        reached_rows = reached_rows.saturating_add(root_work.reached_rows);
+        self.reached_rows = self.reached_rows.saturating_add(root_work.reached_rows);
         for reached in solved.result().reached() {
             let Some(fact) = solved.result().fact(reached.fact()) else {
-                evaluation_error = Some("typestate solve retained an invalid fact row".to_owned());
-                break 'roots;
+                self.evaluation_error =
+                    Some("typestate solve retained an invalid fact row".to_owned());
+                return RootStep::Failed;
             };
             if fact.subject().is_some() {
-                subject_rows = subject_rows.saturating_add(1);
+                self.subject_rows = self.subject_rows.saturating_add(1);
                 root_work.subject_rows = root_work.subject_rows.saturating_add(1);
             }
             if fact.terminal_observation().is_some() {
-                terminal_rows = terminal_rows.saturating_add(1);
+                self.terminal_rows = self.terminal_rows.saturating_add(1);
                 root_work.terminal_rows = root_work.terminal_rows.saturating_add(1);
             }
         }
@@ -1718,77 +1623,81 @@ fn evaluate_compiled_typestate(
             drop(production);
             drop(icfg_provider);
             artifact_window.discard();
-            continue;
+            return RootStep::Unfinished;
         }
-        if remaining_finding_reached_rows == 0
-            || remaining_finding_candidates == 0
-            || remaining_finding_witness_expansions == 0
-            || remaining_finding_witness_bytes == 0
+        if self.remaining_finding_reached_rows == 0
+            || self.remaining_finding_candidates == 0
+            || self.remaining_finding_witness_expansions == 0
+            || self.remaining_finding_witness_bytes == 0
         {
-            shared_lane_reached = true;
-            incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
-            omitted_analysis_findings = omitted_analysis_findings.saturating_add(1);
+            self.shared_lane_reached = true;
+            self.incomplete_reasons
+                .push(PolicyIncompleteReason::PartialDiscovery);
+            self.omitted_analysis_findings = self.omitted_analysis_findings.saturating_add(1);
             drop(production);
             drop(icfg_provider);
             artifact_window.discard();
-            break;
+            return RootStep::Stopped;
         }
         let witness_limits = match WitnessReconstructionLimits::new(
-            limits.max_witness_steps,
-            limits
+            inputs.limits.max_witness_steps,
+            inputs
+                .limits
                 .max_witness_expansions
-                .min(remaining_finding_witness_expansions),
+                .min(self.remaining_finding_witness_expansions),
         ) {
             Ok(limits) => limits,
             Err(error) => {
-                evaluation_error = Some(error.to_string());
-                break 'roots;
+                self.evaluation_error = Some(error.to_string());
+                return RootStep::Failed;
             }
         };
         let finding_limits = match TypestateFindingLimits::with_witness_limits(
-            remaining_finding_reached_rows,
-            remaining_finding_candidates,
+            self.remaining_finding_reached_rows,
+            self.remaining_finding_candidates,
             witness_limits,
-            remaining_finding_witness_expansions,
-            remaining_finding_witness_bytes,
+            self.remaining_finding_witness_expansions,
+            self.remaining_finding_witness_bytes,
         ) {
             Ok(limits) => limits,
             Err(error) => {
-                evaluation_error = Some(error.to_string());
-                break 'roots;
+                self.evaluation_error = Some(error.to_string());
+                return RootStep::Failed;
             }
         };
         let findings = match collect_summary_findings_with_limits(
-            &compiled.protocol,
-            &compiled.bindings,
+            &inputs.compiled.protocol,
+            &inputs.compiled.bindings,
             solved,
             finding_limits,
-            cancellation,
+            inputs.cancellation,
         ) {
             Ok(findings) => findings,
             Err(TypestateFlowProblemError::FindingCancelled) => {
-                shared_lane_reached = true;
-                incomplete_reasons.push(PolicyIncompleteReason::Cancelled);
+                self.shared_lane_reached = true;
+                self.incomplete_reasons
+                    .push(PolicyIncompleteReason::Cancelled);
                 drop(production);
                 drop(icfg_provider);
                 artifact_window.discard();
-                break;
+                return RootStep::Stopped;
             }
             Err(TypestateFlowProblemError::FindingBudgetExceeded) => {
-                shared_lane_reached = true;
-                incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
-                omitted_analysis_findings = omitted_analysis_findings.saturating_add(1);
+                self.shared_lane_reached = true;
+                self.incomplete_reasons
+                    .push(PolicyIncompleteReason::PartialDiscovery);
+                self.omitted_analysis_findings = self.omitted_analysis_findings.saturating_add(1);
                 drop(production);
                 drop(icfg_provider);
                 artifact_window.discard();
-                break;
+                return RootStep::Stopped;
             }
             Err(error) => {
-                evaluation_error = Some(error.to_string());
+                self.evaluation_error = Some(error.to_string());
                 drop(production);
                 drop(icfg_provider);
                 artifact_window.discard();
-                break 'roots;
+                return RootStep::Failed;
             }
         };
         let mut root_projections = Vec::new();
@@ -1798,9 +1707,10 @@ fn evaluate_compiled_typestate(
             // narrowed to this root, so an omission here is not a property of
             // the root alone: a run that reused an earlier root would have had
             // more allowance left and might have omitted nothing.
-            shared_lane_reached = true;
+            self.shared_lane_reached = true;
             root_reasons.push(PolicyIncompleteReason::PartialDiscovery);
-            incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
+            self.incomplete_reasons
+                .push(PolicyIncompleteReason::PartialDiscovery);
         }
         let finding_work = findings.work();
         let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
@@ -1808,45 +1718,62 @@ fn evaluate_compiled_typestate(
         root_work.finding_candidates = count(finding_work.candidates());
         root_work.finding_witness_expansions = count(finding_work.witness_expansions());
         root_work.finding_witness_bytes = count(finding_work.witness_bytes());
-        remaining_finding_reached_rows =
-            remaining_finding_reached_rows.saturating_sub(finding_work.reached_rows());
-        remaining_finding_candidates =
-            remaining_finding_candidates.saturating_sub(finding_work.candidates());
-        remaining_finding_witness_expansions =
-            remaining_finding_witness_expansions.saturating_sub(finding_work.witness_expansions());
-        remaining_finding_witness_bytes =
-            remaining_finding_witness_bytes.saturating_sub(finding_work.witness_bytes());
+        self.remaining_finding_reached_rows = self
+            .remaining_finding_reached_rows
+            .saturating_sub(finding_work.reached_rows());
+        self.remaining_finding_candidates = self
+            .remaining_finding_candidates
+            .saturating_sub(finding_work.candidates());
+        self.remaining_finding_witness_expansions = self
+            .remaining_finding_witness_expansions
+            .saturating_sub(finding_work.witness_expansions());
+        self.remaining_finding_witness_bytes = self
+            .remaining_finding_witness_bytes
+            .saturating_sub(finding_work.witness_bytes());
         root_work.omitted_analysis_findings = u64::try_from(findings.omitted()).unwrap_or(u64::MAX);
-        omitted_analysis_findings =
-            omitted_analysis_findings.saturating_add(root_work.omitted_analysis_findings);
+        self.omitted_analysis_findings = self
+            .omitted_analysis_findings
+            .saturating_add(root_work.omitted_analysis_findings);
         for finding in findings.findings() {
-            let Some(subject) = compiled.bindings.subject(finding.subject()) else {
-                evaluation_error =
+            let Some(subject) = inputs.compiled.bindings.subject(finding.subject()) else {
+                self.evaluation_error =
                     Some("typestate finding refers to an unknown bound subject".to_owned());
-                break 'roots;
+                return RootStep::Failed;
             };
-            if compiled.binding_omission_subjects.contains(subject.key()) {
+            if inputs
+                .compiled
+                .binding_omission_subjects
+                .contains(subject.key())
+            {
                 continue;
             }
             root_retained_analysis_findings = root_retained_analysis_findings.saturating_add(1);
             match project_finding(
-                authority, policy, spec, workspace, budget, compiled, root, finding,
+                inputs.authority,
+                inputs.policy,
+                inputs.spec,
+                inputs.workspace,
+                inputs.budget,
+                inputs.compiled,
+                root,
+                finding,
             ) {
                 Ok(finding_projections) => root_projections.extend(finding_projections),
                 Err(error) => {
-                    evaluation_error = Some(error);
-                    break 'roots;
+                    self.evaluation_error = Some(error);
+                    return RootStep::Failed;
                 }
             }
         }
         drop(findings);
         drop(production);
         drop(icfg_provider);
-        match artifact_window.commit(&mut evaluation_artifact_leases) {
+        match artifact_window.commit(&mut self.evaluation_artifact_leases) {
             Ok(()) => {
-                let execution_after = evaluation_execution_budget.work();
-                root_work.solver = solver_budget.used().saturating_sub(solver_before);
-                root_work.semantic = semantic_budget
+                let execution_after = self.evaluation_execution_budget.work();
+                root_work.solver = self.solver_budget.used().saturating_sub(solver_before);
+                root_work.semantic = self
+                    .semantic_budget
                     .as_ref()
                     .zip(semantic_before.as_ref())
                     .map(|(budget, before)| budget.replay_since(before))
@@ -1862,186 +1789,506 @@ fn evaluate_compiled_typestate(
                         .saturating_sub(execution_before.traversal_steps),
                 );
                 root_work.artifact_leases = count(
-                    evaluation_artifact_leases
+                    self.evaluation_artifact_leases
                         .len()
                         .saturating_sub(leases_before),
                 );
                 root_work.artifact_lease_bytes = count(
-                    evaluation_artifact_leases
+                    self.evaluation_artifact_leases
                         .retained_bytes()
                         .saturating_sub(lease_bytes_before),
                 );
                 root_work.retained_analysis_findings = root_retained_analysis_findings;
-                retained_analysis_findings =
-                    retained_analysis_findings.saturating_add(root_retained_analysis_findings);
-                if let Some(ledger) = root_ledger.as_ref()
-                    && (cancellation.is_cancelled()
-                        || solver_budget.refusal_count() > solver_refusals_before
-                        || semantic_budget.as_ref().map(SemanticBudget::refusal_count)
-                            != semantic_refusals_before
-                        || evaluation_execution_budget.work().exhausted
-                        || workspace.analyzer().project().analysis_generation()
-                            != root_generation_before)
-                {
+                self.retained_analysis_findings = self
+                    .retained_analysis_findings
+                    .saturating_add(root_retained_analysis_findings);
+                let execution_dependent = inputs.cancellation.is_cancelled()
+                    || self.solver_budget.refusal_count() > solver_refusals_before
+                    || self
+                        .semantic_budget
+                        .as_ref()
+                        .map(SemanticBudget::refusal_count)
+                        != semantic_refusals_before
+                    || self.evaluation_execution_budget.work().exhausted
+                    || inputs.workspace.analyzer().project().analysis_generation()
+                        != root_generation_before;
+                if execution_dependent {
                     brokk_bifrost_analysis::profiling::note_with(|| {
                         format!(
                             "policy.units unbounded origin={}:{} cause=root_boundary cancelled={} solver={} semantic={} execution={} snapshot={}",
                             file!(),
                             line!(),
-                            cancellation.is_cancelled(),
-                            solver_budget.refusal_count() > solver_refusals_before,
-                            semantic_budget.as_ref().map(SemanticBudget::refusal_count)
+                            inputs.cancellation.is_cancelled(),
+                            self.solver_budget.refusal_count() > solver_refusals_before,
+                            self.semantic_budget
+                                .as_ref()
+                                .map(SemanticBudget::refusal_count)
                                 != semantic_refusals_before,
-                            evaluation_execution_budget.work().exhausted,
-                            workspace.analyzer().project().analysis_generation()
+                            self.evaluation_execution_budget.work().exhausted,
+                            inputs.workspace.analyzer().project().analysis_generation()
                                 != root_generation_before
                         )
                     });
-                    ledger.mark_execution_dependent();
                 }
-                if let Some(units) = units.as_deref_mut() {
-                    units.publish(
-                        root_index,
-                        RootProduct {
-                            findings: root_projections.clone(),
-                            incomplete_reasons: root_reasons,
-                            work: root_work,
-                        },
-                        root_ledger.as_ref().expect("a unit run records its reads"),
-                        cache_status,
-                    );
-                }
-                projections.extend(root_projections);
                 #[cfg(any(test, feature = "test-support"))]
-                workspace
+                inputs
+                    .workspace
                     .analyzer()
                     .test_hooks()
                     .invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test();
+                RootStep::Solved {
+                    product: RootProduct {
+                        findings: root_projections,
+                        incomplete_reasons: root_reasons,
+                        work: root_work,
+                    },
+                    cache_status,
+                    execution_dependent,
+                }
             }
             Err(
                 SemanticArtifactLeaseError::Capacity(_)
                 | SemanticArtifactLeaseError::RetainedBytesOverflow,
             ) => {
-                shared_lane_reached = true;
-                incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
-                omitted_analysis_findings = omitted_analysis_findings
+                self.shared_lane_reached = true;
+                self.incomplete_reasons
+                    .push(PolicyIncompleteReason::PartialDiscovery);
+                self.omitted_analysis_findings = self
+                    .omitted_analysis_findings
                     .saturating_add(root_retained_analysis_findings.max(1));
-                break;
+                RootStep::Stopped
             }
             Err(error) => {
-                evaluation_error = Some(format!(
+                self.evaluation_error = Some(format!(
                     "typestate evaluation semantic lease transaction failed: {error}"
                 ));
-                break 'roots;
+                RootStep::Failed
             }
         }
     }
 
-    let final_evaluation_execution_work = evaluation_execution_budget.work();
-    let evaluation_materialized_files = final_evaluation_execution_work
-        .materialized_files
-        .saturating_sub(initial_evaluation_execution_work.materialized_files);
-    let evaluation_traversal_steps = final_evaluation_execution_work
-        .traversal_steps
-        .saturating_sub(initial_evaluation_execution_work.traversal_steps);
-    let completed_evaluation = evaluation_error.is_none();
-    if completed_evaluation && final_evaluation_execution_work.exhausted {
-        incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
+    fn charge_reused(&mut self, product: &RootProduct) -> Result<(), WidenReason> {
+        charge_reused_root_lanes(
+            &product.work,
+            &mut self.solver_budget,
+            self.semantic_budget.as_mut(),
+            &self.evaluation_execution_budget,
+            &mut self.replayed_artifact_leases,
+            &mut self.replayed_artifact_lease_bytes,
+        )?;
+        let work = product.work;
+        let lane = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+        self.reached_rows = self.reached_rows.saturating_add(work.reached_rows);
+        self.subject_rows = self.subject_rows.saturating_add(work.subject_rows);
+        self.terminal_rows = self.terminal_rows.saturating_add(work.terminal_rows);
+        self.retained_analysis_findings = self
+            .retained_analysis_findings
+            .saturating_add(work.retained_analysis_findings);
+        self.omitted_analysis_findings = self
+            .omitted_analysis_findings
+            .saturating_add(work.omitted_analysis_findings);
+        self.remaining_finding_reached_rows = self
+            .remaining_finding_reached_rows
+            .saturating_sub(lane(work.finding_reached_rows));
+        self.remaining_finding_candidates = self
+            .remaining_finding_candidates
+            .saturating_sub(lane(work.finding_candidates));
+        self.remaining_finding_witness_expansions = self
+            .remaining_finding_witness_expansions
+            .saturating_sub(lane(work.finding_witness_expansions));
+        self.remaining_finding_witness_bytes = self
+            .remaining_finding_witness_bytes
+            .saturating_sub(lane(work.finding_witness_bytes));
+        Ok(())
     }
-    if completed_evaluation && !compiled.binding_omissions.is_empty() {
-        incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
-    }
-    let semantic_evaluation_work = semantic_budget
-        .as_ref()
-        .map_or_else(SemanticWork::default, SemanticBudget::used);
-    let semantic_peaks = compiled.semantic_compile_peaks.with_child_evaluation(
-        compiled.semantic_compile_work,
-        semantic_evaluation_work,
-        evaluation_artifact_retained_peak,
-        final_evaluation_execution_work.traversal_steps,
-    );
-    let work = typestate_work_report(
-        compiled,
-        &TypestateWorkMeasurements {
-            cache_work,
-            semantic_evaluation_work,
-            semantic_evaluation_resident_peak: semantic_budget
+
+    fn reused_fits(&self, product: &RootProduct) -> bool {
+        let work = product.work;
+        let lane = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+        self.solver_budget.replay_fits(work.solver)
+            && self
+                .semantic_budget
                 .as_ref()
-                .map_or_else(SemanticWork::default, SemanticBudget::resident_peak),
-            semantic_evaluation_root_work_peak: semantic_budget
-                .as_ref()
-                .map_or_else(SemanticWork::default, SemanticBudget::root_work_peak),
-            semantic_peaks,
-            final_execution_work: final_evaluation_execution_work,
-            evaluation_materialized_files,
-            evaluation_traversal_steps,
-            semantic_artifact_leases: evaluation_artifact_leases
+                .is_some_and(|budget| budget.replay_product_fits(work.semantic))
+            && self
+                .evaluation_execution_budget
+                .external_query_work_fits(lane(work.materialized_files), lane(work.traversal_steps))
+            && self
+                .evaluation_artifact_leases
                 .len()
-                .saturating_add(replayed_artifact_leases),
-            evaluation_semantic_artifact_leases: evaluation_artifact_leases
-                .additions_len()
-                .saturating_add(replayed_artifact_leases),
-            reached_rows,
-            subject_rows,
-            terminal_rows,
-            retained_analysis_findings,
-            omitted_analysis_findings,
-            retained_findings: if completed_evaluation {
-                u64::try_from(projections.len()).unwrap_or(u64::MAX)
-            } else {
-                0
-            },
-        },
-    );
-    if let Some(message) = evaluation_error {
-        return RootsPass::Failed(TypestateEvaluationFailure { message, work });
+                .checked_add(self.replayed_artifact_leases)
+                .and_then(|total| total.checked_add(lane(work.artifact_leases)))
+                .is_some()
+            && self
+                .replayed_artifact_lease_bytes
+                .checked_add(lane(work.artifact_lease_bytes))
+                .is_some_and(|bytes| self.evaluation_artifact_leases.window_fits(bytes))
+            && lane(work.finding_reached_rows) <= self.remaining_finding_reached_rows
+            && lane(work.finding_candidates) <= self.remaining_finding_candidates
+            && lane(work.finding_witness_expansions) <= self.remaining_finding_witness_expansions
+            && lane(work.finding_witness_bytes) <= self.remaining_finding_witness_bytes
     }
-    if units.is_some() && (shared_lane_reached || final_evaluation_execution_work.exhausted) {
-        return RootsPass::Widen(WidenReason::MergedLimitReached);
+
+    fn widen_reason(&self) -> Option<WidenReason> {
+        (self.shared_lane_reached || self.evaluation_execution_budget.work().exhausted)
+            .then_some(WidenReason::MergedLimitReached)
     }
-    incomplete_reasons.sort();
-    incomplete_reasons.dedup();
-    let completion = if incomplete_reasons.is_empty() {
-        PolicyRunCompletion::Complete
-    } else {
-        PolicyRunCompletion::inconclusive(incomplete_reasons)
-            .expect("deduplicated typestate incomplete reasons are canonical")
-    };
-    let diagnostics_truncated = compiled.binding_omissions.len() > budget.max_diagnostics();
-    let diagnostics = compiled
-        .binding_omissions
-        .iter()
-        .take(budget.max_diagnostics())
-        .map(|omission| {
-            PolicyDiagnostic::try_new(
-                PolicyDiagnosticCode::CodeQuery {
-                    code: CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
-                },
-                PolicyDiagnosticSeverity::Warning,
-                PolicyDiagnosticImpact::RunIncomplete,
-                format!("typestate endpoint binding omitted: {omission}"),
-                None,
-                Vec::new(),
-            )
-            .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>();
-    let diagnostics = match diagnostics {
-        Ok(diagnostics) => diagnostics,
-        Err(message) => {
-            return RootsPass::Failed(TypestateEvaluationFailure {
-                message,
-                work: work.clone(),
-            });
+
+    fn finish(mut self, inputs: &RootPassInputs<'_>) -> RootsPass {
+        let final_evaluation_execution_work = self.evaluation_execution_budget.work();
+        let evaluation_materialized_files = final_evaluation_execution_work
+            .materialized_files
+            .saturating_sub(self.initial_evaluation_execution_work.materialized_files);
+        let evaluation_traversal_steps = final_evaluation_execution_work
+            .traversal_steps
+            .saturating_sub(self.initial_evaluation_execution_work.traversal_steps);
+        let completed_evaluation = self.evaluation_error.is_none();
+        if completed_evaluation && final_evaluation_execution_work.exhausted {
+            self.incomplete_reasons
+                .push(PolicyIncompleteReason::PartialDiscovery);
         }
+        if completed_evaluation && !inputs.compiled.binding_omissions.is_empty() {
+            self.incomplete_reasons
+                .push(PolicyIncompleteReason::PartialDiscovery);
+        }
+        let semantic_evaluation_work = self
+            .semantic_budget
+            .as_ref()
+            .map_or_else(SemanticWork::default, SemanticBudget::used);
+        let semantic_peaks = inputs
+            .compiled
+            .semantic_compile_peaks
+            .with_child_evaluation(
+                inputs.compiled.semantic_compile_work,
+                semantic_evaluation_work,
+                self.evaluation_artifact_retained_peak,
+                final_evaluation_execution_work.traversal_steps,
+            );
+        let work = typestate_work_report(
+            inputs.compiled,
+            &TypestateWorkMeasurements {
+                cache_work: self.cache_work,
+                semantic_evaluation_work,
+                semantic_evaluation_resident_peak: self
+                    .semantic_budget
+                    .as_ref()
+                    .map_or_else(SemanticWork::default, SemanticBudget::resident_peak),
+                semantic_evaluation_root_work_peak: self
+                    .semantic_budget
+                    .as_ref()
+                    .map_or_else(SemanticWork::default, SemanticBudget::root_work_peak),
+                semantic_peaks,
+                final_execution_work: final_evaluation_execution_work,
+                evaluation_materialized_files,
+                evaluation_traversal_steps,
+                semantic_artifact_leases: self
+                    .evaluation_artifact_leases
+                    .len()
+                    .saturating_add(self.replayed_artifact_leases),
+                evaluation_semantic_artifact_leases: self
+                    .evaluation_artifact_leases
+                    .additions_len()
+                    .saturating_add(self.replayed_artifact_leases),
+                reached_rows: self.reached_rows,
+                subject_rows: self.subject_rows,
+                terminal_rows: self.terminal_rows,
+                retained_analysis_findings: self.retained_analysis_findings,
+                omitted_analysis_findings: self.omitted_analysis_findings,
+                retained_findings: if completed_evaluation {
+                    u64::try_from(self.projections.len()).unwrap_or(u64::MAX)
+                } else {
+                    0
+                },
+            },
+        );
+        if let Some(message) = self.evaluation_error {
+            return RootsPass::Failed(TypestateEvaluationFailure { message, work });
+        }
+        self.incomplete_reasons.sort();
+        self.incomplete_reasons.dedup();
+        let completion = if self.incomplete_reasons.is_empty() {
+            PolicyRunCompletion::Complete
+        } else {
+            PolicyRunCompletion::inconclusive(self.incomplete_reasons)
+                .expect("deduplicated typestate incomplete reasons are canonical")
+        };
+        let diagnostics_truncated =
+            inputs.compiled.binding_omissions.len() > inputs.budget.max_diagnostics();
+        let diagnostics = inputs
+            .compiled
+            .binding_omissions
+            .iter()
+            .take(inputs.budget.max_diagnostics())
+            .map(|omission| {
+                PolicyDiagnostic::try_new(
+                    PolicyDiagnosticCode::CodeQuery {
+                        code: CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+                    },
+                    PolicyDiagnosticSeverity::Warning,
+                    PolicyDiagnosticImpact::RunIncomplete,
+                    format!("typestate endpoint binding omitted: {omission}"),
+                    None,
+                    Vec::new(),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let diagnostics = match diagnostics {
+            Ok(diagnostics) => diagnostics,
+            Err(message) => {
+                return RootsPass::Failed(TypestateEvaluationFailure {
+                    message,
+                    work: work.clone(),
+                });
+            }
+        };
+        RootsPass::Complete(TypestateProjectionPayload {
+            projections: self.projections,
+            completion,
+            diagnostics,
+            diagnostics_truncated,
+            work,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_compiled_typestate(
+    authority: &TypestateProjectionAuthority<'_>,
+    policy: &LoadedPolicy,
+    spec: &ResolvedTypestatePolicySpec,
+    workspace: &WorkspaceAnalyzer,
+    cancellation: Option<&CancellationToken>,
+    budget: &PolicyBudget,
+    compiled: &CompiledTypestatePolicy,
+    summaries: &ProductionTypestateSummaryRepository,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    units: Option<&mut RootUnits<'_>>,
+) -> RootsPass {
+    let uncancelled = CancellationToken::default();
+    let inputs = RootPassInputs {
+        authority,
+        policy,
+        spec,
+        workspace,
+        cancellation: cancellation.unwrap_or(&uncancelled),
+        budget,
+        compiled,
+        summaries,
+        active_semantic_model_snapshot,
+        limits: budget.query_limits().typestate,
     };
-    RootsPass::Complete(TypestateProjectionPayload {
-        projections,
-        completion,
-        diagnostics,
-        diagnostics_truncated,
-        work,
-    })
+    let mut state = RootPassState::new(&inputs);
+    if let Some(units) = units {
+        if let Err(reason) = units.enumerate(&compiled.roots) {
+            return RootsPass::Widen(reason);
+        }
+        let slice = TypestateRootSlice {
+            inputs: &inputs,
+            state: RefCell::new(Some(state)),
+            marker: std::marker::PhantomData,
+        };
+        return match evaluate_reusable_slice(
+            &slice,
+            compiled.roots.iter().zip(&units.keys),
+            &mut units.reuse,
+            &mut units.attempt,
+            workspace.analyzer(),
+            Some(inputs.cancellation),
+        ) {
+            Ok(pass) => pass,
+            Err(reason) => RootsPass::Widen(reason),
+        };
+    }
+    for root in &compiled.roots {
+        state.begin_root();
+        match state.solve_root(&inputs, root) {
+            RootStep::Solved { product, .. } => state.projections.extend(product.findings),
+            RootStep::Unfinished => continue,
+            RootStep::Stopped | RootStep::Failed => break,
+        }
+    }
+    state.finish(&inputs)
+}
+
+struct TypestateRootSlice<'a, 'b, 'r> {
+    inputs: &'a RootPassInputs<'b>,
+    state: RefCell<Option<RootPassState>>,
+    marker: std::marker::PhantomData<&'r ProcedureHandle>,
+}
+
+enum RootOutcome {
+    Reused(RootProduct),
+    Solved {
+        product: RootProduct,
+        cache_status: TypestateProductionCacheStatus,
+        execution_dependent: bool,
+    },
+    Unfinished,
+}
+
+enum RootStop {
+    Widen(WidenReason),
+    Failed,
+}
+
+impl<'r> UnitSlice for TypestateRootSlice<'_, '_, 'r> {
+    type Seed = &'r ProcedureHandle;
+    type Prefix = RootOutcome;
+    type Error = RootStop;
+    type BudgetState = ();
+    type Allowance = ();
+    type Capture<'a> = ();
+    type Merged = ();
+    type Output = RootsPass;
+
+    fn before_lookup(&self, _: &mut (), _: &Self::Seed) -> Result<(), WidenReason> {
+        let mut state = self.state.borrow_mut();
+        let state = state.as_mut().expect("root state available");
+        state.begin_root();
+        if state.remaining_finding_reached_rows == 0
+            || state.remaining_finding_candidates == 0
+            || state.remaining_finding_witness_expansions == 0
+            || state.remaining_finding_witness_bytes == 0
+        {
+            state.shared_lane_reached = true;
+            state
+                .incomplete_reasons
+                .push(PolicyIncompleteReason::PartialDiscovery);
+            state.omitted_analysis_findings = state.omitted_analysis_findings.saturating_add(1);
+            return Err(WidenReason::MergedLimitReached);
+        }
+        Ok(())
+    }
+    fn remaining(&self, _: &()) -> Option<()> {
+        Some(())
+    }
+    fn prefix(&self, seed: &Self::Seed, _: ()) -> Result<Self::Prefix, Self::Error> {
+        let mut state = self.state.borrow_mut();
+        match state
+            .as_mut()
+            .expect("root state available")
+            .solve_root(self.inputs, seed)
+        {
+            RootStep::Solved {
+                product,
+                cache_status,
+                execution_dependent,
+            } => Ok(RootOutcome::Solved {
+                product,
+                cache_status,
+                execution_dependent,
+            }),
+            RootStep::Unfinished => Ok(RootOutcome::Unfinished),
+            RootStep::Stopped => Err(RootStop::Widen(WidenReason::MergedLimitReached)),
+            RootStep::Failed => Err(RootStop::Failed),
+        }
+    }
+    fn decode(
+        &self,
+        _: &Self::Seed,
+        product: PolicyUnitProduct,
+        _: &[ReadKey],
+    ) -> Result<Self::Prefix, UnitDecodeError> {
+        product
+            .into_root()
+            .map(RootOutcome::Reused)
+            .ok_or(UnitDecodeError::Widen(WidenReason::ProductLoadFailed))
+    }
+    fn encode(&self, prefix: &Self::Prefix) -> PolicyUnitProduct {
+        match prefix {
+            RootOutcome::Solved { product, .. } | RootOutcome::Reused(product) => {
+                PolicyUnitProduct::Root(product.clone())
+            }
+            RootOutcome::Unfinished => unreachable!("unfinished roots are not published"),
+        }
+    }
+    fn charge(&self, _: &mut (), prefix: &Self::Prefix) {
+        if let RootOutcome::Reused(product) = prefix {
+            self.state
+                .borrow_mut()
+                .as_mut()
+                .expect("root state available")
+                .charge_reused(product)
+                .expect("reused root fit was checked");
+        }
+    }
+    fn fits(&self, _: &(), prefix: &Self::Prefix) -> bool {
+        match prefix {
+            RootOutcome::Reused(product) => self
+                .state
+                .borrow()
+                .as_ref()
+                .expect("root state available")
+                .reused_fits(product),
+            _ => true,
+        }
+    }
+    fn capture(&self, _: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer) {}
+    fn publishable(&self, prefix: &Self::Prefix) -> bool {
+        match prefix {
+            RootOutcome::Solved {
+                cache_status: TypestateProductionCacheStatus::Hit,
+                ..
+            } => {
+                let policy_id = &self.inputs.policy.definition().metadata.id;
+                brokk_bifrost_analysis::profiling::note_with(|| {
+                    format!(
+                        "policy.units policy={policy_id} partition=root unpublished=result_cache_hit"
+                    )
+                });
+                false
+            }
+            RootOutcome::Solved { .. } => true,
+            _ => false,
+        }
+    }
+    fn execution_dependent(&self, prefix: &Self::Prefix) -> bool {
+        matches!(
+            prefix,
+            RootOutcome::Solved {
+                execution_dependent: true,
+                ..
+            }
+        )
+    }
+    fn failure(&self, error: Self::Error, _: Vec<Self::Prefix>) -> Self::Output {
+        match error {
+            RootStop::Widen(reason) => RootsPass::Widen(reason),
+            RootStop::Failed => self
+                .state
+                .borrow_mut()
+                .take()
+                .expect("root state available")
+                .finish(self.inputs),
+        }
+    }
+    fn merge(&self, products: impl IntoIterator<Item = Self::Prefix>) {
+        let mut state = self.state.borrow_mut();
+        let state = state.as_mut().expect("root state available");
+        for product in products {
+            match product {
+                RootOutcome::Reused(product) => {
+                    state.incomplete_reasons.extend(product.incomplete_reasons);
+                    state.projections.extend(product.findings);
+                }
+                RootOutcome::Solved { product, .. } => state.projections.extend(product.findings),
+                RootOutcome::Unfinished => {}
+            }
+        }
+    }
+    fn suffix(&self, _: (), _: usize) -> Self::Output {
+        let state = self
+            .state
+            .borrow_mut()
+            .take()
+            .expect("root state available");
+        if let Some(reason) = state.widen_reason() {
+            RootsPass::Widen(reason)
+        } else {
+            state.finish(self.inputs)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

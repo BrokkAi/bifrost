@@ -1756,6 +1756,12 @@ pub(crate) fn resolve_rust_type_bounded(
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         BoundedResolution::Complete { value, work } => {
             let mut value = adapt_type_value(query, rust, value);
+            if value.status == TypeLookupStatus::Incomplete
+                && let Some(modeled) =
+                    expression.and_then(|expression| modeled_expression_type(&query, expression))
+            {
+                value = modeled;
+            }
             if expression
                 .is_some_and(|node| matches!(node.kind(), "call_expression" | "struct_expression"))
             {
@@ -1770,6 +1776,52 @@ pub(crate) fn resolve_rust_type_bounded(
             BoundedResolution::Complete { value, work }
         }
     }
+}
+
+/// The activated model type a value expression evaluates to when native
+/// resolution names no workspace type for it. Native facts stop at the
+/// external crate boundary, so this reuses the receiver-owner proof that binds
+/// a modeled method call: the declared type of the binding or field, or the
+/// declared return of a modeled call, proven external by the resolver. Only a
+/// nominal struct, enum, or union record answers; a trait bound is a dispatch
+/// surface, not the value's type (#9050).
+fn modeled_expression_type(
+    query: &BoundedReceiverQuery<'_>,
+    expression: tree_sitter::Node<'_>,
+) -> Option<TypeLookupOutcome> {
+    use crate::analyzer::rust::std_types::RustReceiverOwner;
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+    let RustReceiverOwner::Path(owner) =
+        crate::analyzer::rust::std_types::rust_expression_receiver_owner(
+            query.analyzer,
+            query.file,
+            query.source,
+            expression.byte_range(),
+            query.cancellation,
+        )?
+    else {
+        return None;
+    };
+    let overlay = query.analyzer.semantic_model_overlay()?;
+    let symbol = overlay.symbols_named(&owner).unique()?;
+    if !matches!(
+        symbol.kind,
+        SemanticModelSymbolKind::Struct
+            | SemanticModelSymbolKind::Enum
+            | SemanticModelSymbolKind::Union
+    ) {
+        return None;
+    }
+    let mut outcome =
+        brokk_bifrost_analysis::analyzer::usages::get_type::exact_semantic_model_type_outcome(
+            query.analyzer,
+            query.file,
+            Language::Rust,
+            &owner,
+            TypeLookupTargetKind::ValueExpression,
+        )?;
+    outcome.reference = Some(query.site.clone());
+    Some(outcome)
 }
 
 /// Read the category of the receiver selected by native member lookup.

@@ -2066,6 +2066,31 @@ impl<'source> JavaResolutionBuilder<'source> {
             assert!(self.facts.gaps.iter().any(
                 |gap| gap.site == route.site && gap.kind == ResolutionGapKind::UnsupportedRoute
             ));
+            if route.kind == ResolutionImportRouteKind::TypeOnDemand {
+                let gaps = self
+                    .facts
+                    .gaps
+                    .iter()
+                    .filter(|gap| {
+                        gap.site == route.site && gap.kind == ResolutionGapKind::UnsupportedRoute
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    gaps.len(),
+                    1,
+                    "one route gap per Java type-on-demand import"
+                );
+                assert_eq!(
+                    gaps[0].route(),
+                    Some(ResolutionRouteGap::UnknownBinder {
+                        scope: root_scope,
+                        name: None,
+                        namespace: Some(ResolutionNamespace::Type),
+                        may_publish: false,
+                    }),
+                    "type-on-demand import has one classified UnknownBinder gap"
+                );
+            }
 
             let segments = self
                 .facts
@@ -4665,23 +4690,50 @@ impl<'source> JavaResolutionBuilder<'source> {
     fn record_qualified_type_root(&mut self, node: Node<'_>, reference: ResolutionSiteId) {
         let mut current = node;
         let mut segments = Vec::new();
-        while current.kind() == "scoped_type_identifier" {
-            let Some((scope, name)) = scoped_type_parts(current) else {
-                return;
+        while matches!(current.kind(), "scoped_type_identifier" | "field_access") {
+            let (scope, name) = if current.kind() == "scoped_type_identifier" {
+                let Some(parts) = scoped_type_parts(current) else {
+                    return;
+                };
+                parts
+            } else {
+                let (Some(scope), Some(name)) = (
+                    current.child_by_field_name("object"),
+                    current.child_by_field_name("field"),
+                ) else {
+                    return;
+                };
+                if name.kind() != "identifier" || name.is_missing() || name.has_error() {
+                    return;
+                }
+                (scope, name)
             };
             segments.push(self.intern_name(node_text(name, self.source)));
             current = scope;
         }
-        if current.kind() != "type_identifier" {
+        if !matches!(current.kind(), "type_identifier" | "identifier")
+            || current.is_missing()
+            || current.has_error()
+        {
             return;
         }
-        let Some(prefix_slot) = self.type_slots_by_node.get(&current.id()).copied() else {
+        let prefix_slot = if current.kind() == "type_identifier" {
+            self.type_slots_by_node.get(&current.id()).copied()
+        } else {
+            self.expression_slots_by_node.get(&current.id()).copied()
+        };
+        let Some(prefix_slot) = prefix_slot else {
             return;
         };
         let prefix = self.slot(prefix_slot).site;
-        if self.site(prefix).kind != ResolutionSiteKind::TypeReference {
-            return;
-        }
+        debug_assert_eq!(
+            self.site(prefix).kind,
+            if current.kind() == "type_identifier" {
+                ResolutionSiteKind::TypeReference
+            } else {
+                ResolutionSiteKind::ValueReference
+            }
+        );
         segments.push(self.intern_name(node_text(current, self.source)));
         segments.reverse();
         segments.pop().expect("qualified type has a terminal name");
@@ -4702,10 +4754,12 @@ impl<'source> JavaResolutionBuilder<'source> {
         route: ResolutionRootReferenceFact,
         segments: Vec<ResolutionNameId>,
     ) {
-        if route
-            .prefix_reference
-            .is_some_and(|prefix| self.site(prefix).kind != ResolutionSiteKind::TypeReference)
-        {
+        if route.prefix_reference.is_some_and(|prefix| {
+            !matches!(
+                self.site(prefix).kind,
+                ResolutionSiteKind::TypeReference | ResolutionSiteKind::ValueReference
+            )
+        }) {
             return;
         }
         let reference = route.reference;
@@ -5696,6 +5750,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             },
         });
         self.expression_slots_by_node.insert(node.id(), output);
+        self.record_qualified_type_root(node, reference);
     }
 
     fn add_member_type_reference(

@@ -1869,7 +1869,7 @@ mod row_fixture {
                 PartialFlowPort::Heap {
                     root: Box::new(receiver),
                     selectors: vec![
-                        HeapSelector::Field(field),
+                        HeapSelector::Field(field.clone()),
                         HeapSelector::Property("key".into()),
                         HeapSelector::ConstantIndex("3".into()),
                         HeapSelector::ExactIndex(v(10)),
@@ -1882,6 +1882,16 @@ mod row_fixture {
                     root: Box::new(parameter),
                     selectors: Box::new([]),
                     tail: AccessPathTail::Exact,
+                },
+                PartialFlowPort::Heap {
+                    root: Box::new(PartialFlowPort::NormalReturn),
+                    selectors: vec![HeapSelector::Field(field.clone())].into(),
+                    tail: AccessPathTail::Exact,
+                },
+                PartialFlowPort::Heap {
+                    root: Box::new(PartialFlowPort::IndexedNormalReturn { ordinal: 1 }),
+                    selectors: vec![HeapSelector::AnyIndex].into(),
+                    tail: AccessPathTail::Summary,
                 },
                 PartialFlowPort::CaptureOut {
                     target: ProcedureId::new(1),

@@ -1595,6 +1595,34 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         self.selection.has_jvm_semantics()
     }
 
+    fn external_argument_proof_reasons(
+        &self,
+        definitions: &[SemanticId],
+        receiver_reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        SelectedResolutionTypedSource::external_argument_proof_reasons(
+            self,
+            definitions,
+            receiver_reasons,
+            cancellation,
+        )
+    }
+
+    fn external_receiver_argument_reasons(
+        &self,
+        definitions: &[SemanticId],
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        SelectedResolutionTypedSource::external_receiver_argument_reasons(
+            self,
+            definitions,
+            reasons,
+            cancellation,
+        )
+    }
+
     fn external_callable_result_type_identities(
         &self,
         definitions: &[SemanticId],

@@ -20,7 +20,7 @@ You can print some of these lists from a binary:
 ## Schema versions
 
 Every authored pack declares `schema_version`. This build reads versions `2`
-through `21`, inclusive. Its newest version is `21`. Version `1` and
+through `22`, inclusive. Its newest version is `22`. Version `1` and
 any other value fail with `schema.unsupported_version`. The field is
 required; there is no default.
 
@@ -33,7 +33,8 @@ spec keeps the version its author declared. Current artifact producers supply
 schema-19 extraction authority, so their output requires at least version 19.
 C# assembly packs also carry assembly identities, requiring version 20. JVM
 packs that record enclosing type parameters on owner inventories require
-version 21.
+version 21. Rust packs that state `drop_glue` in value semantics require
+version 22.
 
 A field is accepted only in a pack whose `schema_version` is at least the
 version that introduced it. A pack that declares an earlier version and uses
@@ -61,6 +62,7 @@ of an older version parse every pack that it accepts by number.
 | 19 | Rust implementation-inventory coverage, negative impls and conditional bounds; producer-only extraction authority in compiled manifests and shards. | `declaration.impl_inventory_schema_version`, `declaration.impl_conditions_schema_version`, `declaration.impl_self_schema_version`, `extraction.schema_version` |
 | 20 | `assembly_identity` and non-empty `type_forwards` on declaration payloads. | `schema.assembly_identity_version`, `schema.type_forwards_version` |
 | 21 | Non-empty `enclosing_type_parameters` on JVM owner inventories. | `jvm_inventory.schema_version` |
+| 22 | `drop_glue` in `value_semantics` on Rust type facts. | `declaration.drop_glue_schema_version` |
 
 A declaration payload can record its provider's `assembly_identity` and a
 `type_forwards` vector. Forward names retain CLR spelling, including generic
@@ -78,12 +80,12 @@ forward rows.
 ### JSON schema files
 
 The generated JSON schema is
-[`schemas/semantic-model-pack-v21.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v21.schema.json).
+[`schemas/semantic-model-pack-v22.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v22.schema.json).
 `cargo run --profile measure --example generate_semantic_model_schema` writes it from the Rust
 type `AuthoredSemanticModelPack`, and a repository test requires the
 checked-in file to match the generated schema exactly. The file describes
 every field of every supported version, and it accepts `schema_version` from
-`2` through `21`. It requires `compatibility.bifrost` for versions `2` through
+`2` through `22`. It requires `compatibility.bifrost` for versions `2` through
 `7` and forbids it for versions `8` and newer. It does not express the other
 per-field version gates in the table above; the validator enforces them.
 
@@ -98,7 +100,7 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | integer, 2 to 21 | yes | The pack format version. See [Schema versions](#schema-versions). |
+| `schema_version` | integer, 2 to 22 | yes | The pack format version. See [Schema versions](#schema-versions). |
 | `pack_id` | stable ID | yes | The pack identity. |
 | `version` | SemVer version | yes | The pack version. |
 | `producer` | `{name, version}` | yes | The tool that produced the pack. `name` is non-empty text; `version` is a SemVer version. |
@@ -120,7 +122,7 @@ Compiled schema-19 manifests and shard envelopes may contain `extraction`:
 paths supply this claim in memory; authored documents reject the field. Every
 shard must agree with its manifest. Both semantic digests include the claim,
 and older or curated packs without it have no extraction authority. The
-[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v21.schema.json)
+[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v22.schema.json)
 describes this envelope separately from the authoring format.
 
 A **stable ID** is 1 to 256 bytes of lowercase ASCII letters, digits, `.`,
@@ -363,9 +365,13 @@ recorded constraint.
 | --- | --- | --- |
 | `copy` | `{kind: trivial}` or `{kind: via_member, member}` | How the type copies. `member` is the stable ID of the copy operation. |
 | `move_semantics` | `invalidating` | A move leaves the source invalid. |
+| `drop_glue` | `inert` | Schema 22, Rust structs, enums and unions only. Dropping a value runs no user code: the type has no `Drop` impl and no field's drop glue runs any. A generic application is inert only when its type arguments, including omitted defaults, are inert too. Absence keeps the scope exit of an owned value unproven. |
 
 The validator rejects an empty `value_semantics` object
-(`declaration.empty_value_semantics`).
+(`declaration.empty_value_semantics`), and a `drop_glue` under an older schema
+version (`declaration.drop_glue_schema_version`), in a pack whose language is
+not Rust (`declaration.drop_glue_language`), or on a type that is not a struct,
+enum or union (`declaration.drop_glue_owner`).
 
 `ImplicitOperation` on a member (tagged by `kind`):
 
@@ -1462,7 +1468,7 @@ this build supports. A host passes it to pack selection tools.
 | --- | --- |
 | `engine_version` | The `bifrost` package version. |
 | `build_identity` | The exact source revision of this build. |
-| `model_set_sha256` | SHA-256 over the embedded pack registry: each pack's source ID and manifest bytes, length-prefixed. |
+| `model_set_sha256` | SHA-256 of the engine's built-in model set. The engine embeds no packs, so this is the digest of empty input. |
 | `capability_contract_version` | `1`. |
 | `schemas.policy_document` | Supported policy document versions. |
 | `schemas.rql` | Supported RQL schema versions. |
@@ -1500,7 +1506,7 @@ These variables change pack behavior. The
 | Variable | Effect |
 | --- | --- |
 | `BIFROST_SEMANTIC_PACK_CACHE_ROOT` | Root of the default catalog and of the shared generated-pack cache. |
-| `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` | An extracted release bundle that replaces the embedded packs. Bifrost installs it when it opens a catalog for activation. An empty value, a malformed bundle, or a bundle with no compatible pack makes that activation fail. A policy report then carries `pack-activation-failed` and the run exits 2. |
+| `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` | An extracted release bundle, the engine's only source of semantic packs when acquisition does not supply one. Bifrost installs it when it opens a catalog for activation. An empty value, a malformed bundle, or a bundle with no compatible pack makes that activation fail. A policy report then carries `pack-activation-failed` and the run exits 2. |
 | `BIFROST_POLICY_PACK_ROOT` | An extracted policy rules directory that replaces the embedded policy catalog. See the [policy reference](/reference/policies/). |
 | `BIFROST_WORKSPACE_SEMANTIC_MODELS` | Read by every `SearchToolsService` session: the MCP server, one-shot `--tool` and `--query-file` runs, a policy run with `--sources`, and the Rust and Python libraries. `on`, `1`, or `enabled` registers `.bifrost/semantic-models/` when the session activates packs; `off`, `0`, or `disabled` (the default) does not. Any other value is an error. A CLI policy run without `--sources` reads the directory whether or not this variable is set. |
 | `BIFROST_SEMANTIC_PACK_CATALOG`, `BIFROST_SEMANTIC_PACK_EVIDENCE` | Legacy. Read by every `SearchToolsService` session. Set both or neither. The catalog is opened read-only. The evidence is a non-empty JSON array of rows with `language`, `ecosystem`, and optional `package`, `module`, `toolchain` (`{name, version?}`), `target`, `configuration`, and `artifactSha256`. This route supplies no `enable` controls, and it fails when `.bifrost/packs.json` exists. |

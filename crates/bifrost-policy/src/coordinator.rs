@@ -35,7 +35,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     workspace_semantic_models_not_active,
 };
 use brokk_bifrost_analysis::analyzer::store::policy_units::{
-    PolicyEvaluationPolicyRow, PolicyEvaluationRow, PolicyEvaluationRowKey,
+    PolicyEvaluationPolicyRow, PolicyEvaluationRow, PolicyEvaluationRowKey, PolicyReplayEvidence,
 };
 use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
@@ -51,9 +51,11 @@ use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
 use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 use brokk_bifrost_tools::diff_analysis::{
-    RevisionExport, RevisionWorkspace, changed_buffer_ranges, export_revision,
+    RevisionExport, RevisionSubtree, RevisionWorkspace, changed_buffer_ranges, export_revision,
     resolve_revision_subtree, worktree_paths_match_head,
 };
+
+use super::budget::{PolicySourceCensus, effective_grant};
 
 use super::baseline::{
     DEFAULT_POLICY_BASELINE_PATH, PolicyBaselineDocument, PolicyBaselineEntryReview,
@@ -539,6 +541,8 @@ pub struct PolicyBatchOutcome {
     /// telemetry cannot live inside it. The incremental review carries that
     /// telemetry separately.
     incremental: Option<PolicyIncrementalReview>,
+    /// Actual execution limits and certified snapshot volume, never rendered.
+    replay_evidence: Option<PolicyReplayEvidence>,
 }
 
 impl PolicyBatchOutcome {
@@ -1353,6 +1357,7 @@ fn unreliable_empty_policy_outcome(
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
         incremental: None,
+        replay_evidence: None,
     }
 }
 
@@ -1528,6 +1533,84 @@ fn analyzed_source_volume(workspace: &WorkspaceAnalyzer) -> (u64, usize) {
         })
         .sum();
     (bytes, files.len())
+}
+
+/// Certify the volume of the indexed snapshot from its repository's blob headers.
+/// No disk source or metadata participates, and only the scalar totals survive.
+fn certified_source_census(
+    workspace: &WorkspaceAnalyzer,
+    revision: &RevisionSubtree,
+) -> Option<PolicySourceCensus> {
+    // An inventory can return a useful partial list after a store failure.
+    // Capture its nested read failures before treating the count as certified.
+    // The nested scope preserves the caller's context and cancellation.
+    let scope = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
+    let files = workspace.analyzer().analyzed_files();
+    let mut bytes = 0_u64;
+    for file in &files {
+        if workspace.analyzer().project().has_overlay(file) {
+            return None;
+        }
+        let oid = workspace.analyzer().indexed_blob_oid(file)?;
+        bytes = bytes.checked_add(revision.blob_size(oid)? as u64)?;
+    }
+    if !scope.captured_read_incompleteness().is_empty() {
+        return None;
+    }
+    Some(PolicySourceCensus {
+        bytes,
+        files: files.len(),
+    })
+}
+
+fn replay_evidence(
+    budget: PolicyBatchBudget,
+    registry: PolicyRegistryLimits,
+    census: PolicySourceCensus,
+) -> PolicyReplayEvidence {
+    PolicyReplayEvidence {
+        effective_grant: serde_json::to_string(&budget.replay_caps(registry))
+            .expect("effective policy caps serialize"),
+        census_files: census.files as u64,
+        census_bytes: census.bytes,
+    }
+}
+
+/// The one budget validity rule for both child and aggregate records.
+fn replay_grant_admits(
+    evidence: Option<&PolicyReplayEvidence>,
+    complete: bool,
+    caller: PolicyBatchBudget,
+    registry: PolicyRegistryLimits,
+) -> bool {
+    let Some(evidence) = evidence else {
+        return false;
+    };
+    let Ok(files) = usize::try_from(evidence.census_files) else {
+        return false;
+    };
+    let Ok(recorded) = serde_json::from_str::<BTreeMap<String, u64>>(&evidence.effective_grant)
+    else {
+        return false;
+    };
+    let request = effective_grant(
+        caller,
+        PolicySourceCensus {
+            bytes: evidence.census_bytes,
+            files,
+        },
+    )
+    .replay_caps(registry);
+    request.len() == recorded.len()
+        && request.iter().all(|(name, limit)| {
+            recorded.get(name).is_some_and(|recorded| {
+                if complete {
+                    limit >= recorded
+                } else {
+                    limit <= recorded
+                }
+            })
+        })
 }
 
 /// Activate every semantic source an owned policy workspace uses.
@@ -2694,6 +2777,12 @@ enum PolicyWorkspaceSource<'a> {
     /// choice: an API caller, or the base half of a diff run, which is built
     /// with the head's configuration and mirrors its activation.
     Supplied(&'a WorkspaceAnalyzer),
+    /// An exported revision has no repository beneath its temporary root.
+    /// Its caller certifies indexed blobs against the original repository.
+    Revision {
+        workspace: &'a WorkspaceAnalyzer,
+        census: Option<PolicySourceCensus>,
+    },
 }
 
 /// One policy's evaluation, before the batch-level bookkeeping that reads
@@ -3167,14 +3256,15 @@ fn evaluate_prepared_policy_inputs(
         .iter()
         .any(|input| matches!(input, InputOutcome::Pending(_) | InputOutcome::Runnable(_)));
     let supplied_workspace = match workspace_source {
-        PolicyWorkspaceSource::Supplied(workspace) => Some(workspace),
+        PolicyWorkspaceSource::Supplied(workspace)
+        | PolicyWorkspaceSource::Revision { workspace, .. } => Some(workspace),
         PolicyWorkspaceSource::Root | PolicyWorkspaceSource::HostSession(_) => None,
     };
     let policy_config = AnalyzerConfig::default();
     let mut reused_host_workspace = None;
     let owned_analyzer = match workspace_source {
         _ if !needs_workspace => None,
-        PolicyWorkspaceSource::Supplied(_) => None,
+        PolicyWorkspaceSource::Supplied(_) | PolicyWorkspaceSource::Revision { .. } => None,
         PolicyWorkspaceSource::HostSession(session) => {
             let _scope =
                 brokk_bifrost_analysis::profiling::scope("policy.registration.host_session");
@@ -3585,10 +3675,24 @@ fn evaluate_prepared_policy_inputs(
     // explicitly widened caller budget survives and an explicitly narrowed one
     // is raised back to the fixed defaults.
     let root_memo = brokk_bifrost_rql::TypeFlowRootMemo::default();
-    let batch_budget = batch_budget.with_scaled_per_policy(policy_budget_for_workspace(
-        *batch_budget.per_policy(),
-        workspace,
-    ));
+    let caller_batch_budget = batch_budget;
+    let certified_census = workspace.and_then(|workspace| match workspace_source {
+        PolicyWorkspaceSource::Revision { census, .. } => census,
+        _ => resolve_revision_subtree(root, "HEAD")
+            .ok()
+            .and_then(|revision| certified_source_census(workspace, &revision)),
+    });
+    let census = certified_census.or_else(|| {
+        workspace.map(|workspace| {
+            let (bytes, files) = analyzed_source_volume(workspace);
+            PolicySourceCensus { bytes, files }
+        })
+    });
+    let batch_budget = census.map_or(caller_batch_budget, |census| {
+        effective_grant(caller_batch_budget, census)
+    });
+    let replay_evidence =
+        certified_census.map(|census| replay_evidence(batch_budget, registry_limits, census));
     let per_policy_budget = *batch_budget.per_policy();
     let activation_for_report = workspace_activation
         .as_ref()
@@ -3786,8 +3890,6 @@ fn evaluate_prepared_policy_inputs(
                 base_evaluation_key(
                     options,
                     scope_document.as_ref(),
-                    batch_budget,
-                    registry_limits,
                     WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
                 )
             });
@@ -3803,6 +3905,8 @@ fn evaluate_prepared_policy_inputs(
                     &runnable_policies,
                     store,
                     key,
+                    caller_batch_budget,
+                    registry_limits,
                 ),
                 _ => None,
             };
@@ -3815,7 +3919,7 @@ fn evaluate_prepared_policy_inputs(
                     options,
                     scope_document.as_ref(),
                     base_inputs,
-                    batch_budget,
+                    caller_batch_budget,
                     registry_limits,
                     &runnable_policies,
                     evaluation_key,
@@ -4604,13 +4708,12 @@ fn evaluate_prepared_policy_inputs(
             base_evaluation_key(
                 options,
                 scope_document.as_ref(),
-                batch_budget,
-                registry_limits,
                 WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
             ),
             incremental,
             &report,
             &runnable_policies,
+            replay_evidence.as_ref(),
         )
     {
         store.publish_evaluation(&publication);
@@ -4623,6 +4726,7 @@ fn evaluate_prepared_policy_inputs(
         stage_attribution,
         taint_findings,
         taint_analysis_results,
+        replay_evidence,
         exit_status,
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
@@ -4724,17 +4828,15 @@ impl BatchUnitStore {
 fn base_evaluation_key(
     options: &PolicyEvaluationOptions,
     scope: Option<&PolicyScopeDocument>,
-    batch_budget: PolicyBatchBudget,
-    registry_limits: PolicyRegistryLimits,
     inputs: WorkspaceUnitInputs,
 ) -> PolicyEvaluationRowKey {
     // The base's own options, not the head's: it evaluates with the head's
-    // suppression and gate configuration deliberately stripped, and the
-    // budgets and registry limits it inherits decide what it retains. The
+    // suppression and gate configuration deliberately stripped. Resource
+    // limits are recorded inputs checked by replay_grant_admits. The
     // head's handling of inconclusive runs is kept: it decides the base's
     // recorded aggregate verdict.
     let base_options = format!(
-        "{:?}\u{1}{}\u{1}{}\u{1}{batch_budget:?}\u{1}{registry_limits:?}\u{1}{scope:?}",
+        "{:?}\u{1}{}\u{1}{}\u{1}{scope:?}",
         options.evaluation_date(),
         options.require_explicit_schema_versions(),
         options.on_inconclusive().label(),
@@ -4777,6 +4879,7 @@ fn policy_set_digest(policies: &[&LoadedPolicy]) -> String {
 /// difference from the base cannot be established from the store alone. Every
 /// one of those is reported, because "the base was evaluated again" is a fact
 /// a reader needs to explain a slow run.
+#[allow(clippy::too_many_arguments)]
 fn reuse_persisted_diff_baseline(
     head_root: &Path,
     head_workspace: &WorkspaceAnalyzer,
@@ -4784,6 +4887,8 @@ fn reuse_persisted_diff_baseline(
     policies: &[&LoadedPolicy],
     store: &BatchUnitStore,
     key: &PolicyEvaluationRowKey,
+    caller_batch_budget: PolicyBatchBudget,
+    registry_limits: PolicyRegistryLimits,
 ) -> Option<PolicyDiffBaselineOutcome> {
     let persisted = store.persisted()?;
     let subtree = match resolve_revision_subtree(head_root, revision) {
@@ -4816,6 +4921,19 @@ fn reuse_persisted_diff_baseline(
             return None;
         }
     };
+    let policy_set_matches = evaluation.policy_set_digest == policy_set_digest(policies);
+    if policy_set_matches
+        && !evaluation.evidence_complete.is_some_and(|complete| {
+            replay_grant_admits(
+                evaluation.evidence.as_ref(),
+                complete,
+                caller_batch_budget,
+                registry_limits,
+            )
+        })
+    {
+        return None;
+    }
     // The head verifies the units it reuses against what moved since the base.
     // The base's own facts come from the store, because the base workspace
     // this would otherwise need is exactly what is not being built.
@@ -4860,7 +4978,16 @@ fn reuse_persisted_diff_baseline(
             });
             return None;
         }
-        if evidence.completion != "complete" || !evidence.qualified {
+        let complete = evidence.completion == "complete" && evidence.qualified;
+        if !replay_grant_admits(
+            evidence.evidence.as_ref(),
+            complete,
+            caller_batch_budget,
+            registry_limits,
+        ) {
+            return None;
+        }
+        if !complete {
             unqualified.push(PolicyDiffUnqualifiedPolicy::new(
                 policy_id.clone(),
                 evidence.completion.clone(),
@@ -4882,8 +5009,6 @@ fn reuse_persisted_diff_baseline(
                 .collect(),
         );
     }
-    let requested_policy_set_digest = policy_set_digest(policies);
-    let policy_set_matches = evaluation.policy_set_digest == requested_policy_set_digest;
     let aggregate_unreliable = if policy_set_matches {
         evaluation.aggregate_unreliable
     } else {
@@ -5304,6 +5429,9 @@ fn evaluate_policy_diff_baseline(
         )),
         _ => None,
     };
+    let census = resolve_revision_subtree(head_root, revision)
+        .ok()
+        .and_then(|revision| certified_source_census(base.workspace(), &revision));
     let outcome = {
         let _phase = phase_token.enter_phase(format!("evaluating the diff base `{revision}`"));
         evaluate_policy_inputs_with_limits(
@@ -5312,7 +5440,10 @@ fn evaluate_policy_diff_baseline(
             &base_options,
             batch_budget,
             registry_limits,
-            PolicyWorkspaceSource::Supplied(base.workspace()),
+            PolicyWorkspaceSource::Revision {
+                workspace: base.workspace(),
+                census,
+            },
             None,
             None,
             None,
@@ -5341,8 +5472,10 @@ fn evaluate_policy_diff_baseline(
         snapshot,
     });
     let unqualified_policies = unqualified_base_policies(policies, report, &identities);
-    let aggregate_unreliable = outcome.exit_status() == POLICY_EXIT_UNRELIABLE;
-    let unreliable_detail = aggregate_unreliable.then(|| diff_base_unreliable_detail(report));
+    let aggregate_unreliable =
+        diff_base_report_unreliable(report, policies, head_options.on_inconclusive());
+    let unreliable_detail =
+        aggregate_unreliable.then(|| diff_base_unreliable_detail(report, policies));
     let baseline = PolicyDiffBaseline {
         requested_revision: revision.to_string(),
         resolved_commit: export.commit_id().to_string(),
@@ -5366,6 +5499,7 @@ fn evaluate_policy_diff_baseline(
                     report,
                     policies,
                     &baseline,
+                    outcome.replay_evidence.as_ref(),
                 )
             });
     let base_review = base_incremental
@@ -5401,6 +5535,7 @@ fn evaluate_policy_diff_baseline(
 /// for what it says about its own diff base, which describes another tree. A
 /// head whose semantic sources failed to activate records nothing, because a
 /// base evaluation that met the same failure concludes no identity at all.
+#[allow(clippy::too_many_arguments)]
 fn head_evaluation_publication(
     root: &Path,
     head: &WorkspaceAnalyzer,
@@ -5409,6 +5544,7 @@ fn head_evaluation_publication(
     incremental: &PolicyIncrementalContext<'_>,
     report: &PolicyReportDocument,
     policies: &[&LoadedPolicy],
+    evidence: Option<&PolicyReplayEvidence>,
 ) -> Option<PolicyEvaluationRow> {
     let base_options = PolicyEvaluationOptions::new(options.evaluation_date());
     if *options.range() != PolicyRangeRequest::Workspace
@@ -5477,19 +5613,16 @@ fn head_evaluation_publication(
     let identities = exhaustive_run_identities(report.runs());
     // The base run gates nothing, so only an orphaned suppression exceeds its
     // threshold.
-    let aggregate_unreliable = report_unreliable(
-        report,
-        tree_diagnostics(report),
-        report_has_orphaned_suppression(report),
-        options.on_inconclusive(),
-    );
+    let aggregate_unreliable =
+        diff_base_report_unreliable(report, policies, options.on_inconclusive());
     let baseline = PolicyDiffBaseline {
         requested_revision: "HEAD".to_string(),
         resolved_commit: subtree.commit_id().to_string(),
         unqualified_policies: unqualified_base_policies(policies, report, &identities),
         identities,
         aggregate_unreliable,
-        unreliable_detail: aggregate_unreliable.then(|| diff_base_unreliable_detail(report)),
+        unreliable_detail: aggregate_unreliable
+            .then(|| diff_base_unreliable_detail(report, policies)),
     };
     base_evaluation_publication(
         incremental,
@@ -5498,6 +5631,7 @@ fn head_evaluation_publication(
         report,
         policies,
         &baseline,
+        evidence,
     )
 }
 
@@ -5519,9 +5653,12 @@ fn base_evaluation_publication(
     report: &PolicyReportDocument,
     policies: &[&LoadedPolicy],
     baseline: &PolicyDiffBaseline,
+    evidence: Option<&PolicyReplayEvidence>,
 ) -> Option<PolicyEvaluationRow> {
+    // Uncertified snapshots never partly update a parent or publish children.
+    let evidence = evidence?;
     // Execution termination depends on time or host conditions absent from
-    // the key. Retention truncation is deterministic under its keyed budget.
+    // the key. Retention truncation is deterministic under its recorded grant.
     if report.execution().termination().is_some()
         || !report.execution().timed_out_policy_ids().is_empty()
     {
@@ -5538,6 +5675,7 @@ fn base_evaluation_publication(
             let policy_id = &policy.definition().metadata.id;
             let Some(run) = runs.get(policy_id) else {
                 return PolicyEvaluationPolicyRow {
+                    evidence: Some(evidence.clone()),
                     policy_id: policy_id.to_string(),
                     source_hash: policy.source_hash().to_string(),
                     semantic_hash: policy.semantic_hash().to_string(),
@@ -5568,6 +5706,7 @@ fn base_evaluation_publication(
                 base_run_unqualified_detail(report, run)
             };
             PolicyEvaluationPolicyRow {
+                evidence: Some(evidence.clone()),
                 policy_id: policy_id.to_string(),
                 source_hash: policy.source_hash().to_string(),
                 semantic_hash: policy.semantic_hash().to_string(),
@@ -5587,7 +5726,23 @@ fn base_evaluation_publication(
         })
         .collect::<Vec<_>>();
     policy_rows.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
+    // Evidence completeness precedes any verdict or on-inconclusive policy.
+    // Also inspect every report run: non-runnable requested policies are not
+    // in `policies`, but their missing capability still leaves evidence open.
+    let evidence_complete = !report.diagnostics_truncated()
+        && !tree_diagnostics(report)
+            .any(|diagnostic| diagnostic.severity() == PolicyDiagnosticSeverity::Error)
+        && report.runs().iter().all(|run| {
+            run.completion().is_exhaustive()
+                && !run.diagnostics_truncated()
+                && !run.obligations_truncated()
+        })
+        && policy_rows
+            .iter()
+            .all(|policy| policy.completion == "complete" && policy.qualified);
     Some(PolicyEvaluationRow {
+        evidence: Some(evidence.clone()),
+        evidence_complete: Some(evidence_complete),
         key: PolicyEvaluationRowKey {
             base_tree_oid: tree_id.to_string(),
             ..key
@@ -5774,7 +5929,10 @@ fn base_activates_shipped_models(head_workspace: &WorkspaceAnalyzer) -> bool {
 
 /// Summarize why a base evaluation was unreliable, for the degradation
 /// diagnostic. The composed text is bounded later by `safe_report_text`.
-fn diff_base_unreliable_detail(report: &PolicyReportDocument) -> String {
+fn diff_base_unreliable_detail(
+    report: &PolicyReportDocument,
+    policies: &[&LoadedPolicy],
+) -> String {
     let mut parts = Vec::new();
     if let Some(termination) = report.execution().termination() {
         parts.push(format!("execution terminated ({termination:?})"));
@@ -5788,7 +5946,7 @@ fn diff_base_unreliable_detail(report: &PolicyReportDocument) -> String {
     if report.diagnostics_truncated() {
         parts.push("base report diagnostics were truncated".to_string());
     }
-    for run in report.runs() {
+    for run in diff_base_policy_runs(report, policies) {
         if !run.completion().is_reliable() || !run.completion().is_exhaustive() {
             parts.push(format!(
                 "policy {} completed {:?}",
@@ -6771,6 +6929,33 @@ fn report_has_orphaned_suppression(report: &PolicyReportDocument) -> bool {
         .any(PolicySuppressionReview::is_orphaned)
 }
 
+/// A base is judged without its finding gate and only over policies that ran
+/// on that base. A head-only NotRun policy has no findings to compare.
+fn diff_base_report_unreliable(
+    report: &PolicyReportDocument,
+    policies: &[&LoadedPolicy],
+    on_inconclusive: PolicyOnInconclusive,
+) -> bool {
+    report_unreliable_for_runs(
+        report,
+        tree_diagnostics(report),
+        diff_base_policy_runs(report, policies),
+        report_has_orphaned_suppression(report),
+        on_inconclusive,
+    )
+}
+
+fn diff_base_policy_runs<'a>(
+    report: &'a PolicyReportDocument,
+    policies: &'a [&LoadedPolicy],
+) -> impl Iterator<Item = &'a PolicyRun> + Clone {
+    report.runs().iter().filter(move |run| {
+        policies
+            .iter()
+            .any(|policy| &policy.definition().metadata.id == run.policy_id())
+    })
+}
+
 /// Whether `report` cannot be trusted, judged by `diagnostics` as its report
 /// diagnostics. `threshold_exceeded` is whether the run gates on a finding,
 /// orphaned suppressions included.
@@ -6780,12 +6965,25 @@ fn report_unreliable<'a>(
     threshold_exceeded: bool,
     on_inconclusive: PolicyOnInconclusive,
 ) -> bool {
-    report_lacks_verdict(report, diagnostics, on_inconclusive)
+    report_unreliable_for_runs(
+        report,
+        diagnostics,
+        report.runs().iter(),
+        threshold_exceeded,
+        on_inconclusive,
+    )
+}
+
+fn report_unreliable_for_runs<'a, 'r>(
+    report: &PolicyReportDocument,
+    diagnostics: impl IntoIterator<Item = &'a PolicyReportDiagnostic>,
+    mut runs: impl Iterator<Item = &'r PolicyRun> + Clone,
+    threshold_exceeded: bool,
+    on_inconclusive: PolicyOnInconclusive,
+) -> bool {
+    report_lacks_verdict_for_runs(report, diagnostics, runs.clone(), on_inconclusive)
         || (!threshold_exceeded
-            && report
-                .runs()
-                .iter()
-                .any(|run| PolicyRunGate::of(run, on_inconclusive) == PolicyRunGate::Subset))
+            && runs.any(|run| PolicyRunGate::of(run, on_inconclusive) == PolicyRunGate::Subset))
 }
 
 /// Whether some part of `report` reached no verdict at all, so no exit status
@@ -6796,6 +6994,15 @@ fn report_unreliable<'a>(
 pub(crate) fn report_lacks_verdict<'a>(
     report: &PolicyReportDocument,
     diagnostics: impl IntoIterator<Item = &'a PolicyReportDiagnostic>,
+    on_inconclusive: PolicyOnInconclusive,
+) -> bool {
+    report_lacks_verdict_for_runs(report, diagnostics, report.runs().iter(), on_inconclusive)
+}
+
+fn report_lacks_verdict_for_runs<'a, 'r>(
+    report: &PolicyReportDocument,
+    diagnostics: impl IntoIterator<Item = &'a PolicyReportDiagnostic>,
+    mut runs: impl Iterator<Item = &'r PolicyRun>,
     on_inconclusive: PolicyOnInconclusive,
 ) -> bool {
     // A report diagnostic condemns the run when it is an error. Every load,
@@ -6818,10 +7025,7 @@ pub(crate) fn report_lacks_verdict<'a>(
             .into_iter()
             .any(|diagnostic| diagnostic.severity() == PolicyDiagnosticSeverity::Error)
         || report.diagnostics_truncated()
-        || report
-            .runs()
-            .iter()
-            .any(|run| PolicyRunGate::of(run, on_inconclusive) == PolicyRunGate::Unreliable)
+        || runs.any(|run| PolicyRunGate::of(run, on_inconclusive) == PolicyRunGate::Unreliable)
 }
 
 fn report_diagnostic(
@@ -7065,6 +7269,7 @@ mod tests {
             .map(|completion| {
                 let qualified = completion.is_exhaustive();
                 PolicyEvaluationPolicyRow {
+                    evidence: None,
                     policy_id: format!("test.{}", completion.label()),
                     source_hash: digest.clone(),
                     semantic_hash: digest.clone(),
@@ -7084,6 +7289,8 @@ mod tests {
             .collect::<Vec<_>>();
         store
             .publish_policy_evaluation(PolicyEvaluationRow {
+                evidence: None,
+                evidence_complete: None,
                 key: key.clone(),
                 resolved_commit: "c".repeat(40),
                 policy_set_digest: digest,
@@ -7161,13 +7368,7 @@ mod tests {
             UnitSnapshots::of(workspace_snapshot(&workspace).unwrap()),
         );
         let subtree = resolve_revision_subtree(root.path(), "HEAD").unwrap();
-        let key = base_evaluation_key(
-            &evaluation_options(),
-            None,
-            PolicyBatchBudget::default(),
-            PolicyRegistryLimits::default(),
-            inputs,
-        );
+        let key = base_evaluation_key(&evaluation_options(), None, inputs);
         let report = PolicyReportBuilder::new(PolicyBatchBudget::default(), 0)
             .unwrap()
             .finish()
@@ -7196,6 +7397,11 @@ mod tests {
                 &report,
                 &policies,
                 &baseline,
+                Some(&replay_evidence(
+                    PolicyBatchBudget::default(),
+                    PolicyRegistryLimits::default(),
+                    certified_source_census(&workspace, &subtree).unwrap(),
+                )),
             )
             .unwrap();
             assert_eq!(row.policies.len(), 1);
@@ -7209,6 +7415,8 @@ mod tests {
                 &policies,
                 &store,
                 &key,
+                PolicyBatchBudget::default(),
+                PolicyRegistryLimits::default(),
             )
             .unwrap();
             assert_eq!(replay.state, IncrementalBaseState::Reused);
@@ -7248,7 +7456,12 @@ mod tests {
                     subtree.tree_id(),
                     &terminated,
                     &policies,
-                    &baseline
+                    &baseline,
+                    Some(&replay_evidence(
+                        PolicyBatchBudget::default(),
+                        PolicyRegistryLimits::default(),
+                        certified_source_census(&workspace, &subtree).unwrap()
+                    )),
                 )
                 .is_none()
             );
@@ -9773,6 +9986,559 @@ pub fn run() {
         assert_eq!(
             outcome.report().execution().timed_out_policy_ids(),
             &[PolicyId::new("test.slow").unwrap()]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#8856: byte-changing heads invalidated base keys and replay ignored per-record grants"
+    )]
+    fn budget_independent_base_replay_certifies_each_record() {
+        let root = tempfile::tempdir().unwrap();
+        init_git_workspace(root.path());
+        let source = format!(
+            "{}/*{}*/\n",
+            "export function target() {}\n".repeat(4),
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+                .repeat(6_000)
+        );
+        fs::write(root.path().join("app.ts"), &source).unwrap();
+        let paths = [
+            PathBuf::from("policies/first.rqlp"),
+            PathBuf::from("policies/second.rqlp"),
+        ];
+        let sources = [
+            match_policy("test.first", "First"),
+            match_policy("test.second", "Second"),
+        ];
+        for (path, source) in paths.iter().zip(&sources) {
+            write_policy(root.path(), path.to_str().unwrap(), source);
+        }
+        commit_everything(root.path(), "base");
+        let options = evaluation_options().with_on_inconclusive(PolicyOnInconclusive::Pass);
+        let registry_limits = PolicyRegistryLimits::default()
+            .with_max_endpoint_set_files(128)
+            .unwrap();
+        let batch = |findings| {
+            PolicyBatchBudget::builder()
+                .with_max_total_findings(findings)
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let evaluate = |paths: &[PathBuf], budget, limits| {
+            evaluate_policy_files_with_limits(root.path(), paths, &options, budget, limits).unwrap()
+        };
+        let initial = evaluate(&paths[..1], batch(5), registry_limits);
+        let workspace = WorkspaceAnalyzer::build_persisted(
+            Arc::new(owned_policy_project(root.path()).unwrap()),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let store = BatchUnitStore::of(Some(&workspace));
+        let catalogs = Arc::new(
+            TaintCatalogRegistry::new_for_workspace(
+                root.path().to_path_buf(),
+                CatalogRegistryLimits::default(),
+            )
+            .unwrap(),
+        );
+        let mut registry =
+            PolicyRegistry::new_for_workspace(root.path().to_path_buf(), catalogs, registry_limits)
+                .unwrap();
+        for (path, source) in paths.iter().zip(&sources) {
+            registry
+                .register_policy_bytes_with_analyzer(
+                    PolicySourceIdentity::new(path.to_str().unwrap()),
+                    source.as_bytes(),
+                    workspace.analyzer(),
+                )
+                .unwrap();
+        }
+        let policies = registry.policies().collect::<Vec<_>>();
+        let first = &policies[..1];
+        let revision = resolve_revision_subtree(root.path(), "HEAD").unwrap();
+        let census = certified_source_census(&workspace, &revision).unwrap();
+        assert_eq!(census.bytes, source.len() as u64);
+        assert_eq!(census.files, 1);
+        let changed = ChangedFacts::between(&workspace, &workspace);
+        let activation = activate_owned_policy_workspace(
+            root.path(),
+            &workspace,
+            None,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let models = ready_policy_semantic_model_snapshot(activation.as_ref());
+        let inputs = WorkspaceUnitInputs::of(&workspace, models.as_deref());
+        let incremental = PolicyIncrementalContext::new(
+            store.units(),
+            &workspace,
+            &changed,
+            inputs,
+            IncrementalBaseState::Evaluated,
+            UnitSnapshots::of(workspace_snapshot(&workspace).unwrap()),
+        );
+        let key = PolicyEvaluationRowKey {
+            base_tree_oid: revision.tree_id().to_string(),
+            ..base_evaluation_key(&options, None, inputs)
+        };
+        let publication = |outcome: &PolicyBatchOutcome, policies: &[&LoadedPolicy]| {
+            head_evaluation_publication(
+                root.path(),
+                &workspace,
+                &options,
+                key.clone(),
+                &incremental,
+                outcome.report(),
+                policies,
+                outcome.replay_evidence.as_ref(),
+            )
+            .unwrap()
+        };
+        let replays = |policies: &[&LoadedPolicy], budget, limits| {
+            reuse_persisted_diff_baseline(
+                root.path(),
+                &workspace,
+                "HEAD",
+                policies,
+                &store,
+                &key,
+                budget,
+                limits,
+            )
+            .is_some()
+        };
+        let loaded = || {
+            workspace
+                .store()
+                .unwrap()
+                .policy_evaluation_for_key(&key)
+                .unwrap()
+                .unwrap()
+        };
+        let complete = publication(&initial, first);
+        assert_eq!(complete.evidence_complete, Some(true));
+        assert_eq!(complete.evidence.as_ref(), initial.replay_evidence.as_ref());
+        assert_eq!(complete.policies[0].evidence, complete.evidence);
+        assert_eq!(
+            complete.evidence.as_ref().unwrap(),
+            &replay_evidence(effective_grant(batch(5), census), registry_limits, census)
+        );
+        // Exercise both the same-set aggregate and a retained child whose
+        // parent's set differs, so neither branch can mask the other's check.
+        let incomplete = evaluate(&paths[..1], batch(3), registry_limits);
+        assert!(!incomplete.report().runs()[0].completion().is_exhaustive());
+        assert_eq!(incomplete.exit_status(), POLICY_EXIT_CLEAN);
+        let incomplete = publication(&incomplete, first);
+        assert_eq!(incomplete.evidence_complete, Some(false));
+        assert!(
+            !incomplete.aggregate_unreliable,
+            "Pass cannot turn missing evidence into completeness"
+        );
+        let incomparable_limits = registry_limits.with_max_endpoint_set_files(64).unwrap();
+        for (row, center, expected) in [
+            (&complete, 5, [true, true, false, false]),
+            (&incomplete, 3, [true, false, true, false]),
+        ] {
+            for same_set in [true, false] {
+                let mut row = row.clone();
+                if !same_set {
+                    row.policy_set_digest = policy_set_digest(&policies);
+                }
+                store.publish_evaluation(&row);
+                for ((budget, limits), expected) in [
+                    (batch(center), registry_limits),
+                    (batch(center + 1), registry_limits),
+                    (batch(center - 1), registry_limits),
+                    (batch(center + 1), incomparable_limits),
+                ]
+                .into_iter()
+                .zip(expected)
+                {
+                    assert_eq!(
+                        replays(first, budget, limits),
+                        expected,
+                        "complete={:?}, same_set={same_set}, budget={budget:?}, limits={limits:?}",
+                        row.evidence_complete
+                    );
+                }
+            }
+        }
+        // Legacy NULL, partial cap maps and unknown formats fail closed on
+        // each record, including a same-set parent's completeness flag.
+        for malformed in [None, Some("{}"), Some("[]"), Some("{\"unknown\":1}")] {
+            let mut legacy = complete.clone();
+            legacy.evidence = malformed.map(|json| PolicyReplayEvidence {
+                effective_grant: json.to_string(),
+                ..complete.evidence.clone().unwrap()
+            });
+            store.publish_evaluation(&legacy);
+            assert!(!replays(first, batch(5), registry_limits));
+            legacy.evidence = complete.evidence.clone();
+            legacy.policies[0].evidence = malformed.map(|json| PolicyReplayEvidence {
+                effective_grant: json.to_string(),
+                ..complete.evidence.clone().unwrap()
+            });
+            store.publish_evaluation(&legacy);
+            assert!(!replays(first, batch(5), registry_limits));
+        }
+        // A zero output cap is a real limit, not an absent/unbounded value.
+        let zero = replay_evidence(effective_grant(batch(0), census), registry_limits, census);
+        assert!(replay_grant_admits(
+            Some(&zero),
+            false,
+            batch(0),
+            registry_limits
+        ));
+        assert!(!replay_grant_admits(
+            Some(&zero),
+            false,
+            batch(1),
+            registry_limits
+        ));
+        assert!(!replay_grant_admits(
+            complete.evidence.as_ref(),
+            true,
+            batch(0),
+            registry_limits
+        ));
+
+        let mut legacy = complete.clone();
+        legacy.evidence_complete = None;
+        store.publish_evaluation(&legacy);
+        assert!(!replays(first, batch(5), registry_limits));
+
+        // A sibling published under smaller limits cannot relabel a retained
+        // high-limit child. Request only the retained child, bypassing the
+        // deliberately unchanged policy-set-mismatch aggregate fallback.
+        evaluate(&paths, batch(20), registry_limits);
+        let high_child = loaded()
+            .policies
+            .iter()
+            .find(|p| p.policy_id == "test.first")
+            .unwrap()
+            .evidence
+            .clone();
+        evaluate(&paths[1..], batch(10), registry_limits);
+        let retained = loaded();
+        assert_eq!(
+            retained
+                .policies
+                .iter()
+                .find(|p| p.policy_id == "test.first")
+                .unwrap()
+                .evidence,
+            high_child
+        );
+        assert_ne!(high_child, retained.evidence);
+        assert!(!replays(first, batch(10), registry_limits));
+        assert!(replays(first, batch(20), registry_limits));
+
+        // A clean full head seeds replay. The larger next commit has a
+        // different effective row grant, while the base keeps its own grant.
+        store.publish_evaluation(&complete);
+        let before = loaded();
+        let head_source = format!(
+            "{source}/*{}*/\n",
+            "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n"
+                .repeat(6_000)
+        );
+        fs::write(root.path().join("app.ts"), &head_source).unwrap();
+        assert_eq!(
+            certified_source_census(&workspace, &revision),
+            Some(census),
+            "census follows indexed bytes even when live metadata changes"
+        );
+        commit_everything(root.path(), "byte-changing edit");
+        let check = evaluate_policy_files_with_limits(
+            root.path(),
+            &paths[..1],
+            &options
+                .clone()
+                .with_diff_base(revision.commit_id().to_string()),
+            batch(5),
+            registry_limits,
+        )
+        .unwrap();
+        assert_eq!(
+            check.incremental().unwrap().base(),
+            IncrementalBaseState::Reused
+        );
+        assert_eq!(loaded().evidence, before.evidence);
+        let head = check.replay_evidence.as_ref().unwrap();
+        assert_eq!(head.census_bytes, head_source.len() as u64);
+        assert_ne!(
+            head.effective_grant,
+            before.evidence.as_ref().unwrap().effective_grant
+        );
+
+        // Force a cold base under a different key question to verify nested
+        // execution scales once from original limits, even with a larger head.
+        let cold_options =
+            PolicyEvaluationOptions::new(PolicyEvaluationDate::from_ymd(2026, 7, 28).unwrap())
+                .with_on_inconclusive(PolicyOnInconclusive::Pass)
+                .with_diff_base(revision.commit_id().to_string());
+        let cold = evaluate_policy_files_with_limits(
+            root.path(),
+            &paths[..1],
+            &cold_options,
+            batch(5),
+            registry_limits,
+        )
+        .unwrap();
+        assert_eq!(
+            cold.incremental().unwrap().base(),
+            IncrementalBaseState::Evaluated
+        );
+        let base_key = PolicyEvaluationRowKey {
+            base_tree_oid: revision.tree_id().to_string(),
+            ..base_evaluation_key(&cold_options, None, inputs)
+        };
+        let base = workspace
+            .store()
+            .unwrap()
+            .policy_evaluation_for_key(&base_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(base.evidence, complete.evidence);
+
+        // Dirty indexed bytes absent from the ODB cannot certify a census.
+        // Execution still succeeds and does not overwrite the committed row.
+        let head_revision = resolve_revision_subtree(root.path(), "HEAD").unwrap();
+        let head_key = PolicyEvaluationRowKey {
+            base_tree_oid: head_revision.tree_id().to_string(),
+            ..key.clone()
+        };
+        let before = workspace
+            .store()
+            .unwrap()
+            .policy_evaluation_for_key(&head_key)
+            .unwrap()
+            .unwrap();
+        fs::write(
+            root.path().join("app.ts"),
+            format!("{head_source}// dirty unique census\n"),
+        )
+        .unwrap();
+        let dirty = evaluate(&paths[..1], batch(4), registry_limits);
+        assert!(dirty.replay_evidence.is_none());
+        let after = workspace
+            .store()
+            .unwrap()
+            .policy_evaluation_for_key(&head_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.evidence, before.evidence);
+        assert_eq!(after.policy_set_digest, before.policy_set_digest);
+        fs::write(root.path().join("app.ts"), &head_source).unwrap();
+        fs::write(
+            root.path().join("untracked.ts"),
+            "export function untracked_census() {}\n",
+        )
+        .unwrap();
+        let untracked = evaluate(&paths[..1], batch(4), registry_limits);
+        assert!(untracked.replay_evidence.is_none());
+        assert_eq!(
+            workspace
+                .store()
+                .unwrap()
+                .policy_evaluation_for_key(&head_key)
+                .unwrap()
+                .unwrap()
+                .evidence,
+            before.evidence
+        );
+        fs::remove_file(root.path().join("untracked.ts")).unwrap();
+        let project: Arc<dyn Project> = Arc::new(owned_policy_project(root.path()).unwrap());
+        // The overlay is keyed by the project's canonical root, which differs from
+        // the raw temp path where `/var` is a symlink to `/private/var` (macOS).
+        let overlay_path = project.root().join("app.ts");
+        let overlay = Arc::new(brokk_bifrost_analysis::analyzer::OverlayProject::new(
+            project,
+        ));
+        // Even an overlay equal to an ODB blob is not certified as disk-backed.
+        assert!(overlay.set(overlay_path, head_source.clone()));
+        let overlay_workspace =
+            WorkspaceAnalyzer::build_persisted(overlay, AnalyzerConfig::default()).unwrap();
+        assert!(certified_source_census(&overlay_workspace, &head_revision).is_none());
+        assert!(
+            base_evaluation_publication(
+                &incremental,
+                key,
+                revision.tree_id(),
+                initial.report(),
+                first,
+                &PolicyDiffBaseline {
+                    requested_revision: "HEAD".to_string(),
+                    resolved_commit: revision.commit_id().to_string(),
+                    identities: HashMap::new(),
+                    unqualified_policies: Vec::new(),
+                    unreliable_detail: None,
+                    aggregate_unreliable: false
+                },
+                None
+            )
+            .is_none()
+        );
+
+        // One failed language delegate must not certify the successful
+        // delegate's partial inventory. Exercise a real stale-generation
+        // read failure, nested capture and recovery. Keep the schema intact:
+        // replacing a table with a view lets another store opener rebuild it.
+        fs::write(root.path().join("other.py"), "def other():\n    pass\n").unwrap();
+        commit_everything(root.path(), "mixed-language inventory");
+        let mixed = WorkspaceAnalyzer::build_persisted(
+            Arc::new(owned_policy_project(root.path()).unwrap()),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let mixed_revision = resolve_revision_subtree(root.path(), "HEAD").unwrap();
+        let full_census = certified_source_census(&mixed, &mixed_revision).unwrap();
+        assert_eq!(full_census.files, 2);
+        let mixed_store = mixed.store().unwrap();
+        let generation = mixed_store.execute_selection_publication(|conn| {
+            let generation: i64 = conn
+                .query_row(
+                    "SELECT generation FROM analysis_epochs WHERE lang = 'typescript:ts'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE analysis_epochs SET generation = generation + 1
+                     WHERE lang = 'typescript:ts'",
+                    [],
+                )
+                .unwrap(),
+                1
+            );
+            generation
+        });
+        let failed_census = {
+            let cancellation = CancellationToken::default();
+            let enclosing = AnalyzerQueryScope::with_cancellation(mixed.analyzer(), &cancellation);
+            let capture = AnalyzerQueryScope::capturing_read_incompleteness(mixed.analyzer());
+            assert!(mixed.analyzer().active_query_cancellation().is_some());
+            let failed = certified_source_census(&mixed, &mixed_revision);
+            let partial_files = mixed.analyzer().analyzed_files();
+            assert_eq!(partial_files.len(), 1, "{partial_files:?}");
+            assert_eq!(partial_files[0].language(), Language::Python);
+            assert!(
+                failed.is_none(),
+                "partial inventory must not be certified: {failed:?}"
+            );
+            assert!(
+                capture
+                    .captured_read_incompleteness()
+                    .iter()
+                    .any(|reason| matches!(
+                        reason,
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(error)
+                            if error.is_stale_generation()
+                    ))
+            );
+            assert!(
+                matches!(
+                    enclosing.read_completion(),
+                    Err(brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(error))
+                        if error.is_stale_generation()
+                ),
+                "the outward failure is preserved"
+            );
+            assert!(mixed.analyzer().active_query_cancellation().is_some());
+            failed
+        };
+        mixed_store.execute_selection_publication(move |conn| {
+            assert_eq!(
+                conn.execute(
+                    "UPDATE analysis_epochs SET generation = ?1 WHERE lang = 'typescript:ts'",
+                    [generation],
+                )
+                .unwrap(),
+                1
+            );
+        });
+        assert_eq!(
+            certified_source_census(&mixed, &mixed_revision),
+            Some(full_census)
+        );
+        let recovered = evaluate(&paths[..1], batch(5), registry_limits);
+        assert!(recovered.report().runs()[0].completion().is_exhaustive());
+        let failed_evidence = failed_census.map(|census| {
+            replay_evidence(effective_grant(batch(5), census), registry_limits, census)
+        });
+        // Even after inventory/execution recover, the failed census cannot
+        // certify a smaller grant on a recovered policy result.
+        let changed = ChangedFacts::between(&mixed, &mixed);
+        let mixed_units = BatchUnitStore::of(Some(&mixed));
+        let mixed_incremental = PolicyIncrementalContext::new(
+            mixed_units.units(),
+            &mixed,
+            &changed,
+            WorkspaceUnitInputs::of(&mixed, models.as_deref()),
+            IncrementalBaseState::Evaluated,
+            UnitSnapshots::of(workspace_snapshot(&mixed).unwrap()),
+        );
+        assert_eq!(
+            recovered
+                .replay_evidence
+                .as_ref()
+                .map(|e| (e.census_files, e.census_bytes)),
+            Some((full_census.files as u64, full_census.bytes))
+        );
+        let recovered_baseline = PolicyDiffBaseline {
+            requested_revision: "HEAD".to_string(),
+            resolved_commit: mixed_revision.commit_id().to_string(),
+            identities: exhaustive_run_identities(recovered.report().runs()),
+            unqualified_policies: Vec::new(),
+            unreliable_detail: None,
+            aggregate_unreliable: false,
+        };
+        let protected = base_evaluation_publication(
+            &mixed_incremental,
+            base_evaluation_key(
+                &options,
+                None,
+                WorkspaceUnitInputs::of(&mixed, models.as_deref()),
+            ),
+            mixed_revision.tree_id(),
+            recovered.report(),
+            first,
+            &recovered_baseline,
+            recovered.replay_evidence.as_ref(),
+        )
+        .unwrap();
+        mixed_units.publish_evaluation(&protected);
+        let before = mixed_store
+            .policy_evaluation_for_key(&protected.key)
+            .unwrap()
+            .unwrap();
+        assert!(
+            base_evaluation_publication(
+                &mixed_incremental,
+                protected.key.clone(),
+                mixed_revision.tree_id(),
+                recovered.report(),
+                first,
+                &recovered_baseline,
+                failed_evidence.as_ref(),
+            )
+            .is_none()
+        );
+        let after = mixed_store
+            .policy_evaluation_for_key(&protected.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.evidence, before.evidence,
+            "failed census cannot update parent evidence"
+        );
+        assert_eq!(after.evidence_complete, before.evidence_complete);
+        assert_eq!(
+            after.policies, before.policies,
+            "failed census cannot update any child"
         );
     }
 

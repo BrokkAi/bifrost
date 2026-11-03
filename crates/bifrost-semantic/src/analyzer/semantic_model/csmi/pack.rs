@@ -15,6 +15,7 @@ use crate::analyzer::semantic_model::csmi::model::CsmiPackManifest;
 
 use crate::analyzer::semantic_model::csmi::model::CsmiResourceDescriptor;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt;
 
 pub trait CsmiResourceResolver {
@@ -126,15 +127,21 @@ impl InMemoryCsmiResourceResolver {
         Self::default()
     }
 
+    /// Reject a duplicate path without changing the resource already stored there.
     pub fn insert(&mut self, path: String, bytes: Vec<u8>) -> Result<(), CsmiResourceError> {
         validate_resource_path(&path).map_err(|reason| CsmiResourceError::InvalidPath {
             path: path.clone(),
             reason,
         })?;
-        if self.resources.insert(path.clone(), bytes).is_some() {
-            return Err(CsmiResourceError::DuplicatePath { path });
+        match self.resources.entry(path) {
+            Entry::Vacant(slot) => {
+                slot.insert(bytes);
+                Ok(())
+            }
+            Entry::Occupied(slot) => Err(CsmiResourceError::DuplicatePath {
+                path: slot.key().clone(),
+            }),
         }
-        Ok(())
     }
 
     pub fn get(&self, path: &str) -> Option<&[u8]> {

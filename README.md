@@ -152,7 +152,7 @@ Useful starting points:
 - [Install Bifrost](docs/src/content/docs/install.md)
 - [Evaluate Bifrost in ten minutes](docs/src/content/docs/evaluate-bifrost.md)
 - [MCP server and toolsets](docs/src/content/docs/mcp.md)
-- [LSP server](docs/src/content/docs/lsp.md)
+- [LSP server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md)
 - [CLI usage](docs/src/content/docs/cli.md)
 - [Code querying](docs/src/content/docs/code-querying.md)
 
@@ -175,8 +175,8 @@ The repository is organized around the public product surfaces:
 - **Core analysis:** [`crates/`](crates/) contains the Rust workspace crates;
   [`src/`](src/) provides the top-level facade and CLI; [`schemas/`](schemas/)
   holds shared data contracts.
-- **Integrations and distribution:** [`editors/zed/`](editors/zed/) contains the
-  Zed extension; the VS Code extension is maintained in
+- **Integrations and distribution:** the VS Code extension and the Zed
+  extension scaffold are maintained in
   [`BrokkAi/bifrost-lsp`](https://github.com/BrokkAi/bifrost-lsp).
   [`plugins/`](plugins/) contains coding-agent plugins; [`npm/`](npm/),
   [`packaging/`](packaging/), and

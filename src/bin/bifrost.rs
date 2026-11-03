@@ -203,13 +203,15 @@ fn acquire_open_packs_for_process() -> Result<(), String> {
             }
             Ok(())
         }
-        Ok(brokk_bifrost_semantic_packs::download::OpenPackRuntimeOutcome::EmbeddedFallback {
+        Ok(brokk_bifrost_semantic_packs::download::OpenPackRuntimeOutcome::Unselected {
             kind,
             message,
         }) => {
             if should_warn_open_pack_fallback(&kind, open_packs_offline_requested()) {
                 eprintln!(
-                    "[bifrost] Open-pack acquisition {kind}: {message}. Using embedded packs."
+                    "[bifrost] Open-pack acquisition {kind}: {message}. Continuing without \
+                     semantic packs; set BIFROST_OPEN_SEMANTIC_PACK_BUNDLE to an extracted \
+                     packs release to use one offline."
                 );
             }
             Ok(())

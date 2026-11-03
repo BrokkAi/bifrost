@@ -2665,6 +2665,14 @@ impl SelectedResolutionMountInventory<'_> {
             .stamp_from_workspace(self.connection(), self.operation_workspace_stamp()?))
     }
 
+    /// SQLite's data_version changes after a commit from another connection.
+    /// It cannot witness writes by this connection or commits while a reader
+    /// holds an old snapshot, so only an autocommit, read-only main database
+    /// may lend this stamp to an operation-local publication memo.
+    pub(super) fn publication_data_version(&self) -> Result<Option<i64>> {
+        publication_data_version_on(self.connection())
+    }
+
     #[doc(hidden)]
     pub fn revalidate(
         &mut self,
@@ -2736,6 +2744,16 @@ impl SelectedResolutionMountInventory<'_> {
             }
         }
     }
+}
+
+pub(super) fn publication_data_version_on(conn: &Connection) -> Result<Option<i64>> {
+    if !conn.is_autocommit() || !conn.is_readonly(rusqlite::MAIN_DB)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        conn.prepare_cached("PRAGMA main.data_version")?
+            .query_row([], |row| row.get(0))?,
+    ))
 }
 
 impl Drop for SelectedResolutionMountInventory<'_> {
@@ -4611,6 +4629,15 @@ pub mod tests {
             PreparedResolutionValue::Null,
             PreparedResolutionValue::Null,
         ]));
+        let mut gap_rows =
+            super::super::resolution_prepare::resolution_rows::PreparedGapRows::default();
+        gap_rows.reasons.push(
+            super::super::resolution_prepare::resolution_rows::PreparedGapReasonRow {
+                reason: 2,
+                site: 0,
+                origin: 0,
+            },
+        );
         let bundle = PreparedResolutionBundle::new(
             Language::Go,
             rows,
@@ -4618,7 +4645,7 @@ pub mod tests {
             Vec::new(),
             Default::default(),
             Vec::new(),
-            Default::default(),
+            gap_rows,
             Vec::new(),
             &CancellationToken::new(),
         )

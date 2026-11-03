@@ -2095,11 +2095,145 @@ fn java_native_type_prefix_obscures_package_only_after_complete_lookup() {
     // MissingTypes prefix ambiguity, the unresolved on-demand import that
     // may supply MissingTypes, Nested constructor applicability, and Nested
     // type ambiguity all remain open without a binding for MissingTypes.
+    // #8487 records the unacquired import alternatives as OpenBoundary facts
+    // and carries their acquisition subjects as query obligations.
     assert_eq!(
         binding.message.matches("UnsupportedSemantic:").count(),
-        4,
+        3,
         "{missing:?}"
     );
+    assert_eq!(
+        binding.message.matches("OpenBoundary:").count(),
+        2,
+        "{missing:?}"
+    );
+    assert!(
+        missing.outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "query_obligation"
+                && diagnostic.message
+                    == "jvm-package-provider-unacquired:absent.MissingTypes:unacquired"
+        }),
+        "{missing:?}"
+    );
+}
+
+#[test]
+fn java_native_prefix_export_uses_selected_answer_on_replay() {
+    let cases = [
+        (
+            "unacquired competing prefix",
+            "import absent.*; class Use { void go() { new MissingTypes.Nested(); } }",
+            "MissingTypes",
+            None,
+        ),
+        (
+            "selected single type",
+            "import absent.*; import dep.Types; class Use { void go() { new Types.Nested(); } }",
+            "Types",
+            Some((
+                "dep/Types.java",
+                "package dep; public class Types { public static class Nested { public Nested() {} } }",
+            )),
+        ),
+        (
+            "acquired package with unrelated import",
+            "import other.*; class Types { static class Nested { Nested() {} } } class Use { Unrelated value; void go() { new Types.Nested(); } }",
+            "Types",
+            Some((
+                "Types/Nested.java",
+                "package Types; public class Nested { public Nested() {} }",
+            )),
+        ),
+    ];
+    for (label, source, prefix_name, provider) in cases {
+        let mut project = InlineTestProject::with_language(Language::Java).file("Use.java", source);
+        if let Some((path, content)) = provider {
+            project = project.file(path, content);
+        }
+        let fixture = project.build();
+        let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("Use.java");
+        let creation = source.find("new ").unwrap();
+        let prefix_at = creation + 4;
+        let child_at = source[creation..].find("Nested").unwrap() + creation;
+        let read = || {
+            [
+                native_evidence_at(&analyzer, &file, source, prefix_at, prefix_name.len()),
+                native_evidence_at(&analyzer, &file, source, child_at, "Nested".len()),
+            ]
+        };
+        let cold = read();
+        let warm = read();
+        for (recipient, (before, after)) in ["prefix", "child"]
+            .into_iter()
+            .zip(cold.into_iter().zip(warm))
+        {
+            eprintln!("{label} {recipient} cold: {:?}", before.outcome);
+            eprintln!("{label} {recipient} warm: {:?}", after.outcome);
+            assert_eq!(
+                format!("{:?}", before.outcome),
+                format!("{:?}", after.outcome),
+                "{label} {recipient}"
+            );
+            let expected = match (label, recipient) {
+                ("unacquired competing prefix", "prefix") => {
+                    (DefinitionLookupStatus::Incomplete, 1, 1)
+                }
+                ("unacquired competing prefix", "child") => {
+                    (DefinitionLookupStatus::Incomplete, 3, 2)
+                }
+                _ => (DefinitionLookupStatus::Resolved, 0, 0),
+            };
+            assert_eq!(
+                before.outcome.status, expected.0,
+                "{label} {recipient}: {before:?}"
+            );
+            let binding = before
+                .outcome
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.kind == "incomplete_binding");
+            let message = binding.map_or("", |diagnostic| diagnostic.message.as_str());
+            assert_eq!(
+                message.matches("UnsupportedSemantic:").count(),
+                expected.1,
+                "{label} {recipient}: {before:?}"
+            );
+            assert_eq!(
+                message.matches("OpenBoundary:").count(),
+                expected.2,
+                "{label} {recipient}: {before:?}"
+            );
+            if label == "unacquired competing prefix" {
+                assert!(before.outcome.diagnostics.iter().any(|diagnostic| diagnostic.kind == "query_obligation" && diagnostic.message == "jvm-package-provider-unacquired:absent.MissingTypes:unacquired"), "{label} {recipient}: {before:?}");
+            }
+            if label != "unacquired competing prefix" {
+                assert!(
+                    before
+                        .outcome
+                        .diagnostics
+                        .iter()
+                        .all(|diagnostic| diagnostic.kind != "query_obligation"),
+                    "{label} {recipient}: {before:?}"
+                );
+            }
+        }
+        if label == "acquired package with unrelated import" {
+            let unrelated_at = source.find("Unrelated value").unwrap();
+            let unrelated =
+                native_evidence_at(&analyzer, &file, source, unrelated_at, "Unrelated".len());
+            eprintln!("{label} unrelated: {:?}", unrelated.outcome);
+            assert!(
+                unrelated
+                    .outcome
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == "query_obligation"
+                        && diagnostic.message.contains("other.Unrelated")),
+                "{unrelated:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2264,6 +2398,311 @@ fn java_native_binary_actuals_promote_together_and_string_decides_unknown_operan
     assert!(
         failures.is_empty(),
         "binary actual mismatches: {failures:?}"
+    );
+}
+
+fn model_declared_class_inventory(
+    models: &[&str],
+) -> (
+    brokk_bifrost_analysis::analyzer::semantic_model::SemanticPackCatalog,
+    brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationRequest,
+) {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogCoordinate, CatalogOptions, DurablePackSource, DurablePackSourceKind,
+        SemanticModelActivationEvidence, SemanticModelActivationRequest,
+        SemanticModelRuntimeLimits, SemanticPackCatalog,
+    };
+    use brokk_bifrost_semantic::analyzer::semantic_model::compiler::{
+        CompilerOptions, compile_source,
+    };
+    use brokk_bifrost_semantic::analyzer::semantic_model::source::SourceFormat;
+
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    for &model in models {
+        let type_id = format!("type.{model}");
+        let payload = serde_json::json!({"kind": "declaration_facts", "types": [{
+                    "id": type_id, "name": "java.lang.Class", "type_kind": "class",
+                    "visibility": "public", "is_abstract": false, "is_sealed": false,
+                    "has_explicit_type_terms": false, "type_parameters": [], "type_parameter_constraints": [],
+                    "embedded_types": [], "hierarchy": [], "aliases": [], "extension_surfaces": [],
+                    "locator": {"kind": "artifact", "path": "java/lang/Class.class", "symbol": "java.lang.Class"},
+                    "jvm_inventory": {"callables_complete": true, "values_complete": false, "types_complete": false,
+                        "supertypes_complete": true, "supertypes": [], "nested_types": [], "additional_members": []}
+                }], "members": [{
+                    "id": format!("member.{model}"), "owner": type_id, "name": "forName", "member_kind": "method",
+                    "visibility": "public", "is_static": true, "is_abstract": false, "is_virtual": false,
+                    "signature": {"type_parameters": [], "parameters": [{"name": "n", "type": TypeRef::named("java.lang.String"), "optional": false, "variadic": false}], "returns": TypeRef::named("java.lang.Class")},
+                    "aliases": [], "locator": {"kind": "artifact", "path": "java/lang/Class.class", "symbol": "java.lang.Class.forName"}
+                }, {
+                    "id": format!("resource.{model}"), "owner": type_id, "name": "getResource", "member_kind": "method",
+                    "visibility": "public", "is_static": false, "is_abstract": false, "is_virtual": true,
+                    "signature": {"type_parameters": [], "parameters": [{"name": "n", "type": TypeRef::named("java.lang.String"), "optional": false, "variadic": false}], "returns": TypeRef::named("java.net.URL")},
+                    "aliases": [], "locator": {"kind": "artifact", "path": "java/lang/Class.class", "symbol": "java.lang.Class.getResource"}
+                }], "relations": []});
+        let document = serde_json::json!({
+            "schema_version": 2, "pack_id": format!("test.7728-{model}"), "version": "1.0.0",
+            "producer": {"name": "bifrost-test", "version": "1.0.0"},
+            "language": "java", "ecosystem": "jdk",
+            "compatibility": {"bifrost": ">=0.14.0,<1.0.0", "toolchains": [{"name": "jdk", "requirement": ">=21.0.0"}]},
+            "provenance": {"source": "test:inline", "revision": "7728"},
+            "license": "Apache-2.0", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "decls", "activation": [{"toolchain": {"name": "jdk", "version": ">=21.0.0"}, "targets": ["jvm"], "configurations": []}],
+                "payload": payload
+            }]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&document).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: model.into(),
+                },
+            )
+            .unwrap();
+    }
+    let request = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
+        bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        evidence: vec![SemanticModelActivationEvidence {
+            language: "java".into(),
+            ecosystem: "jdk".into(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".into(),
+                version: Some(semver::Version::new(21, 0, 0)),
+            }),
+            target: Some("jvm".into()),
+            configuration: None,
+            artifact_sha256: None,
+        }],
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    (catalog, request)
+}
+
+#[test]
+fn static_type_qualifier_boundary_requires_its_active_model_owner_identity() {
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        ExternalMemberIdentity, ExternalOwnerIdentity, ResolutionCompletion,
+        ResolutionIncompleteReason, SemanticId,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::{
+        SemanticModelResolutionOutcome, resolve_active_semantic_models,
+    };
+    use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
+    let (catalog, request) = model_declared_class_inventory(&["first", "second"]);
+    let SemanticModelResolutionOutcome::Ready(active) =
+        resolve_active_semantic_models(&catalog, &request, &CancellationToken::default())
+    else {
+        panic!("both test models must activate");
+    };
+    let records = active.types_named("java.lang.Class").records;
+    assert_eq!(
+        records.len(),
+        2,
+        "both models must actually be active: {records:?}"
+    );
+    let owners: Vec<_> = records
+        .iter()
+        .map(|record| ExternalOwnerIdentity {
+            provider_id: Arc::from(record.shard.manifest.semantic_sha256.as_str()),
+            owner_fqn: Arc::from("java.lang.Class"),
+        })
+        .collect();
+    assert_ne!(owners[0], owners[1]);
+    let boundary = SemanticId::local(0, 1);
+    let digest = [42; 32];
+    let binding = NativeExternalArgumentBinding {
+        completion: ResolutionCompletion::incomplete([ResolutionIncompleteReason::OpenBoundary {
+            semantic: boundary,
+            status: BoundaryStatus::ExternalDeclaredUnindexed,
+        }]),
+        // Exercise the path without shared members: FQN equality alone would
+        // otherwise be the only check of the proof's inventory owner.
+        members: Vec::new(),
+        reason_digests: vec![(boundary, digest)],
+        call_binding_reason_digests: Vec::new(),
+        constructor_hierarchy_reason_digests: Vec::new(),
+        static_type_qualifier_reason_digests: vec![(owners[0].clone(), digest)],
+    };
+    let proofs: Vec<_> = owners
+        .into_iter()
+        .map(|owner| {
+            ExactExternalCallProof::java_static_external_member("java.lang.Class", "forName", 1)
+                .with_external_member_identity(Some(ExternalMemberIdentity { owner, ordinal: 0 }))
+        })
+        .collect();
+    let mut same_model = Vec::new();
+    binding.extend_static_type_qualifier_reasons(&proofs[0], &mut same_model);
+    assert_eq!(same_model, vec![digest], "prove the identity guard ran");
+    assert!(binding.admits(&proofs[0], "java.lang.Class", "forName", &same_model));
+    let mut other_model = Vec::new();
+    binding.extend_static_type_qualifier_reasons(&proofs[1], &mut other_model);
+    assert!(other_model.is_empty());
+    assert!(!binding.admits(&proofs[1], "java.lang.Class", "forName", &other_model));
+}
+
+#[test]
+fn model_declared_value_receiver_keeps_its_owner_boundary() {
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        ResolutionCompletion, ResolutionIncompleteReason,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        SemanticModelRuntimeOutcome, acquire_active_semantic_models,
+    };
+    use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
+    let source = "import java.lang.Class; class App { void run(Class raw) { raw.getResource(\"x\"); Class.forName(\"x\"); } }";
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let (catalog, request) = model_declared_class_inventory(&["value-receiver"]);
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    );
+    assert!(
+        matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
+        "{activation:?}"
+    );
+    let java = resolve_analyzer::<JavaAnalyzer>(workspace.analyzer()).unwrap();
+    let file = project.file("App.java");
+    let tree = brokk_bifrost_jvm::java::declarations::parse_tree(source).unwrap();
+    let site = |name: &str| {
+        let start = source.find(name).unwrap();
+        ResolvedReferenceSite {
+            path: file.to_string(),
+            text: name.into(),
+            range: Range {
+                start_byte: start,
+                end_byte: start + name.len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + name.len(),
+        }
+    };
+    let qualifier_site = site("forName");
+    let query = BoundedReceiverQuery {
+        analyzer: workspace.analyzer(),
+        file: &file,
+        source,
+        tree: Some(&tree),
+        site: &qualifier_site,
+        budget: ReceiverAnalysisBudget::default(),
+        cancellation: None,
+    };
+    // Obtain the actual registered model-declared owner obligation and digest.
+    // Isolate that receipt at the bridge input so no unrelated call-local gap
+    // can mask a mistaken static-qualifier discharge on the value receiver.
+    let BoundedResolution::Complete {
+        value: (mut outcome, Some((completion, reason_digests, qualifiers))),
+        ..
+    } = resolve_native_definition_answer_bounded_in_batch(
+        &java.inner,
+        query,
+        None,
+        None,
+        |operation, path, cancellation| {
+            prepare_context(java, query.analyzer, operation, path, cancellation)
+        },
+        || {},
+        |answer| {
+            (
+                answer
+                    .argument_binding
+                    .as_ref()
+                    .unwrap()
+                    .completion()
+                    .clone(),
+                answer.argument_reason_digests.clone(),
+                answer.static_type_qualifier_reason_digests.clone(),
+            )
+        },
+    )
+    else {
+        panic!("the registered qualifier receipt must be available");
+    };
+    assert_eq!(
+        qualifiers.len(),
+        1,
+        "one declaring inventory: {qualifiers:?}"
+    );
+    let digest = qualifiers[0].1;
+    let semantic = reason_digests
+        .iter()
+        .find(|(_, candidate)| *candidate == digest)
+        .unwrap()
+        .0;
+    let owner_reason = ResolutionIncompleteReason::OpenBoundary {
+        semantic,
+        status: BoundaryStatus::ExternalDeclaredUnindexed,
+    };
+    assert!(
+        matches!(completion, ResolutionCompletion::Incomplete(ref reasons) if reasons.iter().any(|reason| reason == &owner_reason))
+    );
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|reason| reason.message.contains("jvm-model-declared-type")),
+        "{outcome:?}"
+    );
+    let binding = NativeExternalArgumentBinding {
+        completion: ResolutionCompletion::incomplete([owner_reason]),
+        members: Vec::new(),
+        reason_digests: vec![(semantic, digest)],
+        call_binding_reason_digests: Vec::new(),
+        constructor_hierarchy_reason_digests: Vec::new(),
+        static_type_qualifier_reason_digests: qualifiers,
+    };
+    let value_site = site("getResource");
+    let mut discharged = Vec::new();
+    let evidence = java_native_call_evidence(
+        java,
+        BoundedReceiverQuery {
+            site: &value_site,
+            ..query
+        },
+        &mut outcome,
+        &[],
+        Some(&binding),
+        &mut discharged,
+        None,
+    )
+    .expect("call evidence must complete");
+    assert_eq!(
+        evidence
+            .external_callee_identity()
+            .map(|identity| (identity.owner_fqn(), identity.member())),
+        Some(("java.lang.Class", "getResource")),
+        "the bridge must reach the selected external member: {evidence:?}",
+    );
+    assert!(
+        evidence.exact_external_call().is_none(),
+        "a value receiver must not use the static qualifier's owner discharge: {evidence:?}"
+    );
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::UnresolvableImportBoundary,
+        "{outcome:?}"
+    );
+    assert!(
+        discharged.is_empty(),
+        "the owner obligation must remain: {discharged:?}"
     );
 }
 
@@ -2803,6 +3242,7 @@ fn native_batch_hit_replays_fill_query_obligations() {
             |outcome| DefinitionResolution {
                 outcome,
                 evidence: Default::default(),
+                call_binding_discharge_digests: Vec::new(),
             },
         )
     });

@@ -4999,6 +4999,7 @@ pub(super) fn validate_dependency_evidence_filter(
         ("sources", &filter.sources),
         ("declared_by", &filter.declared_by),
         ("scopes", &filter.scopes),
+        ("features", &filter.features),
     ] {
         if values.len() > 128 || values.iter().any(String::is_empty) {
             return Err(QueryError::new(
@@ -5029,14 +5030,28 @@ pub(super) fn validate_dependency_evidence_filter(
             ));
         }
     }
+    let go_ecosystem = matches!(
+        filter.ecosystems.as_slice(),
+        [ecosystem] if ecosystem == brokk_bifrost_go_analysis::analyzer::GO_MODULE_ECOSYSTEM
+            || ecosystem == brokk_bifrost_go_analysis::analyzer::GO_TOOLCHAIN_ECOSYSTEM
+    );
     if !filter.version_ranges.is_empty()
         && filter.ecosystems != ["cargo"]
+        && filter.ecosystems != [brokk_bifrost_rust_analysis::analyzer::RUST_TOOLCHAIN_ECOSYSTEM]
         && filter.ecosystems != ["npm"]
         && filter.ecosystems != ["nuget"]
+        && !go_ecosystem
     {
         return Err(QueryError::new(
             child_path(path, "version_ranges"),
-            "version_ranges requires exactly one supported ecosystem: cargo, npm or nuget",
+            "version_ranges requires exactly one supported ecosystem: cargo, rust-toolchain, npm, nuget, go-module or go-toolchain",
+        ));
+    }
+    // Only Cargo records which features a declaration requests.
+    if !filter.features.is_empty() && filter.ecosystems != ["cargo"] {
+        return Err(QueryError::new(
+            child_path(path, "features"),
+            "features requires exactly the cargo ecosystem",
         ));
     }
     for (index, range) in filter.version_ranges.iter().enumerate() {
@@ -5046,6 +5061,9 @@ pub(super) fn validate_dependency_evidence_filter(
                 .map(|e| e.to_string())
         } else if filter.ecosystems == ["nuget"] {
             brokk_bifrost_csharp_analysis::dependency_evidence::NugetVersionRange::parse(range)
+                .err()
+        } else if go_ecosystem {
+            brokk_bifrost_go_analysis::analyzer::GoVersionRange::parse(&filter.ecosystems[0], range)
                 .err()
         } else {
             semver::VersionReq::parse(range)

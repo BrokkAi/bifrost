@@ -7,8 +7,6 @@ use brokk_bifrost_analysis::analyzer::languages::{
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 use brokk_bifrost_analysis::analyzer::store::Result;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
-use brokk_bifrost_analysis::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
-use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
 use brokk_bifrost_analysis::analyzer::store_bridge::jvm_graph::JvmGraphStageExt;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
@@ -83,47 +81,16 @@ fn build<A: LanguageAdapter>(
         return Ok(Outcome::Cancelled);
     }
     let generation = analyzer.project().analysis_generation();
-    let selected = ["java", "kotlin", "scala"].map(str::to_owned);
-    let snapshots = inner
-        .analyzer_store()
-        .workspace_snapshots_for_current_languages(inner.workspace_id(), &selected)?;
-    let (masks, content_mounts) =
-        match inner.selected_resolution_overlay_inputs(&snapshots, cancellation)? {
-            SelectedResolutionOverlayInputsOutcome::Ready {
-                masks,
-                content_mounts,
-            } => (masks, content_mounts),
-            SelectedResolutionOverlayInputsOutcome::Cancelled => return Ok(Outcome::Cancelled),
-            SelectedResolutionOverlayInputsOutcome::Stale(_) => return Ok(Outcome::Stale),
-            SelectedResolutionOverlayInputsOutcome::Unavailable(reason) => {
-                return Ok(Outcome::Unavailable(format!("{reason:?}")));
-            }
-        };
-    let languages = [
-        ("java", Language::Java),
-        ("kotlin", Language::Kotlin),
-        ("scala", Language::Scala),
-    ]
-    .into_iter()
-    .filter(|(storage, _)| snapshots.contains_key(*storage))
-    .map(|(storage, language)| SelectedResolutionLanguage::new(storage, language))
-    .collect::<Vec<_>>();
-    let input = SelectedResolutionOperationInput::new(
-        inner.project(),
-        inner.workspace_id(),
-        &snapshots,
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
-    let mut operation = match inner
-        .analyzer_store()
-        .open_selected_resolution_operation(input, cancellation)?
-    {
-        SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
-        SelectedResolutionOperationOpenOutcome::Cancelled => return Ok(Outcome::Cancelled),
-        SelectedResolutionOperationOpenOutcome::Stale(_) => return Ok(Outcome::Stale),
-        SelectedResolutionOperationOpenOutcome::Unavailable(reason) => {
+    let recipe = super::selected_operation::SelectedJvmRecipe::new(inner)?;
+    let mut operation = match recipe.open(cancellation)? {
+        super::selected_operation::SelectedJvmOperationOutcome::Ready(operation) => *operation,
+        super::selected_operation::SelectedJvmOperationOutcome::Cancelled => {
+            return Ok(Outcome::Cancelled);
+        }
+        super::selected_operation::SelectedJvmOperationOutcome::Stale(_) => {
+            return Ok(Outcome::Stale);
+        }
+        super::selected_operation::SelectedJvmOperationOutcome::Unavailable(reason) => {
             return Ok(Outcome::Unavailable(format!("{reason:?}")));
         }
     };
@@ -153,6 +120,9 @@ fn build<A: LanguageAdapter>(
     )
         },
     )?;
+    brokk_bifrost_analysis::analyzer::root_presence::record_consumed_root_presence(
+        analyzer, &operation,
+    );
     if cancellation.is_cancelled() {
         return Ok(Outcome::Cancelled);
     }

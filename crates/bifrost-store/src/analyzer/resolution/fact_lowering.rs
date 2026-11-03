@@ -923,8 +923,21 @@ impl LoweredResolutionFragment {
             ..
         } = self;
         let mut reference_metadata = Vec::new();
+        let mut path_origins = Vec::new();
         let mut go_definitions = Vec::new();
         for semantic in semantics {
+            use crate::analyzer::store::resolution_prepare::resolution_rows::{
+                semantic_role_code, site_kind_code,
+            };
+            path_origins.push((
+                semantic.node(),
+                super::CandidatePathOrigin {
+                    role: Some(semantic_role_code(semantic.role())),
+                    site_kind: semantic
+                        .published_site_metadata()
+                        .map(|metadata| site_kind_code(metadata.site_kind())),
+                },
+            ));
             if let Some(namespaces) = semantic.go_definition_namespaces {
                 go_definitions.push((semantic.semantic, namespaces));
             }
@@ -942,6 +955,7 @@ impl LoweredResolutionFragment {
         (
             PreloadedFragment::new(fragment, nodes, paths)
                 .with_reference_metadata(reference_metadata)
+                .with_path_origins(path_origins)
                 .with_go_definition_namespaces(go_definitions),
             gaps,
         )
@@ -3206,7 +3220,7 @@ fn lower_root_reference_paths(
                 identities.semantic(root_import_anchor_semantic_identity(reference.fact.anchor)),
             );
             if let Some(prefix_reference) = prefix_reference {
-                // This is the canonical semantic of the positioned Type lookup,
+                // This is the canonical semantic of the positioned prefix lookup,
                 // not a spelling marker. Selected operations can therefore resolve
                 // the prefix through the native lexical graph before continuing
                 // through the selected module/type route.
@@ -4845,7 +4859,8 @@ struct RootPrefixRule {
 }
 
 /// The prefix rule of a language, or `None` when it publishes no positioned
-/// root prefixes. Rust and Java keep the Type prefix. Go classifies a package
+/// root prefixes. Rust keeps the Type prefix. Java, Kotlin and Scala admit
+/// type or expression prefixes. Go classifies a package
 /// or value qualifier. Scala and Kotlin name terms through packages, objects and
 /// values, so their prefix may be either; Kotlin has only the rule so far.
 const fn root_prefix_rule(language: Language) -> Option<RootPrefixRule> {
@@ -4858,14 +4873,6 @@ const fn root_prefix_rule(language: Language) -> Option<RootPrefixRule> {
             prefix_namespaces: TYPE,
             terminal_namespace: None,
             consume_prefix_segment: true,
-            route_namespace: ResolutionNamespace::Type,
-            unprefixed_type_or_value: false,
-            single_prefix_segment: false,
-        }),
-        Language::Java => Some(RootPrefixRule {
-            prefix_namespaces: TYPE,
-            terminal_namespace: None,
-            consume_prefix_segment: false,
             route_namespace: ResolutionNamespace::Type,
             unprefixed_type_or_value: false,
             single_prefix_segment: false,
@@ -4895,7 +4902,7 @@ const fn root_prefix_rule(language: Language) -> Option<RootPrefixRule> {
             unprefixed_type_or_value: false,
             single_prefix_segment: true,
         }),
-        Language::Kotlin | Language::Scala => Some(RootPrefixRule {
+        Language::Java | Language::Kotlin | Language::Scala => Some(RootPrefixRule {
             prefix_namespaces: BOTH,
             terminal_namespace: Some(ResolutionNamespace::TypeOrValue),
             consume_prefix_segment: false,

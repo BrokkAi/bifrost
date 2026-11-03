@@ -1916,6 +1916,30 @@ pub trait SelectedTypedFactSource {
         self.selection_has_java_semantics()
     }
 
+    /// Registered obligations a separate exact argument-conversion proof can
+    /// discharge from binding: known-head receiver arguments and type variables
+    /// occurring only in results. This does not complete any result type.
+    fn external_argument_proof_reasons(
+        &self,
+        _definitions: &[SemanticId],
+        _receiver_reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// Exact parameterized-known-head obligations that cannot affect any of
+    /// these external members' parameter or result types. Other obligations
+    /// must be retained, including nullable and unknown-owner types.
+    fn external_receiver_argument_reasons(
+        &self,
+        _definitions: &[SemanticId],
+        _reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
     /// Exact selected external callable result types keyed by their external
     /// member identities. Results are present only for named types whose owner
     /// has one identity in the selected provider set; unresolved and

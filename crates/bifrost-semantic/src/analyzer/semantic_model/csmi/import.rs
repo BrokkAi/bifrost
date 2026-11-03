@@ -2913,6 +2913,7 @@ fn import_value_transfer_facts(
                 let semantics = type_fact.value_semantics.get_or_insert(TypeValueSemantics {
                     copy: None,
                     move_semantics: None,
+                    drop_glue: None,
                 });
                 match (payload.aspect, payload.semantics) {
                     (CsmiTypeValueSemanticsAspect::Copy, CsmiTypeSemantics::Trivial {}) => {

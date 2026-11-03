@@ -529,9 +529,17 @@ file, byte and row limits and cancellation bound each acquisition.
 Facts retain exact build-file byte ranges and snapshot digests. Semantic import
 paths, pseudo-versions and replacement source identity are preserved. Root
 requirements do not establish the MVS-selected graph; toolchain declarations
-do not identify an installed toolchain. These acquisition APIs do not yet
-publish facts to canonical RQL/CodeQuery or policy execution. Configuration
+do not identify an installed toolchain. The selected store publishes these
+facts to the `dependency_evidence` / `(dependency-evidence ...)` seed with
+ecosystems `go-module` and `go-toolchain`; `analyzer::go_dependency_version_matches`
+evaluates a `GoVersionRange` against one complete locked row. Configuration
 applicability requires an established relation to the same module.
+
+A `go-module` semantic model, including a reviewed workspace model, activates
+from the exact module versions that `go list` reports, and also, without a Go
+toolchain, from the unreplaced modules of a validated `vendor/modules.txt`.
+Root requirements, checksums, replacements and an unvalidated listing name no
+selected version, so they activate no model.
 
 ### JavaScript and TypeScript
 

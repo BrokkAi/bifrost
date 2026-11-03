@@ -87,6 +87,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::SourceSet { .. }
                 | CodeQueryResultValue::BuildTarget { .. }
                 | CodeQueryResultValue::TopologyEdge { .. }
+                | CodeQueryResultValue::BuildConfiguration { .. }
                 | CodeQueryResultValue::RewritePath { .. }
                 | CodeQueryResultValue::DependencyEvidence { .. }
                 | CodeQueryResultValue::ConfigurationFact { .. }
@@ -1388,6 +1389,33 @@ impl CodeQueryResult {
                         if let Some(project) = &value.build_project_id {
                             out.push_str(&format!("  build project {project}\n"));
                         }
+                    }
+                    CodeQueryResultValue::BuildConfiguration { value } => {
+                        out.push_str(&format!(
+                            "{} [build_configuration; {}] {}{}/{} ({}/{})\n",
+                            value.path,
+                            value.file_status,
+                            value
+                                .target
+                                .as_deref()
+                                .map_or_else(String::new, |target| format!("{target} ")),
+                            value.os.as_deref().unwrap_or("?"),
+                            value.arch.as_deref().unwrap_or("?"),
+                            value.os_source.unwrap_or("?"),
+                            value.arch_source.unwrap_or("?"),
+                        ));
+                        if let Some(constraint) = &value.constraint {
+                            out.push_str(&format!("  constraint {constraint}\n"));
+                        }
+                        let scope = |scope: &str, values: &Option<String>| match values {
+                            Some(values) => format!("{scope} [{values}]"),
+                            None => scope.to_owned(),
+                        };
+                        out.push_str(&format!(
+                            "  os {}, arch {}\n",
+                            scope(value.os_scope, &value.os_values),
+                            scope(value.arch_scope, &value.arch_values),
+                        ));
                     }
                     CodeQueryResultValue::TopologyEdge { value } => {
                         out.push_str(&format!(

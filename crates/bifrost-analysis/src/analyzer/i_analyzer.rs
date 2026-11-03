@@ -3833,6 +3833,57 @@ pub fn capture_query_reads<T>(
     (result, captured)
 }
 
+/// Read dependencies and incomplete reasons produced by one query-local read.
+#[doc(hidden)]
+pub struct QueryReadReceipt {
+    reads: Arc<crate::analyzer::ReadLedger>,
+    incomplete: Vec<QueryReadIncomplete>,
+}
+
+impl QueryReadReceipt {
+    /// Run `read` and record every read key and incomplete reason it causes.
+    pub fn capture<T>(analyzer: &dyn IAnalyzer, read: impl FnOnce() -> T) -> (T, Self) {
+        let ((result, incomplete), reads) = capture_query_reads(analyzer, || {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+            let result = read();
+            (result, scope.captured_read_incompleteness())
+        });
+        (result, Self { reads, incomplete })
+    }
+
+    /// Replay the captured read keys and incomplete reasons into the current query.
+    pub fn replay(&self, analyzer: &dyn IAnalyzer) {
+        replay_query_reads(analyzer, &self.reads);
+        for reason in &self.incomplete {
+            analyzer.record_query_incomplete(reason.clone());
+        }
+    }
+}
+
+/// Apply the selected descendant scope without changing open evidence.
+#[doc(hidden)]
+pub fn scope_filter_descendant_answer(
+    mut answer: brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+    scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
+) -> std::result::Result<
+    brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+    brokk_bifrost_core::analyzer::capabilities::Cancelled,
+> {
+    use brokk_bifrost_core::analyzer::capabilities::Cancelled;
+    if scope.cancellation().is_cancelled() {
+        return Err(Cancelled);
+    }
+    answer.edges.retain(|unit| scope.admits(unit));
+    for group in &mut answer.ambiguous {
+        group.retain(|unit| scope.admits(unit));
+    }
+    answer.ambiguous.retain(|group| !group.is_empty());
+    if scope.cancellation().is_cancelled() {
+        return Err(Cancelled);
+    }
+    Ok(answer)
+}
+
 /// Capture an authority build whose named inputs are subsumed by its answer
 /// keys. Unattributed crossings cannot be subsumed and still reach the caller.
 /// Return their count so a retained authority can replay them on later hits.

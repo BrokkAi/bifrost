@@ -420,6 +420,9 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::TopologyEdge {
             value: Default::default(),
         },
+        CodeQueryResultValue::BuildConfiguration {
+            value: Default::default(),
+        },
         CodeQueryResultValue::CrossDomain {
             value: Default::default(),
         },

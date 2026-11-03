@@ -52,6 +52,20 @@ pub struct ValidationLimits {
     pub max_depth: usize,
 }
 
+/// Largest successful admission thresholds observed by the ordinary validator.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationCensus {
+    pub max_text_bytes: usize,
+    pub max_depth: usize,
+}
+
+impl ValidationCensus {
+    pub fn merge(&mut self, other: Self) {
+        self.max_text_bytes = self.max_text_bytes.max(other.max_text_bytes);
+        self.max_depth = self.max_depth.max(other.max_depth);
+    }
+}
+
 fn valid_go_import_path(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('/')
@@ -90,6 +104,14 @@ pub fn validate_pack_locally(
     validate_pack_internal(pack, limits, false).0
 }
 
+pub fn validate_pack_locally_with_census(
+    pack: &AuthoredSemanticModelPack,
+    limits: ValidationLimits,
+) -> (Vec<Diagnostic>, ValidationCensus) {
+    let (diagnostics, _, census) = validate_pack_internal(pack, limits, false);
+    (diagnostics, census)
+}
+
 #[doc(hidden)]
 pub fn validate_csmi_profile_evidence(pack: &AuthoredSemanticModelPack) -> Vec<Diagnostic> {
     let mut diagnostics =
@@ -105,7 +127,7 @@ pub(crate) fn validate_pack_internal(
     pack: &AuthoredSemanticModelPack,
     limits: ValidationLimits,
     validate_references: bool,
-) -> (Vec<Diagnostic>, u32) {
+) -> (Vec<Diagnostic>, u32, ValidationCensus) {
     let mut validator = Validator {
         language: pack.language.clone(),
         go_packages_by_type_id: HashMap::new(),
@@ -113,6 +135,7 @@ pub(crate) fn validate_pack_internal(
         go_current_package: None,
         diagnostics: Vec::new(),
         limits,
+        census: ValidationCensus::default(),
         stable_ids: HashMap::new(),
         declaration_ids: HashSet::new(),
         anonymous_callable_ids: HashSet::new(),
@@ -144,7 +167,11 @@ pub(crate) fn validate_pack_internal(
     validator
         .diagnostics
         .sort_by(|left, right| (&left.path, &left.code).cmp(&(&right.path, &right.code)));
-    (validator.diagnostics, validator.required_schema_version)
+    (
+        validator.diagnostics,
+        validator.required_schema_version,
+        validator.census,
+    )
 }
 
 struct Validator {
@@ -154,6 +181,7 @@ struct Validator {
     go_current_package: Option<String>,
     diagnostics: Vec<Diagnostic>,
     limits: ValidationLimits,
+    census: ValidationCensus,
     stable_ids: HashMap<String, String>,
     declaration_ids: HashSet<String>,
     anonymous_callable_ids: HashSet<String>,
@@ -563,7 +591,8 @@ impl Validator {
                 || shard.runtime_contracts.is_some()
                 || shard.callable_values.is_some()
         }) {
-            if native_profile_depth_within(pack, self.limits.max_depth) {
+            if let Some(depth) = native_profile_depth_within(pack, self.limits.max_depth) {
+                self.census.max_depth = self.census.max_depth.max(depth);
                 if self.validate_references {
                     self.diagnostics
                         .extend(validate_native_profile_contracts(pack));
@@ -766,6 +795,10 @@ impl Validator {
             valid = false;
         }
 
+        self.census.max_depth = self
+            .census
+            .max_depth
+            .max(identity.lexical_owner_chain.len());
         if identity.lexical_owner_chain.len() > self.limits.max_depth {
             self.error(
                 "limit.callable_values_anonymous_owners",
@@ -1713,12 +1746,42 @@ impl Validator {
                     if let Some(value_semantics) = &fact.value_semantics {
                         if value_semantics.copy.is_none()
                             && value_semantics.move_semantics.is_none()
+                            && value_semantics.drop_glue.is_none()
                         {
                             self.error(
                                 "declaration.empty_value_semantics",
                                 format!("{fact_path}.value_semantics"),
-                                "value_semantics must state copy or move behavior",
+                                "value_semantics must state copy, move or drop behavior",
                             );
+                        }
+                        if value_semantics.drop_glue.is_some() {
+                            let path = format!("{fact_path}.value_semantics.drop_glue");
+                            if self.predates_schema(RUST_DROP_GLUE_MIN_SCHEMA_VERSION) {
+                                self.error(
+                                    "declaration.drop_glue_schema_version",
+                                    &path,
+                                    format!(
+                                        "drop_glue requires schema version {RUST_DROP_GLUE_MIN_SCHEMA_VERSION}"
+                                    ),
+                                );
+                            }
+                            if self.language != "rust" {
+                                self.error(
+                                    "declaration.drop_glue_language",
+                                    &path,
+                                    "drop_glue requires language rust",
+                                );
+                            }
+                            if !matches!(
+                                fact.type_kind,
+                                TypeKind::Struct | TypeKind::Enum | TypeKind::Union
+                            ) {
+                                self.error(
+                                    "declaration.drop_glue_owner",
+                                    &path,
+                                    "drop_glue describes a struct, enum or union",
+                                );
+                            }
                         }
                         if let Some(TypeCopySemantics::ViaMember { member }) = &value_semantics.copy
                         {
@@ -2958,16 +3021,21 @@ impl Validator {
             let current = format!("{path}[{index}]");
             self.stable_component(&format!("{current}.vocabulary"), &extension.vocabulary);
             self.version(&format!("{current}.version"), &extension.version);
-            match serde_json::to_vec(&extension.payload) {
-                Ok(value) if value.len() <= self.limits.max_text_bytes => {}
-                Ok(_) => self.error(
-                    "limit.runtime_extension_bytes",
-                    format!("{current}.payload"),
-                    format!(
-                        "runtime extension payload exceeds {} bytes",
-                        self.limits.max_text_bytes
-                    ),
-                ),
+            match runtime_extension_payload_bytes(&extension.payload) {
+                Ok(bytes) if bytes <= self.limits.max_text_bytes => {
+                    self.census.max_text_bytes = self.census.max_text_bytes.max(bytes);
+                }
+                Ok(bytes) => {
+                    self.census.max_text_bytes = self.census.max_text_bytes.max(bytes);
+                    self.error(
+                        "limit.runtime_extension_bytes",
+                        format!("{current}.payload"),
+                        format!(
+                            "runtime extension payload exceeds {} bytes",
+                            self.limits.max_text_bytes
+                        ),
+                    );
+                }
                 Err(error) => self.error(
                     "runtime.extension_payload",
                     format!("{current}.payload"),
@@ -5366,6 +5434,7 @@ impl Validator {
     ) {
         let mut pending = vec![(fact, parameters.to_vec(), 1usize)];
         while let Some((fact, outer_parameters, depth)) = pending.pop() {
+            self.census.max_depth = self.census.max_depth.max(depth);
             if depth > self.limits.max_depth {
                 self.error(
                     "limit.type_depth",
@@ -5423,6 +5492,7 @@ impl Validator {
     fn rust_self_pattern(&mut self, path: &str, pattern: &RustSelfPattern, parameters: &[String]) {
         let mut pending = vec![(pattern, 1)];
         while let Some((pattern, depth)) = pending.pop() {
+            self.census.max_depth = self.census.max_depth.max(depth);
             if depth > self.limits.max_depth {
                 self.error(
                     "limit.type_depth",
@@ -5453,6 +5523,7 @@ impl Validator {
     fn type_ref(&mut self, path: &str, root: &TypeRef, type_parameters: &[String]) {
         let mut stack = vec![(root, 1usize, path.to_owned())];
         while let Some((reference, depth, current_path)) = stack.pop() {
+            self.census.max_depth = self.census.max_depth.max(depth);
             if depth > self.limits.max_depth {
                 self.error(
                     "limit.type_depth",
@@ -5953,6 +6024,7 @@ impl Validator {
     ) {
         let mut stack = vec![(root, 1usize, path.to_owned())];
         while let Some((reference, depth, current_path)) = stack.pop() {
+            self.census.max_depth = self.census.max_depth.max(depth);
             if depth > self.limits.max_depth {
                 self.error(
                     "limit.template_type_depth",
@@ -6015,17 +6087,22 @@ impl Validator {
         captures: &HashMap<&str, &CaptureDeclaration>,
         position: TemplatePosition,
     ) {
-        if matches!(position, TemplatePosition::StableId)
-            && !stable_id_template_has_valid_boundaries(root, self.limits.max_depth)
-        {
-            self.error(
-                "template.invalid_identifier_boundary",
-                path,
-                "stable-id templates must begin and end with a lowercase ASCII alphanumeric",
-            );
+        if matches!(position, TemplatePosition::StableId) {
+            if let Some(depth) =
+                stable_id_template_has_valid_boundaries(root, self.limits.max_depth)
+            {
+                self.census.max_depth = self.census.max_depth.max(depth);
+            } else {
+                self.error(
+                    "template.invalid_identifier_boundary",
+                    path,
+                    "stable-id templates must begin and end with a lowercase ASCII alphanumeric",
+                );
+            }
         }
         let mut stack = vec![(root, 1usize, path.to_owned(), true, position)];
         while let Some((expression, depth, current_path, is_root, position)) = stack.pop() {
+            self.census.max_depth = self.census.max_depth.max(depth);
             if depth > self.limits.max_depth {
                 self.error(
                     "limit.template_depth",
@@ -6334,6 +6411,7 @@ impl Validator {
     }
 
     fn text(&mut self, path: &str, value: &str) {
+        self.census.max_text_bytes = self.census.max_text_bytes.max(value.len());
         if value.is_empty() {
             self.error("text.empty", path, "value must not be empty");
         }
@@ -6546,17 +6624,18 @@ fn is_language_name_fragment(value: &str) -> bool {
 fn stable_id_template_has_valid_boundaries(
     expression: &TemplateExpression,
     max_depth: usize,
-) -> bool {
-    stable_id_template_boundary(expression, true, max_depth)
-        && stable_id_template_boundary(expression, false, max_depth)
+) -> Option<usize> {
+    let first = stable_id_template_boundary(expression, true, max_depth)?;
+    let last = stable_id_template_boundary(expression, false, max_depth)?;
+    Some(first.max(last))
 }
 
 fn stable_id_template_boundary(
     mut expression: &TemplateExpression,
     first: bool,
     max_depth: usize,
-) -> bool {
-    for _ in 0..max_depth {
+) -> Option<usize> {
+    for depth in 1..=max_depth {
         match expression {
             TemplateExpression::Literal { value } => {
                 let boundary = if first {
@@ -6565,15 +6644,13 @@ fn stable_id_template_boundary(
                     value.as_bytes().last()
                 };
                 return boundary
-                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+                    .filter(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                    .map(|_| depth);
             }
-            TemplateExpression::Capture { .. } => return true,
+            TemplateExpression::Capture { .. } => return Some(depth),
             TemplateExpression::Concat { values } => {
                 let next = if first { values.first() } else { values.last() };
-                let Some(next) = next else {
-                    return false;
-                };
-                expression = next;
+                expression = next?;
             }
             TemplateExpression::Transform { value, .. } => expression = value,
             TemplateExpression::Conditional {
@@ -6581,12 +6658,13 @@ fn stable_id_template_boundary(
                 else_value,
                 ..
             } => {
-                return stable_id_template_boundary(then_value, first, max_depth)
-                    && stable_id_template_boundary(else_value, first, max_depth);
+                let then_depth = stable_id_template_boundary(then_value, first, max_depth)?;
+                let else_depth = stable_id_template_boundary(else_value, first, max_depth)?;
+                return Some(depth.max(then_depth).max(else_depth));
             }
         }
     }
-    false
+    None
 }
 
 fn capture_value_kind_name(kind: CaptureValueKind) -> &'static str {
@@ -6941,10 +7019,14 @@ fn native_receiver_reference(owner: &str, binders: &[String]) -> serde_json::Val
     })
 }
 
-fn native_profile_depth_within(pack: &AuthoredSemanticModelPack, max_depth: usize) -> bool {
-    use crate::analyzer::semantic_model::csmi::CsmiDeferredYieldShape;
+fn runtime_extension_payload_bytes(payload: &serde_json::Value) -> serde_json::Result<usize> {
+    serde_json::to_vec(payload).map(|bytes| bytes.len())
+}
 
-    use crate::analyzer::semantic_model::csmi::CsmiTypeExpression;
+fn native_profile_depth_within(
+    pack: &AuthoredSemanticModelPack,
+    max_depth: usize,
+) -> Option<usize> {
     let mut shapes = Vec::new();
     let mut types = Vec::new();
     for shard in &pack.shards {
@@ -6963,9 +7045,26 @@ fn native_profile_depth_within(pack: &AuthoredSemanticModelPack, max_depth: usiz
             }
         }
     }
+    native_profile_depth_from_roots(shapes, types, max_depth)
+}
+
+fn native_profile_depth_from_roots<'a>(
+    mut shapes: Vec<(
+        &'a crate::analyzer::semantic_model::csmi::CsmiDeferredYieldShape,
+        usize,
+    )>,
+    mut types: Vec<(
+        &'a crate::analyzer::semantic_model::csmi::CsmiTypeExpression,
+        usize,
+    )>,
+    max_depth: usize,
+) -> Option<usize> {
+    use crate::analyzer::semantic_model::csmi::{CsmiDeferredYieldShape, CsmiTypeExpression};
+    let mut deepest = 0;
     while let Some((shape, depth)) = shapes.pop() {
+        deepest = deepest.max(depth);
         if depth > max_depth {
-            return false;
+            return None;
         }
         match shape {
             CsmiDeferredYieldShape::Value { r#type } => types.push((r#type, depth + 1)),
@@ -6980,8 +7079,9 @@ fn native_profile_depth_within(pack: &AuthoredSemanticModelPack, max_depth: usiz
         }
     }
     while let Some((ty, depth)) = types.pop() {
+        deepest = deepest.max(depth);
         if depth > max_depth {
-            return false;
+            return None;
         }
         if let CsmiTypeExpression::Reference(reference) = ty {
             types.extend(
@@ -6992,7 +7092,79 @@ fn native_profile_depth_within(pack: &AuthoredSemanticModelPack, max_depth: usiz
             );
         }
     }
-    true
+    Some(deepest)
+}
+
+#[cfg(test)]
+mod validation_census_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_payload_threshold_includes_json_structure() {
+        let payload = serde_json::json!({"one": "abc", "two": "def"});
+        let serialized_len = serde_json::to_string(&payload).unwrap().len();
+        assert!(serialized_len > "abc".len());
+        assert_eq!(
+            runtime_extension_payload_bytes(&payload).unwrap(),
+            serialized_len
+        );
+    }
+
+    #[test]
+    fn native_profile_depth_counts_shape_to_type_offset() {
+        use crate::analyzer::semantic_model::csmi::{
+            CsmiDeferredYieldShape, CsmiTypeExpression, CsmiUnknownType, CsmiUnknownTypeKind,
+        };
+        let shape = CsmiDeferredYieldShape::Product {
+            components: vec![CsmiDeferredYieldShape::Value {
+                r#type: CsmiTypeExpression::Unknown(CsmiUnknownType {
+                    kind: CsmiUnknownTypeKind::Unknown,
+                }),
+            }],
+        };
+        assert_eq!(
+            native_profile_depth_from_roots(vec![(&shape, 0)], vec![], 1),
+            None
+        );
+        assert_eq!(
+            native_profile_depth_from_roots(vec![(&shape, 0)], vec![], 2),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn stable_id_boundary_counts_both_ends_and_conditional_branches() {
+        let literal = |value: &str| TemplateExpression::Literal {
+            value: value.into(),
+        };
+        let expression = TemplateExpression::Concat {
+            values: vec![
+                TemplateExpression::Concat {
+                    values: vec![literal("a")],
+                },
+                TemplateExpression::Conditional {
+                    condition: TemplateCondition::Equals {
+                        left: Box::new(literal("a")),
+                        right: Box::new(literal("a")),
+                    },
+                    then_value: Box::new(literal("z")),
+                    else_value: Box::new(TemplateExpression::Concat {
+                        values: vec![TemplateExpression::Concat {
+                            values: vec![literal("y")],
+                        }],
+                    }),
+                },
+            ],
+        };
+        assert_eq!(
+            stable_id_template_has_valid_boundaries(&expression, 2),
+            None
+        );
+        assert_eq!(
+            stable_id_template_has_valid_boundaries(&expression, 3),
+            Some(3)
+        );
+    }
 }
 
 #[cfg(test)]

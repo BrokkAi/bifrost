@@ -27,11 +27,6 @@
 //! over a smaller policy, and [`CandidateSolve::kills_on`] matches the kills
 //! of the first pass to the paths of the second by program-point identity.
 //!
-//! Persistence-store crossings are seeded across every region before any
-//! region solves, so solving the candidate's regions alone cannot replay them.
-//! A policy that declares store ends is answered with a typed
-//! [`CandidateBoundaryKind::UnsupportedFlow`] boundary instead.
-//!
 //! Ordinary evaluation never calls this module, and nothing it builds outlives
 //! the question it answers.
 
@@ -57,10 +52,12 @@ use brokk_bifrost_flow::value_flow::{
 use brokk_bifrost_rql::structural::CodeQueryCompletion;
 
 use super::{
-    BatchMerge, BoundEndpoint, CompiledTaintEndpoint, CompiledTaintPolicyPlan, PreparedTaintPlan,
-    ProductionTaintPolicyEvaluator, RefusalNotice, StoreWriteEvidenceByRead, TaintBatchError,
-    TaintExecutionBudget, TaintPolicyCompilation, TaintPolicyCompileError, TaintPolicyCompiler,
-    compiled_payload, policy_sink_files, prepared_failure_payload, record_exhausted_lane,
+    BatchMerge, BoundEndpoint, BoundStoreEnd, CompiledTaintEndpoint, CompiledTaintPolicyPlan,
+    EffectiveWitnessLimits, PreparedTaintPlan, ProductionTaintPolicyEvaluator, RefusalNotice,
+    StoreCrossingProvenance, StoreWriteEvidenceByRead, TaintBatchError, TaintExecutionBudget,
+    TaintPolicyCompilation, TaintPolicyCompileError, TaintPolicyCompiler, compiled_payload,
+    composed_crossing_evidence, composed_crossing_matches, policy_sink_files,
+    prepared_failure_payload, project_composed_store_crossing_witness, record_exhausted_lane,
     selector_endpoint_label, solve_and_project_batch, taint_witness_step_kind,
 };
 use crate::budget::PolicyBudget;
@@ -244,6 +241,7 @@ pub(crate) struct CandidateSolve {
     pub(crate) reached: bool,
     /// The witnesses the solver retained for that reach, in solver order.
     pub(crate) witnesses: Vec<Arc<SummaryWitness>>,
+    store_crossings: Vec<(Arc<SummaryWitness>, usize, StoreCrossingProvenance)>,
     /// The kills bound inside the candidate regions, in compile order.
     kills: Vec<CandidateKill>,
 }
@@ -282,6 +280,7 @@ impl CandidateSolve {
 /// within one explanation.
 pub(crate) fn project_candidate_witness(
     workspace: &WorkspaceAnalyzer,
+    solve: &CandidateSolve,
     witness: &SummaryWitness,
     index: usize,
     budget: &PolicyBudget,
@@ -291,14 +290,38 @@ pub(crate) fn project_candidate_witness(
         stable_hex(format!("flow-candidate-counterfactual:{index}").as_bytes()),
     )
     .map_err(|error| error.to_string())?;
-    crate::witness_projection::project_summary_witness(
+    let projected = crate::witness_projection::project_summary_witness(
         workspace,
         witness,
         id,
         budget.max_witness_steps(),
         budget.max_witness_bytes(),
         taint_witness_step_kind,
-    )
+    )?;
+    let Some(projected) = projected else {
+        return Ok(None);
+    };
+    let mut crossings = solve
+        .store_crossings
+        .iter()
+        .filter(|(retained, _, _)| retained.as_ref() == witness)
+        .map(|(_, prefix, evidence)| (*prefix, evidence.clone()))
+        .collect::<Vec<_>>();
+    crossings.sort_by_key(|(prefix, _)| std::cmp::Reverse(*prefix));
+    if crossings.is_empty() {
+        Ok(Some(projected))
+    } else {
+        project_composed_store_crossing_witness(
+            workspace,
+            projected,
+            &crossings,
+            EffectiveWitnessLimits {
+                steps: budget.max_witness_steps(),
+                bytes: budget.max_witness_bytes(),
+            },
+        )
+        .map(Some)
+    }
 }
 
 /// The bound endpoint sites that cover a flow candidate's two positions.
@@ -325,6 +348,44 @@ impl CandidateProbe {
             observation: candidate.observation().clone(),
             recorded: None,
         }
+    }
+
+    /// A declared store write can itself be the candidate's observation.
+    /// The ordinary policy has no finding sink there, so bind that selected
+    /// write as a candidate-only sink when no declared sink covers the site.
+    pub(super) fn store_write_observation_sinks(
+        &self,
+        sources: &[BoundEndpoint],
+        sinks: &[BoundEndpoint],
+        writes: &[BoundStoreEnd],
+    ) -> Vec<BoundEndpoint> {
+        let covers = |endpoint: &BoundEndpoint| {
+            SiteKey::of(program_point_locator(&endpoint.point)).covers(&self.observation)
+        };
+        if sinks.iter().any(covers) {
+            return Vec::new();
+        }
+        let mut labels = Vec::new();
+        for source in sources
+            .iter()
+            .filter(|source| SiteKey::of(program_point_locator(&source.point)).covers(&self.source))
+        {
+            for label in &source.labels {
+                if !labels.contains(label) {
+                    labels.push(label.clone());
+                }
+            }
+        }
+        let labels = labels.into_boxed_slice();
+        writes
+            .iter()
+            .filter(|write| covers(&write.endpoint))
+            .map(|write| {
+                let mut sink = write.endpoint.clone();
+                sink.labels = labels.clone();
+                sink
+            })
+            .collect()
     }
 
     /// Record the bound sources and sinks whose event site covers the
@@ -400,17 +461,6 @@ pub(crate) fn solve_flow_candidate(
     let flow_state = flow_state.into();
     #[cfg(test)]
     CANDIDATE_PASSES.with(|count| count.set(count.get() + 1));
-    if !spec.store_writes.is_empty() || !spec.store_reads.is_empty() {
-        return CandidatePass::stopped(CandidateBoundary::new(
-            CandidateBoundaryKind::UnsupportedFlow,
-            vec![PolicyIncompleteReason::CapabilityIncomplete],
-            None,
-            "the policy declares persistence-store ends, whose crossings are seeded across \
-             every analysis region before any region solves; one candidate's regions do not \
-             replay that seeding"
-                .to_owned(),
-        ));
-    }
     let uncancelled = CancellationToken::default();
     let cancellation = cancellation.unwrap_or(&uncancelled);
     let mut probe = CandidateProbe::new(candidate);
@@ -561,7 +611,11 @@ fn solve_candidate_regions(
                 .iter()
                 .any(|endpoint| SiteKey::of(endpoint.event.site()) == *key)
         };
-        if !binds(&root.sources, &origin_key) || !binds(&root.sinks, &observation_key) {
+        let composed_store_root =
+            matches!(root.engine, super::TaintEngine::Composition) && !root.store_reads.is_empty();
+        if (!binds(&root.sources, &origin_key) && !composed_store_root)
+            || !binds(&root.sinks, &observation_key)
+        {
             continue;
         }
         for kill in root.kills.iter() {
@@ -578,6 +632,7 @@ fn solve_candidate_regions(
             PreparedTaintPlan {
                 policy_id: policy_id.clone(),
                 sources: root.sources,
+                entry_points: root.entry_points,
                 sinks: root.sinks,
                 store_writes: root.store_writes,
                 store_reads: root.store_reads,
@@ -609,6 +664,11 @@ fn solve_candidate_regions(
     let mut boundaries = Vec::new();
     let mut public_findings = Vec::new();
     let mut retained_analyses = Vec::new();
+    let mut composed_reports = Vec::new();
+    let composed = metadata
+        .values()
+        .next()
+        .is_some_and(|plan| matches!(&plan.engine, super::TaintEngine::Composition));
     let mut execution_budget = TaintExecutionBudget::new(budget);
     let planning_started = Instant::now();
     let batches = super::partition_taint_batches(plans).map_err(|error| error.to_string())?;
@@ -635,6 +695,7 @@ fn solve_candidate_regions(
             &icfg_provider,
             &no_store_evidence,
             &composition_memo,
+            Some(&mut composed_reports),
         ) else {
             continue;
         };
@@ -676,48 +737,72 @@ fn solve_candidate_regions(
     let mut proven_by_summary = false;
     let mut reached = false;
     let mut witnesses = Vec::<Arc<SummaryWitness>>::new();
-    for analysis in &retained_analyses {
-        let report = analysis.report();
-        if !report.is_complete() {
-            if report.is_proven_by_authored_summaries() {
-                proven_by_summary = true;
-            } else {
-                boundaries.push(solve_boundary(workspace, analysis.plan(), report)?);
+    let mut matched_store_crossings = Vec::new();
+    if composed {
+        for composed in &composed_reports {
+            let report = &composed.report;
+            if !report.is_complete() {
+                if report.is_proven_by_authored_summaries() {
+                    proven_by_summary = true;
+                } else {
+                    boundaries.push(composed_boundary(report, composed.status.as_ref()));
+                }
             }
+            reached |= read_candidate_reaches(
+                workspace,
+                report,
+                &origin_key,
+                &observation_key,
+                &composed.store_crossings,
+                &mut boundaries,
+                &mut witnesses,
+                &mut matched_store_crossings,
+            )?;
         }
-        for finding in report.findings() {
-            if SiteKey::of(finding.key().sink().site()) != observation_key {
-                continue;
-            }
-            let mut origin_retained = false;
-            for origin in finding.origins().evidence() {
-                if SiteKey::of(origin.origin().value_flow_key().site()) != origin_key {
-                    continue;
-                }
-                origin_retained = true;
-                for witness in origin.witnesses() {
-                    if !witnesses.contains(witness) {
-                        witnesses.push(Arc::clone(witness));
-                    }
+    } else {
+        for analysis in &retained_analyses {
+            let report = analysis.report();
+            if !report.is_complete() {
+                if report.is_proven_by_authored_summaries() {
+                    proven_by_summary = true;
+                } else {
+                    boundaries.push(solve_boundary(workspace, analysis.plan(), report)?);
                 }
             }
-            reached |= origin_retained;
-            if !origin_retained && finding.origins().origin_truncated() {
-                boundaries.push(CandidateBoundary::new(
-                    CandidateBoundaryKind::OutputBudget,
-                    vec![PolicyIncompleteReason::ReportRetentionBudget],
-                    Some(policy_location(workspace, finding.key().sink().site())?),
-                    "the solver reached the observation, but its retained origins were \
-                     truncated before the candidate's origin could be checked"
-                        .to_owned(),
-                ));
-            }
+            reached |= read_candidate_reaches(
+                workspace,
+                report,
+                &origin_key,
+                &observation_key,
+                &[],
+                &mut boundaries,
+                &mut witnesses,
+                &mut matched_store_crossings,
+            )?;
         }
     }
     boundaries.sort_by(|left, right| {
         (left.kind, &left.detail, &left.reasons).cmp(&(right.kind, &right.detail, &right.reasons))
     });
     boundaries.dedup();
+    let mut store_crossings = Vec::new();
+    for crossing in matched_store_crossings {
+        let plan = metadata
+            .values()
+            .find(|plan| {
+                plan.store_writes
+                    .iter()
+                    .any(|write| write.call.durable_key() == crossing.write_call)
+                    && plan
+                        .store_reads
+                        .iter()
+                        .any(|read| read.call.durable_key() == crossing.read_call)
+            })
+            .expect("a retained composed crossing has selected store ends");
+        let (prefix, evidence) =
+            composed_crossing_evidence(plan, &origin_sites[0].endpoint, &crossing);
+        store_crossings.push((crossing.witness, prefix, evidence));
+    }
     Ok(CandidatePass {
         origin: CandidateBinding::Bound(origin_sites),
         observation: CandidateBinding::Bound(observation_sites),
@@ -729,6 +814,7 @@ fn solve_candidate_regions(
             proven_by_summary,
             reached,
             witnesses,
+            store_crossings,
             kills,
         }),
         evaluator: ProductionTaintPolicyEvaluator {
@@ -737,6 +823,122 @@ fn solve_candidate_regions(
             retained_analyses: std::sync::Mutex::new(Vec::new()),
         },
     })
+}
+
+/// The composition reports its own incomplete status. An ICFG plan's first
+/// discovery cause is not an authority for this result.
+fn composed_boundary(
+    report: &TaintFindingReport,
+    status: Option<&SemanticInputStatus>,
+) -> CandidateBoundary {
+    match report.result().termination() {
+        SolverTermination::Cancelled => CandidateBoundary::new(
+            CandidateBoundaryKind::Cancelled,
+            vec![PolicyIncompleteReason::Cancelled],
+            None,
+            "the composed candidate search was cancelled".to_owned(),
+        ),
+        SolverTermination::ExceededBudget(exceeded) => CandidateBoundary::new(
+            CandidateBoundaryKind::AnalysisBudget,
+            vec![PolicyIncompleteReason::PartialDiscovery],
+            None,
+            format!("the composed candidate search exceeded its budget: {exceeded:?}"),
+        ),
+        SolverTermination::FixedPoint => {
+            let (kind, reason) = match status {
+                Some(SemanticInputStatus::Cancelled) => (
+                    CandidateBoundaryKind::Cancelled,
+                    PolicyIncompleteReason::Cancelled,
+                ),
+                Some(SemanticInputStatus::ExceededBudget { .. }) => (
+                    CandidateBoundaryKind::AnalysisBudget,
+                    PolicyIncompleteReason::PartialDiscovery,
+                ),
+                Some(SemanticInputStatus::Unsupported { .. }) => (
+                    CandidateBoundaryKind::SemanticUnavailable,
+                    PolicyIncompleteReason::CapabilityIncomplete,
+                ),
+                _ => (
+                    CandidateBoundaryKind::OpenCoverage,
+                    PolicyIncompleteReason::PartialDiscovery,
+                ),
+            };
+            CandidateBoundary::new(
+                kind,
+                vec![reason],
+                None,
+                format!("the composed candidate retained an open boundary: {status:?}"),
+            )
+        }
+    }
+}
+
+/// Origin and witness evidence is the common report vocabulary. Each engine
+/// supplies its own report and its own completeness boundary above.
+#[allow(clippy::too_many_arguments)]
+fn read_candidate_reaches(
+    workspace: &WorkspaceAnalyzer,
+    report: &TaintFindingReport,
+    origin_key: &SiteKey,
+    observation_key: &SiteKey,
+    store_crossings: &[brokk_bifrost_flow::taint::compose::ComposedStoreCrossing],
+    boundaries: &mut Vec<CandidateBoundary>,
+    witnesses: &mut Vec<Arc<SummaryWitness>>,
+    matched_store_crossings: &mut Vec<brokk_bifrost_flow::taint::compose::ComposedStoreCrossing>,
+) -> Result<bool, String> {
+    let mut reached = false;
+    for finding in report.findings() {
+        if SiteKey::of(finding.key().sink().site()) != *observation_key {
+            continue;
+        }
+        let mut origin_retained = false;
+        for origin in finding.origins().evidence() {
+            let direct = SiteKey::of(origin.origin().value_flow_key().site()) == *origin_key;
+            let via_store = store_crossings.iter().any(|crossing| {
+                super::composed_crossing_matches(crossing, origin.origin(), None)
+                    && crossing.sink == *finding.key().sink()
+                    && SiteKey::of(crossing.original_source.value_flow_key().site()) == *origin_key
+            });
+            if !direct && !via_store {
+                continue;
+            }
+            // A store crossing depends on the complete writer inventory and
+            // every remote artifact visited by composition. A retained path
+            // alone cannot discharge an open inventory.
+            if via_store && !report.is_complete() {
+                continue;
+            }
+            origin_retained = true;
+            for witness in origin.witnesses() {
+                if !witnesses.contains(witness) {
+                    witnesses.push(Arc::clone(witness));
+                }
+                matched_store_crossings.extend(
+                    store_crossings
+                        .iter()
+                        .filter(|crossing| {
+                            composed_crossing_matches(crossing, origin.origin(), Some(witness))
+                                && crossing.sink == *finding.key().sink()
+                                && SiteKey::of(crossing.original_source.value_flow_key().site())
+                                    == *origin_key
+                        })
+                        .cloned(),
+                );
+            }
+        }
+        reached |= origin_retained;
+        if !origin_retained && finding.origins().origin_truncated() {
+            boundaries.push(CandidateBoundary::new(
+                CandidateBoundaryKind::OutputBudget,
+                vec![PolicyIncompleteReason::ReportRetentionBudget],
+                Some(policy_location(workspace, finding.key().sink().site())?),
+                "the solver reached the observation, but its retained origins were \
+                 truncated before the candidate's origin could be checked"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(reached)
 }
 
 /// One site in the analyzed source: a workspace path and an anchor byte span.

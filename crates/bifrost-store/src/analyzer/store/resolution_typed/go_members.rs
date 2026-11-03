@@ -59,6 +59,33 @@ LEFT JOIN main.resolution_semantic_sites AS interface_method_semantic
  AND interface_method_semantic.semantic_role='definition'
 "#;
 
+pub(in crate::analyzer::store) static ALIAS_DECLARATIONS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"{}
+SELECT json_extract(request.value,'$[0]'), pair.alias_key,
+       pair.member_name, pair.method_key
+FROM json_each(?1) request
+JOIN temp.selected_resolution_mounts mount
+ ON mount.mount_ordinal=json_extract(request.value,'$[0]')
+ AND mount.semantic_language='go'
+JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=mount.mount_ordinal
+JOIN main.resolution_fragment_interiors interior ON interior.blob_id=mount.blob_id
+ AND interior.lang=mount.storage_language AND interior.semantic_language=mount.semantic_language
+ AND interior.producer_epoch=mount.producer_epoch
+ AND interior.interior_digest=mount.interior_digest AND interior.publication_state='complete'
+JOIN main.source_fact_manifests source ON source.blob_id=mount.blob_id
+ AND source.publication_state='complete'
+JOIN main.source_go_manifests go_source ON go_source.blob_id=source.blob_id
+JOIN alias_method_pairs pair ON pair.blob_id=mount.blob_id
+ AND pair.alias_key=json_extract(request.value,'$[1]')
+ORDER BY 1,2,4"#,
+            super::super::resolution_operation::go_hierarchy::go_alias_literal_method_pairs_sql(
+                "SELECT alias.blob_id,alias.target_type_id,0,alias.declaration_id FROM json_each(?1) request JOIN temp.selected_resolution_mounts seed_mount ON seed_mount.mount_ordinal=json_extract(request.value,'$[0]') JOIN main.source_go_aliases alias ON alias.blob_id=seed_mount.blob_id WHERE alias.target_type_id IS NOT NULL"
+            )
+        )
+    });
+
 pub(super) fn read(
     source: &SelectedResolutionTypedSource<'_, '_>,
     definitions: &[SemanticId],
@@ -180,7 +207,43 @@ pub(super) fn read(
             }
             Ok(Some(found))
         })?;
-        let Some(rows) = rows else { return Ok(None) };
+        let Some(mut rows) = rows else {
+            return Ok(None);
+        };
+        let aliases = source.read_statement(cancellation, |connection| {
+            let names = selection.shared_name_table().interner(connection);
+            let mut statement = connection.prepare_cached(ALIAS_DECLARATIONS.as_str())?;
+            let mut query = statement.query([&requests])?;
+            let mut found = Vec::new();
+            while let Some(row) = query.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                let ordinal = SelectedResolutionMountOrdinal::new(row.get(0)?);
+                let key: u32 = row.get(1)?;
+                let definition = coordinates[&(ordinal, i64::from(key))];
+                let name: String = row.get(2)?;
+                let recipe = crate::analyzer::resolution::ResolutionLookupSemanticRecipe::new(
+                    Language::Go,
+                    ResolutionNamespace::Callable,
+                    &name,
+                );
+                found.push(GoMemberDeclaration {
+                    definition,
+                    kind: GoMemberDeclarationKind::Interface {
+                        methods: vec![crate::analyzer::resolution::GoInterfaceMethod {
+                            callable_lookup: recipe.semantic(&names),
+                            definition: Some(SemanticId::local(ordinal.get(), row.get(3)?)),
+                        }],
+                    },
+                });
+            }
+            Ok(Some(found))
+        })?;
+        let Some(aliases) = aliases else {
+            return Ok(None);
+        };
+        rows.extend(aliases);
         for row in rows {
             if cancellation.is_cancelled() {
                 return Ok(None);

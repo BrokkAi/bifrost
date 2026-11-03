@@ -61,8 +61,21 @@ pub struct GuardConditionSyntax {
     pub operand_field: &'static str,
 }
 
+/// A structurally classified field value in an object allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarObjectFieldKind {
+    Boolean,
+    Number,
+    String,
+}
+
 /// Language syntax and rules independent of query-time engine state.
 pub trait LanguageKnowledge: Send + Sync {
+    /// Whether a field with this structured scalar value kind cannot carry a
+    /// reference into a copied object of this language.
+    fn scalar_object_field_is_copy(&self, _kind: ScalarObjectFieldKind) -> bool {
+        false
+    }
     /// Compose every semantic-model shard of this language from catalog rows.
     /// Row-backed declarations are projected on demand in the bounded store cache.
     fn models_compose_from_catalog_rows(&self) -> bool {

@@ -30,6 +30,7 @@ use crate::analyzer::semantic::ValueTypeBarrierReason;
 use crate::analyzer::semantic::ValueTypePredicate;
 
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::topology::{TopologySupport, WorkspaceTopology};
 
 use crate::analyzer::usages::get_definition::BoundedResolution;
 use crate::analyzer::usages::get_definition::DefinitionLookupOutcome;
@@ -636,9 +637,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
     }
 
     /// A build ecosystem provider, registered even without source files of this language.
-    fn build_model_provider(
-        &self,
-    ) -> Option<&'static dyn crate::analyzer::topology::BuildModelProvider> {
+    fn build_model_provider(&self) -> Option<&'static dyn BuildModelProvider> {
         None
     }
 
@@ -3329,13 +3328,47 @@ pub(crate) fn selected_external_inventory_providers(analyzer: &dyn IAnalyzer) ->
 /// build model serves several languages -- Java, Kotlin, and Scala share the
 /// Maven reactor -- and because a workspace can carry build metadata for a
 /// language it has no sources in yet.
-pub(crate) fn build_model_providers()
--> impl Iterator<Item = &'static dyn crate::analyzer::topology::BuildModelProvider> {
+fn build_model_providers() -> impl Iterator<Item = &'static dyn BuildModelProvider> {
     // Java support registers the shared JVM model once for all JVM languages.
     ANALYZABLE_LANGUAGES
         .iter()
         .filter_map(|&language| language_support(language))
         .filter_map(|support| support.build_model_provider())
+}
+
+/// One build ecosystem's reader of its own build files.
+///
+/// A provider is the only code that knows what its build files mean, so it
+/// alone decides which axes it answers and what justifies each row. The
+/// registry that names the providers is `build_model_providers`; nothing
+/// else dispatches over ecosystems. The trait lives here rather than with the
+/// topology vocabulary in `crate::analyzer::topology` because a provider reads
+/// the analyzer, and the vocabulary sits below the analyzer in the crate
+/// layering (#4452).
+#[doc(hidden)]
+pub trait BuildModelProvider: Send + Sync {
+    /// The axes this provider answers from build evidence.
+    fn support(&self) -> &'static TopologySupport;
+
+    /// Read this workspace's build files. Must not run a build tool or open a
+    /// network connection: a topology row is derived from checked-in build
+    /// metadata alone, or from the analyzer's stored rows over it.
+    ///
+    /// `None` means the workspace holds neither a build file nor a source file
+    /// of this ecosystem, so this build model has nothing to own and its
+    /// absence is not missing evidence. A workspace with sources of the
+    /// ecosystem and no readable build answers `Some` incomplete.
+    fn topology(&self, analyzer: &dyn IAnalyzer) -> Option<WorkspaceTopology>;
+}
+
+/// The topology of the analyzed workspace as every registered build model
+/// that applies to it declares it ([`WorkspaceTopology::fold`]).
+pub fn workspace_topology(analyzer: &dyn IAnalyzer) -> WorkspaceTopology {
+    WorkspaceTopology::fold(build_model_providers().filter_map(|provider| {
+        provider
+            .topology(analyzer)
+            .map(|topology| (provider.support(), topology))
+    }))
 }
 
 pub use crate::analyzer::resolution::registry_vocabulary::{

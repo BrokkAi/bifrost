@@ -327,7 +327,8 @@ pub(crate) mod jvm_extraction_tests {
                 &cancellation,
                 &mut SelectedResolutionContextMetrics,
             )
-            .unwrap();
+            .unwrap()
+            .0;
         let SelectedResolutionOperationOutcome::Native(confirmed) = confirmed else {
             panic!("selected JVM confirmation must produce a native result");
         };
@@ -565,6 +566,7 @@ pub(crate) mod jvm_extraction_tests {
                     &mut SelectedResolutionContextMetrics,
                 )
                 .unwrap()
+                .0
         };
         let render = |confirmed: &JvmReverseConfirmed| {
             let mut rows = confirmed
@@ -855,7 +857,8 @@ pub(crate) mod jvm_extraction_tests {
                 &cancellation,
                 &mut SelectedResolutionContextMetrics,
             )
-            .unwrap();
+            .unwrap()
+            .0;
         let SelectedResolutionOperationOutcome::Native(confirmed) = confirmed else {
             panic!("selected JVM confirmation must produce a native result");
         };

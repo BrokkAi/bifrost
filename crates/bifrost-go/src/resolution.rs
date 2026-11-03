@@ -241,32 +241,10 @@ fn go_membership_digest(root: Node<'_>, source: &str) -> Option<[u8; 32]> {
     Some(hash.finish())
 }
 
-/// Build constraints are comment nodes in Go's syntax tree. Inspect only
-/// leading top-level line comments; matching bytes inside a block comment or
-/// later documentation cannot constrain package selection.
+/// Build constraints are comment nodes in Go's syntax tree; see
+/// [`crate::build_constraints::go_build_constraint_comments`].
 fn go_has_build_constraints(root: Node<'_>, source: &str) -> bool {
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if child.kind() == "package_clause" {
-            return false;
-        }
-        if child.kind() != "comment" {
-            continue;
-        }
-        let comment = &source[child.start_byte()..child.end_byte()];
-        if !comment.starts_with("//") {
-            continue;
-        }
-        for directive in ["//go:build", "// +build"] {
-            if comment
-                .strip_prefix(directive)
-                .is_some_and(|tail| tail.chars().next().is_none_or(char::is_whitespace))
-            {
-                return true;
-            }
-        }
-    }
-    false
+    !crate::build_constraints::go_build_constraint_comments(root, source).is_empty()
 }
 
 fn go_source_type_parameter_counts(root: Node<'_>, source: &str) -> HashMap<String, usize> {
@@ -962,18 +940,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         if let Some(syntax) = self.type_syntax_by_node.get(&node.id()) {
             return *syntax;
         }
-        let scope = self.scope_for_source_range(node.start_byte(), node.end_byte());
-        let declaration = self.add_site_in_scope(node, ResolutionSiteKind::TypeDeclaration, scope);
-        let synthetic_name = crate::declarations::go_synthetic_name(node);
-        let name = self.intern_name(&synthetic_name);
-        self.facts.identifiers.push(PositionedIdentifierFact {
-            site: declaration,
-            name,
-            role: ResolutionIdentifierRole::Declaration,
-            namespace: ResolutionNamespace::Type,
-            qualifier: None,
-        });
-        let output = self.add_slot(declaration, ResolutionTypeSlotRole::TargetTypeIdentity);
+        let (declaration, output, name) = self.lower_anonymous_type_identity(node);
         self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
             output,
             name,
@@ -983,6 +950,29 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         let source_declaration = self.declare_node(node, None);
         self.declaration_sources
             .push((declaration, source_declaration));
+        let syntax = LoweredTypeSyntax {
+            input: output,
+            indirection_delta: 0,
+        };
+        assert!(self.type_syntax_by_node.insert(node.id(), syntax).is_none());
+        syntax
+    }
+
+    fn lower_anonymous_type_identity(
+        &mut self,
+        node: Node<'tree>,
+    ) -> (ResolutionSiteId, ResolutionTypeSlotId, ResolutionNameId) {
+        let scope = self.scope_for_source_range(node.start_byte(), node.end_byte());
+        let declaration = self.add_site_in_scope(node, ResolutionSiteKind::TypeDeclaration, scope);
+        let name = self.intern_name(&crate::declarations::go_synthetic_name(node));
+        self.facts.identifiers.push(PositionedIdentifierFact {
+            site: declaration,
+            name,
+            role: ResolutionIdentifierRole::Declaration,
+            namespace: ResolutionNamespace::Type,
+            qualifier: None,
+        });
+        let output = self.add_slot(declaration, ResolutionTypeSlotRole::TargetTypeIdentity);
         self.facts
             .declaration_type_slots
             .push(DeclarationTypeSlotFact {
@@ -990,12 +980,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 slot: output,
                 role: DeclarationTypeRole::Identity,
             });
-        let syntax = LoweredTypeSyntax {
-            input: output,
-            indirection_delta: 0,
-        };
-        assert!(self.type_syntax_by_node.insert(node.id(), syntax).is_none());
-        syntax
+        (declaration, output, name)
     }
 
     fn push_block_scope(&mut self, node: Node<'tree>) -> ResolutionScopeId {
@@ -4110,18 +4095,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         if let Some(syntax) = self.type_syntax_by_node.get(&node.id()) {
             return *syntax;
         }
-        let scope = self.scope_for_source_range(node.start_byte(), node.end_byte());
-        let declaration = self.add_site_in_scope(node, ResolutionSiteKind::TypeDeclaration, scope);
-        let synthetic_name = crate::declarations::go_synthetic_name(node);
-        let name = self.intern_name(&synthetic_name);
-        self.facts.identifiers.push(PositionedIdentifierFact {
-            site: declaration,
-            name,
-            role: ResolutionIdentifierRole::Declaration,
-            namespace: ResolutionNamespace::Type,
-            qualifier: None,
-        });
-        let output = self.add_slot(declaration, ResolutionTypeSlotRole::TargetTypeIdentity);
+        let (declaration, output, _) = self.lower_anonymous_type_identity(node);
         self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
         self.lower_interface_type_elements(
             declaration,

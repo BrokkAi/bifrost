@@ -135,7 +135,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 fn run_rule(root: PathBuf) -> Result<CodeQueryResponse, String> {
-    // Register the shipped semantic packs once per process.
+    // Connect semantic-pack registration once per process.
     brokk_bifrost::install_bifrost_semantic_model_packs()?;
     let service = SearchToolsService::new(root)?;
     let response = service.query_code_result(json!({
@@ -151,8 +151,8 @@ fn run_rule(root: PathBuf) -> Result<CodeQueryResponse, String> {
 
 `query_code_result` returns a typed `CodeQueryResponse`, not JSON. In the
 default results mode, `response.result()` returns the `CodeQueryResult`.
-Without `install_bifrost_semantic_model_packs()`, no shipped semantic pack
-activates in an embedding process. Constructing `SearchToolsService` owns
+Without `install_bifrost_semantic_model_packs()`, no semantic pack activates
+in an embedding process, even with `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` set. Constructing `SearchToolsService` owns
 workspace indexing and file watching for a long-lived integration.
 
 ## 5. Consume Every Result Variant

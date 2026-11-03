@@ -1,5 +1,6 @@
 use crate::analyzer::semantic::ids::ProgramPointId;
 
+use crate::analyzer::semantic::ids::SourceSpan;
 use crate::analyzer::semantic::ids::ValueId;
 
 use crate::analyzer::semantic::ir::ValueTransfer;
@@ -26,7 +27,19 @@ use crate::analyzer::semantic::ir::ProofStatus;
 
 use crate::analyzer::semantic::ir::SemanticCallSite;
 
+use crate::analyzer::semantic::SemanticCapability;
+use crate::analyzer::semantic::ir::AllocationKind;
+use crate::analyzer::semantic::ir::MemoryLocationKind;
+use crate::analyzer::semantic::ir::SemanticEffect;
+use crate::analyzer::semantic::ir::SemanticGapSubject;
 use crate::analyzer::semantic::ir::SemanticValueKind;
+use crate::analyzer::semantic::ir::TransferKind;
+use crate::analyzer::semantic::ir::ValueFlowKind;
+use crate::analyzer::semantic::oracle::value_flow::CollapseRead;
+use crate::analyzer::semantic::oracle::value_flow::ValueFlowEndpoint;
+use crate::analyzer::semantic::oracle::value_flow::ValueFlowRelationKind;
+use crate::analyzer::semantic::oracle::value_flow::ValueFlowSnapshot;
+use brokk_bifrost_core::analyzer::language_knowledge::ScalarObjectFieldKind;
 
 use crate::analyzer::semantic::ir::ValueHandle;
 
@@ -74,6 +87,454 @@ pub enum CallArgumentEndpoint {
         value: ValueHandle,
         location: Box<AccessPathAtPoint>,
     },
+}
+
+/// The storage relationship of an actual and its formal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallStorageSharing {
+    Shares,
+    Isolated,
+    Unknown,
+}
+
+/// The member of a by-value actual that a callee heap output writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallWrittenMember {
+    /// An exact direct field of the copied aggregate, with no traversal.
+    DirectField,
+    /// A path whose storage isolation is not established by the copy alone.
+    MayTraverseReferent,
+}
+
+/// Fields for which every matching store in the callee writes the formal's
+/// own cell. This is shared by composition and ICFG writeback. In particular,
+/// a single Field selector alone cannot exclude Rust DerefMut or a Go
+/// promoted field through an embedded pointer.
+pub fn direct_formal_store_fields(
+    callee: &ProcedureHandle,
+    formal: &crate::analyzer::semantic::partial_flow::PartialFlowPort,
+) -> Box<[crate::analyzer::semantic::SemanticLocator]> {
+    use crate::analyzer::semantic::partial_flow::PartialFlowPort;
+    use std::collections::{HashMap, HashSet};
+
+    let semantics = callee.semantics();
+    let formal_values = semantics
+        .values()
+        .iter()
+        .filter(|value| match (&value.kind, formal) {
+            (
+                SemanticValueKind::Parameter { ordinal: left, .. },
+                PartialFlowPort::Parameter { ordinal: right },
+            ) => left == right,
+            (SemanticValueKind::Receiver { .. }, PartialFlowPort::Receiver) => true,
+            _ => false,
+        })
+        .map(|value| value.id)
+        .collect::<HashSet<_>>();
+    // Adapters materialize a direct spelling of a formal (`p.f`) as a
+    // Temporary with one lexical Parameter/Receiver flow from the formal.
+    // A local alias has a Local flow instead and cannot certify this proof.
+    let mut direct_uses = HashSet::new();
+    let mut other_origins = HashSet::new();
+    for point in semantics.points() {
+        for event in &point.events {
+            match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                } if formal_values.contains(&source)
+                    && matches!(kind, ValueFlowKind::Parameter | ValueFlowKind::Receiver) =>
+                {
+                    direct_uses.insert(target);
+                }
+                SemanticEffect::ValueFlow { target, .. }
+                | SemanticEffect::Assignment { target, .. } => {
+                    other_origins.insert(target);
+                }
+                _ => {}
+            }
+        }
+    }
+    let blocked_points = semantics
+        .gaps()
+        .iter()
+        .filter(|gap| {
+            matches!(
+                gap.capability,
+                SemanticCapability::FieldMemory | SemanticCapability::Calls
+            ) || matches!(gap.subject, SemanticGapSubject::Point)
+                && gap.capability == SemanticCapability::Assignments
+        })
+        .map(|gap| gap.point)
+        .collect::<HashSet<_>>();
+    let mut fields = HashMap::new();
+    for point in semantics.points() {
+        let point_has_gap = blocked_points.contains(&point.id);
+        let point_dereferences = point.events.iter().any(|event| match event.effect {
+            SemanticEffect::MemoryLoad { location, .. }
+            | SemanticEffect::MemoryStore { location, .. } => {
+                semantics.memory_location(location).is_some_and(|location| {
+                    matches!(location.kind, MemoryLocationKind::Dereference { .. })
+                })
+            }
+            _ => false,
+        });
+        for event in &point.events {
+            let SemanticEffect::MemoryStore { location, .. } = event.effect else {
+                continue;
+            };
+            let Some(location) = semantics.memory_location(location) else {
+                continue;
+            };
+            let MemoryLocationKind::Field { base, ref member } = location.kind else {
+                continue;
+            };
+            let direct = (formal_values.contains(&base)
+                || direct_uses.contains(&base) && !other_origins.contains(&base))
+                && !point_has_gap
+                && !point_dereferences;
+            fields
+                .entry(member.clone())
+                .and_modify(|safe: &mut bool| *safe &= direct)
+                .or_insert(direct);
+        }
+    }
+    fields
+        .into_iter()
+        .filter_map(|(field, safe)| safe.then_some(field))
+        .collect()
+}
+
+/// Incoming value relations for one immutable procedure snapshot. Keep this
+/// alongside the snapshot only for the query that reads it.
+pub struct CallStorageRelationIndex {
+    incoming: std::collections::HashMap<ValueId, Vec<usize>>,
+    construction_points: std::collections::HashMap<SourceSpan, Vec<usize>>,
+    relation_count: usize,
+}
+
+impl CallStorageRelationIndex {
+    pub fn new(snapshot: &ValueFlowSnapshot) -> Self {
+        let mut incoming = std::collections::HashMap::<ValueId, Vec<usize>>::new();
+        for (index, relation) in snapshot.relations().iter().enumerate() {
+            if let ValueFlowEndpoint::Value(target) = &relation.target {
+                incoming.entry(target.id()).or_default().push(index);
+            }
+        }
+        let semantics = snapshot.procedure().semantics();
+        let mut construction_points = std::collections::HashMap::<SourceSpan, Vec<usize>>::new();
+        for (index, point) in semantics.points().iter().enumerate() {
+            let source = semantics
+                .source_mapping(point.source)
+                .expect("a point names its live source");
+            construction_points
+                .entry(source.locator.anchor().span())
+                .or_default()
+                .push(index);
+        }
+        Self {
+            incoming,
+            construction_points,
+            relation_count: snapshot.relations().len(),
+        }
+    }
+}
+
+/// Classify a call actual from structured value-flow origins. An untraced
+/// reference is unknown; an aggregate copy or a Rust struct allocation
+/// proves independent storage for a by-value formal.
+pub fn argument_shares_storage_with_formal(
+    actual: &CallArgumentEndpoint,
+    mode: CallPassingMode,
+    member: CallWrittenMember,
+    snapshot: &ValueFlowSnapshot,
+    index: &CallStorageRelationIndex,
+) -> CallStorageSharing {
+    if mode != CallPassingMode::Value {
+        return CallStorageSharing::Shares;
+    }
+    if matches!(actual, CallArgumentEndpoint::Location { .. }) {
+        return CallStorageSharing::Shares;
+    }
+    assert_eq!(index.relation_count, snapshot.relations().len());
+    let mut pending = vec![actual.value().id()];
+    let mut seen = std::collections::HashSet::new();
+    let mut isolated = false;
+    let mut unknown = false;
+    while let Some(value) = pending.pop() {
+        if !seen.insert(value) {
+            continue;
+        }
+        if snapshot
+            .procedure()
+            .semantics()
+            .value(value)
+            .is_some_and(|value| value.kind == SemanticValueKind::Address)
+        {
+            return CallStorageSharing::Shares;
+        }
+        let Some(relations) = index.incoming.get(&value) else {
+            unknown = true;
+            continue;
+        };
+        // A collapse records a member's contribution to an aggregate's
+        // contents, not another storage origin for its own direct cells. A
+        // proven copy isolates those cells even when another member is a
+        // pointer. Traversal through that member still needs scalar proof.
+        let has_direct_copy = member == CallWrittenMember::DirectField
+            && has_proven_value_transfer(snapshot, index, value);
+        for &relation_index in relations {
+            let relation = &snapshot.relations()[relation_index];
+            if !relation.is_proven_complete() {
+                unknown = true;
+                continue;
+            }
+            match (relation.kind, relation.transfer, &relation.source) {
+                (ValueFlowRelationKind::Allocation, _, _)
+                    if scalar_object_allocation(snapshot, index, value) =>
+                {
+                    isolated = true
+                }
+                // A by-value let also publishes its own fresh Allocation.
+                // The proven copy, rather than that allocation's fields,
+                // certifies isolation of this value's direct cells.
+                (ValueFlowRelationKind::Allocation, _, _) if has_direct_copy => {}
+                (
+                    ValueFlowRelationKind::Assignment,
+                    Some(transfer),
+                    ValueFlowEndpoint::Value(source),
+                ) if matches!(transfer.kind, TransferKind::AggregateCopy | TransferKind::Move { .. })
+                    && (member == CallWrittenMember::DirectField
+                        || scalar_object_origin(snapshot, index, source.id())) =>
+                {
+                    isolated = true
+                }
+                (ValueFlowRelationKind::Assignment, None, ValueFlowEndpoint::Value(source))
+                    if member == CallWrittenMember::DirectField
+                        && relations.iter().any(|&other| {
+                            let copy = &snapshot.relations()[other];
+                            copy.is_proven_complete()
+                                && copy.kind == ValueFlowRelationKind::Assignment
+                                && copy.transfer.is_some_and(|transfer| matches!(transfer.kind, TransferKind::AggregateCopy | TransferKind::Move { .. }))
+                                && matches!(&copy.source, ValueFlowEndpoint::Value(from) if from.id() == source.id())
+                        }) => {}
+                (ValueFlowRelationKind::Assignment, None, ValueFlowEndpoint::Value(source)) => {
+                    pending.push(source.id());
+                }
+                (
+                    ValueFlowRelationKind::ContainerCollapse,
+                    _,
+                    ValueFlowEndpoint::Location(location),
+                ) if has_direct_copy
+                    && relation.collapse_read == Some(CollapseRead::Root)
+                    && matches!(location.path().root(),
+                        crate::analyzer::semantic::AccessPathRoot::Value(root)
+                            if relations.iter().any(|&other| {
+                                let copy = &snapshot.relations()[other];
+                                copy.is_proven_complete()
+                                    && copy.kind == ValueFlowRelationKind::Assignment
+                                    && copy.transfer.is_some_and(|transfer| matches!(transfer.kind, TransferKind::AggregateCopy | TransferKind::Move { .. }))
+                                    && matches!(&copy.source, ValueFlowEndpoint::Value(source) if source.id() == root.id())
+                            })) => {}
+                (
+                    ValueFlowRelationKind::ContainerCollapse,
+                    _,
+                    ValueFlowEndpoint::Location(location),
+                ) if matches!(location.path().root(),
+                        crate::analyzer::semantic::AccessPathRoot::Allocation(allocation)
+                            if snapshot.procedure().semantics().allocations().iter().any(|site|
+                                site.id == allocation.id()
+                                    && scalar_object_allocation(snapshot, index, site.result)))
+                    || relation.collapse_read == Some(CollapseRead::Root)
+                        && matches!(location.path().root(),
+                            crate::analyzer::semantic::AccessPathRoot::Value(root)
+                                if scalar_object_origin(snapshot, index, root.id())) => {}
+                _ => unknown = true,
+            }
+        }
+    }
+    if unknown || !isolated {
+        CallStorageSharing::Unknown
+    } else {
+        CallStorageSharing::Isolated
+    }
+}
+
+fn has_proven_value_transfer(
+    snapshot: &ValueFlowSnapshot,
+    index: &CallStorageRelationIndex,
+    value: ValueId,
+) -> bool {
+    index.incoming.get(&value).is_some_and(|relations| {
+        relations.iter().any(|&relation_index| {
+            let relation = &snapshot.relations()[relation_index];
+            relation.is_proven_complete()
+                && relation.kind == ValueFlowRelationKind::Assignment
+                && relation.transfer.is_some_and(|transfer| {
+                    matches!(
+                        transfer.kind,
+                        TransferKind::AggregateCopy | TransferKind::Move { .. }
+                    )
+                })
+        })
+    })
+}
+
+/// Follow only proven value copies to an object whose members cannot carry
+/// addresses. A missing or mixed origin leaves a collapsed member unknown.
+fn scalar_object_origin(
+    snapshot: &ValueFlowSnapshot,
+    index: &CallStorageRelationIndex,
+    root: ValueId,
+) -> bool {
+    let mut pending = vec![(root, false)];
+    let mut active = std::collections::HashSet::new();
+    let mut done = std::collections::HashSet::new();
+    let mut allocation = false;
+    while let Some((value, exiting)) = pending.pop() {
+        if exiting {
+            active.remove(&value);
+            done.insert(value);
+            continue;
+        }
+        if done.contains(&value) {
+            continue;
+        }
+        if !active.insert(value) {
+            return false;
+        }
+        pending.push((value, true));
+        if snapshot
+            .procedure()
+            .semantics()
+            .value(value)
+            .is_some_and(|row| row.kind == SemanticValueKind::Address)
+        {
+            return false;
+        }
+        let Some(relations) = index.incoming.get(&value) else {
+            return false;
+        };
+        for &relation_index in relations {
+            let relation = &snapshot.relations()[relation_index];
+            if !relation.is_proven_complete() {
+                return false;
+            }
+            match (relation.kind, relation.transfer, &relation.source) {
+                (ValueFlowRelationKind::Allocation, _, _)
+                    if scalar_object_allocation(snapshot, index, value) =>
+                {
+                    allocation = true;
+                }
+                (ValueFlowRelationKind::Assignment, None, ValueFlowEndpoint::Value(source)) => {
+                    pending.push((source.id(), false));
+                }
+                (
+                    ValueFlowRelationKind::Assignment,
+                    Some(transfer),
+                    ValueFlowEndpoint::Value(source),
+                ) if transfer.kind == TransferKind::AggregateCopy => {
+                    pending.push((source.id(), false));
+                }
+                _ => return false,
+            }
+        }
+    }
+    allocation
+}
+
+fn scalar_object_allocation(
+    snapshot: &ValueFlowSnapshot,
+    index: &CallStorageRelationIndex,
+    value: ValueId,
+) -> bool {
+    let semantics = snapshot.procedure().semantics();
+    let language = snapshot.procedure().artifact().key().language().language();
+    let Some(knowledge) = crate::analyzer::semantic::languages::language_knowledge(language) else {
+        return false;
+    };
+    let Some(allocation) = semantics
+        .allocations()
+        .iter()
+        .find(|allocation| allocation.result == value && allocation.kind == AllocationKind::Object)
+    else {
+        return false;
+    };
+    // A partial struct update can store scalar fields while leaving an
+    // omitted reference field unresolved. Its value-scoped initialization
+    // gap is outside the relation projection, so check the snapshot itself.
+    if semantics.gaps().iter().any(|gap| {
+        !snapshot.gap_is_discharged(gap.id)
+            && match gap.subject {
+                SemanticGapSubject::Value(subject) if subject == value => {
+                    gap.capability == SemanticCapability::FieldMemory
+                        || gap.point == allocation.point
+                }
+                SemanticGapSubject::MemoryLocation(location)
+                    if gap.capability == SemanticCapability::FieldMemory =>
+                {
+                    semantics.memory_location(location).is_some_and(|location| {
+                        matches!(location.kind, MemoryLocationKind::Field { base, .. } if base == value)
+                    })
+                }
+                _ => false,
+            }
+    }) {
+        return false;
+    }
+    let construction_span = semantics
+        .source_mapping(allocation.source)
+        .expect("an allocation names its live source")
+        .locator
+        .anchor()
+        .span();
+    let mut fields = 0;
+    // Go allocates at the composite literal's entry point and stores fields
+    // at its terminal point. Both points retain that literal's source span.
+    let Some(points) = index.construction_points.get(&construction_span) else {
+        return false;
+    };
+    for &point_index in points {
+        let point = &semantics.points()[point_index];
+        for event in &point.events {
+            if let SemanticEffect::MemoryStore {
+                location,
+                value: field_value,
+                ..
+            } = event.effect
+                && let Some(location) = semantics.memory_location(location)
+                && matches!(&location.kind, MemoryLocationKind::Field { base, .. } if *base == value)
+            {
+                let field_kind = semantics
+                    .value(field_value)
+                    .and_then(|field| match &field.kind {
+                        SemanticValueKind::Boolean(_) => Some(ScalarObjectFieldKind::Boolean),
+                        SemanticValueKind::UnsignedInteger(_)
+                        | SemanticValueKind::SignedInteger(_)
+                        | SemanticValueKind::FloatingPoint { .. } => {
+                            Some(ScalarObjectFieldKind::Number)
+                        }
+                        SemanticValueKind::ConstantString(payload)
+                            if knowledge.semantic_string_constant_value(payload).is_some() =>
+                        {
+                            Some(ScalarObjectFieldKind::String)
+                        }
+                        _ => None,
+                    });
+                if !field_kind.is_some_and(|kind| knowledge.scalar_object_field_is_copy(kind)) {
+                    return false;
+                }
+                fields += 1;
+            }
+            if let SemanticEffect::ValueFlow { target, .. } = event.effect
+                && target == value
+            {
+                return false;
+            }
+        }
+    }
+    fields > 0
 }
 
 impl CallArgumentEndpoint {

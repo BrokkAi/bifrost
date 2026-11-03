@@ -484,6 +484,9 @@ native_point_canonical_leaves!(
     bool,
     usize,
     u32,
+    // A call-binding discharge digest names frozen selected evidence, not a
+    // context-local SemanticId; it replays with the same read ledger.
+    [u8; 32],
     crate::analyzer::CodeUnit,
     crate::analyzer::ProjectFile,
     crate::analyzer::Range,
@@ -878,7 +881,7 @@ pub fn resolve_native_definition_bounded<A: LanguageAdapter>(
     ) -> crate::analyzer::store::Result<NativePointContext>,
     after_open: impl FnOnce(),
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    resolve_native_definition_reference(
+    match resolve_native_definition_reference(
         inner,
         NativePointReference {
             #[cfg(any(test, feature = "test-support"))]
@@ -889,7 +892,18 @@ pub fn resolve_native_definition_bounded<A: LanguageAdapter>(
         },
         prepare_context,
         after_open,
-    )
+        |_| (),
+    ) {
+        BoundedResolution::Complete {
+            value: (outcome, _),
+            work,
+        } => BoundedResolution::Complete {
+            value: outcome,
+            work,
+        },
+        BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+        BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -906,6 +920,47 @@ pub fn resolve_native_definition_bounded_in_batch<A: LanguageAdapter>(
     ) -> crate::analyzer::store::Result<NativePointContext>,
     after_open: impl FnOnce(),
 ) -> BoundedResolution<DefinitionLookupOutcome> {
+    match resolve_native_definition_reference(
+        inner,
+        NativePointReference {
+            batch,
+            query,
+            namespace: reference_namespace,
+            call_argument_ordinal: None,
+        },
+        prepare_context,
+        after_open,
+        |_| (),
+    ) {
+        BoundedResolution::Complete {
+            value: (outcome, _),
+            work,
+        } => BoundedResolution::Complete {
+            value: outcome,
+            work,
+        },
+        BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+        BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+    }
+}
+
+/// Retain a selected query's structured binding evidence before navigation
+/// renders its diagnostic identities. The callback observes this answer only.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn resolve_native_definition_answer_bounded_in_batch<A: LanguageAdapter, T>(
+    inner: &TreeSitterAnalyzer<A>,
+    query: BoundedReceiverQuery<'_>,
+    reference_namespace: Option<ResolutionNamespace>,
+    batch: Option<&NativePointBatch>,
+    prepare_context: impl FnOnce(
+        &SelectedResolutionOperation<'_, '_>,
+        &str,
+        &CancellationToken,
+    ) -> crate::analyzer::store::Result<NativePointContext>,
+    after_open: impl FnOnce(),
+    project: impl FnOnce(&SelectedNativeReferenceUnits) -> T,
+) -> BoundedResolution<(DefinitionLookupOutcome, Option<T>)> {
     resolve_native_definition_reference(
         inner,
         NativePointReference {
@@ -916,10 +971,11 @@ pub fn resolve_native_definition_bounded_in_batch<A: LanguageAdapter>(
         },
         prepare_context,
         after_open,
+        project,
     )
 }
 
-fn resolve_native_definition_reference<A: LanguageAdapter>(
+fn resolve_native_definition_reference<A: LanguageAdapter, T>(
     inner: &TreeSitterAnalyzer<A>,
     reference: NativePointReference<'_>,
     prepare_context: impl FnOnce(
@@ -928,7 +984,8 @@ fn resolve_native_definition_reference<A: LanguageAdapter>(
         &CancellationToken,
     ) -> crate::analyzer::store::Result<NativePointContext>,
     after_open: impl FnOnce(),
-) -> BoundedResolution<DefinitionLookupOutcome> {
+    project: impl FnOnce(&SelectedNativeReferenceUnits) -> T,
+) -> BoundedResolution<(DefinitionLookupOutcome, Option<T>)> {
     let query = reference.query;
     resolve_native_point_bounded(
         inner,
@@ -948,6 +1005,7 @@ fn resolve_native_definition_reference<A: LanguageAdapter>(
         |answer, work, selected_import_model| match answer.definitions {
             SelectedNativeDefinitions::Cancelled => BoundedResolution::Cancelled { work },
             _ => {
+                let projected = project(&answer);
                 let obligations = answer.query_obligations.clone();
                 let owners = answer.absent_member_owners.clone();
                 let mut value = adapt_definition_answer_impl(
@@ -963,10 +1021,13 @@ fn resolve_native_definition_reference<A: LanguageAdapter>(
                 // Interpret absence before adding independent selected-environment scope.
                 state_absent_member(&mut value, member, &owners);
                 append_query_obligation_diagnostics(&mut value, &obligations);
-                BoundedResolution::Complete { value, work }
+                BoundedResolution::Complete {
+                    value: (value, Some(projected)),
+                    work,
+                }
             }
         },
-        unavailable_definition,
+        |site, kind, message| (unavailable_definition(site, kind, message), None),
     )
 }
 
@@ -1130,6 +1191,12 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
             }
             SelectedResolutionOperationOpenOutcome::Cancelled => return Ok(cancelled()),
         };
+        // This handle retains only the finite implicit roots for this operation's
+        // scope and epoch, and dies with the point query. Export inside its capture.
+        let mut root_read_guard = crate::analyzer::root_presence::RootPresenceExportGuard {
+            analyzer: query.analyzer,
+            handle: Some(operation.root_presence_read_handle()),
+        };
         #[cfg(any(test, feature = "test-support"))]
         NATIVE_POINT_OPERATION_OPEN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         #[cfg(any(test, feature = "test-support"))]
@@ -1193,6 +1260,7 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
             &cancellation,
             selected_import_gap,
         )?;
+        root_read_guard.export_now();
         Ok(match result {
             BoundedResolution::Exceeded { limit, work } => {
                 BoundedResolution::Exceeded { limit, work }

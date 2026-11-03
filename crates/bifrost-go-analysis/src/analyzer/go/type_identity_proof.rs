@@ -124,6 +124,7 @@ pub fn go_native_error_function_value_obligation(
     file: &ProjectFile,
     range: Range,
     result_ordinal: u32,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Option<NativeResultObligation> {
     let identity =
         crate::analyzer::usages::get_definition::go::go_function_value_result_type_identity(
@@ -131,6 +132,7 @@ pub fn go_native_error_function_value_obligation(
             file,
             range,
             usize::try_from(result_ordinal).ok()?,
+            cancellation,
         )?;
     let Some(StructuredTypeNodeView::Named(name)) = identity.view(identity.root_id()) else {
         return None;
@@ -308,10 +310,31 @@ pub fn go_explicit_binding_type_identity(
 ) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
     Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
 > {
+    go_explicit_binding_declared_type(analyzer, file, source, binding, cancellation)
+        .map(|selected| selected.canonical)
+}
+
+pub(crate) struct GoExplicitBindingDeclaredType {
+    pub canonical: Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
+    pub nominal: Option<CodeUnit>,
+}
+
+pub(crate) fn go_explicit_binding_declared_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    binding: Range,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
+    GoExplicitBindingDeclaredType,
+> {
     use super::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
     use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
     let unknown = || BoundedResolution::Complete {
-        value: None,
+        value: GoExplicitBindingDeclaredType {
+            canonical: None,
+            nominal: None,
+        },
         work: Default::default(),
     };
     if cancellation.is_cancelled() {
@@ -441,6 +464,7 @@ pub(super) fn explicit_binding_type_node(
     }
     let declaration = name.parent()?;
     if !matches!(declaration.kind(), "var_spec" | "parameter_declaration")
+        || declaration.has_error()
         || !node_has_field_child(declaration, "name", name)
         || (declaration.kind() == "parameter_declaration"
             && parameter_has_generic_callable_context(declaration, &mut scope_step))
@@ -448,6 +472,9 @@ pub(super) fn explicit_binding_type_node(
         return None;
     }
     let type_node = declaration.child_by_field_name("type")?;
+    if type_node.has_error() {
+        return None;
+    }
     (name.end_byte() <= type_node.start_byte()).then_some(type_node)
 }
 

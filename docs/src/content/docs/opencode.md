@@ -10,12 +10,12 @@ OpenCode can use Bifrost in two ways:
 - OpenCode's MCP client can start `bifrost --mcp` for Bifrost's analyzer
   tools, such as `get_summaries` and `query_code`.
 
-:::caution[bifrost-lsp is not released yet]
+:::caution[The language server moved to bifrost-lsp]
 Bifrost built after release 0.12.0 does not serve LSP: `bifrost --lsp` exits
-with an error. The language server is now the separate `bifrost-lsp` program, and
-`bifrost-lsp` has no release yet. The `lsp` configuration below is ready for
-its first release. The `mcp` configuration works now. See
-[LSP Server](/lsp/).
+with an error. Install the separate `bifrost-lsp` program for the `lsp`
+configuration below. See
+[LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md)
+for releases and supported versions. The `mcp` configuration uses the Bifrost CLI.
 :::
 
 For OpenCode's underlying host conventions, see the official

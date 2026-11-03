@@ -76,6 +76,9 @@ impl AnalyzerExecutionPool {
 
     /// Wait for a slot without blocking a runtime worker thread.
     pub async fn acquire(&self, cancelled: &CancellationToken) -> Admission {
+        if cancelled.is_cancelled() {
+            return Admission::Cancelled;
+        }
         // Free capacity is taken without ever entering the queue, so ordinary
         // traffic cannot exhaust the backlog allowance.
         if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
@@ -85,10 +88,11 @@ impl AnalyzerExecutionPool {
             return Admission::Saturated;
         };
         tokio::select! {
+            biased;
+            () = cancelled.cancelled() => Admission::Cancelled,
             permit = Arc::clone(&self.slots).acquire_owned() => Admission::Granted(AnalyzerPermit(Some(
                 permit.expect("the analyzer pool semaphore is never closed"),
             ))),
-            () = cancelled.cancelled() => Admission::Cancelled,
         }
     }
 }
@@ -102,6 +106,7 @@ impl Default for AnalyzerExecutionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     fn granted(admission: Admission) -> AnalyzerPermit {
@@ -110,6 +115,22 @@ mod tests {
             Admission::Cancelled => panic!("expected admission, got cancelled"),
             Admission::Saturated => panic!("expected admission, got saturated"),
         }
+    }
+
+    #[tokio::test]
+    #[hardwon("dc3335c4250e: a cancelled request acquired an idle analyzer slot")]
+    async fn cancelled_request_never_enters_analyzer_with_idle_capacity() {
+        let pool = AnalyzerExecutionPool::new(1, 0);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            pool.acquire(&cancelled).await,
+            Admission::Cancelled
+        ));
+        assert!(matches!(
+            pool.acquire(&CancellationToken::new()).await,
+            Admission::Granted(_)
+        ));
     }
 
     #[tokio::test]

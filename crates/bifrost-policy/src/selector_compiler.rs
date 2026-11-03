@@ -3459,6 +3459,22 @@ pub(super) fn selected_site_quality(
                 ProofStatus::Proven,
                 topology_completeness(value.completeness),
             ),
+            // An undecided build constraint makes the selector's evidence
+            // partial: the row cannot say whether the file is built (#9048).
+            CodeQueryResultValue::BuildConfiguration { value } => (
+                ProofStatus::Proven,
+                if value.file_status == "unknown"
+                    || value.os_scope == "unknown"
+                    || value.arch_scope == "unknown"
+                {
+                    EvidenceCompleteness::Partial(
+                        "the file's build constraint is undecided under its build configuration"
+                            .into(),
+                    )
+                } else {
+                    EvidenceCompleteness::Complete
+                },
+            ),
             // A rewrite-path row states its own per-domain completeness the
             // same way, so a derivation that could not run makes the
             // selector's evidence partial rather than silently complete

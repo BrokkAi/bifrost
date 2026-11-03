@@ -263,16 +263,100 @@ pub const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // Batch 676be8c9: combine #7027 S2b-0 (v352) with master (v367); the two halves move together.
 // #7960: a JavaScript call's thrown value now binds the enclosing catch parameter, so
 // interprocedural exceptional flow changes; assigned above master v368/v367.
+// Merge #8741 with master v368/v367; the two halves move together.
+// Merge #8741 with master v376/v375 at the coordinator-assigned v384/v383; the two halves move together.
+// #7619: parameterized JDK call results bind type-parameter-free receiver members.
+// Coordinator reassigned the #7619 pair above master v439/v438.
 // #8792: explicit Kotlin lambda parameters now publish lexical binders.
 // Coordinator reassigned this pair to v402/v401 above master v376/v375.
 // Batch 30414977: combine #8820 (v402) with master (v376); the two halves move together.
 // #8836: revert #7960, so JavaScript call throws no longer bind catch parameters;
 // assigned above master v376/v375 and every open pull request's pair (up to v388/v387).
 // Batch 30414977: combine #8844 (v394) with #8820 (v403); the two halves move together.
+// #7509 3a: Go call application roles come from selected native evidence, so a method expression
+// on a parenthesized type operand is now Unknown; assigned above master v404/v403.
 // #8872: preserve proven JS/TS package-module receiver identities across the
 // available neutral gate; coordinator assigned v428/v427 above master v404/v403.
+// #7509 5b step 1: Go source selector refinement takes owner, member, receiver preparation, field
+// anchor and the interface trigger from selected native evidence; assigned above master v404/v403.
+// Batch 66a984a8: combine #8881 (v428) with #8888 (v436); the two halves move together.
+// Batch 66a984a8 promotion: combine master #8874 (v426) with this batch (v437); the two halves move together.
+// #8388: Go builtin shadows can no longer refine an open ICFG snapshot to Complete;
+// re-rung to v438 above master v426 and ready #8888 (v436).
+// Batch c536ab7b: combine master (v438) with #8895 (v438); the two halves move together.
+// Merge: combine #8888 (v436) with master #8874 (v426); the two halves move together.
+// #7509 5b step 2: Go allocation dispatch narrowing takes the allocation type and member from
+// selected native evidence; assigned above master v426/v425 and the reserved v438 and v440.
+// Batch 7dd04e18: combine master (v439) with #8901 (v442); the two halves move together.
+// #8823: retain binary JDK type-parameter scope in merged dependency packs; assigned above
+// master v439/v438.
+// Batch 7dd04e18 update: combine master #8823 (v462) with this batch (v443); the two halves move together.
+// #8870: composed entry-point origins change policy answers;
+// re-rung to v446 above master v439 and the ready and reserved pairs (up to v444).
+// Batch 7880504b promotion: combine master (v463) with #8903 (v446); the two halves move together.
+// #7509: a Go function-valued field call has no bound receiver; assigned above master
+// v462/v461 and the open reservations.
+// Batch 9dd7ee48: combine master (v464) with #8916 (v476); the two halves move together.
+// #8866: Rust method receivers proven through ?, unwrap and expect on std Option/Result now bind modeled targets; coordinator-assigned v474/v473.
+// Batch 7e70b7bc: combine master (v464) with #8866 (v474) and #8884 (v470); the two halves move together.
+// #8884: Rust external receiver, member and type proofs read imports from the selected operation
+// instead of live pooled imports; coordinator-assigned v470/v469 as conservative authority invalidation.
+// Batch 7e70b7bc promotion: combine master (v477) with this batch (v475); the two halves move together.
+// #8822: closed C# derivations remain resolved under an open compilation inventory; assigned
+// above master v464/v463.
+// Batch d50922f0: combine master (v477) with #8924 (v482); the two halves move together.
+// #7509 5b step 3: Go nested-call result counts come from the selected native definition's
+// signature instead of the legacy source inference; assigned above master and open reservations.
+// Batch d50922f0: combine this batch (v483) with #8928 (v486); the two halves move together.
+// Batch d50922f0 promotion: combine master (v478) with this batch (v487); the two halves move together.
+// #8803: C# enclosing namespace scope selection changes resolved type and member answers.
+// Coordinator reassigned the #7619 pair to v498/v497 above master v489/v488.
+// #7509 G2: Go interface satisfaction proves slice, map and predeclared error signature
+// identity, and shared projected shapes fold every node's completion; assigned above master.
+// #7869: an unacquired JVM package provider is a per-reference obligation, and a targetless answer stays open (rung v480, coordinator).
+// Batch 5aea0d33: combine master (v488) with #8679 (v480); the two halves move together.
+// #8870: composed store ends change the workspace taint behavior identity;
+// coordinator assigned v496/v495 above master v489/v488 and every reserved pair.
+// Batch 8da812cd promotion: combine master (v490) with this batch (v496); the two halves move together.
+// #8870: composed flow policies change endpoint inventory and candidate answers.
+// Set to v506/v505, the coordinator's assignment above master v497/v496 and the open pairs through v504.
+// Batch 5b711078: combine master and #7728 (v497, v498); the two halves move together.
+// #8487: selected Java on-demand package outcomes reach the reference frame (rung v508, coordinator).
+// #8992: glob admission requires a provider-declared owner before shadowing default gaps (rung v516, coordinator).
+// Batch 5b711078: combine master and #8915 (v499, v516); the two halves move together.
+// Batch 5b711078: combine master and #8973 (v504, v517); the two halves move together.
+// Batch 6a13abe4 promotion: combine master (v518) with #8995 (v506); the two halves move together.
+// #7804: Java expression chains take rooted package and type routes, and a targetless answer needs language-owned terminal proof to close; coordinator assigned v522 above master v518.
+// Batch 565a8ef8: combine master (v519) with #7804 (v522); the two halves move together.
+// Batch 7dcb059c: combine master (v523) with #9034 (v532); the two halves move together.
+// #9063: a certified same-depth Go promotion collision leaves the method set, which changes satisfaction answers behind the native family and incoming-call recipients; coordinator assigned v540 above master v533.
+// Batch 378fac65: combine master (v533) with #9063 (v540); the two halves move together.
+// #9053: Go model-interface calls keep a reference receiver preparation and the declaring
+// member's identity while dispatch stays open; set to v548 above master v541 and open pairs through v544.
+// #8834: selected JVM root presence reads are verified before implicit-root answers are reused;
+// coordinator assigned v514/v513 above master v497/v496 and every reserved pair.
+// Coordinator re-assigned the #8834 pair to v524/v523 above master v518/v517.
+// Coordinator re-assigned the #8834 pair to v542/v541 above master v533/v532 and the reserved pairs through v540.
+// Coordinator re-assigned the #8834 pair to v550/v549 above master v548/v547 and the reserved pairs.
+// Batch 02d43023 (#8834): combine v548 with v550; the two halves move together.
+// #8811: closed relation discharges replay before a newly built request consumes its answer.
+// Coordinator reassigned the #8811 pair to v494/v493 above master v489/v488.
+// Coordinator reassigned the #8811 pair to v510/v509 above master v497/v496.
+// Coordinator re-assigned the #8811 pair to v526/v525 above master v518/v517.
+// Coordinator re-assigned the #8811 pair to v544/v543 above master v533/v532 and the reserved pairs through v540.
+// Coordinator re-assigned the #8946 pair to v552/v551 above master v548/v547 and the reserved pairs.
+// Batch 02d43023 (#8946): combine v551 with v552; the two halves move together.
+// #9101: member selection on a model-declared Go interface no longer marks the promotion
+// frontier unavailable; coordinator assigned v558 above master v548.
+// Batch e4fc49ee (#9101): combine master v553 with #9101 v558 as max + 1; the two halves move together.
+// #9050: Rust type lookup answers model-declared external types, and an unprojectable external type identity no longer makes the type operation unavailable, which changes resolved type and member answers; coordinator assigned v550 above master v541.
+// Merge for #9050: combine master (v548) with #9050 (v550); the two halves move together.
+// Merge for #9050: combine master (v553) with #9050 (v551); the two halves move together.
+// Merge for #9050: combine master (v559) with #9050 (v554); the two halves move together.
+// #8929 (#8896): member reads cross content-preserving argument copies in call plans;
+// coordinator assigned v562/v561 above master v560/v559 and every reserved pair.
 pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v428";
+    b"bifrost-icfg-provider/workspace-behavior/v562";
 
 /// The domain of the same behavior without the workspace's content identity.
 ///
@@ -361,13 +445,83 @@ pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // Batch c1b44b74: combine #8667 (v363) with #7509 G1b-3 G (v365); the two halves move together.
 // Batch 676be8c9: combine #7027 S2b-0 (v351) with master (v366); the two halves move together.
 // #7960: rotate read-side reuse built before JavaScript call throws reached catch binders.
+// Merge #8741 with master v368/v367; the two halves move together.
+// Merge #8741 with master v376/v375 at the coordinator-assigned v384/v383; the two halves move together.
+// #7619: rotate read-side reuse with projected JDK call-result receiver binding.
 // #8792: rotate read-side reuse for the Kotlin lambda binder facts.
 // Batch 30414977: combine #8820 (v402) with master (v376); the two halves move together.
 // #8836: rotate read-side reuse built while JavaScript call throws reached catch binders.
 // Batch 30414977: combine #8844 (v394) with #8820 (v403); the two halves move together.
+// #7509 3a: rotate read-side reuse built when the legacy Go binding walk chose call roles.
 // #8872: rotate read-side reuse that discarded proven package-module receivers.
+// #7509 5b step 1: rotate read-side reuse built from the legacy Go typed selector target.
+// Batch 66a984a8: combine #8881 (v427) with #8888 (v435); the two halves move together.
+// Batch 66a984a8 promotion: combine master #8874 (v425) with this batch (v436); the two halves move together.
+// #8388: invalidate read reuse that treated shadowed Go builtins as complete.
+// Batch c536ab7b: combine master (v437) with #8895 (v437); the two halves move together.
+// Merge: combine #8888 (v435) with master #8874 (v425); the two halves move together.
+// #7509 5b step 2: rotate read-side reuse built from the legacy Go allocation selector inference.
+// Batch 7dd04e18: combine master (v438) with #8901 (v441); the two halves move together.
+// #8823: rotate read-side reuse built while the generated JDK pack was rejected.
+// Batch 7dd04e18 update: combine master #8823 (v461) with this batch (v442); the two halves move together.
+// #8870: composed entry-point origins change read-side answers.
+// Batch 7880504b promotion: combine master (v462) with #8903 (v445); the two halves move together.
+// #7509: rotate reads built with a bound receiver for a function-valued field.
+// Batch 9dd7ee48: combine master (v463) with #8916 (v475); the two halves move together.
+// #8866: rotate read-side reuse built while unwrapped Rust receivers stayed unresolved.
+// Batch 7e70b7bc: combine master (v463) with #8866 (v473) and #8884 (v469); the two halves move together.
+// #8884: rotate read-side reuse built while Rust external proofs read live pooled imports.
+// Batch 7e70b7bc promotion: combine master (v476) with this batch (v474); the two halves move together.
+// #8822: rotate read-side reuse for closed C# inventory derivations.
+// Batch d50922f0: combine master (v476) with #8924 (v481); the two halves move together.
+// #7509 5b step 3: rotate read-side reuse built from legacy Go nested-call count inference.
+// Batch d50922f0: combine this batch (v482) with #8928 (v485); the two halves move together.
+// Batch d50922f0 promotion: combine master (v477) with this batch (v486); the two halves move together.
+// #8803: rotate read-side reuse for C# enclosing namespace scope selection.
+// Coordinator reassigned the #7619 pair to v498/v497 above master v489/v488.
+// #7509 G2: rotate read-side reuse built while structural signature slots were never proven.
+// #7869: rotate read-side reuse with per-reference JVM provider obligations (rung v479, coordinator).
+// Batch 5aea0d33: combine master (v487) with #8679 (v479); the two halves move together.
+// #8870: composed store ends change the workspace taint read behavior identity;
+// coordinator assigned v496/v495 above master v489/v488 and every reserved pair.
+// Batch 8da812cd promotion: combine master (v489) with this batch (v495); the two halves move together.
+// #8870: composed flow policies read the complete endpoint inventory.
+// Set to v506/v505, the coordinator's assignment above master v497/v496 and the open pairs through v504.
+// Batch 5b711078: combine master and #7728 (v496, v497); the two halves move together.
+// #8487: rotate read-side reuse with frame-owned Java package outcomes (rung v507, coordinator).
+// #8992: rotate read-side reuse with declared-owner glob admission (rung v515, coordinator).
+// Batch 5b711078: combine master and #8915 (v498, v515); the two halves move together.
+// Batch 5b711078: combine master and #8973 (v503, v516); the two halves move together.
+// Batch 6a13abe4 promotion: combine master (v517) with #8995 (v505); the two halves move together.
+// #7804: rotate read-side reuse with rooted Java expression prefixes and targetless terminal proof; coordinator assigned v521 above master v517.
+// Batch 565a8ef8: combine master (v518) with #7804 (v521); the two halves move together.
+// Batch 7dcb059c: combine master (v522) with #9034 (v531); the two halves move together.
+// #9063: rotate read-side reuse with certified Go method-set collisions; coordinator assigned v539 above master v532.
+// Batch 378fac65: combine master (v532) with #9063 (v539); the two halves move together.
+// #9053: rotate read-side reuse built while Go model-interface calls had no receiver preparation.
+// #8834: rotate read-side reuse built before selected JVM root presence reads were recorded;
+// coordinator assigned v514/v513 above master v497/v496 and every reserved pair.
+// Coordinator re-assigned the #8834 pair to v524/v523 above master v518/v517.
+// Coordinator re-assigned the #8834 pair to v542/v541 above master v533/v532 and the reserved pairs through v540.
+// Coordinator re-assigned the #8834 pair to v550/v549 above master v548/v547 and the reserved pairs.
+// Batch 02d43023 (#8834): combine v547 with v549; the two halves move together.
+// #8811: the same replay change rotates read-side answer reuse.
+// Coordinator reassigned the #8811 pair to v494/v493 above master v489/v488.
+// Coordinator reassigned the #8811 pair to v510/v509 above master v497/v496.
+// Coordinator re-assigned the #8811 pair to v526/v525 above master v518/v517.
+// Coordinator re-assigned the #8811 pair to v544/v543 above master v533/v532 and the reserved pairs through v540.
+// Coordinator re-assigned the #8946 pair to v552/v551 above master v548/v547 and the reserved pairs.
+// Batch 02d43023 (#8946): combine v550 with v551; the two halves move together.
+// #9101: rotate read-side reuse built while model-interface member selection was incomplete; coordinator assigned v557 above master v547.
+// Batch e4fc49ee (#9101): combine master v552 with #9101 v557 as max + 1; the two halves move together.
+// #9050: rotate read-side reuse built while Rust type lookup ignored model-declared external types; coordinator assigned v549 above master v540.
+// Merge for #9050: combine master (v547) with #9050 (v549); the two halves move together.
+// Merge for #9050: combine master (v552) with #9050 (v550); the two halves move together.
+// Merge for #9050: combine master (v558) with #9050 (v553); the two halves move together.
+// #8929 (#8896): read-side ICFG plans include copied argument members;
+// v561 is the paired coordinator-assigned read behavior domain.
 pub const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v427";
+    b"bifrost-icfg-provider/workspace-read-behavior/v561";
 
 #[cfg(test)]
 mod domain_tests {

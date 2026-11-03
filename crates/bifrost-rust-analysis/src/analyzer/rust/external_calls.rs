@@ -106,19 +106,42 @@ fn native_external_root(
     tree: &Tree,
     root: Node<'_>,
     cancellation: Option<&CancellationToken>,
+    imports: Option<&[ImportInfo]>,
     operation_factory: Option<&native_points::RustDefinitionOperationFactory<'_>>,
-    operation: Option<
+    mut operation: Option<
         &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
     >,
 ) -> bool {
+    let selected_imports;
+    let imports = if let Some(imports) = imports {
+        imports
+    } else if let Some(selected) = operation.as_deref_mut() {
+        let cancellation = cancellation.cloned().unwrap_or_default();
+        let Some(imports) = crate::analyzer::rust::std_types::selected_import_infos(
+            analyzer,
+            selected,
+            file,
+            &cancellation,
+        ) else {
+            return false;
+        };
+        selected_imports = imports;
+        &selected_imports
+    } else {
+        let provider = analyzer.import_analysis_provider_for_file(file);
+        selected_imports = provider
+            .map(|provider| provider.import_info_of(token, file))
+            .unwrap_or_default();
+        &selected_imports
+    };
     native_external_root_with_resolver(
         analyzer,
-        token,
         file,
         source,
         tree,
         root,
         cancellation,
+        imports,
         |query| match operation {
             Some(operation) => operation_factory
                 .expect("a selected Rust operation has its factory")
@@ -137,12 +160,12 @@ fn native_external_root(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn native_external_root_with_resolver(
     analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
     root: Node<'_>,
     cancellation: Option<&CancellationToken>,
+    imports: &[ImportInfo],
     resolve: impl FnOnce(BoundedReceiverQuery<'_>) -> BoundedResolution<DefinitionLookupOutcome>,
 ) -> bool {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -157,8 +180,8 @@ pub(crate) fn native_external_root_with_resolver(
     if rust_path_is_leading_absolute(root) {
         return true;
     }
-    if let Some(imports) = analyzer.import_analysis_provider_for_file(file) {
-        for import in imports.import_info_of(token, file) {
+    {
+        for import in imports {
             if !import.is_wildcard
                 && import.local_name() == Some(name)
                 && import
@@ -458,6 +481,7 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
         tree,
         *root,
         cancellation,
+        None,
         operation_factory,
         operation.as_deref_mut(),
     ) {
@@ -554,7 +578,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
         // prelude/import evidence. Otherwise the external root must prove it.
         if components.iter().map(String::as_str).eq(written)
             && !native_external_root(
-                analyzer, token, file, source, tree, root, None, factory, operation,
+                analyzer, token, file, source, tree, root, None, None, factory, operation,
             )
         {
             return None;
@@ -795,6 +819,7 @@ pub(crate) fn rust_import_binder_external_callee(
     file: &ProjectFile,
     site: &ExternalCalleeSite<'_>,
     import: &ImportInfo,
+    imports: &[ImportInfo],
     member: &str,
     owner_components: &[String],
     operation_factory: Option<&native_points::RustDefinitionOperationFactory<'_>>,
@@ -819,6 +844,7 @@ pub(crate) fn rust_import_binder_external_callee(
             tree,
             written.root,
             None,
+            Some(imports),
             operation_factory,
             operation,
         )

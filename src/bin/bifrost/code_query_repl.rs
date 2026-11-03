@@ -2613,6 +2613,29 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.completeness,
                     ));
                 }
+                CodeQueryResultValue::BuildConfiguration { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let constraint = value
+                        .constraint
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "none".into());
+                    out.push_str(&format!(
+                        "{}\n  {} {}/{} {} (constraint {}; os {}, arch {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "build configuration:",
+                            use_color
+                        ),
+                        sanitize_terminal_text(value.os.as_deref().unwrap_or("?")),
+                        sanitize_terminal_text(value.arch.as_deref().unwrap_or("?")),
+                        paint(Style::new().bold(), value.file_status, use_color),
+                        constraint,
+                        value.os_values.as_deref().unwrap_or(value.os_scope),
+                        value.arch_values.as_deref().unwrap_or(value.arch_scope),
+                    ));
+                }
                 CodeQueryResultValue::TopologyEdge { value } => {
                     let path = sanitize_terminal_text(&value.build_file);
                     let from = sanitize_terminal_text(&value.from_name);

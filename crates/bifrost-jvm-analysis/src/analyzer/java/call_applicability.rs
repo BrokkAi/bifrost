@@ -55,6 +55,10 @@ pub(crate) static JAVA_CALL_APPLICABILITY_ADAPTER: JavaCallApplicabilityAdapter 
 pub(crate) struct JavaCallApplicabilityAdapter;
 
 impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
+    fn discharges_known_head_external_arguments(&self) -> bool {
+        true
+    }
+
     fn implicit_receiver_lookup(&self) -> Option<ImplicitReceiverLookup> {
         Some(ImplicitReceiverLookup::FirstMemberName)
     }

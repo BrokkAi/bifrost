@@ -17,7 +17,7 @@ const INITIALIZER_RELATION_AXES: &[FlowStateAxis] = &[FlowStateAxis::BindingEven
 
 pub(super) fn initializer_relation_expansions(
     workspace: &WorkspaceAnalyzer,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'_>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,

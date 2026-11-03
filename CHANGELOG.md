@@ -5,6 +5,139 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## [0.15.1] - 2026-11-03
+
+### Added
+
+- Native flow and taint policies support cross-procedure composition, including
+  declared taint entry points and store crossings retained in witnesses
+  (#8903, #8907, #8995). Composition also follows values that a callee writes
+  through a reference argument and struct members returned from calls, and
+  flow-candidate explanations follow composed store crossings instead of
+  declining store-ended candidates (#8931, #9028, #9107).
+- Rust and Go `procedure-effects` follows calls even when return values are
+  discarded, keeps lambda annotations separate from enclosing procedures, and
+  retains incompleteness for unsupported invocation behavior (#8980).
+- RQL `dependency-evidence` covers Go. `go.mod`, `go.work`, `go.sum` and
+  `vendor/modules.txt` produce `go-module` rows, and `go` and `toolchain`
+  directives produce `go-toolchain` rows. Version ranges compare complete
+  locked module versions by semver and toolchain versions in Go's release
+  order; a declared `go` minimum stays unknown instead of counting as
+  affected (#9047).
+- The new RQL step `build-configuration-of` reports the build configuration a
+  file is analyzed under and the file's own build constraint. Go files report
+  the selected `GOOS` and `GOARCH` and where each came from, whether the
+  `//go:build` line and filename suffix include the file, and the platforms
+  the constraint admits. Rust files report Cargo `build.target` and
+  toolchain-file targets; their own `#[cfg]` gating stays unknown
+  (#9048, #9049).
+- Rust code rows relate to their owning Cargo package, so a policy can join a
+  call site through `target-of` to the dependency evidence that package
+  declares, including transitive lockfile dependencies. Rust toolchain files
+  and `rust-version` produce `rust-toolchain` rows that version ranges compare
+  when a release is pinned. A Cargo-only workspace is no longer incomplete for
+  lacking a Maven build model (#9055, #9049).
+- `dependency-evidence :ecosystem cargo` accepts `:features` to select
+  dependencies by requested feature. Enabled default features, forwarding
+  member features and feature implications that the manifest cannot settle
+  make the answer incomplete instead of a non-match (#9051).
+- Package-scoped semantic models activate from exact crates.io entries in
+  `Cargo.lock` without Cargo metadata, and go-module models activate from a
+  validated `vendor/modules.txt` without a Go toolchain. Git, path and
+  alternate-registry sources activate nothing, and members that lock several
+  versions of one package report `rust.lockfile.ambiguous_activation`
+  (#9056, #9052).
+- Semantic-model schema 22 lets a Rust struct, enum or union model declare
+  `value_semantics.drop_glue: "inert"`, so owned locals and parameters of that
+  type no longer make a procedure's analysis unknown. Packs must declare
+  schema 22 to use the field; packs at earlier schemas load unchanged (#9057).
+
+### Changed
+
+- The engine no longer falls back to built-in semantic packs. When open-pack
+  acquisition selects no release (offline, with `BIFROST_OPEN_PACKS_DISABLE=1`,
+  or after a failed download), runs continue without semantic packs and the
+  CLI warning says so. To run offline, download and verify a `packs/vX.Y.Z`
+  release of `bifrost-packs`, then set `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` to
+  the extracted bundle or install it with `bifrost install-semantic-packs`.
+  Rust embedders that call `install_bifrost_semantic_model_packs()` get no
+  packs without that variable, and `open_pack_engine_profile()` reports the
+  digest of an empty model set (#4438).
+- Go packages under a vendor tree are named by their import path, as the go
+  command names them, instead of `<main module>/vendor/<path>`. Policies and
+  queries that name a vendored package by the old path must use the import
+  path. When vendored source and an active model define the same API, a
+  qualified-call locator reports ambiguity instead of no match (#9052).
+- RQL `value_flow` reached rows carry IDs that do not depend on the analysis
+  engine or the checkout location, so IDs recorded with earlier versions change
+  once. Rust endpoint-only value-flow queries run on the shared composition
+  search (#8386, #9127).
+- Incremental policy runs reuse unchanged files' results for policies rooted at
+  an intersect of declaration or occurrence rows. Such cached results from
+  earlier versions are recomputed once (#8389).
+- `js/misspelled-identifier` reports a misspelled identifier part only when the
+  identifier with the corrected part also occurs in the file, removing reports
+  such as `fromLink` in a file that uses `form`. A slip whose correct spelling
+  appears only inside other names is no longer reported (#9134).
+
+### Fixed
+
+- Go analysis improves interface and method-signature comparisons, promoted
+  receiver lookup, and calls through function values and fields. Unknown
+  signatures and unproven built-in assumptions retain open coverage
+  (#8852, #8888, #8891, #8901, #8916, #8973, #8990, #9000, #9011). A promoted
+  method that is ambiguous at its shallowest depth is excluded from the method
+  set, as the Go specification requires, instead of leaving interface
+  satisfaction inconclusive (#9063).
+- Go calls through model-declared interfaces, such as `Close` on a `net.Conn`
+  or `Accept` on a `net.Listener`, bind to the model member and can act as
+  taint sources instead of leaving the enclosing procedure's analysis
+  unknown. Dispatch stays open unless the model's summary covers every
+  override (#9053, #9101).
+- Java/JVM resolution preserves uncertainty from imported package providers,
+  requires a proven wildcard-import match before shadowing default imports,
+  and improves parameterized JDK member and inner-class type-parameter lookup
+  (#7728, #8849, #8915, #8979). Kotlin definitions no longer depend on the
+  order in which a class's implicit `Any` superclass edge is published
+  (#8741).
+- C# analysis respects file-scoped namespaces and destination conversions for
+  constructed values and string concatenation. Incomplete package inventories
+  preserve resolved calls without falsely proving complete coverage
+  (#8924, #8953).
+- Rust method lookup preserves receiver types through `?`, `unwrap` and
+  `expect`. Overwriting a field in a by-value struct copy now clears the
+  earlier field taint while preserving separate storage (#8899, #9016).
+- Rust `member-targets` resolves field accesses on types that an active
+  semantic model declares, and `field-write-value` now selects Rust
+  assignments, which it previously never matched (#9050).
+- Rust branch-conditioned sanitizers apply when the condition is a direct
+  call, as in `if check(path) { sink(path) }`. A guard that composition cannot
+  witness is reported as an advisory diagnostic naming the sanitizer
+  (#9013, #8870).
+- Cold policy scans repeat less work: procedures in one query share call
+  transfers and non-return analysis, `contradictory-condition` checks its
+  per-procedure memo before redispatching receiver calls, and Go resolves a
+  file's call targets in one operation with repeated context reads reused
+  (#9015).
+- MCP checks cancellation before analyzer admission, trims oversized compact
+  outlines, and truncates text at UTF-8 character boundaries (#8825).
+- Procedure-openness queries report cancellation as interruption instead of
+  returning a complete result (#8932).
+- Policy evaluation charges reused units against the cumulative budget and
+  preserves per-seed union filtering. Diff-base reuse handles compatible
+  budget changes and excludes never-run policies from reliability checks
+  (#8876, #8945, #8970, #8999).
+- A match finding that selects a whole declaration, such as a declaration
+  result or a Python class-hierarchy fact, keeps its finding ID when the
+  declaration's body or the code above it changes. The ID now follows the
+  declaration's identity and, for hierarchy facts, the base the fact is about.
+  This rotates the IDs of these findings once: ignores, suppressions and
+  baselines recorded against the old IDs, including finding ignores stored in
+  bifrost-service, stop matching and must be recorded again (#9084).
+- Rejecting a duplicate resource path while building a CSMI logical pack keeps
+  the resource already stored, so later reads pass digest verification
+  (#8993).
+
 ## [0.15.0] - 2026-11-01
 
 ### Added

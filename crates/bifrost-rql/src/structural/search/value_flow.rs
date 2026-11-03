@@ -19,23 +19,27 @@ use super::{
 };
 use crate::analyzer::semantic::{
     IcfgProvider, IcfgProviderBehaviorIdentity, LengthDelimitedDigest, ProcedureHandle,
-    ProgramPointHandle, SemanticBudget, SemanticLocator, WorkspaceIcfgProvider,
+    ProgramPointHandle, SemanticBudget, SemanticExecutionBudget, SemanticLocator, SemanticRequest,
+    WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
-use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
+use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use crate::structural::analysis_context::{
     QueryAnalysisContext, QueryAnalysisContextError, ValueFlowPlanRef,
 };
+use brokk_bifrost_flow::composition::UnitCompositionProvider;
 use brokk_bifrost_flow::dataflow::{
     DataflowRequest, FactId, PathQuality, SemanticInputStatus, SolverBudget, SolverTermination,
     WitnessReconstructionLimits, WitnessRetentionLimits,
 };
+use brokk_bifrost_flow::taint::compose::{CompositionBudget, search_value_flow};
 use brokk_bifrost_flow::value_flow::{
-    ValueFlowCarrierKey, ValueFlowMayStatus, ValueFlowMeeting, ValueFlowObservationPhase,
-    ValueFlowPlan, ValueFlowPortKey, ValueFlowScopedRootKind, ValueFlowSelectorKey,
-    ValueFlowSourceSpec, ValueFlowSummaryResult, solve_value_flow_with_witnesses,
+    ValueFlowCache, ValueFlowCarrierKey, ValueFlowMayStatus, ValueFlowMeeting,
+    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPortKey, ValueFlowScopedRootKind,
+    ValueFlowSelectorKey, ValueFlowSourceSpec, ValueFlowSummaryResult,
+    solve_value_flow_with_witnesses,
 };
 use brokk_bifrost_rql::WitnessTraversal;
 
@@ -50,6 +54,7 @@ struct ValueFlowCacheKey {
 #[derive(Debug)]
 struct ValueFlowAnalysisResult {
     plan: Arc<ValueFlowPlan>,
+    plan_digest: String,
     result: Arc<ValueFlowSummaryResult>,
 }
 
@@ -61,6 +66,7 @@ enum CachedValueFlowAnalysis {
 
 #[derive(Default)]
 pub(super) struct ValueFlowQueryState {
+    pub(super) witness_requested: bool,
     cache: HashMap<ValueFlowCacheKey, CachedValueFlowAnalysis>,
     diagnostics: Vec<CodeQueryDiagnostic>,
     work: CodeQueryValueFlowWork,
@@ -70,11 +76,80 @@ pub(super) struct ValueFlowQueryState {
 }
 
 #[derive(Debug, Clone)]
+struct FlowAlternative {
+    analysis: Arc<ValueFlowAnalysisResult>,
+    meeting: ValueFlowMeeting,
+}
+
+#[derive(Debug)]
+enum ValueFlowEngine {
+    Icfg { reason: String },
+    Composition,
+}
+
+thread_local! { static FORCE_ICFG_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static FRESH_ICFG_RESULTS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_icfg_value_flow_engine_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_ICFG_FOR_TEST.set(self.0);
+        }
+    }
+    let restore = Restore(FORCE_ICFG_FOR_TEST.replace(true));
+    let result = run();
+    drop(restore);
+    result
+}
+
+/// Exercise a set merge with independently owned solver results for one plan.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_fresh_icfg_value_flow_results_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FRESH_ICFG_RESULTS_FOR_TEST.set(self.0);
+        }
+    }
+    let restore = Restore(FRESH_ICFG_RESULTS_FOR_TEST.replace(true));
+    let result = with_icfg_value_flow_engine_for_test(run);
+    drop(restore);
+    result
+}
+
+fn select_value_flow_engine(plan: &ValueFlowPlan, witnesses: bool) -> ValueFlowEngine {
+    if FORCE_ICFG_FOR_TEST.get() {
+        return ValueFlowEngine::Icfg {
+            reason: "test override".into(),
+        };
+    }
+    if witnesses {
+        return ValueFlowEngine::Icfg {
+            reason: "witness projection".into(),
+        };
+    }
+    if let Some(reason) = plan.composition_exclusion() {
+        return ValueFlowEngine::Icfg {
+            reason: format!("{reason:?}"),
+        };
+    }
+    if plan.root().artifact().key().language()
+        != crate::analyzer::semantic::SemanticLanguage::Standard(Language::Rust)
+    {
+        return ValueFlowEngine::Icfg {
+            reason: "language admission".into(),
+        };
+    }
+    ValueFlowEngine::Composition
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct SemanticFlowEndpointValue {
     pub(super) public: CodeQueryFlowEndpoint,
     plan_ref: ValueFlowPlanRef,
-    analysis: Arc<ValueFlowAnalysisResult>,
-    meeting: Option<ValueFlowMeeting>,
+    alternatives: Vec<FlowAlternative>,
     file: ProjectFile,
     byte_span: std::ops::Range<usize>,
 }
@@ -101,6 +176,7 @@ impl ValueFlowQueryState {
         plan_ref: &ValueFlowPlanRef,
         semantic_budget: &mut SemanticBudget,
         limits: CodeQueryValueFlowLimits,
+        max_materialized_files: usize,
         max_endpoints: usize,
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
@@ -144,17 +220,40 @@ impl ValueFlowQueryState {
             }
         };
         let plan = Arc::clone(registration.plan());
+        let plan_digest = plan.public_fingerprint().to_string();
         let root = plan.root().clone();
         let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
             workspace,
             active_semantic_model_snapshot,
         );
+        match select_value_flow_engine(&plan, self.witness_requested) {
+            ValueFlowEngine::Composition => {
+                return self.composed_endpoints(
+                    workspace,
+                    plan_ref,
+                    &plan,
+                    &plan_digest,
+                    &provider,
+                    semantic_budget,
+                    limits,
+                    max_materialized_files,
+                    max_endpoints.min(limits.max_endpoints),
+                    cancellation,
+                );
+            }
+            ValueFlowEngine::Icfg { reason } => brokk_bifrost_core::profiling::note_with(|| {
+                format!("rql.value_flow engine=icfg reason={reason}")
+            }),
+        }
         let cache_key = ValueFlowCacheKey {
             root: root.clone(),
             plan_allocation: Arc::as_ptr(&plan) as usize,
             provider_behavior: provider.behavior_identity(),
         };
-        let analysis = match self.cache.get(&cache_key).cloned() {
+        let analysis = match (!FRESH_ICFG_RESULTS_FOR_TEST.get())
+            .then(|| self.cache.get(&cache_key).cloned())
+            .flatten()
+        {
             Some(CachedValueFlowAnalysis::Complete(analysis)) => {
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 analysis
@@ -258,6 +357,7 @@ impl ValueFlowQueryState {
                 }
                 let analysis = Arc::new(ValueFlowAnalysisResult {
                     plan,
+                    plan_digest,
                     result: Arc::new(solved),
                 });
                 self.cache.insert(
@@ -273,6 +373,174 @@ impl ValueFlowQueryState {
             analysis,
             max_endpoints.min(limits.max_endpoints),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn composed_endpoints(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        plan_ref: &ValueFlowPlanRef,
+        plan: &ValueFlowPlan,
+        plan_digest: &str,
+        icfg: &WorkspaceIcfgProvider<'_>,
+        semantic_budget: &mut SemanticBudget,
+        limits: CodeQueryValueFlowLimits,
+        max_materialized_files: usize,
+        max_endpoints: usize,
+        cancellation: &CancellationToken,
+    ) -> Vec<SemanticFlowEndpointValue> {
+        let provider = brokk_bifrost_flow::value_flow::WorkspaceValueFlowProvider::with_oracle(
+            icfg.oracle().clone(),
+            icfg.behavior_identity(),
+            ValueFlowCache::new(limits.max_retained_bytes as u64),
+        );
+        let composition = UnitCompositionProvider::new(
+            workspace,
+            provider,
+            plan,
+            SemanticExecutionBudget::new(max_materialized_files),
+            limits.max_endpoints,
+        );
+        let budget = CompositionBudget {
+            max_procedures: semantic_budget.remaining().procedures,
+            max_hops: limits.max_retained_relations,
+            max_callers_per_procedure: limits.max_endpoints,
+        };
+        let mut request = SemanticRequest::new(semantic_budget, cancellation);
+        let outcome = match search_value_flow(plan, &composition, budget, &mut request) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.work.failed_solves = self.work.failed_solves.saturating_add(1);
+                push_deduplicated_diagnostic(
+                    &mut self.diagnostics,
+                    CodeQueryDiagnosticCode::ValueFlowProviderFailed,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                    format!("value-flow composition failed: {error}"),
+                );
+                return Vec::new();
+            }
+        };
+        self.work.solves = self.work.solves.saturating_add(1);
+        let complete = plan.discovery_complete() && outcome.incomplete.is_empty();
+        if complete {
+            self.work.fixed_point_solves = self.work.fixed_point_solves.saturating_add(1);
+        } else if plan.discovery_status() == SemanticInputStatus::Complete {
+            push_deduplicated_diagnostic(
+                &mut self.diagnostics,
+                CodeQueryDiagnosticCode::ValueFlowAnalysisPartial,
+                Incompleteness::Operational(DerivationExecutionCause::Provider),
+                format!(
+                    "value-flow composition retained incomplete evidence: {:?}",
+                    outcome.incomplete
+                ),
+            );
+        }
+        self.record_semantic_status(plan.discovery_status());
+        let (status, reason) = public_semantic_status(plan.discovery_status(), complete);
+        let mut projected = Vec::new();
+        for (sink_id, sink) in plan.sinks() {
+            let sink_public = public_event(workspace, plan_ref, "sink", sink);
+            let mut reached = outcome
+                .pairs
+                .iter()
+                .filter(|pair| pair.sink == sink_id)
+                .collect::<Vec<_>>();
+            reached.sort_unstable_by_key(|pair| pair.source.index());
+            for pair in &reached {
+                if projected.len() >= max_endpoints {
+                    self.record_endpoint_budget(1);
+                    return projected;
+                }
+                let source = plan
+                    .sources()
+                    .nth(pair.source.index())
+                    .map(|(_, source)| source)
+                    .expect("composition's source index belongs to the registered plan");
+                let mut qualities = pair
+                    .paths
+                    .iter()
+                    .map(|(_, quality)| {
+                        super::results::public_semantic_evidence(
+                            quality.proven,
+                            quality.complete,
+                            None,
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                qualities.sort_unstable_by_key(|quality| {
+                    (quality.proof.label(), quality.completeness.label())
+                });
+                qualities.dedup();
+                let locator = sink.key().site();
+                projected.push(SemanticFlowEndpointValue {
+                    public: CodeQueryFlowEndpoint {
+                        id: endpoint_id(plan_ref, plan_digest, source, sink),
+                        plan_ref: plan_ref.to_string(),
+                        source: Some(public_event(workspace, plan_ref, "source", source)),
+                        sink: sink_public.clone(),
+                        reachability: CodeQueryFlowReachability::Reached,
+                        certainty: Some(
+                            if pair.paths.iter().any(|(_, quality)| quality.is_certain()) {
+                                CodeQueryFlowCertainty::Exact
+                            } else {
+                                CodeQueryFlowCertainty::May
+                            },
+                        ),
+                        ambiguous: plan.has_ambiguous_dispatch(),
+                        status,
+                        reason: reason.clone(),
+                        path: locator.path().as_str().to_string(),
+                        language: locator.language().config_label(),
+                        range: locator_range(workspace, locator),
+                        path_qualities: qualities,
+                        retained_witnesses: 0,
+                        omitted_witnesses: 0,
+                    },
+                    plan_ref: plan_ref.clone(),
+                    alternatives: Vec::new(),
+                    file: locator_file(workspace, locator),
+                    byte_span: locator_span(locator),
+                });
+            }
+            if reached.is_empty() {
+                if projected.len() >= max_endpoints {
+                    self.record_endpoint_budget(1);
+                    return projected;
+                }
+                let reachability = if complete {
+                    CodeQueryFlowReachability::NotReached
+                } else {
+                    CodeQueryFlowReachability::Inconclusive
+                };
+                let locator = sink.key().site();
+                projected.push(SemanticFlowEndpointValue {
+                    public: CodeQueryFlowEndpoint {
+                        id: negative_endpoint_id(plan_ref, &sink_public.id, reachability),
+                        plan_ref: plan_ref.to_string(),
+                        source: None,
+                        sink: sink_public,
+                        reachability,
+                        certainty: None,
+                        ambiguous: plan.has_ambiguous_dispatch(),
+                        status,
+                        reason: reason.clone(),
+                        path: locator.path().as_str().to_string(),
+                        language: locator.language().config_label(),
+                        range: locator_range(workspace, locator),
+                        path_qualities: Vec::new(),
+                        retained_witnesses: 0,
+                        omitted_witnesses: 0,
+                    },
+                    plan_ref: plan_ref.clone(),
+                    alternatives: Vec::new(),
+                    file: locator_file(workspace, locator),
+                    byte_span: locator_span(locator),
+                });
+            }
+            self.work.sink_outcomes = self.work.sink_outcomes.saturating_add(1);
+        }
+        projected
     }
 
     fn project_endpoints(
@@ -311,41 +579,66 @@ impl ValueFlowQueryState {
             let sink_public = public_event(workspace, plan_ref, "sink", sink);
             match meetings_by_sink.remove(&sink_id) {
                 Some(meetings) => {
+                    // Summary entries and contexts are alternative derivations
+                    // of one existential answer for each source/sink pair.
+                    // Keep every original meeting for its own witnesses.
+                    let mut groups: Vec<(
+                        brokk_bifrost_flow::value_flow::ValueFlowSourceId,
+                        Vec<ValueFlowMeeting>,
+                    )> = Vec::new();
                     for meeting in meetings {
+                        if let Some((_, alternatives)) = groups
+                            .iter_mut()
+                            .find(|(source, _)| *source == meeting.source())
+                        {
+                            alternatives.push(meeting.clone());
+                        } else {
+                            groups.push((meeting.source(), vec![meeting.clone()]));
+                        }
+                    }
+                    for (source_id, alternatives) in groups {
                         if projected.len() >= max_endpoints {
                             self.record_endpoint_budget(1);
                             break 'sinks;
                         }
                         let source = analysis
                             .plan
-                            .source(meeting.source())
+                            .source(source_id)
                             .expect("validated meeting source resolves");
                         let source_public = public_event(workspace, plan_ref, "source", source);
-                        let endpoint_id = endpoint_id(
-                            plan_ref,
-                            Some(&source_public.id),
-                            &sink_public.id,
-                            &analysis.plan,
-                            &analysis.result,
-                            meeting,
-                        );
                         let locator = sink.key().site();
-                        let path_qualities = meeting
-                            .path_qualities()
-                            .iter()
-                            .map(public_path_quality)
-                            .collect::<Vec<_>>();
-                        let retained_witnesses = path_qualities.len();
+                        let mut path_qualities = Vec::new();
+                        let mut retained_witnesses = 0usize;
+                        let mut exact = false;
+                        for meeting in &alternatives {
+                            exact |= meeting.may_status() == ValueFlowMayStatus::Proven;
+                            retained_witnesses = retained_witnesses
+                                .saturating_add(meeting.path_qualities().iter().count());
+                            for quality in meeting.path_qualities().iter().map(public_path_quality)
+                            {
+                                if !path_qualities.contains(&quality) {
+                                    path_qualities.push(quality);
+                                }
+                            }
+                        }
+                        path_qualities.sort_unstable_by(|left, right| {
+                            (left.proof.label(), left.completeness.label(), &left.reason).cmp(&(
+                                right.proof.label(),
+                                right.completeness.label(),
+                                &right.reason,
+                            ))
+                        });
                         projected.push(SemanticFlowEndpointValue {
                             public: CodeQueryFlowEndpoint {
-                                id: endpoint_id,
+                                id: endpoint_id(plan_ref, &analysis.plan_digest, source, sink),
                                 plan_ref: plan_ref.to_string(),
                                 source: Some(source_public),
                                 sink: sink_public.clone(),
                                 reachability: CodeQueryFlowReachability::Reached,
-                                certainty: Some(match meeting.may_status() {
-                                    ValueFlowMayStatus::Proven => CodeQueryFlowCertainty::Exact,
-                                    ValueFlowMayStatus::Unproven => CodeQueryFlowCertainty::May,
+                                certainty: Some(if exact {
+                                    CodeQueryFlowCertainty::Exact
+                                } else {
+                                    CodeQueryFlowCertainty::May
                                 }),
                                 ambiguous,
                                 status,
@@ -354,12 +647,27 @@ impl ValueFlowQueryState {
                                 language: locator.language().config_label(),
                                 range: locator_range(workspace, locator),
                                 path_qualities,
-                                retained_witnesses,
+                                // Endpoint-only queries cannot retrieve witnesses. Keep
+                                // the public count independent of the selected engine.
+                                retained_witnesses: if self.witness_requested {
+                                    retained_witnesses
+                                } else {
+                                    0
+                                },
                                 omitted_witnesses: 0,
                             },
                             plan_ref: plan_ref.clone(),
-                            analysis: Arc::clone(&analysis),
-                            meeting: Some(meeting.clone()),
+                            alternatives: if self.witness_requested {
+                                alternatives
+                                    .into_iter()
+                                    .map(|meeting| FlowAlternative {
+                                        analysis: Arc::clone(&analysis),
+                                        meeting,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            },
                             file: locator_file(workspace, locator),
                             byte_span: locator_span(locator),
                         });
@@ -391,8 +699,7 @@ impl ValueFlowQueryState {
                             omitted_witnesses: 0,
                         },
                         plan_ref: plan_ref.clone(),
-                        analysis: Arc::clone(&analysis),
-                        meeting: None,
+                        alternatives: Vec::new(),
                         file: locator_file(workspace, locator),
                         byte_span: locator_span(locator),
                     });
@@ -410,9 +717,9 @@ impl ValueFlowQueryState {
         traversal: &WitnessTraversal,
         limits: CodeQueryValueFlowLimits,
     ) -> Vec<SemanticFlowWitnessValue> {
-        let Some(meeting) = endpoint.meeting.as_ref() else {
+        if endpoint.alternatives.is_empty() {
             return Vec::new();
-        };
+        }
         let query_max_steps = traversal
             .max_steps
             .unwrap_or(limits.max_witness_steps)
@@ -422,7 +729,25 @@ impl ValueFlowQueryState {
             .unwrap_or(limits.max_witness_bytes)
             .min(limits.max_witness_bytes);
         let mut values = Vec::new();
-        for (witness_index, quality) in meeting.path_qualities().iter().enumerate() {
+        let mut alternatives = endpoint.alternatives.iter().collect::<Vec<_>>();
+        alternatives.sort_by_cached_key(|alternative| {
+            (
+                format!("{:?}", alternative.meeting.entry()),
+                format!("{:?}", alternative.meeting.point()),
+                alternative.meeting.reached_index(),
+            )
+        });
+        for (witness_index, (alternative, quality)) in alternatives
+            .into_iter()
+            .flat_map(|alternative| {
+                alternative
+                    .meeting
+                    .path_qualities()
+                    .iter()
+                    .map(move |quality| (alternative, quality))
+            })
+            .enumerate()
+        {
             let remaining_witnesses = limits
                 .max_witnesses
                 .saturating_sub(usize::try_from(self.work.witnesses).unwrap_or(usize::MAX));
@@ -448,12 +773,11 @@ impl ValueFlowQueryState {
                 limits.max_witness_expansions.min(remaining_expansions),
             )
             .expect("positive remaining CodeQuery value-flow witness budget");
-            let Ok(witness) =
-                endpoint
-                    .analysis
-                    .result
-                    .witness_for_meeting(meeting, quality, reconstruction)
-            else {
+            let Ok(witness) = alternative.analysis.result.witness_for_meeting(
+                &alternative.meeting,
+                quality,
+                reconstruction,
+            ) else {
                 continue;
             };
             self.work.witness_expansions = self
@@ -469,8 +793,8 @@ impl ValueFlowQueryState {
                         public_fact_symbol(
                             workspace,
                             &endpoint.plan_ref,
-                            &endpoint.analysis.plan,
-                            &endpoint.analysis.result,
+                            &alternative.analysis.plan,
+                            &alternative.analysis.result,
                             fact_id,
                         )
                     })
@@ -690,6 +1014,54 @@ impl ValueFlowQueryState {
 }
 
 impl SemanticFlowEndpointValue {
+    /// Equal IDs denote one source/sink proposition. Retain every distinct
+    /// derivation with its own analysis owner for later witness reconstruction.
+    pub(super) fn merge_evidence(&mut self, other: Self) {
+        debug_assert_eq!(self.public.id, other.public.id);
+        debug_assert_eq!(self.public.source, other.public.source);
+        debug_assert_eq!(self.public.sink, other.public.sink);
+        if other.public.certainty == Some(CodeQueryFlowCertainty::Exact) {
+            self.public.certainty = other.public.certainty;
+        }
+        self.public.ambiguous |= other.public.ambiguous;
+        if flow_status_rank(other.public.status) > flow_status_rank(self.public.status)
+            || (self.public.status == other.public.status
+                && other.public.reason < self.public.reason)
+        {
+            self.public.status = other.public.status;
+            self.public.reason = other.public.reason;
+        }
+        self.public.omitted_witnesses = self
+            .public
+            .omitted_witnesses
+            .max(other.public.omitted_witnesses);
+        for quality in other.public.path_qualities {
+            if !self.public.path_qualities.contains(&quality) {
+                self.public.path_qualities.push(quality);
+            }
+        }
+        self.public.path_qualities.sort_unstable_by(|left, right| {
+            (left.proof.label(), left.completeness.label(), &left.reason).cmp(&(
+                right.proof.label(),
+                right.completeness.label(),
+                &right.reason,
+            ))
+        });
+        for alternative in other.alternatives {
+            if self.alternatives.iter().any(|kept| {
+                Arc::ptr_eq(&kept.analysis.result, &alternative.analysis.result)
+                    && kept.meeting.reached_index() == alternative.meeting.reached_index()
+            }) {
+                continue;
+            }
+            self.public.retained_witnesses = self
+                .public
+                .retained_witnesses
+                .saturating_add(alternative.meeting.path_qualities().iter().count());
+            self.alternatives.push(alternative);
+        }
+    }
+
     pub(super) fn key(&self) -> &str {
         &self.public.id
     }
@@ -709,6 +1081,110 @@ impl SemanticFlowEndpointValue {
             path: self.public.path.clone(),
             range: self.public.range,
         }
+    }
+}
+
+fn flow_status_rank(status: CodeQueryFlowStatus) -> u8 {
+    match status {
+        CodeQueryFlowStatus::Complete => 0,
+        CodeQueryFlowStatus::Partial => 1,
+        CodeQueryFlowStatus::Ambiguous => 2,
+        CodeQueryFlowStatus::Unproven => 3,
+        CodeQueryFlowStatus::Unknown => 4,
+        CodeQueryFlowStatus::Unsupported => 5,
+        CodeQueryFlowStatus::SemanticBudgetExhausted
+        | CodeQueryFlowStatus::SolverBudgetExhausted => 6,
+        CodeQueryFlowStatus::SemanticCancelled
+        | CodeQueryFlowStatus::SolverCancelled
+        | CodeQueryFlowStatus::QueryCancelled => 7,
+    }
+}
+
+#[cfg(all(test, feature = "query-result-fixtures"))]
+mod endpoint_merge_properties {
+    use super::super::results::{CodeQuerySemanticCompleteness, CodeQuerySemanticProof};
+    use super::*;
+
+    fn quality(proven: bool, complete: bool) -> CodeQuerySemanticEvidence {
+        CodeQuerySemanticEvidence::new(
+            if proven {
+                CodeQuerySemanticProof::Proven
+            } else {
+                CodeQuerySemanticProof::Unproven
+            },
+            if complete {
+                CodeQuerySemanticCompleteness::Complete
+            } else {
+                CodeQuerySemanticCompleteness::Partial
+            },
+            None,
+        )
+    }
+
+    fn endpoint(
+        certainty: CodeQueryFlowCertainty,
+        status: CodeQueryFlowStatus,
+        qualities: Vec<CodeQuerySemanticEvidence>,
+    ) -> SemanticFlowEndpointValue {
+        let public = CodeQueryFlowEndpoint {
+            id: "same-pair".into(),
+            plan_ref: "test:pair".into(),
+            reachability: CodeQueryFlowReachability::Reached,
+            certainty: Some(certainty),
+            status,
+            path_qualities: qualities,
+            ..Default::default()
+        };
+        SemanticFlowEndpointValue {
+            public,
+            plan_ref: "test:pair".parse().unwrap(),
+            alternatives: Vec::new(),
+            file: ProjectFile::new(std::env::current_dir().unwrap(), "pair.rs"),
+            byte_span: 0..0,
+        }
+    }
+
+    #[test]
+    fn may_alternatives_do_not_synthesize_exact_and_merge_is_order_independent() {
+        let left = endpoint(
+            CodeQueryFlowCertainty::May,
+            CodeQueryFlowStatus::Complete,
+            vec![quality(true, false)],
+        );
+        let right = endpoint(
+            CodeQueryFlowCertainty::May,
+            CodeQueryFlowStatus::Unknown,
+            vec![quality(false, true)],
+        );
+        let mut forward = left.clone();
+        forward.merge_evidence(right.clone());
+        let mut reverse = right;
+        reverse.merge_evidence(left);
+        assert_eq!(forward.public, reverse.public);
+        assert_eq!(forward.public.certainty, Some(CodeQueryFlowCertainty::May));
+        assert_eq!(forward.public.status, CodeQueryFlowStatus::Unknown);
+        assert_eq!(forward.public.path_qualities.len(), 2);
+        let once = forward.public.clone();
+        forward.merge_evidence(reverse);
+        assert_eq!(forward.public, once);
+    }
+
+    #[test]
+    fn actual_exact_alternative_survives_a_may_alternative() {
+        let mut may = endpoint(
+            CodeQueryFlowCertainty::May,
+            CodeQueryFlowStatus::Unknown,
+            vec![quality(false, true)],
+        );
+        let exact = endpoint(
+            CodeQueryFlowCertainty::Exact,
+            CodeQueryFlowStatus::Complete,
+            vec![quality(true, true)],
+        );
+        may.merge_evidence(exact);
+        assert_eq!(may.public.certainty, Some(CodeQueryFlowCertainty::Exact));
+        assert_eq!(may.public.status, CodeQueryFlowStatus::Unknown);
+        assert_eq!(may.public.path_qualities.len(), 2);
     }
 }
 
@@ -932,51 +1408,37 @@ fn phase_label(phase: ValueFlowObservationPhase) -> &'static str {
     }
 }
 
+/// Alternative meeting derivations are one existential source/sink answer.
+/// Its identity contains the registered plan and full stable event identities,
+/// never a meeting, path, uncertainty or witness detail.
 fn endpoint_id(
     plan_ref: &ValueFlowPlanRef,
-    source_id: Option<&str>,
-    sink_id: &str,
-    plan: &ValueFlowPlan,
-    result: &ValueFlowSummaryResult,
-    meeting: &ValueFlowMeeting,
+    plan_digest: &str,
+    source: &ValueFlowSourceSpec,
+    sink: &brokk_bifrost_flow::value_flow::ValueFlowSinkSpec,
 ) -> String {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.flow_endpoint.v1");
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.flow_endpoint.v2");
     digest.push(plan_ref.to_string().as_bytes());
-    digest.push(source_id.unwrap_or("").as_bytes());
-    digest.push(sink_id.as_bytes());
-    hash_public_point(&mut digest, meeting.entry().entry_point());
-    hash_public_point(&mut digest, meeting.point());
-    digest.push(match meeting.may_status() {
-        ValueFlowMayStatus::Proven => b"exact",
-        ValueFlowMayStatus::Unproven => b"may",
-    });
-    for quality in meeting.path_qualities().iter() {
-        digest.push(if quality.is_proven() {
-            b"proven"
-        } else {
-            b"unproven"
-        });
-        digest.push(if quality.is_complete() {
-            b"complete"
-        } else {
-            b"partial"
-        });
-    }
-    if let Some(entry_fact) = result.result().fact(meeting.entry().entry_fact()) {
-        digest.push(if entry_fact.uncertainty().is_empty() {
-            b"certain"
-        } else {
-            b"uncertain"
-        });
-        if let Some(carrier) = entry_fact.carrier().and_then(|id| plan.carrier_key(id)) {
-            hash_public_carrier_key(&mut digest, carrier);
-        } else if entry_fact.sink().is_some() {
-            digest.push(b"meeting");
-        } else if entry_fact.source().is_some() {
-            digest.push(b"source");
-        } else {
-            digest.push(b"zero");
-        }
+    digest.push(plan_digest.as_bytes());
+    for (role, key, phase, carrier) in [
+        (
+            b"source".as_slice(),
+            source.key(),
+            source.phase(),
+            source.carrier(),
+        ),
+        (b"sink".as_slice(), sink.key(), sink.phase(), sink.carrier()),
+    ] {
+        digest.push(role);
+        hash_public_locator(&mut digest, key.site());
+        digest.push(&key.ordinal().to_le_bytes());
+        digest.push(phase_label(phase).as_bytes());
+        hash_public_carrier_key(
+            &mut digest,
+            &carrier
+                .stable_key()
+                .expect("validated event carrier has stable identity"),
+        );
     }
     digest.finish().to_string()
 }
@@ -1416,21 +1878,6 @@ pub(super) fn call_symbol_site(
     handle: &crate::analyzer::semantic::CallSiteHandle,
 ) -> CodeQueryFlowSymbolSite {
     public_symbol_site(workspace, call_site_locator(handle))
-}
-
-fn hash_public_point(digest: &mut LengthDelimitedDigest, point: &ProgramPointHandle) {
-    let row = point
-        .procedure()
-        .semantics()
-        .point(point.id())
-        .expect("validated value-flow point resolves");
-    let locator = &point
-        .procedure()
-        .semantics()
-        .source_mapping(row.source)
-        .expect("validated value-flow point has source mapping")
-        .locator;
-    hash_public_locator(digest, locator);
 }
 
 fn locator_span(locator: &SemanticLocator) -> std::ops::Range<usize> {

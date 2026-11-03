@@ -105,3 +105,12 @@ Current history:
   need no rebuild of this table. The table, its indexes, the
   generated-production view and the mutation triggers are rebuilt as 0028 left
   them; every row is preserved.
+
+- `0030-shard-validation-census.sql`: replaces the shard validation
+  certificates (#8860). The old key held a digest of every decode limit, so a
+  request with different limits always validated again. A certificate is now
+  one row per manifest digest, shard and validation version that records what
+  one successful full validation measured: `max_text_bytes` and `max_depth`.
+  A reader admits it when the request's caps cover those measures and the
+  manifest's own size and count census. The old rows hold no measures, so they
+  are dropped and each shard validates once more.

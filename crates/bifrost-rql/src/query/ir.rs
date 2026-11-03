@@ -573,6 +573,7 @@ pub enum QueryValueKind {
     SourceSet,
     BuildTarget,
     TopologyEdge,
+    BuildConfiguration,
     RewritePath,
     QualifiedPath,
     PathSegment,
@@ -752,6 +753,7 @@ impl QueryValueKind {
             | Self::SourceSet
             | Self::BuildTarget
             | Self::TopologyEdge
+            | Self::BuildConfiguration
             | Self::RewritePath
             | Self::QualifiedPath
             | Self::PathSegment
@@ -840,6 +842,7 @@ impl QueryValueKind {
             Self::SourceSet => "source_set",
             Self::BuildTarget => "build_target",
             Self::TopologyEdge => "topology_edge",
+            Self::BuildConfiguration => "build_configuration",
             Self::RewritePath => "rewrite_path",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
@@ -1985,6 +1988,7 @@ pub enum QueryStep {
     TargetOf,
     SourceSetOf,
     TopologyEdgesOf,
+    BuildConfigurationOf,
     RewritePathsOf(RewritePathFilter),
     SegmentsOf(SegmentsOfOptions),
     SegmentTarget,
@@ -2586,6 +2590,7 @@ impl QueryStep {
             Self::TargetOf => QueryStepOp::TargetOf,
             Self::SourceSetOf => QueryStepOp::SourceSetOf,
             Self::TopologyEdgesOf => QueryStepOp::TopologyEdgesOf,
+            Self::BuildConfigurationOf => QueryStepOp::BuildConfigurationOf,
             Self::RewritePathsOf(_) => QueryStepOp::RewritePathsOf,
             Self::SegmentsOf(_) => QueryStepOp::SegmentsOf,
             Self::SegmentTarget => QueryStepOp::SegmentTarget,
@@ -2783,6 +2788,7 @@ impl QueryStep {
             QueryStepOp::TargetOf => Some(Self::TargetOf),
             QueryStepOp::SourceSetOf => Some(Self::SourceSetOf),
             QueryStepOp::TopologyEdgesOf => Some(Self::TopologyEdgesOf),
+            QueryStepOp::BuildConfigurationOf => Some(Self::BuildConfigurationOf),
             QueryStepOp::GuardsOf => Some(Self::GuardsOf),
             QueryStepOp::FailureHandlerState => Some(Self::FailureHandlerState),
             QueryStepOp::ControlRelations => {
@@ -3274,6 +3280,9 @@ impl QueryStep {
             (Self::TopologyEdgesOf, QueryValueKind::BuildTarget) => {
                 Some(QueryValueKind::TopologyEdge)
             }
+            (Self::BuildConfigurationOf, QueryValueKind::File) => {
+                Some(QueryValueKind::BuildConfiguration)
+            }
             (Self::RewritePathsOf(_), QueryValueKind::File) => Some(QueryValueKind::RewritePath),
             _ => None,
         }
@@ -3502,7 +3511,9 @@ fn validate_query_steps(
             | QueryStep::RustPointerFindings => "procedure",
             QueryStep::RustMarkerImplsOf => "declaration or structural_match",
             QueryStep::GuardsOf => "procedure",
-            QueryStep::TargetOf | QueryStep::SourceSetOf => "file",
+            QueryStep::TargetOf | QueryStep::SourceSetOf | QueryStep::BuildConfigurationOf => {
+                "file"
+            }
             QueryStep::TopologyEdgesOf => "build_target",
             QueryStep::RewritePathsOf(_) => "file",
             QueryStep::SegmentsOf(_) => "qualified_path",
@@ -4074,6 +4085,7 @@ pub struct DependencyEvidenceFilter {
     pub sources: Vec<String>,
     pub declared_by: Vec<String>,
     pub scopes: Vec<String>,
+    pub features: Vec<String>,
 }
 #[derive(Debug, Clone)]
 pub struct DependencyEvidenceSeed {
@@ -5110,7 +5122,7 @@ fn child_query_path(path: &str, field: &str) -> String {
 }
 
 impl CodeQuerySeed {
-    fn positive_capture_names(&self) -> std::collections::HashSet<String> {
+    pub(crate) fn positive_capture_names(&self) -> std::collections::HashSet<String> {
         let mut captures = std::collections::HashSet::new();
         let mut stack = vec![&self.root];
         if let Some(inside) = &self.inside {

@@ -1060,6 +1060,7 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::SourceSet(_)
                     | PipelineValue::BuildTarget(_)
                     | PipelineValue::TopologyEdge(_)
+                    | PipelineValue::BuildConfiguration(_)
                     | PipelineValue::RewritePath(_)
                     | PipelineValue::QualifiedPath(_)
                     | PipelineValue::PathSegment(_)
@@ -1171,6 +1172,7 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::SourceSet(_)
                                 | PipelineValue::BuildTarget(_)
                                 | PipelineValue::TopologyEdge(_)
+                                | PipelineValue::BuildConfiguration(_)
                                 | PipelineValue::RewritePath(_)
                                 | PipelineValue::QualifiedPath(_)
                                 | PipelineValue::PathSegment(_)
@@ -1294,6 +1296,7 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::SourceSet(_)
                         | PipelineValue::BuildTarget(_)
                         | PipelineValue::TopologyEdge(_)
+                        | PipelineValue::BuildConfiguration(_)
                         | PipelineValue::RewritePath(_)
                         | PipelineValue::QualifiedPath(_)
                         | PipelineValue::PathSegment(_)
@@ -1826,6 +1829,10 @@ pub(super) fn query_plan_requires_value_flow(plan: &CodeQueryPlan) -> bool {
     })
 }
 
+pub(super) fn query_plan_requests_witnesses(plan: &CodeQueryPlan) -> bool {
+    query_plan_has_step(plan, |step| matches!(step, QueryStep::Witness(_)))
+}
+
 /// Whether this query can ask the Python absence solver to prove a missing
 /// member from a selected Python structural seed. The declaration-surface
 /// capability gate must run before seed enumeration, including when selected
@@ -2045,7 +2052,7 @@ fn apply_pipeline_step<'a>(
     environment_cache: &mut EnvironmentTraversalCache,
     materialization_cache: &mut materialization::MaterializationTraversalCache,
     edge_cache: &mut EdgeTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     control_relation_cache: &mut ControlRelationTraversalCache,
     branch_relation_cache: &mut BranchRelationTraversalCache,
     cpp_expression_cache: &mut HashMap<
@@ -2418,7 +2425,7 @@ fn apply_pipeline_step_general<'a>(
     environment_cache: &mut EnvironmentTraversalCache,
     materialization_cache: &mut materialization::MaterializationTraversalCache,
     edge_cache: &mut EdgeTraversalCache,
-    flow_state_cache: &mut FlowStateTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     control_relation_cache: &mut ControlRelationTraversalCache,
     branch_relation_cache: &mut BranchRelationTraversalCache,
     cpp_expression_cache: &mut HashMap<
@@ -5925,6 +5932,9 @@ fn apply_pipeline_step_general<'a>(
             }
             (PipelineValue::File(file), QueryStep::SourceSetOf) => {
                 source_set_expansions(topology_cache, analyzer, file, diagnostics)
+            }
+            (PipelineValue::File(file), QueryStep::BuildConfigurationOf) => {
+                build_configuration_expansions(topology_cache, analyzer, token, file, diagnostics)
             }
             (PipelineValue::BuildTarget(target), QueryStep::TopologyEdgesOf) => {
                 topology_edge_expansions(analyzer, topology_cache, target, diagnostics)

@@ -30,9 +30,10 @@ use serde::{Deserialize, Serialize};
 /// nineteen carries implementation inventories, conditions and extraction authority.
 /// Version twenty carries assembly identities and type-forwarding records.
 /// Version twenty-one carries lexically enclosing type parameters on JVM owner
-/// inventories.
+/// inventories. Version twenty-two carries reviewed Rust drop glue on type
+/// value semantics.
 pub const VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION: u32 = 8;
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 21;
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 22;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -43,7 +44,7 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 21;
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
 pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
 ];
 /// Explicit unknown type knowledge first appeared in schema nine.
 pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
@@ -65,6 +66,8 @@ pub const EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION: u32 = 16;
 pub const RUNTIME_BASES_MIN_SCHEMA_VERSION: u32 = 17;
 /// Structured Rust declaration contracts first appeared in schema eighteen.
 pub const RUST_DECLARATION_CONTRACT_MIN_SCHEMA_VERSION: u32 = 18;
+/// Reviewed Rust drop glue first appeared in schema twenty-two.
+pub const RUST_DROP_GLUE_MIN_SCHEMA_VERSION: u32 = 22;
 /// Structured channel-close effects and returned-callable bindings first
 /// appeared in schema eleven.
 pub const CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION: u32 = 11;
@@ -3053,6 +3056,20 @@ pub struct TypeValueSemantics {
     pub copy: Option<TypeCopySemantics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_semantics: Option<TypeMoveSemantics>,
+    /// What dropping a Rust value of this type executes (#9057). Absence
+    /// makes no claim, so the value's scope exit stays unproven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_glue: Option<TypeDropGlue>,
+}
+
+/// Reviewed Rust drop glue for one declared type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeDropGlue {
+    /// The type has no `Drop` impl and none of its fields' drop glue runs user
+    /// code. A generic application also drops the values of its type
+    /// arguments, so it is inert only when every type argument is.
+    Inert,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

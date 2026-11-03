@@ -46,6 +46,7 @@ fn is_lexical_scope_continuation(path: &PartialPath) -> bool {
 // The source can issue several namespace roots for one reference. Keep each
 // prefix and request its endpoint; a callable local may exist on only one.
 struct ReceiverLexicalFrame {
+    owner: SemanticId,
     requests: Vec<BatchCandidateRequest>,
     prefixes: Vec<PartialPath>,
     scopes: Vec<ImplicitReceiverScope>,
@@ -54,8 +55,12 @@ struct ReceiverLexicalFrame {
 }
 
 impl ReceiverLexicalFrame {
+    fn request_owner(&self, _request: &BatchCandidateRequest) -> SemanticId {
+        self.owner
+    }
     fn new(seed: &ReferenceSeed) -> Self {
         Self {
+            owner: seed.reference(),
             requests: vec![BatchCandidateRequest::new(
                 0,
                 closed_endpoint(seed.node(), []),
@@ -70,9 +75,19 @@ impl ReceiverLexicalFrame {
     fn poll(
         &mut self,
         evaluation: &mut FactEvaluation<'_, '_>,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<bool> {
-        if readiness(&self.requests)? == DemandForwardReadiness::AwaitingDependencies {
+        let owned = self
+            .requests
+            .iter()
+            .map(|request| OwnedBatchCandidateRequest {
+                owner: self.request_owner(request),
+                request,
+            })
+            .collect::<Vec<_>>();
+        if readiness(&owned)? == DemandForwardReadiness::AwaitingDependencies {
             return Ok(false);
         }
         let mut paths = BTreeMap::new();
@@ -264,6 +279,26 @@ pub(super) struct DemandImplicitReceiverFrame {
 }
 
 impl DemandImplicitReceiverFrame {
+    pub(super) fn outer_owner(&self) -> SemanticId {
+        self.seed.reference()
+    }
+    pub(super) fn request_owner(&self, request: &BatchCandidateRequest) -> SemanticId {
+        if let Some(lexical) = &self.lexical {
+            return lexical.request_owner(request);
+        }
+        if self.selected.is_some() {
+            return self.seed.reference();
+        }
+        if let Some(group) = &self.group {
+            return group.request_owner(request);
+        }
+        let active = self.active.as_ref().expect("a pending implicit batch");
+        debug_assert_eq!(
+            active.pending_request_reference(request),
+            self.seed.reference()
+        );
+        self.seed.reference()
+    }
     pub(super) fn new(
         evaluation: &mut FactEvaluation<'_, '_>,
         reference: SemanticId,
@@ -488,7 +523,9 @@ impl DemandImplicitReceiverFrame {
         &mut self,
         evaluation: &mut FactEvaluation<'_, '_>,
         previous_states: &StateMap,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandQualifiedPoll> {
         use DemandQualifiedPoll::{
             AwaitingDependencies, AwaitingHierarchyReferences, Continue, Ready,
@@ -510,7 +547,16 @@ impl DemandImplicitReceiverFrame {
         }
         if self.selected.is_some() {
             if !self.bridge_requests.is_empty()
-                && readiness(&self.bridge_requests)? == DemandForwardReadiness::AwaitingDependencies
+                && readiness(
+                    &self
+                        .bridge_requests
+                        .iter()
+                        .map(|request| OwnedBatchCandidateRequest {
+                            owner: self.seed.reference(),
+                            request,
+                        })
+                        .collect::<Vec<_>>(),
+                )? == DemandForwardReadiness::AwaitingDependencies
             {
                 return Ok(AwaitingDependencies);
             }
@@ -702,7 +748,9 @@ impl DemandImplicitReceiverFrame {
             let Some(roots) = evaluation.prepare_hierarchy_roots(shape, &roots) else {
                 return Ok(Ready(None));
             };
-            let Some(local) = DemandHierarchyLocalFrame::new(evaluation, &roots.root_keys) else {
+            let Some(local) =
+                DemandHierarchyLocalFrame::new(evaluation, &roots.root_keys, self.seed.reference())
+            else {
                 return Ok(Ready(None));
             };
             self.group = Some(DemandHierarchyOwnerFrame {
@@ -1381,7 +1429,9 @@ impl DemandReferenceEvaluationFrame {
         &mut self,
         evaluation: &mut FactEvaluation<'_, '_>,
         previous_states: &StateMap,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandFactEvaluationPoll> {
         let reference = self.references[self.cursor];
         if self.implicit.is_none() {
@@ -1554,6 +1604,15 @@ pub(super) struct DemandQualifiedFrame {
 }
 
 impl DemandQualifiedFrame {
+    pub(super) fn request_owner(
+        &self,
+        request: &BatchCandidateRequest,
+        current: SemanticId,
+    ) -> SemanticId {
+        self.frame
+            .as_ref()
+            .map_or(current, |frame| frame.request_owner(request, current))
+    }
     pub(super) fn new(frame: QualifiedReceiverFrame, states: &StateMap) -> Self {
         let template = frame
             .prepared
@@ -1643,7 +1702,9 @@ impl DemandQualifiedFrame {
         reference: SemanticId,
         evaluation: &mut FactEvaluation<'_, '_>,
         previous_states: &StateMap,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandQualifiedPoll> {
         use DemandQualifiedPoll::{Continue, Ready};
         loop {

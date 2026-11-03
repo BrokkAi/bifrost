@@ -63,6 +63,23 @@ impl PendingLexicalHierarchy {
         self.answers[self.cursor].0
     }
 
+    pub(super) fn request_owner(&self, request: &BatchCandidateRequest) -> SemanticId {
+        let current = self.current_reference();
+        if let Some(replay) = &self.replay {
+            if let Some(group) = &replay.group {
+                // A live hierarchy frame pins the lexical cursor.
+                debug_assert_eq!(group.local.owner, current);
+                return group.request_owner(request);
+            }
+            if let Some(active) = &replay.active {
+                let owner = active.pending_request_reference(request);
+                debug_assert_eq!(owner, current);
+                return owner;
+            }
+        }
+        current
+    }
+
     pub(super) fn pending_requests(&self) -> &[BatchCandidateRequest] {
         self.replay
             .as_ref()
@@ -88,7 +105,9 @@ impl PendingLexicalHierarchy {
     pub(super) fn poll(
         &mut self,
         evaluation: &mut FactEvaluation<'_, '_>,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandFactEvaluationPoll> {
         if evaluation.poll_cancelled() {
             return Ok(DemandFactEvaluationPoll::ready(
@@ -601,7 +620,9 @@ impl JavaLexicalReplay {
     fn poll(
         &mut self,
         evaluation: &mut FactEvaluation<'_, '_>,
-        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+        readiness: &mut impl FnMut(
+            &[OwnedBatchCandidateRequest<'_>],
+        ) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandQualifiedPoll> {
         use DemandQualifiedPoll::{
             AwaitingDependencies, AwaitingHierarchyReferences, Continue, Ready,
@@ -689,7 +710,9 @@ impl JavaLexicalReplay {
             let Some(roots) = evaluation.prepare_hierarchy_roots(*shape, &roots) else {
                 return Ok(Ready(None));
             };
-            let Some(local) = DemandHierarchyLocalFrame::new(evaluation, &roots.root_keys) else {
+            let Some(local) =
+                DemandHierarchyLocalFrame::new(evaluation, &roots.root_keys, self.seed.reference())
+            else {
                 return Ok(Ready(None));
             };
             self.group = Some(DemandHierarchyOwnerFrame {

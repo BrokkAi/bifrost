@@ -1,97 +1,13 @@
 ---
 title: Cursor
-description: Install and validate Bifrost in Cursor.
+description: Install and validate Bifrost MCP tools in Cursor Agents.
 ---
 
-Cursor has two independent Bifrost integrations:
-
-| Integration | Process | Surface |
-| --- | --- | --- |
-| Bifrost editor extension | Version 0.11.5: `bifrost --root <workspace> --lsp`, using its own Bifrost 0.11.5 binary. Next version: `bifrost-lsp --root <workspace>`. | Editor features such as definitions, references, hover, rename, diagnostics, and workspace symbols, plus RQL and Rune editor features |
-| Bifrost agent plugin | `bifrost --mcp symbol\|extended`, started by the plugin's launcher | Bifrost tools that Cursor agents can call |
-
-Install either integration for its own surface, or install both. They run
-separate processes. Never point the agent plugin at the extension's language
-server.
-
-:::caution[The language server moved to bifrost-lsp]
-Bifrost built after release 0.12.0 does not serve LSP: `bifrost --lsp` exits
-with an error. The language server is now the separate `bifrost-lsp` program, and
-`bifrost-lsp` has no release yet. The extension version on Open VSX, 0.11.5,
-still works because it downloads its own Bifrost 0.11.5 binary. See
-[LSP Server](/lsp/).
-:::
-
-## Install the Editor Extension
-
-Install the [Bifrost extension from Open VSX](https://open-vsx.org/extension/brokk/bifrost-vscode),
-or open Cursor's **Extensions** view and search for `brokk.bifrost-vscode`.
-Confirm that the publisher is **brokk**, choose **Install**, and open a supported
-source workspace. With the default `auto` launch mode, accept the prompt to
-install the managed server binary.
-
-Open **Output > Bifrost** and keep the lines that show the download and the
-installed version and path. The managed installer:
-
-1. downloads the platform archive and its `.sha256` file from the GitHub
-   release. Version 0.11.5 downloads Bifrost from BrokkAi/bifrost. The next
-   version downloads `bifrost-lsp` from BrokkAi/bifrost-lsp;
-2. checks that the `.sha256` file and the archive both match the hash built
-   into the extension package; and
-3. runs the binary with `--version` before it starts the language server.
-
-A visible Bifrost status item does not by itself show that these checks
-passed or that the server serves the active workspace.
-
-To upgrade, choose **Update** for Bifrost in Cursor's Extensions view. Fully
-quit and reopen Cursor. Then check the installed extension version and the
-managed server version in **Output > Bifrost**. If the extension asks to
-install a new managed binary, choose **Update**.
-
-See [VS Code LSP](/vscode/) for all extension settings, commands, and launch
-modes.
-
-### Validate the Editor Extension
-
-Use a normal workspace rather than a Cursor agent worktree for this smoke. Add
-a temporary, uniquely named declaration and usage in a supported language. For
-example, in Rust:
-
-```rust
-pub fn cursor_bifrost_lsp_probe_4f6f2b7() {}
-
-pub fn call_cursor_bifrost_lsp_probe_4f6f2b7() {
-    cursor_bifrost_lsp_probe_4f6f2b7();
-}
-```
-
-From the usage, verify **Go to Definition**, **Find All References**, and
-hover. Run **Rename Symbol**, confirm that both declaration and usage change,
-then undo the rename. To exercise diagnostics, temporarily enable
-`bifrost.unrecognizedSymbolDiagnostics`, replace the call with a unique missing
-symbol, and confirm that Bifrost reports it before restoring the valid call and
-disabling the experimental setting.
-
-Pass only if every result belongs to the active checkout and **Output >
-Bifrost** shows the language-server launch for that workspace. Remove the
-temporary probe after you record the Cursor version, extension version,
-managed server version, platform, output, and operation results.
-
-### Troubleshoot the Editor Extension
-
-- Run **Bifrost: Show Output** and check the full launch command, download,
-  checksum, version, and handler errors.
-- Run **Bifrost: Restart Language Server** after changing roots, exclusions, or
-  launch settings.
-- Set `bifrost.launchMode` to `bundled` to require the managed binary, or use
-  `path` with `bifrost.serverPath` to diagnose a specific local binary.
-- Set `bifrost.debug` to `true` for LSP request tracing and lower
-  `bifrost.slowRequestMs` when investigating latency.
-- If the output shows `the LSP server has moved out of this repository`, the
-  extension started a Bifrost CLI newer than 0.12.0. Use `auto` or `bundled`
-  mode, or point `bifrost.serverPath` at a server binary that serves LSP.
-- Do not use healthy MCP status as evidence that the editor extension works;
-  it is a different process and protocol.
+The Bifrost agent plugin lets Cursor Agents call analyzer tools through MCP.
+For editor features such as definitions, references, hover and rename, use the
+separate [Cursor LSP guide](https://github.com/BrokkAi/bifrost-lsp/blob/c3e7caaed7c3e8db54521edc985a7ff1fc51cdf2/docs/cursor.md).
+The extension and its language server are maintained in
+[BrokkAi/bifrost-lsp](https://github.com/BrokkAi/bifrost-lsp).
 
 ## Install the Agent Plugin From GitHub
 

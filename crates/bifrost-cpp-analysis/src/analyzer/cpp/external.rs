@@ -1717,6 +1717,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 type_fact.value_semantics = Some(TypeValueSemantics {
                     copy: copy_member.map(|member| TypeCopySemantics::ViaMember { member }),
                     move_semantics: move_member.then_some(TypeMoveSemantics::Invalidating),
+                    drop_glue: None,
                 });
             }
         }
@@ -3134,6 +3135,7 @@ mod tests {
             Some(TypeValueSemantics {
                 copy: Some(TypeCopySemantics::ViaMember { member }),
                 move_semantics: Some(TypeMoveSemantics::Invalidating),
+                drop_glue: None,
             }) if basic_string_members.iter().any(|candidate| candidate.id == *member)
         ));
         let string_alias = types

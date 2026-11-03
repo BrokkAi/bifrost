@@ -2166,6 +2166,7 @@ pub(crate) mod tests {
                     member: member_id.clone(),
                 }),
                 move_semantics: None,
+                drop_glue: None,
             });
             (type_id, member_id)
         };
@@ -2817,6 +2818,7 @@ pub(crate) mod tests {
             types[0].value_semantics = Some(TypeValueSemantics {
                 copy: Some(TypeCopySemantics::Trivial),
                 move_semantics: None,
+                drop_glue: None,
             });
         }
         let exported = export_authored_csmi_pack(&value_semantics, &artifact, &options)

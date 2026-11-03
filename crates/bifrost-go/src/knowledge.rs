@@ -4,12 +4,16 @@ use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::language_knowledge::GuardConditionSyntax;
 use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
 use brokk_bifrost_core::analyzer::language_knowledge::ParserFlavor;
+use brokk_bifrost_core::analyzer::language_knowledge::ScalarObjectFieldKind;
 use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 
 /// Go syntax and static language rules.
 pub struct GoKnowledge;
 
 impl LanguageKnowledge for GoKnowledge {
+    fn scalar_object_field_is_copy(&self, _kind: ScalarObjectFieldKind) -> bool {
+        true
+    }
     fn semantic_string_constant_value(&self, payload: &str) -> Option<String> {
         String::from_utf8(crate::build_files::go_string_literal_bytes(payload)?).ok()
     }

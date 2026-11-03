@@ -349,6 +349,7 @@ pub(super) struct SemanticQueryContext<'a> {
         CaptureScopedMemo<HashMap<ProjectFile, Option<Arc<SemanticSourceCallIndex>>>>,
     prepared_source_dispatch: CaptureScopedMemo<Vec<PreparedSourceDispatchCache<'a>>>,
     budget_exhausted: bool,
+    pub(super) effect_work: super::CodeQueryEffectWork,
     typestate: TypestateQueryState,
     value_flow: ValueFlowQueryState,
     taint: TaintQueryState,
@@ -490,6 +491,10 @@ fn callback_invoked_formals(
 }
 
 impl<'a> SemanticQueryContext<'a> {
+    pub(super) fn cancellation(&self) -> &CancellationToken {
+        self.cancellation.unwrap_or(&self.uncancelled)
+    }
+
     pub(super) fn analyzer(&self) -> &'a dyn crate::analyzer::IAnalyzer {
         self.workspace.analyzer()
     }
@@ -701,6 +706,7 @@ impl<'a> SemanticQueryContext<'a> {
             source_call_indexes: CaptureScopedMemo::default(),
             prepared_source_dispatch: CaptureScopedMemo::default(),
             budget_exhausted: false,
+            effect_work: super::CodeQueryEffectWork::default(),
             typestate: TypestateQueryState::default(),
             value_flow: ValueFlowQueryState::default(),
             taint: TaintQueryState::default(),
@@ -1222,6 +1228,15 @@ impl<'a> SemanticQueryContext<'a> {
                 .is_some_and(|unit| self.locator_exactly_names_unit(caller_locator, unit));
             let call_context = call_contexts.len();
             call_contexts.push(super::dispatch::DispatchCallContext {
+                call: Some((call.procedure().durable_key(), call.id())),
+                proven_non_callable: observation.dispatch().resolver_proved_no_callee(),
+                residuals: observation
+                    .dispatch()
+                    .boundaries()
+                    .iter()
+                    .filter(|boundary| boundary.kind.target_locator().is_none())
+                    .map(|boundary| boundary.kind.clone())
+                    .collect(),
                 member_receiver_preparation: observation.dispatch().member_receiver_preparation(),
                 procedure_id: procedure_wire_id(call.procedure()),
                 caller,
@@ -1248,6 +1263,8 @@ impl<'a> SemanticQueryContext<'a> {
                 let locator = target.semantics().locator();
                 arms.push(DispatchArm {
                     call_context,
+                    target_procedure: Some(target.durable_key()),
+                    boundary: None,
                     execution_timing: dispatch_arm_execution_timing(
                         semantic_call.execution_timing,
                         None,
@@ -1291,6 +1308,8 @@ impl<'a> SemanticQueryContext<'a> {
                     .map(|target| target.artifact().public_fingerprint().to_string());
                 arms.push(DispatchArm {
                     call_context,
+                    target_procedure: None,
+                    boundary: Some(boundary.kind.clone()),
                     execution_timing: dispatch_arm_execution_timing(
                         semantic_call.execution_timing,
                         Some(&boundary.kind),
@@ -1786,7 +1805,7 @@ impl<'a> SemanticQueryContext<'a> {
     /// statement) around the callable node. In that case the locator's named
     /// declaration path must match the declaration's structured FQ-name suffix.
     /// An anonymous locator never borrows the enclosing named declaration.
-    fn locator_exactly_names_unit(
+    pub(super) fn locator_exactly_names_unit(
         &self,
         locator: &SemanticLocator,
         unit: &crate::analyzer::CodeUnit,
@@ -2667,6 +2686,7 @@ impl<'a> SemanticQueryContext<'a> {
             typestate: self.typestate.work(),
             value_flow: self.value_flow.work(),
             type_flow: self.type_flow.work(),
+            effects: self.effect_work,
         }
     }
 
@@ -3423,10 +3443,15 @@ impl<'a> SemanticQueryContext<'a> {
             plan_ref,
             &mut self.budget,
             self.value_flow_limits,
+            self.limits.max_materialized_files,
             max_endpoints,
             cancellation,
             self.active_semantic_model_snapshot.clone(),
         )
+    }
+
+    pub(super) fn set_value_flow_witness_demand(&mut self, requested: bool) {
+        self.value_flow.witness_requested = requested;
     }
 
     pub(super) fn value_flow_witnesses(

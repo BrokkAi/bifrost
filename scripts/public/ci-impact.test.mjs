@@ -369,11 +369,7 @@ test("broad analyzer PRs avoid unrelated packaging and plugin lanes", () => {
   ]);
 });
 
-test("Zed extension changes select Rust validation while plugin changes select Node checks", () => {
-  assert.deepEqual(
-    selected(classifyChangeSet({ eventName: "pull_request", changedPaths: ["editors/zed/src/lib.rs"] })),
-    ["rust"],
-  );
+test("plugin changes select Node checks", () => {
   assert.deepEqual(
     selected(classifyChangeSet({ eventName: "pull_request", changedPaths: fixture("plugin") })),
     ["agent_plugin", "pi_package"],
@@ -404,7 +400,7 @@ test("public release contract fixtures retain their host and package checks", ()
 test("combined paths union selected checks", () => {
   const decision = classifyChangeSet({
     eventName: "pull_request",
-    changedPaths: ["editors/zed/src/lib.rs", ...fixture("plugin")],
+    changedPaths: ["crates/bifrost-ruby/src/lib.rs", ...fixture("plugin")],
   });
   assert.deepEqual(selected(decision), ["agent_plugin", "pi_package", "rust"]);
 });

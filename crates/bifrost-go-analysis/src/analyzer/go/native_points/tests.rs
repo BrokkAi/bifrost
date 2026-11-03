@@ -1185,6 +1185,8 @@ func caller(file *os.File) {
                 ExactExternalCallProof::call_application,
             );
             GoNativeDefinitionResolution {
+                selected_callable_result_count: None,
+                source_member_evidence: None,
                 native_resolution: None,
                 model_member_selection: None,
                 outcome: value.0,
@@ -2449,6 +2451,62 @@ fn go_native_point_keeps_frontier_open_for_refused_package_file() {
 
 #[test]
 #[hardwon(
+    "#8874: review found a package-level function variable treated as a bound-receiver field call"
+)]
+fn go_native_point_package_function_variable_has_no_bound_receiver() {
+    let provider = "package p\nvar F = func() {}\nfunc local() { F() }\n";
+    let consumer = "package consumer\nimport \"example.test/native/p\"\nfunc use() { p.F() }\n";
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file("p/p.go", provider)
+        .file(CALLER, consumer)
+        .build();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    for (path, source, expected_application) in [
+        (CALLER, consumer, CallApplicationKind::Unknown),
+        ("p/p.go", provider, CallApplicationKind::PackageFunction),
+    ] {
+        let start_byte = source.rfind("F()").unwrap();
+        let site = brokk_bifrost_analysis::analyzer::usages::common::build_reference_site(
+            path.into(),
+            "F".into(),
+            Range {
+                start_byte,
+                end_byte: start_byte + 1,
+                start_line: 0,
+                end_line: 0,
+            },
+            start_byte,
+            start_byte + 1,
+        );
+        let file = fixture.file(path);
+        let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source).unwrap();
+        let answer = complete_with_evidence(resolve_go_definition_with_evidence_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            },
+            || {},
+        ));
+        assert_eq!(
+            answer.outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{path}: {answer:?}"
+        );
+        assert_eq!(
+            answer.call_application, expected_application,
+            "{path}: {answer:?}"
+        );
+    }
+}
+
+#[test]
+#[hardwon(
     "#6650: the tool context renamed the gap of an unselected member, hiding it from lookups"
 )]
 fn go_native_point_keeps_frontier_open_for_refused_package_file_in_tool_context() {
@@ -2608,6 +2666,7 @@ func run(opts *Options) { c, err := opts.Client(); _, _ = c, err }
 }
 
 #[test]
+#[hardwon("#7509: type method expressions were classified as bound receiver calls")]
 fn go_native_point_resolves_method_expressions_with_exact_method_sets() {
     let caller_source = r#"package consumer
 
@@ -2671,6 +2730,45 @@ func caller(value Widget) {
             outcome.definitions[0].fq_name().to_string(),
             expected,
             "{selector}: {outcome:?}"
+        );
+    }
+
+    // The target alone cannot distinguish a bound method value from T.M(x).
+    for (selector, expected_application) in [
+        ("Widget.Value", CallApplicationKind::ReceiverBindingUnknown),
+        ("(*Widget).Value", CallApplicationKind::Unknown),
+    ] {
+        let start_byte = caller_source.find(selector).unwrap() + selector.rfind('.').unwrap() + 1;
+        let site = brokk_bifrost_analysis::analyzer::usages::common::build_reference_site(
+            CALLER.into(),
+            "Value".into(),
+            Range {
+                start_byte,
+                end_byte: start_byte + "Value".len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            start_byte,
+            start_byte + "Value".len(),
+        );
+        let file = fixture.file(CALLER);
+        let tree =
+            crate::analyzer::usages::get_definition::go::parse_go_tree(caller_source).unwrap();
+        let result = complete_with_evidence(resolve_go_definition_with_evidence_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source: caller_source,
+                tree: Some(&tree),
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            },
+            || {},
+        ));
+        assert_eq!(
+            result.call_application, expected_application,
+            "{selector}: {result:?}"
         );
     }
 

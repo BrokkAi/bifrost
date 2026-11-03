@@ -59,6 +59,77 @@ fn decode_external_member_visibility(label: &str) -> StoreResult<DeclaredVisibil
 }
 
 impl SelectedResolutionTypedSource<'_, '_> {
+    pub(super) fn external_argument_proof_reasons(
+        &self,
+        definitions: &[SemanticId],
+        receiver_reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        // This exemption still requires Java's exact argument-conversion proof.
+        // TypeParameter (also nested) is nonground: see java_known_ground_type,
+        // crates/bifrost-jvm-analysis/src/analyzer/jvm/external.rs:4337.
+        // crates/bifrost-jvm/src/java/conversion.rs:74-75 returns Unknown for a
+        // nonground formal, so List.add(E) cannot satisfy the bridge. A variable
+        // only in the result does not participate in argument conversion.
+        let memo = self.external_signatures.borrow();
+        let mut reasons = Vec::new();
+        for &reason in receiver_reasons {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            // Class (i)'s sole exception: this registered known nominal head
+            // does not require its unknown arguments to select this member.
+            if memo.nominal_argument_reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        }
+        for definition in definitions {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            // Class (ii) for the binding only: a proven argument conversion
+            // does not depend on a variable that occurs solely in the result.
+            // Its original result-type obligation remains unchanged.
+            // A repeated call to the same declaration can inherit this same
+            // registered identity from its receiver. That inner result remains
+            // open even when it is also this call's own result obligation (#7667).
+            if let Some(&reason) = memo.result_only_generic_reasons.get(definition)
+                && !receiver_reasons.contains(&reason)
+            {
+                reasons.push(reason);
+            }
+        }
+        Ok(Some(reasons))
+    }
+
+    pub(super) fn external_receiver_argument_reasons(
+        &self,
+        definitions: &[SemanticId],
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        let memo = self.external_signatures.borrow();
+        let independent = !definitions.is_empty()
+            && definitions.iter().all(|definition| {
+                memo.signatures
+                    .get(definition)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|signature| {
+                        signature.row().completion() == &ResolutionCompletion::Complete
+                    })
+            });
+        let mut selected = Vec::new();
+        for &reason in reasons {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if independent && memo.nominal_argument_reasons.contains(&reason) {
+                selected.push(reason);
+            }
+        }
+        Ok(Some(selected))
+    }
+
     pub(super) fn external_callable_result_type_identities(
         &self,
         definitions: &[SemanticId],
@@ -669,6 +740,8 @@ pub(super) struct ExternalSignatureMemo {
         crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
     pub(super) seeds: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredIntrinsicSeed>>,
     parameter_slots: crate::hash::HashSet<SemanticId>,
+    nominal_argument_reasons: crate::hash::HashSet<SemanticId>,
+    result_only_generic_reasons: crate::hash::HashMap<SemanticId, SemanticId>,
     pub(super) components:
         crate::hash::HashMap<SemanticId, Vec<SelectedTypedRow<LoweredTypeComponent>>>,
     pub(super) descriptors:
@@ -775,11 +848,12 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     .map_err(|error| invalid_fact(format!("external declaration type: {error}")))?;
                 let mut pending = parameters
                     .iter()
-                    .map(|parameter| &parameter.r#type)
-                    .chain(result.iter())
+                    .map(|parameter| (&parameter.r#type, true))
+                    .chain(result.iter().map(|term| (term, false)))
                     .collect::<Vec<_>>();
                 let mut generic = false;
-                while let Some(term) = pending.pop() {
+                let mut generic_parameters = false;
+                while let Some((term, parameter)) = pending.pop() {
                     if cancellation.is_cancelled() {
                         return cancelled();
                     }
@@ -792,25 +866,36 @@ impl SelectedResolutionTypedSource<'_, '_> {
                             {
                                 type_names.insert(name.clone());
                             }
-                            pending.extend(arguments);
+                            pending.extend(arguments.iter().map(|term| (term, parameter)));
                         }
-                        TypeRef::Declared { arguments, .. } => pending.extend(arguments),
-                        TypeRef::TypeParameter { .. } => generic = true,
+                        TypeRef::Declared { arguments, .. } => {
+                            pending.extend(arguments.iter().map(|term| (term, parameter)))
+                        }
+                        TypeRef::TypeParameter { .. } => {
+                            generic = true;
+                            generic_parameters |= parameter;
+                        }
                         TypeRef::Array { element }
                         | TypeRef::ByRef { element, .. }
                         | TypeRef::Pointer { element }
                         | TypeRef::Slice { element }
                         | TypeRef::FixedArray { element, .. }
-                        | TypeRef::Channel { element, .. } => pending.push(element),
+                        | TypeRef::Channel { element, .. } => pending.push((element, parameter)),
                         TypeRef::Map { key, value } => {
-                            pending.push(key);
-                            pending.push(value);
+                            pending.push((key, parameter));
+                            pending.push((value, parameter));
                         }
-                        TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref()),
-                        TypeRef::Tuple { elements } => pending.extend(elements),
+                        TypeRef::Wildcard { bound, .. } => {
+                            pending.extend(bound.as_deref().map(|term| (term, parameter)))
+                        }
+                        TypeRef::Tuple { elements } => {
+                            pending.extend(elements.iter().map(|term| (term, parameter)))
+                        }
                         TypeRef::Function { parameters, result } => {
-                            pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
-                            pending.extend(result.as_deref());
+                            pending.extend(
+                                parameters.iter().map(|formal| (&formal.r#type, parameter)),
+                            );
+                            pending.extend(result.as_deref().map(|term| (term, parameter)));
                         }
                         // Rust projections have no Java owner or substitution proof.
                         // lower_type_term retains their unsupported type obligation.
@@ -836,6 +921,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     parameters,
                     result,
                     generic,
+                    generic_parameters,
                     kind,
                 ));
             }
@@ -893,7 +979,17 @@ impl SelectedResolutionTypedSource<'_, '_> {
             for definition in requested.values() {
                 memo.signatures.insert(*definition, None);
             }
-            for (definition, owner, ordinal, parameters, result, generic, kind) in decoded {
+            for (
+                definition,
+                owner,
+                ordinal,
+                parameters,
+                result,
+                generic,
+                generic_parameters,
+                kind,
+            ) in decoded
+            {
                 let callable = matches!(kind.as_str(), "method" | "function" | "constructor");
                 let member = crate::analyzer::resolution::ExternalMemberIdentity {
                     owner: owner.clone(),
@@ -997,6 +1093,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
                         "UnsupportedExternalSignatureTypeVariable",
                         "The external declaration has an unproven type-variable substitution",
                     );
+                    if !generic_parameters {
+                        memo.result_only_generic_reasons.insert(definition, reason);
+                    }
                     ResolutionCompletion::incomplete([
                         ResolutionIncompleteReason::UnsupportedSemantic(reason),
                     ])
@@ -1419,6 +1518,7 @@ pub(super) fn lower_type_term(
                         TypedFrontierState::new(slot, values, frontier.completion().clone()),
                     )),
                 );
+
                 continue;
             }
             let (constructor, children) = match component {
@@ -1544,6 +1644,18 @@ pub(super) fn lower_type_term(
                 incomplete_type(),
             )
         };
+        // #7619: this known non-nullable head has an incomplete argument term.
+        // Retain that exact reason identity without certifying the full type.
+        if !values.is_empty()
+            && matches!(term, TypeRef::Named { arguments, nullable: false, .. } if !arguments.is_empty())
+            && let ResolutionCompletion::Incomplete(reasons) = &completion
+        {
+            for reason in reasons.iter() {
+                if let ResolutionIncompleteReason::UnsupportedSemantic(reason) = reason {
+                    memo.nominal_argument_reasons.insert(*reason);
+                }
+            }
+        }
         memo.seeds.insert(
             slot,
             hooks.wrap(LoweredIntrinsicSeed::new(

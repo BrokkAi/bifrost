@@ -18,7 +18,6 @@ on:
       - .github/actions/policy-scan/**
       - .github/workflows/policy-scan-smoke.yml
       - scripts/public/policy-sarif-catalog.test.mjs
-      - crates/bifrost-semantic-packs/src/prepared_registry.rs
       - crates/bifrost-policy/policy-packs/**
   push:
     branches: [master]
@@ -26,7 +25,6 @@ on:
       - .github/actions/policy-scan/**
       - .github/workflows/policy-scan-smoke.yml
       - scripts/public/policy-sarif-catalog.test.mjs
-      - crates/bifrost-semantic-packs/src/prepared_registry.rs
       - crates/bifrost-policy/policy-packs/**
   schedule:
     # Sunday 04:17 UTC, off peak.
@@ -43,12 +41,9 @@ concurrency:
 jobs:
   smoke:
     name: policy action (${{ matrix.os }})
-    # Public contributors use ordinary PR CI; private sources use merge batches.
-    if: >-
-      github.event_name != 'pull_request' || !github.event.repository.private ||
-      (github.event.pull_request.user.login == 'mergemarshall[bot]' &&
-       startsWith(github.head_ref, 'mergemarshall/batch-') &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+    # Public contributor PRs retain checks. Private batch PRs are validated
+    # locally by the merge agent; master push CI runs after landing.
+    if: ${{ github.event_name != 'pull_request' || !github.event.repository.private }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -89,16 +84,6 @@ jobs:
           cargo build --locked --bin bifrost --bin bifrost-semantic-pack
           -p brokk-bifrost -p brokk-bifrost-semantic-packs
           --features brokk-bifrost-semantic-packs/release-tooling
-
-      - name: Verify complete prepared semantic selection
-        env:
-          BIFROST_PARALLELISM: 1
-          RAYON_NUM_THREADS: 1
-          JAVA_HOME: ''
-          BIFROST_OPEN_PACKS_DISABLE: '1'
-        run: >-
-          cargo test --locked --lib -p brokk-bifrost-semantic-packs
-          --features release-tooling prepared_registry
 
       - name: Verify acquired host catalog against the actual engine
         shell: bash

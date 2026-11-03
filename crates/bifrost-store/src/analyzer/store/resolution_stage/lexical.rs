@@ -171,7 +171,14 @@ pub fn prepare_lexical_fragment(
             codec::encode_path(path)
         ]));
     }
+    // A producer publishes one semantic origin per node. Hydration joins on
+    // (host, producer, node); duplicate origins would multiply a path row.
+    let mut semantic_nodes = crate::hash::HashSet::default();
     for semantic in fragment.semantics() {
+        assert!(
+            semantic_nodes.insert(semantic.node()),
+            "one semantic origin per staged producer node: {semantic:?}"
+        );
         if cancellation.is_cancelled() {
             return None;
         }

@@ -89,6 +89,57 @@ impl Default for PolicyRegistryLimits {
 }
 
 impl PolicyRegistryLimits {
+    pub(crate) fn replay_caps(self) -> [(&'static str, u64); 10] {
+        let Self {
+            max_policies,
+            max_endpoints,
+            max_match_directories_per_policy,
+            max_match_directory_depth,
+            max_match_directory_candidates,
+            max_match_directory_entries,
+            max_retained_source_and_selector_bytes,
+            max_endpoint_set_files,
+            max_endpoint_set_depth,
+            max_endpoint_set_entries,
+        } = self;
+        [
+            ("registry.max_policies", max_policies as u64),
+            ("registry.max_endpoints", max_endpoints as u64),
+            (
+                "registry.max_match_directories_per_policy",
+                max_match_directories_per_policy as u64,
+            ),
+            (
+                "registry.max_match_directory_depth",
+                max_match_directory_depth as u64,
+            ),
+            (
+                "registry.max_match_directory_candidates",
+                max_match_directory_candidates as u64,
+            ),
+            (
+                "registry.max_match_directory_entries",
+                max_match_directory_entries as u64,
+            ),
+            (
+                "registry.max_retained_source_and_selector_bytes",
+                max_retained_source_and_selector_bytes as u64,
+            ),
+            (
+                "registry.max_endpoint_set_files",
+                max_endpoint_set_files as u64,
+            ),
+            (
+                "registry.max_endpoint_set_depth",
+                max_endpoint_set_depth as u64,
+            ),
+            (
+                "registry.max_endpoint_set_entries",
+                max_endpoint_set_entries as u64,
+            ),
+        ]
+    }
+
     pub const fn max_endpoint_set_files(self) -> usize {
         self.max_endpoint_set_files
     }

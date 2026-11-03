@@ -457,6 +457,7 @@ pub use batch::BatchedReferenceAnswer;
 pub use batch::CandidatePathIdentity;
 pub use batch::ClassificationMemberOwnerReader;
 pub use batch::FactReferenceSiteMetadata;
+pub use batch::JvmSelectedRootPresence;
 pub use batch::MAX_REFERENCE_SEEDS_PER_BATCH;
 pub use batch::ReferenceBatchAnswer;
 pub use batch::ReferenceLocalPathEvidence;
@@ -1557,3 +1558,6 @@ pub(crate) use fact_resolution::{
 };
 
 pub use selected_context::ExternalOwnerLanguage;
+
+#[doc(hidden)]
+pub use batch::{CandidatePathOrigin, HydratedCandidatePath};

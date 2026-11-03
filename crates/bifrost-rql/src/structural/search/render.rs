@@ -342,6 +342,9 @@ pub(super) fn render_pipeline_item(
         PipelineValue::TopologyEdge(value) => CodeQueryResultValue::TopologyEdge {
             value: Box::new(topology_rows::public_topology_edge(&value)),
         },
+        PipelineValue::BuildConfiguration(value) => CodeQueryResultValue::BuildConfiguration {
+            value: Box::new(value.row),
+        },
         PipelineValue::RewritePath(value) => CodeQueryResultValue::RewritePath {
             value: Box::new(render_rewrite_path(analyzer, &value, cache)),
         },
@@ -785,6 +788,11 @@ pub(super) fn render_trace_value_ref(
         PipelineTraceValue::SourceSet(value) => topology_rows::source_set_ref(value),
         PipelineTraceValue::BuildTarget(value) => topology_rows::build_target_ref(value),
         PipelineTraceValue::TopologyEdge(value) => topology_rows::topology_edge_ref(value),
+        PipelineTraceValue::BuildConfiguration(value) => CodeQueryResultRef::BuildConfiguration {
+            id: value.row.id.clone(),
+            path: value.row.path.clone(),
+            configuration_id: value.row.configuration_id.clone(),
+        },
         PipelineTraceValue::RewritePath(value) => render_rewrite_path_ref(analyzer, value, cache),
         PipelineTraceValue::QualifiedPath(value) => {
             render_qualified_path_ref(analyzer, value, cache)

@@ -213,4 +213,28 @@ mod tests {
         assert!(progress.snapshot(1).unwrap().intermediate.is_empty());
         retry.complete();
     }
+
+    #[test]
+    fn parse_progress_serializes_blobs_and_ignores_late_callbacks() {
+        let progress = Arc::new(WorkspaceBuildProgress::default());
+        let build = progress.begin(1);
+        let sink = build.sink();
+        sink(event(3, 10));
+
+        let running = serde_json::to_value(progress.snapshot(1).unwrap()).unwrap();
+        assert_eq!(running["status"], "running");
+        assert_eq!(running["counters"][0]["phase"], "parse");
+        assert_eq!(running["counters"][0]["unit"], "blobs");
+        assert_eq!(running["counters"][0]["completed"], 3);
+
+        build.complete();
+        let completed = serde_json::to_value(progress.snapshot(1).unwrap()).unwrap();
+        assert_eq!(completed["status"], "completed");
+        sink(event(9, 10));
+        assert_eq!(
+            serde_json::to_value(progress.snapshot(1).unwrap()).unwrap(),
+            completed,
+            "a retained callback must not change a completed snapshot"
+        );
+    }
 }

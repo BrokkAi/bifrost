@@ -1322,6 +1322,53 @@ pub mod rust_departing_root_tests {
     }
 
     #[test]
+    fn selected_rust_import_infos_match_canonical_parser_and_store_rows() {
+        let mut fixture = RustRootResolutionOperationFixture::new();
+        let source = "use std::fs::File as Renamed;\n\
+            use std::fs::{self as fs_alias, File};\n\
+            use std::io::*;\n\
+            use foo;\n\
+            use std::fs::File as AlsoRenamed;\n\
+            use other::File as Conflict;\n\
+            mod nested { use std::fs::File as Nested; pub fn g() { let _ = Nested::create(\"x\"); } }\n\
+            mod sibling { pub fn g() { let _ = 1; } }\n\
+            pub fn g() { let _ = Renamed::create(\"x\"); }\n";
+        let (state, _) = fixture.replace_persisted_consumer_source(source);
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+        let canonical = {
+            let connection = fixture.store.conn.lock().unwrap();
+            brokk_bifrost_analysis::analyzer::store::read_import_infos(
+                &connection,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+            )
+            .unwrap()
+        };
+        assert_eq!(canonical, state.imports.to_vec());
+        let cancellation = CancellationToken::new();
+        let input = SelectedResolutionOperationInput::new(
+            &fixture.project,
+            &fixture.workspace_id,
+            &fixture.snapshots,
+            &fixture.languages,
+            &[],
+        );
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = fixture
+            .store
+            .open_selected_resolution_operation(input, &cancellation)
+            .unwrap()
+        else {
+            panic!("ready Rust operation")
+        };
+        let file = ProjectFile::new(fixture._project_root.path(), RUST_ROOT_CONSUMER_PATH);
+        let (selected_oid, selected) = operation
+            .selected_rust_import_infos(&file, &cancellation)
+            .unwrap()
+            .expect("selected Rust import facts");
+        assert_eq!(selected_oid, oid);
+        assert_eq!(selected, canonical);
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#4460: a crate-anchored `use` of a module left its qualified type route unplaced"
     )]

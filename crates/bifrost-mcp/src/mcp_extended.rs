@@ -1866,7 +1866,12 @@ mod tests {
                 );
             }
         }
-        for op in ["target_of", "source_set_of", "topology_edges_of"] {
+        for op in [
+            "target_of",
+            "source_set_of",
+            "topology_edges_of",
+            "build_configuration_of",
+        ] {
             assert!(
                 plain_ops.contains(op),
                 "topology operator {op} must be plain"

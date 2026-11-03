@@ -533,7 +533,7 @@ pub(crate) fn fit_get_summaries_output_to_budget(
     }
 
     let (budgeted, rendered_text) =
-        degrade_get_summaries_value(service, structured, None, original_bytes, render_options)?;
+        degrade_get_summaries_value(service, structured, original_bytes, render_options)?;
     Ok(ToolOutput::Structured {
         structured: budgeted,
         rendered_text: Some(rendered_text),
@@ -543,36 +543,11 @@ pub(crate) fn fit_get_summaries_output_to_budget(
 fn degrade_get_summaries_value(
     service: &SearchToolsService,
     mut structured: Value,
-    compact_text: Option<String>,
     original_bytes: usize,
     render_options: RenderOptions,
 ) -> Result<(Value, String), SearchToolsServiceError> {
-    let mut compact_text = compact_text;
-    if let Some(paths) = compact_symbols_paths(&structured) {
-        if serialized_json_len(&structured) > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
-            let compact_output = service.call_tool_output(
-                "list_symbols",
-                json!({ "file_patterns": paths }),
-                render_options,
-            )?;
-            compact_text = rendered_text_for_output(&compact_output);
-            let ToolOutput::Structured {
-                structured: compact_structured,
-                ..
-            } = compact_output
-            else {
-                return Err(SearchToolsServiceError {
-                    code: SearchToolsServiceErrorCode::Internal,
-                    message: "list_symbols returned non-structured output during MCP budgeting"
-                        .to_string(),
-                    retryable_stale_generation: false,
-                });
-            };
-            structured =
-                compact_only_get_summaries_value(structured, compact_structured, original_bytes);
-        }
-    } else if let Some((compact_structured, rendered)) = compact_symbols_from_summaries(&structured)
-    {
+    let mut compact_text = None;
+    if let Some((compact_structured, rendered)) = compact_symbols_from_summaries(&structured) {
         compact_text = Some(rendered);
         structured =
             compact_only_get_summaries_value(structured, compact_structured, original_bytes);
@@ -641,19 +616,6 @@ fn summary_paths_for_compaction(structured: &Value) -> Vec<String> {
             (label == path).then(|| path.to_string())
         })
         .collect()
-}
-
-fn compact_symbols_paths(structured: &Value) -> Option<Vec<String>> {
-    let files = structured
-        .get("compact_symbols")?
-        .get("files")?
-        .as_array()?;
-    Some(
-        files
-            .iter()
-            .filter_map(|file| file.get("path").and_then(Value::as_str).map(str::to_string))
-            .collect(),
-    )
 }
 
 fn compact_only_get_summaries_value(
@@ -783,7 +745,7 @@ fn compact_symbol_depth(
 
 fn compact_symbol_label(symbol: &str) -> &str {
     let mut start = 0;
-    for separator in [".", "::", "->", "$", "+"] {
+    for separator in [".", "::", "$", "+"] {
         if let Some(index) = symbol.rfind(separator) {
             start = start.max(index + separator.len());
         }
@@ -820,6 +782,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_server_spec_accepts_instructions_at_character_limit_and_rejects_over() {
+        let instructions = "x".repeat(MCP_DISCOVERY_TEXT_MAX_CHARS);
+        let spec = build_server_spec_with_hidden(
+            instructions.clone(),
+            Vec::new(),
+            vec!["hidden".to_string()],
+        )
+        .expect("instructions at the public character limit are accepted");
+        assert_eq!(spec.instructions, instructions);
+        assert!(spec.tool_names.contains("hidden"));
+
+        assert!(
+            build_server_spec_with_hidden(
+                format!("{}x", "x".repeat(MCP_DISCOVERY_TEXT_MAX_CHARS)),
+                Vec::new(),
+                vec!["hidden".to_string()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn compact_summary_reuses_parent_aware_elements() {
         let structured = json!({
             "summaries": [{
@@ -847,7 +831,8 @@ mod tests {
 
 fn shrink_compact_symbols_value_to_budget(mut structured: Value) -> Value {
     loop {
-        if serialized_json_len(&structured) <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
+        let serialized_bytes = serialized_json_len(&structured);
+        if serialized_bytes <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
             return structured;
         }
         let Some(files) = structured
@@ -858,13 +843,37 @@ fn shrink_compact_symbols_value_to_budget(mut structured: Value) -> Value {
             return structured;
         };
         if files.len() <= 1 {
+            let mut remaining_bytes = serialized_bytes;
             if let Some(compact) = structured
                 .get_mut("compact_symbols")
                 .and_then(Value::as_object_mut)
             {
+                let was_truncated = compact
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .expect("compact symbols have a truncation flag");
                 compact.insert("truncated".to_string(), json!(true));
+                if !was_truncated {
+                    remaining_bytes -= 1;
+                }
             }
-            return structured;
+            let Some(lines) = structured
+                .get_mut("compact_symbols")
+                .and_then(|compact| compact.get_mut("files"))
+                .and_then(Value::as_array_mut)
+                .and_then(|files| files.first_mut())
+                .and_then(|file| file.get_mut("lines"))
+                .and_then(Value::as_array_mut)
+            else {
+                return structured;
+            };
+            while remaining_bytes > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
+                let Some(line) = lines.pop() else {
+                    return structured;
+                };
+                remaining_bytes -= serialized_json_len(&line) + usize::from(!lines.is_empty());
+            }
+            continue;
         }
         files.pop();
         if let Some(compact) = structured
@@ -940,7 +949,7 @@ fn render_budgeted_get_summaries_text(
     if text.len() > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
         let suffix = "\n\n[truncated for MCP text budget; inspect structuredContent for full compact result]";
         let keep = GET_SUMMARIES_RESPONSE_BUDGET_BYTES.saturating_sub(suffix.len());
-        text.truncate(keep);
+        text.truncate(text.floor_char_boundary(keep));
         text.push_str(suffix);
     }
     text

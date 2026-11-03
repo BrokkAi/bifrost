@@ -338,6 +338,10 @@ pub mod reason {
         CSHARP_INHERITED_TYPES_UNMODELED = "csharp_inherited_types_unmodeled" => Some(DerivationExecutionCause::Provider),
         CSHARP_METHOD_APPLICABILITY_UNMODELED = "csharp_method_applicability_unmodeled" => Some(DerivationExecutionCause::Provider),
         OPEN_BOUNDARY = "OpenBoundary" => Some(DerivationExecutionCause::Provider),
+        JVM_UNIT_PACKAGE_UNKNOWN = "jvm-unit-package-unknown" => Some(DerivationExecutionCause::Provider),
+        JVM_PACKAGE_PROVIDER_PARTIAL = "jvm-package-provider-partial" => Some(DerivationExecutionCause::Provider),
+        JVM_PACKAGE_PROVIDER_UNACQUIRED = "jvm-package-provider-unacquired" => Some(DerivationExecutionCause::Provider),
+        JVM_EXPRESSION_PREFIX_UNPROVEN = "jvm-expression-prefix-unproven" => None,
         EXTERNAL_DECLARED_UNINDEXED = "external_declared_unindexed" => Some(DerivationExecutionCause::Provider),
         // A Go import is incomplete when its package rows are missing or
         // unconfirmed, which also depends on the selected external inventory.

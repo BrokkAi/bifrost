@@ -5,11 +5,13 @@
 
 use std::sync::Arc;
 
+use crate::analyzer::semantic::SemanticLocator;
 use crate::analyzer::semantic::partial_flow::{
     CrossedCalls, HeapSelector, PartialFlowPort, ProcedurePartialFlows,
 };
 use crate::analyzer::semantic::{
-    AccessPathTail, BarrierObservation, CallSiteId, ObservationPhase, ProcedureHandle,
+    AbstractLocation, AccessPathTail, BarrierObservation, CallInvocationMode, CallSiteId,
+    CandidateCoverage, DispatchBoundaryKind, ExecutionTiming, ObservationPhase, ProcedureHandle,
     ProgramPointHandle, ProgramPointId, SemanticCapability, SemanticGapHandle, SemanticRequest,
     ValueId, ValueTypeBarrierDecision, ValueTypePredicate,
 };
@@ -20,16 +22,235 @@ use crate::value_flow::{
     ValueFlowObservationPhase,
 };
 
-use super::graph::HopQuality;
+use super::graph::{ExecutionTarget, HopQuality};
 
-/// Answers the composition engine needs from outside the plan.
+/// Match selectors after a return binding proves the caller and callee refer
+/// to the same returned object. Only the language hook may equate a declared
+/// field with its canonical member; all other selectors keep exact identity.
+pub fn bound_return_selector_matches(
+    actual: &HeapSelector,
+    formal: &HeapSelector,
+    canonical_field: impl FnOnce(&SemanticLocator) -> Option<SemanticLocator>,
+) -> bool {
+    actual == formal
+        || matches!(
+            (actual, formal),
+            (HeapSelector::ExactIndex(_), HeapSelector::AnyIndex)
+        )
+        || match (actual, formal) {
+            (HeapSelector::Field(actual), HeapSelector::Field(formal)) => {
+                canonical_field(formal).as_ref() == Some(actual)
+            }
+            _ => false,
+        }
+}
+
+/// Match one member demand after a return pairing proves object identity.
+pub fn bound_return_member_matches(
+    actual: &PartialFlowPort,
+    returned: &PartialFlowPort,
+    caller_root: &PartialFlowPort,
+    callee_root: &PartialFlowPort,
+    mut canonical_field: impl FnMut(&SemanticLocator) -> Option<SemanticLocator>,
+) -> bool {
+    let (
+        PartialFlowPort::Heap {
+            root: actual_root,
+            selectors: actual_selectors,
+            tail: actual_tail,
+        },
+        PartialFlowPort::Heap {
+            root: returned_root,
+            selectors: returned_selectors,
+            tail: returned_tail,
+        },
+    ) = (actual, returned)
+    else {
+        return false;
+    };
+    actual_root.as_ref() == caller_root
+        && returned_root.as_ref() == callee_root
+        && actual_tail == returned_tail
+        && actual_selectors.len() == returned_selectors.len()
+        && actual_selectors
+            .iter()
+            .zip(returned_selectors)
+            .all(|(actual, formal)| {
+                bound_return_selector_matches(actual, formal, |field| canonical_field(field))
+            })
+}
+
+/// Exact body-owned calls; lexical containment alone is not an invocation.
+#[derive(Debug, Clone)]
+pub struct Invocations {
+    pub sites: Vec<InvocationSite>,
+    pub coverage: Completeness,
+}
+
+#[derive(Debug, Clone)]
+pub struct InvocationSite {
+    pub call: DurableCallSiteKey,
+    pub source_site: CallSiteId,
+    pub mode: CallInvocationMode,
+}
+
+/// The result's status is independent of its arm and residual counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionDispatchOutcome {
+    Complete,
+    Unsupported(Box<str>),
+    Cancelled(Box<str>),
+    Budget(Box<str>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionDispatch<Function> {
+    pub arms: Vec<ExecutionArm<Function>>,
+    pub residuals: Vec<DispatchBoundaryKind>,
+    pub coverage: CandidateCoverage,
+    pub outcome: ExecutionDispatchOutcome,
+}
+
+/// Per-arm proof is carried into the item key, including for shared external targets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExecutionArmContext {
+    pub call: DurableCallSiteKey,
+    pub ordinal: usize,
+    pub quality: HopQuality,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionArm<Function> {
+    pub target: ExecutionTarget,
+    pub function: Function,
+    pub quality: HopQuality,
+    pub timing: ExecutionTiming,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionEndpointStatus {
+    Complete,
+    Partial(Box<str>),
+    Conflict(Box<str>),
+    Absent,
+}
+
+/// A declaration with no fabricated value carrier.
+#[derive(Debug, Clone)]
+pub struct ExecutionSource<Fact> {
+    pub identity: Box<str>,
+    pub fact: Fact,
+    pub provenance: Box<str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionEndpoints<Fact> {
+    pub sources: Vec<ExecutionSource<Fact>>,
+    pub status: ExecutionEndpointStatus,
+    pub covers_overrides: bool,
+}
+
+/// Answers the composition engine needs from outside the plan. `Fact` and
+/// `Function` are the label types of the client's
+/// [`ComposeLabels`](super::labels::ComposeLabels), which the provider's
+/// bound endpoints carry.
+pub type ProjectedPartialFlows<F> = Vec<(Option<F>, Arc<ProcedurePartialFlows>)>;
+pub type ProjectedInteriorFlows<F> = Vec<(Option<F>, InteriorFlows)>;
+
 pub trait CompositionProvider {
     type Error: std::fmt::Display;
+    type Fact: Clone + Eq + std::hash::Hash + std::fmt::Debug;
+    type Function: Clone + Eq + std::hash::Hash + std::fmt::Debug;
+
+    fn invocations(
+        &self,
+        _procedure: &DurableProcedureKey,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<Invocations, Self::Error> {
+        unimplemented!("this client has no execution relation")
+    }
+
+    fn execution_dispatch(
+        &self,
+        _call: &DurableCallSiteKey,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ExecutionDispatch<Self::Function>, Self::Error> {
+        unimplemented!("this client has no execution relation")
+    }
+
+    fn execution_endpoints(
+        &self,
+        _target: &ExecutionTarget,
+        _incoming: Option<&ExecutionArmContext>,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ExecutionEndpoints<Self::Fact>, Self::Error> {
+        unimplemented!("this client has no execution relation")
+    }
+
+    /// Only an exact named arm or the guarded single-residual rule may close
+    /// a residual. The search never treats an empty residual list as proof.
+    fn discharge_execution_residual(
+        &self,
+        _call: &DurableCallSiteKey,
+        _dispatch: &ExecutionDispatch<Self::Function>,
+    ) -> bool {
+        false
+    }
+
+    /// Write observations in this query's selected store inventory.
+    fn store_writes(&self) -> Vec<StoreWriteObservation> {
+        Vec::new()
+    }
+
+    /// May-alias writes for a selected read output. Incomplete coverage never
+    /// proves an empty channel; the search keeps the dependent answer open.
+    fn store_links(
+        &self,
+        _procedure: &DurableProcedureKey,
+        _output: &PartialFlowPort,
+    ) -> StoreChannelLinks {
+        StoreChannelLinks::default()
+    }
+
+    /// A declared field and a canonical field may name one slot only after
+    /// this call's returned object has been paired with its caller result.
+    fn canonical_returned_field(
+        &self,
+        _callee: &DurableProcedureKey,
+        _caller: &DurableProcedureKey,
+        _declared: &SemanticLocator,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Option<SemanticLocator> {
+        None
+    }
 
     /// Whether this policy declares value-type barriers. False preserves the
     /// stored-summary path and performs no barrier type lookup.
     fn has_value_type_barriers(&self) -> bool {
         false
+    }
+
+    /// Cheap pre-dispatch check for a call that may share caller storage.
+    /// Production providers can use snapshot origins for local references.
+    fn may_share_call_storage(
+        &self,
+        procedure: &ProcedureHandle,
+        call: CallSiteId,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<bool, Self::Error> {
+        let call = procedure
+            .semantics()
+            .call_site(call)
+            .expect("a call belongs to its procedure");
+        Ok(call
+            .receiver
+            .into_iter()
+            .chain(call.arguments.iter().map(|argument| argument.value))
+            .any(|value| {
+                procedure.semantics().value(value).is_some_and(|value| {
+                    value.kind == crate::analyzer::semantic::SemanticValueKind::Address
+                })
+            }))
     }
 
     /// Install the lenient observation filter for this query's candidate
@@ -67,14 +288,14 @@ pub trait CompositionProvider {
 
     fn retain_strict_value_type_witness(
         &self,
-        _source: &BoundSource,
+        _source: &BoundSource<Self::Fact>,
         _sink: crate::value_flow::ValueFlowSinkId,
     ) {
     }
 
     fn prepare_value_type_witness(
         &self,
-        _source: &BoundSource,
+        _source: &BoundSource<Self::Fact>,
         _sink: crate::value_flow::ValueFlowSinkId,
     ) {
     }
@@ -85,6 +306,21 @@ pub trait CompositionProvider {
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Arc<ProcedurePartialFlows>, Self::Error>;
+
+    /// Query-local label partitions of one procedure's port relation. `None`
+    /// is the identity label function. A partition may contain the stored
+    /// rows or a policy-local projection; the union is the procedure answer.
+    /// A partition without extra edge kills must reuse the `Arc` returned by
+    /// `partial_flows` so the search can retain its path-sensitive openness
+    /// refinement. A fresh projection with extra kills has to certify its
+    /// entire relation before any removed path can count as absent.
+    fn projected_partial_flows(
+        &self,
+        procedure: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ProjectedPartialFlows<Self::Function>, Self::Error> {
+        Ok(vec![(None, self.partial_flows(procedure, request)?)])
+    }
 
     /// The M2 fixpoint on one procedure with extra seeds (bound source
     /// carriers) and extra observations (sink carriers, caller-side
@@ -99,6 +335,21 @@ pub trait CompositionProvider {
         request: &mut SemanticRequest<'_>,
     ) -> Result<InteriorFlows, Self::Error>;
 
+    /// Interior runs use the same label partitions as port relations.
+    fn projected_interior_flows(
+        &self,
+        procedure: &DurableProcedureKey,
+        seeds: &[InteriorSeed],
+        observations: &[InteriorObservation],
+        witnesses: bool,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ProjectedInteriorFlows<Self::Function>, Self::Error> {
+        Ok(vec![(
+            None,
+            self.interior_flows(procedure, seeds, observations, witnesses, request)?,
+        )])
+    }
+
     /// A stored edge's witness uses the same file-local relations as its
     /// producer; it must not silently acquire workspace refinements.
     fn stored_interior_flows(
@@ -110,6 +361,20 @@ pub trait CompositionProvider {
         request: &mut SemanticRequest<'_>,
     ) -> Result<InteriorFlows, Self::Error> {
         self.interior_flows(procedure, seeds, observations, witnesses, request)
+    }
+
+    fn projected_stored_interior_flows(
+        &self,
+        procedure: &DurableProcedureKey,
+        seeds: &[InteriorSeed],
+        observations: &[InteriorObservation],
+        witnesses: bool,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ProjectedInteriorFlows<Self::Function>, Self::Error> {
+        Ok(vec![(
+            None,
+            self.stored_interior_flows(procedure, seeds, observations, witnesses, request)?,
+        )])
     }
 
     /// Dispatch candidates of one call with their bindings and the
@@ -139,7 +404,7 @@ pub trait CompositionProvider {
     /// The model that replaces the call, if any. Asked after `dispatch` of the
     /// same call. A model wins over every candidate body, and a call it covers
     /// is not a boundary: its dispatch answer is complete.
-    fn model(&self, call: &DurableCallSiteKey) -> Option<CallModel>;
+    fn model(&self, call: &DurableCallSiteKey) -> Option<CallModel<Self::Function>>;
 
     /// What the policy does at a call that no model covers and whose
     /// dispatch has no candidate or leaves a boundary beside its candidates:
@@ -179,7 +444,7 @@ pub trait CompositionProvider {
         &self,
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<ProcedureEndpoints, Self::Error>;
+    ) -> Result<ProcedureEndpoints<Self::Fact, Self::Function>, Self::Error>;
 
     /// The selector evidence of a source whose `evidence` is
     /// [`EndpointEvidence::Unknown`], judged the way the ICFG engine judges
@@ -189,9 +454,37 @@ pub trait CompositionProvider {
     /// finding depends on it.
     fn source_evidence(
         &self,
-        source: &BoundSource,
+        source: &BoundSource<Self::Fact>,
         request: &mut SemanticRequest<'_>,
     ) -> Result<HopQuality, Self::Error>;
+}
+
+/// An internal observation of a selected store-write input.
+#[derive(Debug, Clone)]
+pub struct StoreWriteObservation {
+    pub procedure: DurableProcedureKey,
+    pub owner: ProcedureHandle,
+    pub point: ProgramPointId,
+    pub phase: ValueFlowObservationPhase,
+    pub carrier: ValueFlowCarrier,
+}
+
+/// A selected read output's may-alias write observations.
+#[derive(Debug, Clone, Default)]
+pub struct StoreChannelLinks {
+    pub writes: Vec<StoreChannelLink>,
+    pub incomplete: Option<Box<str>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreChannelLink {
+    pub write: usize,
+    pub write_call: DurableCallSiteKey,
+    pub read_call: DurableCallSiteKey,
+    pub read_origin: crate::taint::SourceEventKey,
+    pub read_phase: ValueFlowObservationPhase,
+    pub read_carrier: ValueFlowCarrier,
+    pub uncertain: bool,
 }
 
 /// Query-local proof for a named policy barrier and exact value observation.
@@ -217,14 +510,14 @@ pub struct ValueTypeBarrierFindingNotes {
 /// incomplete when the match may have missed an endpoint there: a selector
 /// row the binding refused, or a selector evaluation that did not finish.
 #[derive(Debug, Clone)]
-pub struct ProcedureEndpoints {
-    pub sources: Vec<BoundSource>,
-    pub sanitizers: Vec<BoundSanitizer>,
-    pub transforms: Vec<BoundTransform>,
+pub struct ProcedureEndpoints<Fact = TaintClassSet, Function = TaintEdgeFunction> {
+    pub sources: Vec<BoundSource<Fact>>,
+    pub sanitizers: Vec<BoundSanitizer<Function>>,
+    pub transforms: Vec<BoundTransform<Function>>,
     pub completeness: Completeness,
 }
 
-impl ProcedureEndpoints {
+impl<Fact, Function> ProcedureEndpoints<Fact, Function> {
     /// No endpoint, and nothing missed.
     pub const fn none() -> Self {
         Self {
@@ -248,19 +541,19 @@ pub enum EndpointEvidence {
     Unknown,
 }
 
-/// A policy source: the carrier at a point and phase that generates
-/// `classes`. `origin` is the source event a finding names. `evidence` is the
+/// A policy source: the carrier at a point and phase that generates the
+/// labels `classes`. `origin` is the source event a finding names. `evidence` is the
 /// proof and completeness of its selector evidence: a source without proven
 /// and complete evidence leaves the run incomplete and enters every path that
 /// starts at it, as the ICFG engine's plan treats it. The search treats an
 /// `Unknown` evidence as neutral; the report stage judges it for the sources
 /// that reach a sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundSource {
+pub struct BoundSource<Fact = TaintClassSet> {
     pub point: ProgramPointHandle,
     pub phase: ValueFlowObservationPhase,
     pub carrier: ValueFlowCarrier,
-    pub classes: TaintClassSet,
+    pub classes: Fact,
     pub origin: SourceEventKey,
     pub evidence: EndpointEvidence,
 }
@@ -270,11 +563,11 @@ pub struct BoundSource {
 /// in-place sanitizer. Only a proven sanitizer removes `removed`; one that is
 /// not resolved makes the run incomplete.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundSanitizer {
+pub struct BoundSanitizer<Function = TaintEdgeFunction> {
     pub point: ProgramPointHandle,
     pub input: ValueFlowCarrier,
     pub output: ValueFlowCarrier,
-    pub removed: TaintClassSet,
+    pub function: Function,
     pub proven: bool,
     pub resolved: bool,
 }
@@ -285,11 +578,11 @@ pub struct BoundSanitizer {
 /// policy-local relation is. `uncertain` when its binding is not proven and
 /// complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundTransform {
+pub struct BoundTransform<Function = TaintEdgeFunction> {
     pub point: ProgramPointHandle,
     pub input: ValueFlowCarrier,
     pub output: ValueFlowCarrier,
-    pub function: TaintEdgeFunction,
+    pub function: Function,
     pub uncertain: bool,
 }
 
@@ -330,6 +623,13 @@ pub enum InteriorSeed {
     /// An input port of the procedure (receiver, parameter, capture slot,
     /// heap input, call result or thrown value).
     Port(PartialFlowPort),
+    /// A callee heap output written into shared caller storage on normal return.
+    Writeback {
+        call: CallSiteId,
+        storage: Box<AbstractLocation>,
+        selectors: Box<[HeapSelector]>,
+        tail: AccessPathTail,
+    },
 }
 
 /// What one interior run observes besides the procedure's output ports.
@@ -394,10 +694,28 @@ pub struct DispatchCandidate {
     /// Caller-side actual port (`CallReceiver`, `CallArgument`) to callee
     /// formal port (`Receiver`, `Parameter`), implicit arguments included.
     pub arguments: Box<[(PartialFlowPort, PartialFlowPort)]>,
+    /// Storage shared by a bound actual and formal, with the binding evidence
+    /// needed before a callee heap output may be written back to the caller.
+    pub writeback: Box<[WritebackBinding]>,
     /// Callee return port (`NormalReturn`, `IndexedNormalReturn`,
     /// `ExceptionalReturn`) to caller-side result port (`CallResult`,
     /// `CallThrown`).
     pub returns: Box<[(PartialFlowPort, PartialFlowPort)]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WritebackBinding {
+    pub actual: PartialFlowPort,
+    pub formal: PartialFlowPort,
+    pub shares_storage: crate::analyzer::semantic::CallStorageSharing,
+    pub direct_field_sharing: crate::analyzer::semantic::CallStorageSharing,
+    /// Callee fields whose every matching store is proven to target this
+    /// formal's own cell rather than a promoted or dereferenced referent.
+    pub direct_fields: Box<[crate::analyzer::semantic::SemanticLocator]>,
+    pub conversion_preserves_identity: bool,
+    pub proven: bool,
+    pub complete: bool,
+    pub storage: Box<[AbstractLocation]>,
 }
 
 /// The dispatch of one call. An open, unproven or exceeded dispatch is
@@ -430,10 +748,9 @@ pub struct Callers {
 /// carries, `None` for every label; `removed` are the labels a sanitize effect
 /// of the model removes on this transfer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ModelTransfer {
+pub struct ModelTransfer<Function = TaintEdgeFunction> {
     pub actual: PartialFlowPort,
-    pub moved: Option<Box<[Box<str>]>>,
-    pub removed: Box<[Box<str>]>,
+    pub function: Function,
 }
 
 /// A model that replaces one call to one candidate.
@@ -447,14 +764,14 @@ pub struct ModelTransfer {
 /// `certain_witness_closures` requires. A curated or inferred model is
 /// `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CallModel {
-    pub transfers: Vec<ModelTransfer>,
+pub struct CallModel<Function = TaintEdgeFunction> {
+    pub transfers: Vec<ModelTransfer<Function>>,
     pub proven: bool,
     pub completeness: Completeness,
     pub authored: Option<Box<[AuthoredArmClosure]>>,
 }
 
-impl CallModel {
+impl<Function> CallModel<Function> {
     /// The quality of a path through the model. A curated or inferred model
     /// is proven and complete or neither. An authored model's transfers are
     /// unproven unless the closure guards admitted at least one closure, and

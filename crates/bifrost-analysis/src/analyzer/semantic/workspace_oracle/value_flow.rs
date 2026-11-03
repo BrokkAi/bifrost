@@ -1290,6 +1290,7 @@ impl WorkspaceSemanticOracle<'_> {
         }
         if request.cancellation.is_cancelled() {
             request.budget.retain_performed_work(&staged.budget);
+            return Ok(interrupted_openness(Interruption::Cancelled, staged.work));
         } else {
             *request.budget = staged.budget;
         }

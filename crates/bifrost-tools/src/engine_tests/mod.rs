@@ -143,6 +143,7 @@ mod rust_analyzer_semantic_icfg_tests;
 mod rust_analyzer_semantic_partial_flow_host_tests;
 
 mod rust_analyzer_semantic_workspace_oracle_dispatch_tests;
+mod rust_analyzer_semantic_workspace_oracle_value_flow;
 
 mod rust_analyzer_semantic_workspace_oracle_heap_tests;
 

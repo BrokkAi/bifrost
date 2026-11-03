@@ -852,7 +852,7 @@ impl ModeledProcedureKey {
 
 /// One activated declaration bound to one exact callee, with the pack
 /// provenance the row publishes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BoundDeclaredEffect {
     pub effect_id: String,
     pub timing: EffectTiming,
@@ -1376,21 +1376,24 @@ pub struct ProcedureEffectReport {
     pub rows: Vec<ProcedureEffectRow>,
 }
 
-/// One effect attributed to one procedure during the fixpoint.
+/// One effect attributed to a procedure through an execution witness.
+///
+/// The call-graph solver and the shared composition client project the same
+/// public rows from these values.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AttributedEffect {
-    depth: usize,
-    certainty: EffectCertainty,
-    timing: EffectTiming,
-    execution_timing: ExecutionTiming,
-    witness: Vec<EffectWitnessStep>,
-    witness_truncated: bool,
-    pack_id: String,
-    model_id: String,
-    summary_id: String,
+pub struct ProcedureEffectAttribution {
+    pub depth: usize,
+    pub certainty: EffectCertainty,
+    pub timing: EffectTiming,
+    pub execution_timing: ExecutionTiming,
+    pub witness: Vec<EffectWitnessStep>,
+    pub witness_truncated: bool,
+    pub pack_id: String,
+    pub model_id: String,
+    pub summary_id: String,
 }
 
-impl AttributedEffect {
+impl ProcedureEffectAttribution {
     /// Merge another attribution of the same effect onto the same procedure.
     ///
     /// The retained witness is the shallowest chain, and ties break on the
@@ -1398,7 +1401,7 @@ impl AttributedEffect {
     /// Certainty joins to the best-evidenced chain; timing joins to `Unknown`
     /// on disagreement, which is what keeps a deferred path from being
     /// laundered into an immediate claim.
-    fn merge(&mut self, other: Self) -> bool {
+    pub fn merge(&mut self, other: Self) -> bool {
         let mut changed = false;
         let certainty = self.certainty.join(other.certainty);
         if certainty != self.certainty {
@@ -1434,6 +1437,29 @@ fn witness_key(witness: &[EffectWitnessStep]) -> Vec<&str> {
     witness.iter().map(|step| step.site_id.as_str()).collect()
 }
 
+/// Work performed by one declared-effect propagation, independent of acquisition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcedureEffectWork {
+    pub scc_node_visits: u64,
+    pub scc_edge_visits: u64,
+    /// Components used by propagation, including singleton fallback components
+    /// when the bounded SCC pass cannot complete.
+    pub scc_components: u64,
+    pub propagation_rounds: u64,
+    pub propagation_node_visits: u64,
+    pub propagation_edge_visits: u64,
+    pub inherited_effect_candidates: u64,
+    pub coverage_rounds: u64,
+    pub coverage_edge_visits: u64,
+    pub projected_rows: u64,
+}
+
+#[derive(Debug)]
+pub struct ProcedureEffectSummary {
+    pub reports: Vec<ProcedureEffectReport>,
+    pub work: ProcedureEffectWork,
+}
+
 /// Run the bounded deterministic fixpoint and project one report per procedure.
 ///
 /// The algorithm is a reverse-topological sweep over the graph's strongly
@@ -1450,7 +1476,7 @@ fn witness_key(witness: &[EffectWitnessStep]) -> Vec<&str> {
 pub fn summarize_procedure_effects(
     graph: &EffectGraph,
     budget: ProcedureEffectBudget,
-) -> Vec<ProcedureEffectReport> {
+) -> ProcedureEffectSummary {
     let node_count = graph.procedures.len();
     let view = DenseUsizeGraph::new(
         node_count,
@@ -1471,6 +1497,12 @@ pub fn summarize_procedure_effects(
                 .collect()
         });
 
+    let mut work = ProcedureEffectWork {
+        scc_node_visits: request.budget.used().node_visits as u64,
+        scc_edge_visits: request.budget.used().edge_visits as u64,
+        scc_components: components.len() as u64,
+        ..ProcedureEffectWork::default()
+    };
     let mut component_by_node = vec![0usize; node_count];
     for (component, members) in components.iter().enumerate() {
         for &member in members.iter() {
@@ -1478,7 +1510,7 @@ pub fn summarize_procedure_effects(
         }
     }
 
-    let mut effects: Vec<BTreeMap<String, AttributedEffect>> = graph
+    let mut effects: Vec<BTreeMap<String, ProcedureEffectAttribution>> = graph
         .procedures
         .iter()
         .map(|procedure| {
@@ -1488,7 +1520,7 @@ pub fn summarize_procedure_effects(
                 .map(|declared| {
                     (
                         declared.effect_id.clone(),
-                        AttributedEffect {
+                        ProcedureEffectAttribution {
                             depth: 0,
                             certainty: declared.certainty,
                             timing: declared.timing,
@@ -1518,10 +1550,13 @@ pub fn summarize_procedure_effects(
             unconverged = true;
             break;
         }
+        work.propagation_rounds = work.propagation_rounds.saturating_add(1);
         let mut changed = false;
         for component in components.iter().rev() {
             for &node in component.iter() {
+                work.propagation_node_visits = work.propagation_node_visits.saturating_add(1);
                 for edge in &graph.edges {
+                    work.propagation_edge_visits = work.propagation_edge_visits.saturating_add(1);
                     if edge.caller != node {
                         continue;
                     }
@@ -1531,6 +1566,8 @@ pub fn summarize_procedure_effects(
                         .map(|(id, effect)| (id.clone(), effect.clone()))
                         .collect::<Vec<_>>();
                     for (effect_id, source) in inherited {
+                        work.inherited_effect_candidates =
+                            work.inherited_effect_candidates.saturating_add(1);
                         let depth = source.depth.saturating_add(1);
                         if depth > budget.max_depth {
                             depth_exhausted[node] = true;
@@ -1545,7 +1582,7 @@ pub fn summarize_procedure_effects(
                         let witness_truncated =
                             source.witness_truncated || witness.len() > budget.max_witness_steps;
                         witness.truncate(budget.max_witness_steps);
-                        let candidate = AttributedEffect {
+                        let candidate = ProcedureEffectAttribution {
                             depth,
                             certainty: source.certainty.meet(edge.certainty),
                             timing: source.timing,
@@ -1625,8 +1662,10 @@ pub fn summarize_procedure_effects(
         })
         .collect::<Vec<_>>();
     for _ in 0..=components.len() {
+        work.coverage_rounds = work.coverage_rounds.saturating_add(1);
         let mut changed = false;
         for edge in &graph.edges {
+            work.coverage_edge_visits = work.coverage_edge_visits.saturating_add(1);
             let callee = coverage[edge.callee];
             let merged = coverage[edge.caller].meet(callee);
             if merged != coverage[edge.caller] {
@@ -1645,76 +1684,98 @@ pub fn summarize_procedure_effects(
         }
     }
 
-    graph
+    let reports = graph
         .procedures
         .iter()
         .enumerate()
         .map(|(node, procedure)| {
-            let node_coverage = coverage[node];
-            let mut rows = effects[node]
-                .iter()
-                .map(|(effect_id, effect)| ProcedureEffectRow {
-                    id: procedure_effect_row_id(&procedure.declaration_id, Some(effect_id)),
-                    procedure_declaration_id: procedure.declaration_id.clone(),
-                    procedure_name: procedure.display_name.clone(),
-                    effect_id: Some(effect_id.clone()),
-                    classification: Some(if effect.depth <= 1 {
-                        EffectClassification::Direct
-                    } else {
-                        EffectClassification::Transitive
-                    }),
-                    certainty: Some(effect.certainty),
-                    timing: Some(effect.timing),
-                    execution_timing: Some(effect.execution_timing),
-                    depth: Some(effect.depth),
-                    derivation: EffectDerivation::Declared,
-                    reason: None,
-                    coverage: node_coverage,
-                    witness: effect.witness.clone(),
-                    witness_truncated: effect.witness_truncated,
-                    pack_id: Some(effect.pack_id.clone()),
-                    model_id: Some(effect.model_id.clone()),
-                    summary_id: Some(effect.summary_id.clone()),
-                    terminal: false,
-                })
-                .collect::<Vec<_>>();
-            if rows.is_empty() {
-                let reason = local_reason[node];
-                rows.push(ProcedureEffectRow {
-                    id: procedure_effect_row_id(&procedure.declaration_id, None),
-                    procedure_declaration_id: procedure.declaration_id.clone(),
-                    procedure_name: procedure.display_name.clone(),
-                    effect_id: None,
-                    classification: None,
-                    certainty: None,
-                    timing: None,
-                    execution_timing: None,
-                    depth: None,
-                    derivation: if node_coverage == EffectCoverage::Unsupported {
-                        EffectDerivation::Unsupported
-                    } else if reason.is_some() {
-                        EffectDerivation::Incomplete
-                    } else {
-                        EffectDerivation::None
-                    },
-                    reason,
-                    coverage: node_coverage,
-                    witness: Vec::new(),
-                    witness_truncated: false,
-                    pack_id: None,
-                    model_id: None,
-                    summary_id: None,
-                    terminal: true,
-                });
-            }
-            rows.sort_by(|left, right| left.id.cmp(&right.id));
-            ProcedureEffectReport {
-                procedure_declaration_id: procedure.declaration_id.clone(),
-                coverage: node_coverage,
-                rows,
-            }
+            let report = project_procedure_effect_report(
+                &procedure.declaration_id,
+                &procedure.display_name,
+                effects[node]
+                    .iter()
+                    .map(|(id, effect)| (id.as_str(), effect)),
+                coverage[node],
+                local_reason[node],
+            );
+            work.projected_rows = work.projected_rows.saturating_add(report.rows.len() as u64);
+            report
         })
-        .collect()
+        .collect();
+    ProcedureEffectSummary { reports, work }
+}
+
+/// Render one procedure's attributed effects, including a terminal row when
+/// no effect was found. Both propagation paths use the same row identities,
+/// evidence fields and distinction between exhaustive and incomplete emptiness.
+pub fn project_procedure_effect_report<'a>(
+    declaration_id: &str,
+    display_name: &str,
+    effects: impl IntoIterator<Item = (&'a str, &'a ProcedureEffectAttribution)>,
+    coverage: EffectCoverage,
+    reason: Option<EffectReason>,
+) -> ProcedureEffectReport {
+    let mut rows = effects
+        .into_iter()
+        .map(|(effect_id, effect)| ProcedureEffectRow {
+            id: procedure_effect_row_id(declaration_id, Some(effect_id)),
+            procedure_declaration_id: declaration_id.to_owned(),
+            procedure_name: display_name.to_owned(),
+            effect_id: Some(effect_id.to_owned()),
+            classification: Some(if effect.depth <= 1 {
+                EffectClassification::Direct
+            } else {
+                EffectClassification::Transitive
+            }),
+            certainty: Some(effect.certainty),
+            timing: Some(effect.timing),
+            execution_timing: Some(effect.execution_timing),
+            depth: Some(effect.depth),
+            derivation: EffectDerivation::Declared,
+            reason: None,
+            coverage,
+            witness: effect.witness.clone(),
+            witness_truncated: effect.witness_truncated,
+            pack_id: Some(effect.pack_id.clone()),
+            model_id: Some(effect.model_id.clone()),
+            summary_id: Some(effect.summary_id.clone()),
+            terminal: false,
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        rows.push(ProcedureEffectRow {
+            id: procedure_effect_row_id(declaration_id, None),
+            procedure_declaration_id: declaration_id.to_owned(),
+            procedure_name: display_name.to_owned(),
+            effect_id: None,
+            classification: None,
+            certainty: None,
+            timing: None,
+            execution_timing: None,
+            depth: None,
+            derivation: if coverage == EffectCoverage::Unsupported {
+                EffectDerivation::Unsupported
+            } else if reason.is_some() {
+                EffectDerivation::Incomplete
+            } else {
+                EffectDerivation::None
+            },
+            reason,
+            coverage,
+            witness: Vec::new(),
+            witness_truncated: false,
+            pack_id: None,
+            model_id: None,
+            summary_id: None,
+            terminal: true,
+        });
+    }
+    rows.sort_by(|left, right| left.id.cmp(&right.id));
+    ProcedureEffectReport {
+        procedure_declaration_id: declaration_id.to_owned(),
+        coverage,
+        rows,
+    }
 }
 
 fn procedure_effect_row_id(declaration_id: &str, effect_id: Option<&str>) -> String {
@@ -2036,7 +2097,7 @@ mod tests {
             edges: vec![edge(0, 1, "site.pure"), edge(1, 2, "site.helper")],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         let row = &reports[0].rows[0];
         assert_eq!(row.depth, Some(2));
         assert_eq!(row.classification, Some(EffectClassification::Transitive));
@@ -2075,7 +2136,7 @@ mod tests {
             ],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         for report in reports.iter().take(2) {
             assert_eq!(report.rows.len(), 1);
             assert_eq!(report.rows[0].effect_id.as_deref(), Some("acme.network_io"));
@@ -2105,7 +2166,7 @@ mod tests {
             edges: vec![edge(0, 1, "site.pure"), edge(1, 2, "site.helper")],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Deferred));
         assert_eq!(
             reports[0].rows[0].execution_timing,
@@ -2143,7 +2204,8 @@ mod tests {
                 edges: vec![call],
                 truncated: false,
             };
-            let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+            let reports =
+                summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
             assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Immediate));
             assert_eq!(reports[0].rows[0].execution_timing, Some(expected));
         }
@@ -2174,7 +2236,7 @@ mod tests {
             edges: vec![edge(0, 1, "site.now"), edge(0, 2, "site.later")],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Unknown));
         assert_eq!(
             reports[0].rows[0].execution_timing,
@@ -2201,7 +2263,7 @@ mod tests {
             edges: vec![ambiguous],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         assert_eq!(
             reports[0].rows[0].certainty,
             Some(EffectCertainty::Possible)
@@ -2217,7 +2279,7 @@ mod tests {
             edges: vec![edge(0, 1, "site.pure")],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         assert_eq!(reports[0].coverage, EffectCoverage::Open);
         assert_eq!(reports[0].rows[0].derivation, EffectDerivation::Incomplete);
         assert_eq!(
@@ -2251,7 +2313,7 @@ mod tests {
             edges: vec![edge(0, 1, "site.render")],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
         assert_eq!(
             reports[0].rows[0].effect_id.as_deref(),
@@ -2274,7 +2336,7 @@ mod tests {
             edges: vec![edge(0, 1, "site.pure")],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
         assert_eq!(reports[0].rows[0].derivation, EffectDerivation::None);
         assert_eq!(reports[0].rows[0].reason, None);
@@ -2302,7 +2364,7 @@ mod tests {
             max_depth: 1,
             ..ProcedureEffectBudget::default()
         };
-        let reports = summarize_procedure_effects(&graph, budget);
+        let reports = summarize_procedure_effects(&graph, budget).reports;
         assert_eq!(reports[0].rows.len(), 1);
         assert!(reports[0].rows[0].terminal);
         assert_eq!(reports[0].coverage, EffectCoverage::Truncated);
@@ -2345,8 +2407,8 @@ mod tests {
             truncated: false,
         };
         assert_eq!(
-            summarize_procedure_effects(&forward, ProcedureEffectBudget::default()),
-            summarize_procedure_effects(&reversed, ProcedureEffectBudget::default())
+            summarize_procedure_effects(&forward, ProcedureEffectBudget::default()).reports,
+            summarize_procedure_effects(&reversed, ProcedureEffectBudget::default()).reports
         );
     }
 
@@ -2360,7 +2422,7 @@ mod tests {
             edges: vec![edge(0, 1, "site.pure")],
             truncated: false,
         };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default()).reports;
         assert_eq!(reports[0].rows.len(), 1);
         assert!(reports[0].rows[0].terminal);
         assert_eq!(reports[0].rows[0].derivation, EffectDerivation::None);

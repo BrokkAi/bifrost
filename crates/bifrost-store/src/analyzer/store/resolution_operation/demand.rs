@@ -153,6 +153,8 @@ pub(crate) trait DemandLanguage {
         endpoint: &EndpointSignature,
     ) -> Result<LanguageRootDiscovery<Self::RootQuestion>>;
 
+    fn bind_relation(&self, _question: &mut Self::RootQuestion, _relation: &DemandRelationKey) {}
+
     /// Prepare independent root reads as one batch before the provider
     /// materializes their language questions. The default retains the scalar
     /// behavior for languages without a keyed batch reader.
@@ -489,6 +491,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
                 return Ok(RootDiscovery::Cancelled(completion));
             }
         };
+        self.language.bind_relation(&mut question, endpoint);
         let context_key = self.language.context_key(&question);
         if let Some(key) = context_key.as_ref() {
             if !self.contexts.contains_key(key) {
@@ -1229,6 +1232,13 @@ impl ClosedForwardSource<'_> {
 }
 
 impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
+    fn jvm_selected_root_presence(
+        &self,
+        root_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::analyzer::resolution::JvmSelectedRootPresence> {
+        self.base.jvm_selected_root_presence(root_fqn, cancellation)
+    }
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
         Some(self.session)
     }
@@ -1711,6 +1721,22 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
         candidates: &[CandidatePathIdentity],
         cancellation: &CancellationToken,
     ) -> Result<Vec<(CandidatePathIdentity, PartialPath)>> {
+        Ok(self
+            .hydrate_candidate_paths_with_origin(candidates, cancellation)?
+            .into_iter()
+            .map(|(id, row)| (id, row.path))
+            .collect())
+    }
+    fn hydrate_candidate_paths_with_origin(
+        &self,
+        candidates: &[CandidatePathIdentity],
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Vec<(
+            CandidatePathIdentity,
+            crate::analyzer::resolution::HydratedCandidatePath,
+        )>,
+    > {
         assert!(candidates.len() <= MAX_SOURCE_ROWS_PER_BATCH);
         let arena = self.arena.borrow();
         let mut persisted = Vec::new();
@@ -1720,13 +1746,19 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
                 return Ok(rows);
             }
             match arena.paths.get(id) {
-                Some(path) => rows.push((*id, path.clone())),
+                Some(path) => rows.push((
+                    *id,
+                    crate::analyzer::resolution::HydratedCandidatePath {
+                        path: path.clone(),
+                        origin: Default::default(),
+                    },
+                )),
                 None => persisted.push(*id),
             }
         }
         rows.extend(
             self.base
-                .hydrate_candidate_paths(&persisted, cancellation)?,
+                .hydrate_candidate_paths_with_origin(&persisted, cancellation)?,
         );
         Ok(rows)
     }

@@ -11,7 +11,6 @@ use crate::analyzer::semantic_model::ExactArtifact;
 use crate::analyzer::semantic_model::GoPinnedPackage;
 use crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION;
 use crate::analyzer::semantic_model::decode_manifest;
-use crate::analyzer::semantic_model::decode_validated_shard_for_manifest;
 use crate::analyzer::semantic_model::validate_manifest_inventory;
 use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
@@ -768,9 +767,25 @@ impl SemanticPackCatalog {
         descriptor: &CompiledShardDescriptor,
         bytes: &[u8],
     ) -> Result<CompiledShard, CatalogError> {
+        self.decode_stored_shard_with_census(manifest, descriptor, bytes)
+            .map(|(shard, _)| shard)
+    }
+
+    fn decode_stored_shard_with_census(
+        &self,
+        manifest: &CompiledPackManifest,
+        descriptor: &CompiledShardDescriptor,
+        bytes: &[u8],
+    ) -> Result<
+        (
+            CompiledShard,
+            brokk_bifrost_semantic::analyzer::semantic_model::validate::ValidationCensus,
+        ),
+        CatalogError,
+    > {
         self.validated_manifest_inventory(manifest)?;
         self.shard_validations.fetch_add(1, Ordering::Relaxed);
-        decode_validated_shard_for_manifest(
+        brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_validated_shard_for_manifest_with_census(
             manifest,
             descriptor,
             bytes,
@@ -2325,7 +2340,7 @@ impl SemanticPackCatalog {
                 &transaction,
                 &validated.manifest.content_sha256,
                 &descriptor.shard_id,
-                &decode_limits_digest(&self.options.decode_limits),
+                shard.census,
             )?;
             rows::publish_semantic_rows(&transaction, &validated.manifest, &shard.decoded)?;
             insert_selectors(
@@ -4083,6 +4098,9 @@ impl SemanticPackCatalog {
         // The manifest comes from the memo, not from this statement: a pack
         // with 44 shards used to ship its multi-megabyte manifest bytes out of
         // SQLite once per loaded shard (#3101).
+        // The manifest is decoded under this catalog's immutable options on a
+        // memo miss. Memo hits reuse that admission, including manifest text;
+        // the shard certificate only needs to measure shard text and depth.
         let manifest = self.stored_manifest(&candidate.manifest_digest)?;
         self.validate_stored_python_profile_pack(&manifest)?;
         let connection = self
@@ -4112,20 +4130,29 @@ impl SemanticPackCatalog {
             .optional()
             .map_err(|error| CatalogError::sqlite("load candidate location", error))?
             .ok_or(CatalogError::Unavailable)?;
-        let limits_digest = decode_limits_digest(&self.options.decode_limits);
         self.sql_statements.fetch_add(1, Ordering::Relaxed);
-        let certified: bool = connection
+        let recorded: Option<(i64, i64)> = connection
             .query_row(
                 CERTIFIED_SHARD_SQL,
                 params![
                     manifest.content_sha256,
                     candidate.shard_id,
                     SHARD_VALIDATION_VERSION,
-                    limits_digest
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .optional()
             .map_err(|error| CatalogError::sqlite("lookup shard validation", error))?;
+        let certified = recorded.is_some_and(|(text, depth)| {
+            let Ok(text) = usize::try_from(text) else {
+                return false;
+            };
+            let Ok(depth) = usize::try_from(depth) else {
+                return false;
+            };
+            text <= self.options.decode_limits.max_text_bytes
+                && depth <= self.options.decode_limits.max_depth
+        });
         if self.mode == CatalogOpenMode::ReadOnly {
             let indexed: bool = connection
                 .query_row(
@@ -4161,7 +4188,8 @@ impl SemanticPackCatalog {
             )
             .map_err(|error| CatalogError::Artifact(error.to_string()))?
         } else {
-            let shard = self.decode_stored_shard(&manifest, &candidate.descriptor, &bytes)?;
+            let (shard, census) =
+                self.decode_stored_shard_with_census(&manifest, &candidate.descriptor, &bytes)?;
             if self.mode == CatalogOpenMode::ReadWrite {
                 let connection = self
                     .connection
@@ -4171,7 +4199,7 @@ impl SemanticPackCatalog {
                     &connection,
                     &manifest.content_sha256,
                     &candidate.shard_id,
-                    &limits_digest,
+                    census,
                 )?;
             }
             shard
@@ -5795,6 +5823,9 @@ pub(crate) mod generated_production_cache_version_tests {
 
 #[cfg(test)]
 pub(crate) mod native_compatibility_catalog_tests {
+    use brokk_bifrost_analysis::analyzer::semantic_model::DecodeLimits;
+    use brokk_bifrost_semantic::analyzer::semantic_model::catalog::SHARD_VALIDATION_VERSION;
+    use rusqlite::params;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogCoordinate;
 
@@ -5961,6 +5992,32 @@ pub(crate) mod native_compatibility_catalog_tests {
                 },
             )
             .unwrap();
+        let recorded: (i64, i64) = catalog
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT max_text_bytes, max_depth FROM catalog_shard_validations
+             WHERE manifest_digest = ?1 AND shard_id = ?2 AND validation_version = ?3",
+                params![
+                    pack.manifest.content_sha256,
+                    pack.shards[0].descriptor.shard_id,
+                    SHARD_VALIDATION_VERSION
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (_, observed) =
+            brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_shard_with_census(
+                &pack.shards[0].descriptor,
+                &pack.shards[0].bytes,
+                &DecodeLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded,
+            (observed.max_text_bytes as i64, observed.max_depth as i64)
+        );
         assert_eq!(pack.shards.len(), 1);
         let candidate = super::CatalogCandidate {
             manifest_digest: pack.manifest.content_sha256.clone(),
@@ -5981,10 +6038,51 @@ pub(crate) mod native_compatibility_catalog_tests {
             .unwrap();
         let validated = catalog.load_decoded_for_test(&candidate).unwrap();
         assert_eq!(catalog.shard_validation_count(), 1);
+        let fallback_recorded: (i64, i64) = catalog
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT max_text_bytes, max_depth FROM catalog_shard_validations
+             WHERE manifest_digest = ?1 AND shard_id = ?2 AND validation_version = ?3",
+                params![
+                    pack.manifest.content_sha256,
+                    pack.shards[0].descriptor.shard_id,
+                    SHARD_VALIDATION_VERSION
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fallback_recorded, recorded);
         let summaries = validated.decoded().payload().procedure_summaries().unwrap();
         assert!(!summaries.is_empty());
         let record_bytes = serde_json::to_vec(summaries).unwrap();
         drop(catalog);
+
+        let (_, manifest_census) = brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_manifest_with_census(
+            &pack.manifest_bytes,
+            &DecodeLimits::default(),
+        ).unwrap();
+        let exact_options = CatalogOptions {
+            decode_limits: DecodeLimits {
+                max_text_bytes: usize::try_from(recorded.0)
+                    .unwrap()
+                    .max(manifest_census.max_text_bytes),
+                max_depth: usize::try_from(recorded.1).unwrap(),
+                ..DecodeLimits::default()
+            },
+        };
+        let equal_reader =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadOnly, exact_options).unwrap();
+        assert_eq!(
+            equal_reader
+                .load_decoded_for_test(&candidate)
+                .unwrap()
+                .decoded(),
+            validated.decoded()
+        );
+        assert_eq!(equal_reader.shard_validation_count(), 0);
+        drop(equal_reader);
 
         let reopened =
             SemanticPackCatalog::open(&root, CatalogOpenMode::ReadOnly, CatalogOptions::default())
@@ -5998,6 +6096,159 @@ pub(crate) mod native_compatibility_catalog_tests {
         assert_eq!(
             serde_json::to_vec(hydrated_summaries).unwrap(),
             record_bytes
+        );
+    }
+
+    #[test]
+    fn measured_shard_caps_admit_equal_and_refuse_tighter_read_only_requests() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::model::{
+            AuthoredPayload, AuthoredSemanticModelPack,
+        };
+        let source =
+            include_bytes!("../../../../testdata/semantic-model-packs/declarations-v1.json");
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(source).unwrap();
+        let AuthoredPayload::DeclarationFacts { types, .. } = &mut authored.shards[0].payload
+        else {
+            panic!("fixture has declaration facts");
+        };
+        types[0]
+            .aliases
+            .push(format!("com.acme.{}", "VeryLongAlias".repeat(12)));
+        let pack = brokk_bifrost_semantic::analyzer::semantic_model::compile_pack(
+            &authored,
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let catalog =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadWrite, CatalogOptions::default())
+                .unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "measured-cap-fixture".into(),
+                },
+            )
+            .unwrap();
+        let (text, depth): (i64, i64) = catalog
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT max_text_bytes, max_depth FROM catalog_shard_validations
+             WHERE manifest_digest = ?1 AND shard_id = ?2 AND validation_version = ?3",
+                params![
+                    pack.manifest.content_sha256,
+                    pack.shards[0].descriptor.shard_id,
+                    SHARD_VALIDATION_VERSION
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (_, manifest_census) = brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_manifest_with_census(
+            &pack.manifest_bytes, &DecodeLimits::default(),
+        ).unwrap();
+        assert!(text > i64::try_from(manifest_census.max_text_bytes).unwrap());
+        assert!(depth > 0);
+        let candidate = super::CatalogCandidate {
+            manifest_digest: pack.manifest.content_sha256.clone(),
+            shard_id: pack.shards[0].descriptor.shard_id.clone(),
+            descriptor: pack.shards[0].descriptor.clone(),
+            completeness: pack.manifest.completeness,
+            source_kind: super::CatalogPackSourceKind::Installed,
+            source_id: "measured-cap-fixture".into(),
+            location: super::CatalogCandidateLocation::Durable,
+        };
+        let expected = brokk_bifrost_semantic::analyzer::semantic_model::decode_shard(
+            &candidate.descriptor,
+            &pack.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        drop(catalog);
+        let exact = DecodeLimits {
+            max_text_bytes: usize::try_from(text).unwrap(),
+            max_depth: usize::try_from(depth).unwrap(),
+            ..DecodeLimits::default()
+        };
+        let reader = SemanticPackCatalog::open(
+            &root,
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions {
+                decode_limits: exact,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reader.load_decoded_for_test(&candidate).unwrap().decoded(),
+            &expected
+        );
+        assert_eq!(reader.shard_validation_count(), 0);
+        drop(reader);
+        for limits in [
+            DecodeLimits {
+                max_text_bytes: usize::try_from(text - 1).unwrap(),
+                ..exact
+            },
+            DecodeLimits {
+                max_depth: usize::try_from(depth - 1).unwrap(),
+                ..exact
+            },
+        ] {
+            let reader = SemanticPackCatalog::open(
+                &root,
+                CatalogOpenMode::ReadOnly,
+                CatalogOptions {
+                    decode_limits: limits,
+                },
+            )
+            .unwrap();
+            assert!(reader.load_decoded_for_test(&candidate).is_err());
+            assert_eq!(reader.shard_validation_count(), 1);
+        }
+        let mut changed_content = candidate.clone();
+        changed_content.descriptor.content_sha256 = "0".repeat(64);
+        let reader =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadOnly, CatalogOptions::default())
+                .unwrap();
+        assert!(reader.load_decoded_for_test(&changed_content).is_err());
+        assert_eq!(
+            reader.shard_validation_count(),
+            0,
+            "certified hydration still verifies content"
+        );
+        drop(reader);
+
+        let writer =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadWrite, CatalogOptions::default())
+                .unwrap();
+        {
+            let connection = writer.connection.lock().unwrap();
+            connection.execute("DELETE FROM catalog_shard_validations WHERE manifest_digest = ?1 AND shard_id = ?2",
+                params![pack.manifest.content_sha256, candidate.shard_id]).unwrap();
+            connection.execute("INSERT INTO catalog_shard_validations(manifest_digest, shard_id, validation_version, max_text_bytes, max_depth) VALUES (?1, ?2, ?3, 0, 0)",
+                params![pack.manifest.content_sha256, candidate.shard_id, SHARD_VALIDATION_VERSION - 1]).unwrap();
+        }
+        drop(writer);
+        let reader = SemanticPackCatalog::open(
+            &root,
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions {
+                decode_limits: DecodeLimits {
+                    max_text_bytes: usize::try_from(text - 1).unwrap(),
+                    ..DecodeLimits::default()
+                },
+            },
+        )
+        .unwrap();
+        assert!(reader.load_decoded_for_test(&candidate).is_err());
+        assert_eq!(
+            reader.shard_validation_count(),
+            1,
+            "wrong-version certificate must miss"
         );
     }
 
@@ -6107,8 +6358,6 @@ pub(crate) mod generated_sharing_tests {
     use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SHARD_VALIDATION_VERSION;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
-
-    use brokk_bifrost_analysis::analyzer::semantic_model::catalog::decode_limits_digest;
 
     fn generated_fixture(version: &str) -> (CompiledSemanticModelPack, GeneratedProductionKey) {
         let source = serde_json::json!({
@@ -6318,19 +6567,19 @@ pub(crate) mod generated_sharing_tests {
                 .unwrap();
             catalog.install_generated(&key, &pack).unwrap();
             let connection = catalog.connection.lock().unwrap();
-            let limits = decode_limits_digest(&catalog.options.decode_limits);
             for version in (1..)
                 .filter(|version| *version != SHARD_VALIDATION_VERSION)
                 .take(256)
             {
                 connection
                     .execute(
-                        "INSERT INTO catalog_shard_validations VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT INTO catalog_shard_validations VALUES (?1, ?2, ?3, ?4, ?5)",
                         params![
                             pack.manifest.content_sha256,
                             pack.manifest.shards[0].shard_id,
                             version,
-                            limits
+                            0_i64,
+                            0_i64
                         ],
                     )
                     .unwrap();
@@ -6371,7 +6620,6 @@ pub(crate) mod generated_sharing_tests {
                         pack.manifest.content_sha256,
                         pack.manifest.shards[0].shard_id,
                         SHARD_VALIDATION_VERSION,
-                        limits
                     ],
                     |row| row.get::<_, String>(3),
                 )

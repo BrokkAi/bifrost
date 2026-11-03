@@ -398,8 +398,8 @@ want those counters for one run.
 Python client use, so the argument object is the canonical query's JSON, without
 the `limit` the section above added.
 
-The `bifrost` binary registers Bifrost's shipped semantic packs when it starts,
-and the Python client registers them when it opens a session. A Rust program
+The `bifrost` binary connects semantic-pack registration when it starts, and
+the Python client does so when it opens a session. A Rust program
 must do this itself: call
 `install_bifrost_semantic_model_packs()` once before it builds a
 `SearchToolsService`. See the [Rust API reference](/reference/rust-api/).
@@ -412,8 +412,8 @@ use std::path::PathBuf;
 
 /// Split the `commit` receivers into proven single targets and unproven sites.
 fn commit_receivers(root: PathBuf) -> Result<(Vec<String>, Vec<String>), String> {
-    // Register the shipped semantic packs once per process. Without this
-    // call, no shipped pack activates in an embedding process.
+    // Connect semantic-pack registration once per process. Without this
+    // call, no semantic pack activates in an embedding process.
     brokk_bifrost::install_bifrost_semantic_model_packs()?;
     let service = SearchToolsService::new(root)?;
     let response = service

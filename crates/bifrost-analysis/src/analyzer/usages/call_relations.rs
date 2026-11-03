@@ -225,6 +225,8 @@ pub enum CallDispatchBoundaryKind {
 #[doc(hidden)]
 pub struct CallDispatchLookup {
     #[doc(hidden)]
+    pub source_member_evidence: Option<Box<[super::get_definition::SourceMemberCallEvidence]>>,
+    #[doc(hidden)]
     pub native_resolution: Option<Box<crate::analyzer::usages::get_definition::NativeResolutionCompletion>>,
     #[doc(hidden)]
     pub model_member_selection: Option<Box<crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>>,
@@ -3248,13 +3250,29 @@ fn apply_call_target_outcome(
     site: Option<&ExternalCalleeSite<'_>>,
 ) {
     let ExpandedExternalCallee {
-        outcome,
+        mut outcome,
         resolver_proven_identity,
     } = expanded;
+    // An imported-boundary expansion may replace or demote the selected
+    // definitions. Member facts from the earlier source answer then cannot
+    // execute, even when their old projected units still exist elsewhere.
+    if outcome.outcome.status != DefinitionLookupStatus::Resolved
+        || outcome
+            .source_member_evidence
+            .as_ref()
+            .is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|member| !outcome.outcome.definitions.contains(&member.definition))
+            })
+    {
+        outcome.source_member_evidence = None;
+    }
     let native_incomplete_source_reason = outcome
         .unique_incomplete_native_source_candidate()
         .map(|(_, reason)| Box::<str>::from(reason));
     let CallTargetLookupOutcome {
+        source_member_evidence,
         native_resolution,
         model_member_selection,
         outcome,
@@ -3268,6 +3286,7 @@ fn apply_call_target_outcome(
         truncated,
     } = outcome;
     lookup.native_resolution = native_resolution;
+    lookup.source_member_evidence = source_member_evidence;
     // A selection with a native invocation outcome is diagnostic evidence for
     // call bindings only (#8167); it never reaches a dispatch decision.
     lookup.model_member_selection =
@@ -4673,6 +4692,7 @@ mod tests {
             "relay",
         );
         let outcome = |status, structure_unavailable, truncated| CallTargetLookupOutcome {
+            source_member_evidence: None,
             native_resolution: None,
             model_member_selection: None,
             outcome: DefinitionLookupOutcome {

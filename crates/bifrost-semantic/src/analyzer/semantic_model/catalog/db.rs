@@ -12,7 +12,7 @@ use crate::analyzer::semantic_model::catalog::CatalogOpenMode;
 use brokk_bifrost_core::sqlite_template;
 
 pub(in crate::analyzer::semantic_model::catalog) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 29;
+pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 30;
 const PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 10;
 const NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 11;
 const UNKNOWN_TYPES_CATALOG_VERSION: i64 = 12;
@@ -98,6 +98,8 @@ pub(in crate::analyzer::semantic_model::catalog) const ASSEMBLY_TYPE_FORWARDS_SQ
 
 const OPEN_SCHEMA_VERSION_BOUND_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0029-open-schema-version-bound.sql");
+const SHARD_VALIDATION_CENSUS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0030-shard-validation-census.sql");
 
 /// This build's empty-catalog template. The migrations are the schema inputs:
 /// on an empty catalog their Rust steps have no rows to change, so the SQL
@@ -136,6 +138,7 @@ static CATALOG_TEMPLATE: LazyLock<sqlite_template::Template> = LazyLock::new(|| 
             PACK_MANIFEST_OBJECTS_SQL.as_bytes(),
             ASSEMBLY_TYPE_FORWARDS_SQL.as_bytes(),
             OPEN_SCHEMA_VERSION_BOUND_SQL.as_bytes(),
+            SHARD_VALIDATION_CENSUS_SQL.as_bytes(),
         ],
     )
 });
@@ -338,7 +341,8 @@ fn migrate(
     migrate_catalog_through_payload_families(connection)?;
     migrate_pack_manifest_objects(connection, root)?;
     migrate_manifest_schema(connection, 28, ASSEMBLY_TYPE_FORWARDS_SQL)?;
-    migrate_manifest_schema(connection, 29, OPEN_SCHEMA_VERSION_BOUND_SQL)
+    migrate_manifest_schema(connection, 29, OPEN_SCHEMA_VERSION_BOUND_SQL)?;
+    migrate_manifest_schema(connection, 30, SHARD_VALIDATION_CENSUS_SQL)
 }
 
 fn migrate_catalog_through_payload_families(
@@ -2781,6 +2785,39 @@ mod tests {
                     [&manifest]
                 )
                 .is_err()
+        );
+        connection.execute(
+            "INSERT INTO catalog_shard_validations(manifest_digest, shard_id, validation_version, limits_sha256)
+             VALUES (?1, 's', 12, ?2)",
+            rusqlite::params![&manifest, "a".repeat(64)],
+        ).unwrap();
+        migrate_manifest_schema(&mut connection, 30, SHARD_VALIDATION_CENSUS_SQL).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM catalog_shard_validations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "old hash-only certificates must miss"
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            30
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM catalog_packs WHERE manifest_digest = ?1",
+                    [&manifest],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
         );
     }
 

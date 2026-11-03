@@ -167,3 +167,70 @@ fn descriptors_for_toolset(name: &str, render_options: McpRenderOptions) -> Vec<
 pub fn single_shot_only_tool_descriptors() -> Vec<Value> {
     crate::mcp_cli::cli_tool_descriptors()
 }
+
+#[cfg(test)]
+mod descriptor_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn schema<'a>(descriptors: &'a [Value], name: &str) -> &'a Value {
+        &descriptors
+            .iter()
+            .find(|item| item["name"] == name)
+            .unwrap()["inputSchema"]
+    }
+
+    #[test]
+    fn advertised_tool_inputs_match_required_arguments_and_defaults() {
+        let spec = resolve_server_spec("symbol|workspace|text").unwrap();
+        let descriptors = &spec.tool_descriptors;
+        assert_eq!(
+            schema(descriptors, "scan_usages_by_location")["required"],
+            json!(["targets"])
+        );
+        assert_eq!(
+            schema(descriptors, "scan_usages_by_location")["properties"]["include_tests"]["default"],
+            false
+        );
+        let references = resolve_server_spec_for_render_options(
+            "symbol",
+            McpRenderOptions {
+                render_line_numbers: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            schema(&references.tool_descriptors, "get_definitions_by_reference")["properties"]["references"]
+                ["items"]["required"],
+            json!(["symbol", "context", "target"])
+        );
+        assert_eq!(
+            schema(descriptors, "activate_workspace")["required"],
+            json!(["workspace_path"])
+        );
+        assert_eq!(
+            schema(descriptors, "get_file_contents")["required"],
+            json!(["file_paths"])
+        );
+        assert_eq!(
+            schema(&single_shot_only_tool_descriptors(), "classify_test_files")["required"],
+            json!(["file_paths"])
+        );
+    }
+
+    #[test]
+    fn mode_expression_accepts_spaces_between_toolsets() {
+        let spec = resolve_server_spec("symbol | text").unwrap();
+        assert!(spec.tool_names.contains("search_symbols"));
+        assert!(spec.tool_names.contains("get_file_contents"));
+    }
+
+    #[test]
+    fn workspace_discovery_describes_workspace_control() {
+        let spec = resolve_server_spec("workspace").unwrap();
+        assert!(
+            spec.instructions
+                .contains("Workspace tools refresh indexed state and manage workspace selection")
+        );
+    }
+}

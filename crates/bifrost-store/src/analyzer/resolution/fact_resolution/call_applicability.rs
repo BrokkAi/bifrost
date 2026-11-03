@@ -205,6 +205,12 @@ pub enum ImplicitReceiverScopeKind {
 
 #[doc(hidden)]
 pub trait CallApplicabilityAdapter: Sync {
+    /// Whether exact external call evidence may discharge a known-head
+    /// receiver argument reason for this language.
+    fn discharges_known_head_external_arguments(&self) -> bool {
+        false
+    }
+
     /// Interpret a repeated formal's producer type for this actual. A
     /// language may prove fixed-arity use of a whole sequence here.
     #[allow(clippy::too_many_arguments)]

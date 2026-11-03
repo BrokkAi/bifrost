@@ -210,7 +210,17 @@ pub enum SelectedRootPathHalf {
         anchor_semantic: SemanticId,
         token: SemanticId,
         demand: SemanticId,
+        source_origin: super::CandidatePathOrigin,
     },
+}
+
+impl SelectedRootPathHalf {
+    pub(crate) fn with_source_origin(mut self, origin: super::CandidatePathOrigin) -> Self {
+        if let Self::Reference { source_origin, .. } = &mut self {
+            *source_origin = origin;
+        }
+        self
+    }
 }
 
 /// Which root-import anchor one selected semantic is, if it is one.
@@ -446,6 +456,7 @@ pub fn classify_selected_root_path_half(
         return Ok(Some(SelectedRootPathHalf::Reference {
             identity,
             source_reference: path.start().node(),
+            source_origin: super::CandidatePathOrigin::default(),
             source_scope_head,
             lexical_scope_head,
             prefix_reference,
@@ -678,7 +689,7 @@ where
             .iter()
             .map(|matched| matched.candidate())
             .collect::<Vec<_>>();
-        let hydrated = source.hydrate_candidate_paths(&identities, cancellation)?;
+        let hydrated = source.hydrate_candidate_paths_with_origin(&identities, cancellation)?;
         if cancellation.is_cancelled() {
             return Ok(false);
         }
@@ -692,7 +703,8 @@ where
             )));
         }
         let mut halves = Vec::with_capacity(hydrated.len());
-        for (identity, path) in hydrated {
+        for (identity, row) in hydrated {
+            let path = row.path;
             if super::poll_resolution_work(cancellation, &mut admission_work) {
                 return Ok(false);
             }
@@ -714,7 +726,7 @@ where
                 continue;
             };
             if accepts(&half) {
-                halves.push(half);
+                halves.push(half.with_source_origin(row.origin));
             }
         }
         if halves.is_empty() {
@@ -912,6 +924,9 @@ fn is_jvm_language(language: Language) -> bool {
 #[derive(Clone, Debug, Default)]
 #[doc(hidden)]
 pub struct SelectedContextIdentities {
+    // #7314 6b: per-operation oracle registration provenance, never persisted.
+    #[cfg(any(test, feature = "test-support"))]
+    oracle_trace: Arc<std::sync::Mutex<(Option<String>, Vec<String>)>>,
     unindexed_go_imports:
         Arc<std::sync::Mutex<HashMap<SemanticId, super::UnindexedExternalFrontier>>>,
     numbers: Arc<std::sync::Mutex<super::CanonicalIdentityNumbers>>,
@@ -933,10 +948,14 @@ pub struct SelectedContextIdentities {
     /// closed by complete selected package/type rows. This set is request-local
     /// and each entry names one exact source import site.
     java_import_route_gap_reasons: Arc<std::sync::Mutex<BTreeSet<SemanticId>>>,
+
+    java_import_member_scopes: Arc<std::sync::Mutex<JavaImportMemberScopes>>,
+
     /// Exact external-provider boundaries and the request-local type identity
     /// they establish. The language tag keeps inventory classification separate.
     jvm_external_type_identities:
         Arc<std::sync::Mutex<HashMap<SemanticId, (ExternalOwnerLanguage, SemanticId)>>>,
+
     /// Bare TypeIdentity references whose unindexed implicit roots establish
     /// the same external type identity despite a complete-empty name answer.
     jvm_external_type_identities_by_reference:
@@ -1038,6 +1057,8 @@ struct SelectedJvmContextIdentities {
     jvm_external_members: Arc<std::sync::Mutex<JvmExternalMemberMap>>,
 }
 
+type JavaImportMemberScopes = HashMap<SemanticId, (SemanticId, Arc<str>)>;
+
 type JvmExternalMemberMap =
     HashMap<SemanticId, (super::ExternalOwnerIdentity, u32, HashMap<SemanticId, bool>)>;
 
@@ -1062,6 +1083,7 @@ pub enum PreparedContextIdentityField {
     RustPreludeReferences,
     ExternalTypeImportPaths,
     JavaImportRouteGapReasons,
+    JavaImportMemberScopes,
     JvmExternalTypeIdentities,
     JvmExternalTypeIdentitiesByReference,
     JvmExternalTypeBoundaries,
@@ -1232,6 +1254,11 @@ impl SelectedContextIdentities {
                 .expect("the selected context's Rust external path table is not poisoned")
                 .is_empty()
             && self
+                .java_import_member_scopes
+                .lock()
+                .expect("Java import member scopes are not poisoned")
+                .is_empty()
+            && self
                 .java_import_route_gap_reasons
                 .lock()
                 .expect("the selected context's Java import reason set is not poisoned")
@@ -1275,6 +1302,10 @@ impl SelectedContextIdentities {
     /// own identity table independently.
     pub(crate) fn isolated_clone(&self) -> Self {
         Self {
+            #[cfg(any(test, feature = "test-support"))]
+            oracle_trace: Arc::new(std::sync::Mutex::new(
+                self.oracle_trace.lock().unwrap().clone(),
+            )),
             unindexed_go_imports: Arc::new(std::sync::Mutex::new(
                 self.unindexed_go_imports
                     .lock()
@@ -1303,6 +1334,12 @@ impl SelectedContextIdentities {
                 self.external_type_import_paths
                     .lock()
                     .expect("the selected context's Rust external path table is not poisoned")
+                    .clone(),
+            )),
+            java_import_member_scopes: Arc::new(std::sync::Mutex::new(
+                self.java_import_member_scopes
+                    .lock()
+                    .expect("Java import member scopes are not poisoned")
                     .clone(),
             )),
             java_import_route_gap_reasons: Arc::new(std::sync::Mutex::new(
@@ -1419,6 +1456,14 @@ impl SelectedContextIdentities {
             .expect("the cached context's Rust external path table is not poisoned")
             .clone();
         *self
+            .java_import_member_scopes
+            .lock()
+            .expect("Java import member scopes are not poisoned") = other
+            .java_import_member_scopes
+            .lock()
+            .expect("Java import member scopes are not poisoned")
+            .clone();
+        *self
             .java_import_route_gap_reasons
             .lock()
             .expect("the selected context's Java import reason set is not poisoned") = other
@@ -1491,6 +1536,10 @@ impl SelectedContextIdentities {
             && Arc::ptr_eq(
                 &self.external_type_import_paths,
                 &other.external_type_import_paths,
+            )
+            && Arc::ptr_eq(
+                &self.java_import_member_scopes,
+                &other.java_import_member_scopes,
             )
             && Arc::ptr_eq(
                 &self.java_import_route_gap_reasons,
@@ -1689,6 +1738,44 @@ impl SelectedContextIdentities {
             .unwrap_or_default()
     }
 
+    /// Only an unavailable selected Java static-import owner member scope.
+    /// Other unsupported routes retain their original producer placeholder.
+    pub(crate) fn record_jvm_import_member_scope(
+        &self,
+        reason: SemanticId,
+        source_site: SemanticId,
+        owner: &str,
+    ) {
+        assert_eq!(reason.ordinal(), source_site.ordinal());
+        let value = (source_site, Arc::from(owner));
+        let previous = self
+            .java_import_member_scopes
+            .lock()
+            .expect("Java import member scopes are not poisoned")
+            .insert(reason, value.clone());
+        assert!(previous.is_none_or(|previous| previous == value));
+    }
+
+    pub(crate) fn java_import_member_scope(
+        &self,
+        reason: SemanticId,
+    ) -> Option<(SemanticId, Arc<str>)> {
+        self.java_import_member_scopes
+            .lock()
+            .expect("Java import member scopes are not poisoned")
+            .get(&reason)
+            .cloned()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn java_import_member_scope_count_for_test(&self) -> usize {
+        self.java_import_member_scopes
+            .lock()
+            .expect("Java import member scopes are not poisoned")
+            .len()
+    }
+
     pub(crate) fn record_java_import_route_gap_reason(&self, reason: SemanticId) {
         assert!(
             reason.ordinal().is_some() && reason.local_key().is_some(),
@@ -1749,6 +1836,16 @@ impl SelectedContextIdentities {
         hash.field("provider-id", owner.provider_id.as_bytes());
         hash.field("owner-fqn", owner.owner_fqn.as_bytes());
         let semantic = SemanticId::shared_name(names.intern(hash.finish()));
+        self.record_external_owner_semantic_for_language(language, semantic, owner);
+        semantic
+    }
+
+    pub(crate) fn record_external_owner_semantic_for_language(
+        &self,
+        language: ExternalOwnerLanguage,
+        semantic: SemanticId,
+        owner: &super::ExternalOwnerIdentity,
+    ) {
         let previous = self
             .jvm_external_owners
             .lock()
@@ -1758,7 +1855,47 @@ impl SelectedContextIdentities {
             previous.is_none_or(|previous| previous.0 == language && previous.1 == *owner),
             "one external owner semantic has one provider coordinate"
         );
-        semantic
+    }
+
+    // #7314 6b: oracle-only authority and observations of actual registrations.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn java_oracle_reference_association(
+        &self,
+        reference: SemanticId,
+    ) -> serde_json::Value {
+        let claim = self
+            .jvm_external_type_identities_by_reference
+            .lock()
+            .unwrap()
+            .get(&reference)
+            .copied();
+        let identity = match claim {
+            Some(
+                JvmExternalTypeIdentityClaim::Provider(_, id)
+                | JvmExternalTypeIdentityClaim::ImplicitFallback(id),
+            ) => Some(id),
+            None => None,
+        };
+        let owner = identity.and_then(|id| self.external_owner_identity(id));
+        let boundaries = identity.map(|id| self.jvm_external_provider_type_boundaries(id));
+        serde_json::json!({"claim": format!("{claim:?}"), "owner": owner.map(|owner| serde_json::json!({"fqn": owner.owner_fqn.as_ref(), "provider_id": owner.provider_id.as_ref()})), "boundaries": format!("{boundaries:?}"), "has_boundary": boundaries.as_ref().is_some_and(|b| !b.is_empty())})
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_java_oracle_authority(&self, authority: String) {
+        let mut trace = self.oracle_trace.lock().unwrap();
+        assert!(trace.0.as_ref().is_none_or(|old| old == &authority));
+        trace.0 = Some(authority);
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    fn trace_java_oracle_registration(&self, value: String) {
+        let mut trace = self.oracle_trace.lock().unwrap();
+        if let Some(authority) = trace.0.clone() {
+            trace.1.push(format!("{authority}/{value}"));
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn java_oracle_registration_trace(&self) -> Vec<String> {
+        self.oracle_trace.lock().unwrap().1.clone()
     }
 
     pub(crate) fn external_owner_identity(
@@ -1828,6 +1965,10 @@ impl SelectedContextIdentities {
         hash.field("owner-fqn", owner.owner_fqn.as_bytes());
         hash.field("member-ordinal", &ordinal.to_be_bytes());
         let semantic = SemanticId::shared_name(names.intern(hash.finish()));
+        #[cfg(any(test, feature = "test-support"))]
+        self.trace_java_oracle_registration(format!(
+            "member-inventory {owner:?}/{ordinal} -> {semantic:?}"
+        ));
         let coordinates = (owner.clone(), ordinal);
         let mut members = self
             .jvm
@@ -1934,6 +2075,10 @@ impl SelectedContextIdentities {
             "one provider boundary names one tagged external type identity"
         );
         self.record_provider_type_reference(language, source_reference, identity);
+        #[cfg(any(test, feature = "test-support"))]
+        self.trace_java_oracle_registration(format!(
+            "boundary-reference {source_reference:?} -> {identity:?}"
+        ));
         self.record_external_provider_type_boundary(language, identity, enumeration_boundary);
     }
 
@@ -1953,6 +2098,10 @@ impl SelectedContextIdentities {
         source_reference: SemanticId,
         identity: SemanticId,
     ) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.trace_java_oracle_registration(format!(
+            "provider-reference {source_reference:?} -> {identity:?}"
+        ));
         assert!(identity.shared_name_id().is_some());
         let previous = self
             .jvm_external_type_identities_by_reference
@@ -2123,6 +2272,19 @@ impl SelectedContextIdentities {
                 .is_some_and(|(tag, _)| *tag == ExternalOwnerLanguage::Jvm)
     }
 
+    /// The exact model declaring this registered type-enumeration boundary.
+    /// FQN equality cannot distinguish two active models declaring one type.
+    pub(crate) fn model_declared_jvm_boundary_owner(
+        &self,
+        boundary: SemanticId,
+    ) -> Option<super::ExternalOwnerIdentity> {
+        let (kind, _) = self.named_reason(boundary)?;
+        if kind != "jvm-model-declared-type" {
+            return None;
+        }
+        self.external_owner_identity(self.jvm_external_provider_type_identity(boundary)?)
+    }
+
     pub(crate) fn jvm_external_provider_type_boundaries(
         &self,
         identity: SemanticId,
@@ -2143,13 +2305,19 @@ impl SelectedContextIdentities {
         classify: impl Fn(PreparedContextIdentityField) -> PreparedContextIdentityPolicy,
     ) {
         let Self {
+            #[cfg(any(test, feature = "test-support"))]
+                oracle_trace: _,
             unindexed_go_imports,
             numbers,
             named_reasons,
             rust_prelude_references,
             external_type_import_paths,
             java_import_route_gap_reasons,
+
+            java_import_member_scopes,
+
             jvm_external_type_identities,
+
             jvm_external_type_identities_by_reference,
             jvm_external_type_boundaries,
             jvm_external_owners,
@@ -2174,6 +2342,7 @@ impl SelectedContextIdentities {
                 }
             };
         }
+
         classify_field!(
             unindexed_go_imports,
             UnindexedGoImports,
@@ -2195,6 +2364,11 @@ impl SelectedContextIdentities {
             java_import_route_gap_reasons,
             JavaImportRouteGapReasons,
             "Java import route reasons"
+        );
+        classify_field!(
+            java_import_member_scopes,
+            JavaImportMemberScopes,
+            "Java import member scopes"
         );
         classify_field!(
             jvm_external_type_identities,
@@ -5786,6 +5960,7 @@ mod tests {
         );
         assert!(
             halves.contains(&SelectedRootPathHalf::Reference {
+                source_origin: Default::default(),
                 identity: halves
                     .iter()
                     .find_map(|half| match half {
@@ -5817,6 +5992,26 @@ mod tests {
             })
         );
 
+        let reference_origin = {
+            use crate::analyzer::store::resolution_prepare::resolution_rows::{
+                semantic_role_code, site_kind_code,
+            };
+            let site = lowered
+                .semantics()
+                .iter()
+                .find(|site| {
+                    site.site() == reference_site
+                        && site.role()
+                            == super::super::fact_lowering::LoweredSemanticRole::Reference
+                })
+                .unwrap();
+            super::super::CandidatePathOrigin {
+                role: Some(semantic_role_code(site.role())),
+                site_kind: site
+                    .published_site_metadata()
+                    .map(|metadata| site_kind_code(metadata.site_kind())),
+            }
+        };
         let source = PreloadedFragmentSource::from_lowered_fragments([lowered]);
         let mut visited_imports = Vec::new();
         let every_mount = [SelectedResolutionMountOrdinal::new(0)];
@@ -5845,6 +6040,7 @@ mod tests {
                     )
                 })
                 .cloned()
+                .map(|half| half.with_source_origin(reference_origin))
                 .collect::<Vec<_>>()
         );
 
@@ -6099,6 +6295,15 @@ impl SelectedContextIdentities {
                         heap.add(part.capacity());
                     }
                 }
+            }
+        });
+        heap.arc(&self.java_import_member_scopes, |scopes, heap| {
+            let scopes = scopes
+                .lock()
+                .expect("Java import member scopes are not poisoned");
+            heap.map(&scopes);
+            for (_, owner) in scopes.values() {
+                heap.arc(owner, |_, _| {});
             }
         });
         heap.arc(&self.java_import_route_gap_reasons, |reasons, heap| {

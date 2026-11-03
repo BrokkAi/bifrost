@@ -46,6 +46,7 @@ pub mod prelude;
 pub mod proof;
 pub mod queries;
 mod resolution;
+pub use resolution::rust_unwrap_operand;
 #[cfg(any(test, feature = "test-support"))]
 pub mod resolution_spike_fixture;
 pub mod selected_context;

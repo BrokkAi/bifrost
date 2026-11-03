@@ -928,6 +928,30 @@ pub mod pinned_plans {
                 text("module3/src/main0"),
             ],
         )];
+        // Unit reads bind the complete typed partition tuple, including both
+        // halves of root, prefix and output questions.
+        queries.push(pin(
+            "policy_unit_batch",
+            super::super::policy_units::policy_unit_batch_sql("(?,?,?,?,?,?,?,?,?,?,?,?)"),
+            vec![
+                text(&"a".repeat(64)),
+                text("match"),
+                text(&"b".repeat(64)),
+                text(&"c".repeat(64)),
+                text(&"d".repeat(64)),
+                text("root"),
+                text("a.java"),
+                text(&"1".repeat(40)),
+            ]
+            .into_iter()
+            .chain((0..9).map(|_| text(&"e".repeat(64))))
+            .collect(),
+        ));
+        queries.push(pin(
+            "policy_unit_snapshots",
+            super::super::policy_units::POLICY_UNIT_SNAPSHOTS_SQL,
+            vec![text("[1,2]")],
+        ));
         queries.push(pin(
             "rust_receiver_impl_targets",
             RUST_RECEIVER_IMPL_TARGETS_SQL,
@@ -1502,6 +1526,16 @@ pub mod pinned_plans {
             "go_definition_package_anchor",
             super::super::resolution_operation::native_units::GO_DEFINITION_PACKAGE_ANCHOR,
             vec![integer(1)],
+        ));
+        queries.push(pin(
+            "native_argument_reason_identity_digest",
+            super::super::resolution_operation::native_units::NATIVE_ARGUMENT_REASON_IDENTITY_DIGEST_SQL,
+            vec![text("[[1,1],[1,2]]")],
+        ));
+        queries.push(pin(
+            "native_argument_reason_gap_reasons",
+            super::super::resolution_operation::native_units::NATIVE_ARGUMENT_REASON_GAP_REASONS_SQL,
+            vec![text("[[1,1],[1,2]]")],
         ));
         queries.push(pin(
             "go_reverse_inventory_complete",
@@ -2407,6 +2441,11 @@ pub mod pinned_plans {
                 vec![integer(1), text("[0]")],
             ),
             pin(
+                "stage_hydrate_paths",
+                crate::analyzer::store::resolution_stage::lexical_readers::HYDRATE_PATHS_SQL,
+                vec![text("[[0,1]]")],
+            ),
+            pin(
                 "resolution_identity_recipes",
                 rows::RESOLUTION_IDENTITY_RECIPES_SQL,
                 vec![text(
@@ -2494,6 +2533,11 @@ pub mod pinned_plans {
             vec![integer(1), integer(1), integer(1), text("go")],
         ));
         queries.push(pin(
+            "go_point_type_name",
+            crate::analyzer::store::resolution_operation::go_receiver_anchor::GO_POINT_TYPE_NAME,
+            vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
             "go_alias_without_bridge",
             crate::analyzer::store::resolution_operation::go_hierarchy::GO_ALIAS_WITHOUT_BRIDGE_SQL
                 .as_str(),
@@ -2533,14 +2577,14 @@ pub mod pinned_plans {
             vec![integer(1)],
         ));
         queries.push(pin(
-            "go_unbound_alias_interface",
-            crate::analyzer::store::resolution_operation::go_hierarchy::GO_UNBOUND_ALIAS_INTERFACE_SQL.as_str(),
-            vec![integer(1)],
-        ));
-        queries.push(pin(
             "go_method_interface_owners",
             crate::analyzer::store::resolution_operation::go_hierarchy::GO_METHOD_INTERFACE_OWNERS_SQL.as_str(),
             vec![integer(1), integer(1), text("M"), integer(1), text("go")],
+        ));
+        queries.push(pin(
+            "go_unprojected_interface_method",
+            crate::analyzer::store::resolution_operation::go_hierarchy::GO_UNPROJECTED_INTERFACE_METHOD_SQL.as_str(),
+            vec![integer(1), text("M")],
         ));
         queries.push(pin(
             "go_interface_owner_for_method",
@@ -2737,6 +2781,11 @@ pub mod pinned_plans {
         queries.push(pin(
             "go_member_declarations",
             super::super::resolution_typed::go_members::DECLARATIONS,
+            vec![text("[[0,0]]")],
+        ));
+        queries.push(pin(
+            "go_alias_member_declarations",
+            super::super::resolution_typed::go_members::ALIAS_DECLARATIONS.as_str(),
             vec![text("[[0,0]]")],
         ));
         queries.push(pin(
@@ -5454,8 +5503,23 @@ pub mod tests {
                 ),
                 (
                     "resolution_paths_by_key",
-                    "SEARCH resolution_paths USING PRIMARY KEY (blob_id=? AND path=?)",
-                    "SCAN resolution_paths",
+                    "SEARCH path USING PRIMARY KEY (blob_id=? AND path=?)",
+                    "SCAN path",
+                ),
+                (
+                    "resolution_paths_by_key",
+                    "SEARCH site USING PRIMARY KEY (blob_id=? AND site=?) LEFT-JOIN",
+                    "SCAN site",
+                ),
+                (
+                    "stage_hydrate_paths",
+                    "SEARCH path USING PRIMARY KEY (host_ordinal=? AND path=?)",
+                    "SCAN path",
+                ),
+                (
+                    "stage_hydrate_paths",
+                    "selected_resolution_stage_semantics_node (node=? AND host_ordinal=? AND producer_id=?) LEFT-JOIN",
+                    "SCAN site",
                 ),
                 (
                     "resolution_identity_recipes",
@@ -7612,6 +7676,36 @@ pub mod tests {
     /// opens through its root page, and `sqlite_schema` maps that root page
     /// back to a table. No source text is scanned, so a statement assembled
     /// at runtime is covered exactly as a literal one is.
+    #[test]
+    fn policy_unit_batch_uses_typed_key_index_with_both_statistics_states() {
+        let store = AnalyzerStore::open_ephemeral().expect("open store");
+        let conn = store.conn.lock().expect("store mutex");
+        for ordinal in 0..128 {
+            conn.execute(
+                "INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at) VALUES(?1,'match','seed',?2,?3,?4,?5,?6,'complete','exhaustive','rows',jsonb('{}'),zeroblob(32),1)",
+                rusqlite::params!["a".repeat(64),format!("f{ordinal}.java"),"1".repeat(40),"b".repeat(64),"c".repeat(64),"d".repeat(64)],
+            ).unwrap();
+        }
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("policy_unit_batch"));
+            assert!(
+                plan.iter().any(
+                    |line| line.contains("SEARCH units USING INDEX policy_units_key")
+                        || line.contains("SEARCH units USING COVERING INDEX policy_units_key")
+                ),
+                "{state}: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.starts_with("SCAN units") || line.contains("AUTOMATIC")),
+                "{state}: {plan:?}"
+            );
+        }
+    }
+
+    #[cfg(test)]
     #[hardwon("#6218: TEMP root pages were mistaken for unrelated main-schema tables")]
     #[test]
     fn no_pinned_statement_opens_a_resolution_table_outside_tier_one() {

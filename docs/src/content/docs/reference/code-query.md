@@ -550,6 +550,51 @@ carries the Maven scope.
 - A file that no build file claims, in a fully read build, returns no row and
   no diagnostic.
 
+### Build configuration
+
+| JSON `op` | RQL form | Input -> output | Options | Meaning |
+| --- | --- | --- | --- | --- |
+| `build_configuration_of` | `build-configuration-of`, `build_configuration_of` | `file` -> `build_configuration` | none | The build configuration the file is analyzed under, whether that configuration compiles the file, and the target operating systems and architectures the file's own constraint admits. |
+
+One row per file and configuration. Go and Rust have build-configuration
+providers; a file in another language returns no row and a
+`topology_derivation_incomplete` diagnostic.
+
+- `os` and `arch` are the selected `GOOS` and `GOARCH`. `os_source` and
+  `arch_source` say where each came from: `configuration` (the
+  `go.dependency_discovery` settings), `toolchain` (`go env` for the active
+  discovery, which includes the `GOOS` and `GOARCH` environment variables), or
+  `host` (no toolchain selection is active, so the platform Bifrost runs on).
+- `file_status` is `included` or `excluded` under the selected configuration,
+  or `unknown` when the constraint names a release tag such as `go1.21` or
+  cannot be parsed.
+- `constraint` is the file's `_GOOS`/`_GOARCH` filename suffix and its
+  `//go:build` directive (or legacy `// +build` lines) conjoined, in canonical
+  spelling. It is absent for an unconstrained file and holds the directive as
+  written when the directive is invalid.
+- `os_scope` and `arch_scope` describe the constraint alone, independent of the
+  host: `any` (unrestricted), `restricted` (the space-separated values in
+  `os_values` or `arch_values`), `none` (no target satisfies it), or `unknown`
+  (invalid). A target is admitted when some choice of the remaining tags
+  satisfies the constraint.
+
+For Rust, the rows come from the `rust-toolchain` dependency evidence of the
+Cargo package whose manifest is nearest above the file. Each configured
+`build.target` is a row with source `configuration`; with none, the build
+compiles for the host, a row with source `host`. Each further target of the
+package's rustup toolchain file is a row with source `toolchain`. `target`
+holds the target triple, and `os` and `arch` are its `target_os` and
+`target_arch`, absent for a target rustc does not know, such as a custom
+target file. A Rust file's own `#[cfg]` gating is not evaluated, so
+`file_status`, `os_scope` and `arch_scope` are `unknown`. A Rust file no
+Cargo package owns returns no row and a `topology_derivation_incomplete`
+diagnostic.
+
+A rule that applies only to Windows builds can treat `os_values` equal to
+`windows` as a Windows-only file, a `restricted` scope without `windows` as
+never built for Windows, and `any` or `unknown` as undecided: a platform-neutral
+file is not evidence that the program never runs on Windows.
+
 ### Materialization
 
 | JSON `op` | RQL form | Input -> output | Options | Meaning |
@@ -997,6 +1042,7 @@ in the last column is left out of the JSON when it has no value. With
 | `source_set` | `build_file`, `completeness`, `id`, `name` | `target_id` |
 | `build_target` | `build_file`, `completeness`, `id`, `name` | `build_project_id` |
 | `topology_edge` | `build_file`, `completeness`, `from_id`, `from_name`, `id`, `scope`, `to_name` | `to_id` |
+| `build_configuration` | `arch_scope`, `configuration_id`, `file_status`, `id`, `language`, `os_scope`, `path` | `arch`, `arch_source`, `arch_values`, `constraint`, `os`, `os_source`, `os_values`, `target` |
 | `cross_domain` | `domain`, `id`, `operator`, `path` | `binding`, `code`, `code_id`, `code_path`, `configuration`, `configuration_contributors`, `configuration_id`, `configuration_path`, `dependency_id`, `effective_configuration`, `key`, `mapping_id`, `mitigated`, `owner`, `range`, `relation` |
 
 Member-family summaries publish `ancestor_coverage` and `descendant_coverage`
@@ -1312,8 +1358,8 @@ limits remain separate.
 
 ## Static dependency evidence
 
-`dependency_evidence` reads facts acquired from selected Cargo, JS/TS and C#
-(NuGet) manifests and lockfiles before query execution. A files-only checkout can supply
+`dependency_evidence` reads facts acquired from selected Cargo, JS/TS, C#
+(NuGet) and Go manifests and lockfiles before query execution. A files-only checkout can supply
 these facts without installed dependencies, declaration files, a build or a
 semantic-pack artifact. Acquisition does not execute package managers, target
 project scripts, lifecycle hooks or network requests. JS/TS supported formats
@@ -1334,19 +1380,52 @@ adds implicitly, are separate `declared` rows with source `framework` and
 `provided` scope, because the runtime, not restore, picks their version.
 MSBuild property references in a version leave the row incomplete.
 
+For Go, the `go` and `toolchain` directives of each `go.mod` and `go.work` are
+`constraint` rows with ecosystem `go-toolchain` and package `go`; the
+`go_constraint` condition says whether a row is the declared language minimum
+or the declared toolchain. Neither proves the toolchain that builds the
+binary, so a version range leaves them unknown rather than affected. `go.mod`
+`require` entries are `declared` `go-module` rows with a `go_indirect`
+condition; `replace` and `exclude` are constraints and mark the requirements
+they redirect or exclude incomplete. `go.sum` entries are `checksum` rows. A
+`vendor/modules.txt` module is `locked` only when the snapshot agrees with its
+`go.mod`; otherwise it is an unvalidated constraint. Rows are owned by their
+module's (or `go.work`'s) BuildProject. Root requirements do not establish the
+module graph that minimal version selection picks, so every Go answer stays
+incomplete.
+
+For Rust, every Cargo package also owns `rust-toolchain` rows with package
+`rust`, each tagged by its `rust.toolchain_evidence` condition. The
+`rust-toolchain.toml` or legacy `rust-toolchain` file that rustup finds from
+the workspace root upward is a `toolchain_file` row: a pinned release channel
+(`1.77.0`) is `locked` with that exact version, and any other channel
+(`stable`, `1.77`, a nightly) or a custom `path` toolchain is a `constraint`
+with no version. Its `targets` are `rust.toolchain_target` conditions. A
+package with no toolchain file has a `no_toolchain_file` constraint row
+instead, so the toolchain stays a typed unknown. The package's `rust-version`
+is a `minimum_supported_rust_version` constraint, a minimum rather than the
+toolchain that builds. Each `build.target` of the Cargo configuration a
+workspace build reads is a `declared` `cargo_build_target` row with a
+`rust.build_target` condition. Overrides outside the workspace
+(`RUSTUP_TOOLCHAIN`, `rustup override`, `cargo +toolchain`,
+`CARGO_BUILD_TARGET`) are not read, which `rust.toolchain_override=unobserved`
+records on toolchain-file rows. Every row carries the `cargo.member_manifest`
+and `cargo.member_package` of its owner.
+
 Each axis is an array of exact alternatives; different axes combine with AND.
 JSON axes and their RQL options are:
 
 | JSON | RQL | Meaning |
 | --- | --- | --- |
-| `ecosystems` | `:ecosystem`, `:ecosystems` | Package ecosystem; Cargo uses `cargo`, JS/TS packages use `npm`, JS toolchain constraints use `npm-toolchain`, and C# packages and shared frameworks use `nuget`. |
+| `ecosystems` | `:ecosystem`, `:ecosystems` | Package ecosystem; Cargo uses `cargo`, Rust toolchain and build-target rows use `rust-toolchain`, JS/TS packages use `npm`, JS toolchain constraints use `npm-toolchain`, C# packages and shared frameworks use `nuget`, Go modules use `go-module`, and the Go `go`/`toolchain` directives use `go-toolchain`. |
 | `packages` | `:package`, `:packages` | Actual package names, independent of manifest aliases. |
 | `kinds` | `:kind`, `:kinds` | `declared`, `constraint`, `locked`, `installed`, or `checksum`. Cargo file acquisition emits declared and locked facts. |
 | `exact_versions` | `:exact-version`, `:exact_versions` | Exact recorded version strings. Declarations have requirements, not exact versions. |
-| `version_ranges` | `:version-range`, `:version_ranges` | Version requirements matched against complete exact locked/installed evidence. Requires exactly `ecosystems: ["cargo"]`, `["npm"]` or `["nuget"]`; each uses its ecosystem semantics, including prerelease rules. npm supports comparator sets, unions, caret/tilde, partial/wildcard and hyphen ranges. NuGet supports interval notation (`[1.0,2.0)`, `[1.2.3]`, `(,1.0]`), a bare inclusive minimum (`1.0`), whitespace-joined comparators (`>=1.2 <1.5.51`) and `\|\|` unions, with NuGet's ordering: up to four numeric parts, a prerelease below its release, and case-insensitive labels. Arbitrary sources and tags remain unresolved. |
+| `version_ranges` | `:version-range`, `:version_ranges` | Version requirements matched against complete exact locked/installed evidence. Requires exactly `ecosystems: ["cargo"]`, `["rust-toolchain"]`, `["npm"]`, `["nuget"]`, `["go-module"]` or `["go-toolchain"]`; each uses its ecosystem semantics, including prerelease rules. npm supports comparator sets, unions, caret/tilde, partial/wildcard and hyphen ranges. NuGet supports interval notation (`[1.0,2.0)`, `[1.2.3]`, `(,1.0]`), a bare inclusive minimum (`1.0`), whitespace-joined comparators (`>=1.2 <1.5.51`) and `\|\|` unions, with NuGet's ordering: up to four numeric parts, a prerelease below its release, and case-insensitive labels. Go supports whitespace-joined comparators and `\|\|` unions; `go-module` bounds are module versions (`v0.17.0` or `0.17.0`, pseudo-versions order as prereleases) and `go-toolchain` bounds are Go release versions in `go/version` order (`1.21` < `1.21rc1` < `1.21.0`, `go1.21.0` accepted). `rust-toolchain` ranges are Cargo semver requirements over the pinned release of a toolchain file. Arbitrary sources and tags remain unresolved. |
 | `sources` | `:source`, `:sources` | Exact source identities. Registry URL and git revision identities remain distinct. |
 | `declared_by` | `:declared-by`, `:declared_by` | Established owning BuildProject IDs from build topology identity. |
 | `scopes` | `:scope`, `:scopes` | Recorded `compile`, `runtime`, `test`, `provided`, `optional`, `feature_gated`, or `unknown` scope. Cargo build requirements use `unknown` and retain their build kind as a condition. |
+| `features` | `:feature`, `:features` | Features the owning manifest requests of the package. Requires exactly `ecosystems: ["cargo"]`. See below. |
 
 For example, a curated review can select an exact recorded package and source:
 
@@ -1364,6 +1443,28 @@ member through its `declared_by` ID when the policy requires ownership:
 (dependency-evidence
   :ecosystem npm :package example-lib :kind locked
   :version-range ">=1.0.0 <1.3.0")
+```
+
+A `features` match means the owning Cargo manifest requests one of the
+features in the dependency's `features` list, including features a member adds
+to an inherited workspace dependency. It does not prove the feature is enabled
+in a build, and a non-match does not prove it is off: the query cannot resolve
+features. A row with no explicit request is unknown, and makes the result
+incomplete, when its package's default features are enabled (the default list
+is in the package's own manifest), when a member `[features]` entry forwards to
+the dependency (`dep/feature` or `dep?/feature`), or when it requests another
+feature that the package's own feature table may expand to the one selected.
+Only a declaration with default features off, no requested features and no
+forwarding member feature is a definite non-match. Locked rows answer through
+the declaration they are associated with; an unowned or transitive lock
+instance records no request and stays unknown, so select `:kind declared` to
+read requests alone. Feature-gated lettre `boring-tls` uses could be selected
+like this:
+
+```lisp
+(dependency-evidence
+  :ecosystem cargo :package lettre :kind declared
+  :features ["boring-tls"])
 ```
 
 Each identity filter and version predicate applies to the same stored row.

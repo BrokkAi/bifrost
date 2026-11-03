@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use crate::analyzer::semantic::icfg::invoked_call_at;
+use crate::analyzer::semantic::partial_flow::PartialFlowPort;
 use crate::analyzer::semantic::{
     ControlEdgeKind, EvidenceCompleteness, IcfgEdgeKind, ProcedureHandle, ProofStatus,
     SemanticRequest,
@@ -16,8 +17,8 @@ use crate::dataflow::{
 };
 use crate::hash::HashMap;
 use crate::taint::{
-    TaintAnalysisPlan, TaintFact, TaintFinding, TaintFindingReport, TaintOriginFindingEvidence,
-    TaintOriginStatus, TaintSummaryResult,
+    TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction, TaintFact, TaintFinding,
+    TaintFindingReport, TaintOriginFindingEvidence, TaintOriginStatus, TaintSummaryResult,
 };
 use crate::value_flow::{
     AuthoredArmClosure, DurableCallSiteKey, DurableProcedureKey, ValueFlowSinkId,
@@ -35,14 +36,43 @@ use super::{ComposeError, CompositionBudget};
 /// per-carrier facts.
 const ZERO_FACT: usize = 0;
 
-pub(super) fn build_report<Provider: CompositionProvider>(
+/// One crossing's position in a retained composed witness. The prefix ends
+/// after the write observation and before the read continuation.
+#[derive(Debug, Clone)]
+pub(super) struct StoreWitnessBoundary {
+    pub write_call: DurableCallSiteKey,
+    pub read_call: DurableCallSiteKey,
+    pub prefix_steps: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComposedStoreCrossing {
+    pub source: crate::taint::SourceEventKey,
+    pub original_source: crate::taint::SourceEventKey,
+    pub sink: crate::value_flow::ValueFlowEventKey,
+    pub witness: Arc<SummaryWitness>,
+    pub write_call: DurableCallSiteKey,
+    pub read_call: DurableCallSiteKey,
+    pub prefix_steps: usize,
+}
+
+pub(super) fn build_report<
+    Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>,
+>(
     plan: &TaintAnalysisPlan,
     provider: &Provider,
     budget: CompositionBudget,
-    outcome: &SearchOutcome,
+    outcome: &SearchOutcome<super::labels::TaintLabels<'_>>,
     labeled: Vec<LabeledPath>,
     request: &mut SemanticRequest<'_>,
-) -> Result<(TaintFindingReport, Vec<Incompleteness>), ComposeError> {
+) -> Result<
+    (
+        TaintFindingReport,
+        Vec<Incompleteness>,
+        Vec<ComposedStoreCrossing>,
+    ),
+    ComposeError,
+> {
     let termination = termination(budget, &outcome.incomplete);
     let complete = outcome.incomplete.is_empty() && outcome.sanitizers_resolved;
     // A composition that rests on an authored external summary is not
@@ -64,6 +94,7 @@ pub(super) fn build_report<Provider: CompositionProvider>(
         plan,
         sources: &outcome.sources,
         provider,
+        functions: &outcome.functions,
         handles: HashMap::default(),
     };
     let mut by_sink: Vec<(ValueFlowSinkId, Vec<LabeledPath>)> = Vec::new();
@@ -76,10 +107,15 @@ pub(super) fn build_report<Provider: CompositionProvider>(
     by_sink.sort_by_key(|(sink, _)| *sink);
     let mut findings = Vec::new();
     let mut finding_incompleteness = Vec::new();
+    let mut store_crossings = Vec::new();
     for (sink, paths) in by_sink {
         let mut classes = plan.universe().empty_set();
         let mut qualities = PathQualityFrontier::default();
-        let mut by_source: Vec<(ComposedSourceId, Vec<&LabeledPath>)> = Vec::new();
+        let mut by_source: Vec<(
+            ComposedSourceId,
+            crate::taint::SourceEventKey,
+            Vec<&LabeledPath>,
+        )> = Vec::new();
         for path in &paths {
             classes = classes.union(&path.reached);
             if path.quality.proven && path.quality.complete && !path.quality.is_certain() {
@@ -88,17 +124,26 @@ pub(super) fn build_report<Provider: CompositionProvider>(
             } else {
                 qualities.insert(path_quality(path.quality));
             }
+            let source_origin = path
+                .hops
+                .iter()
+                .rev()
+                .find_map(|hop| match hop {
+                    Hop::Store { read_origin, .. } => Some(read_origin.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| outcome.sources[path.source.index()].origin.clone());
             match by_source
                 .iter_mut()
-                .find(|(source, _)| *source == path.source)
+                .find(|(source, origin, _)| *source == path.source && *origin == source_origin)
             {
-                Some((_, grouped)) => grouped.push(path),
-                None => by_source.push((path.source, vec![path])),
+                Some((_, _, grouped)) => grouped.push(path),
+                None => by_source.push((path.source, source_origin, vec![path])),
             }
         }
         let mut witness_unavailable = false;
         let mut evidence = Vec::new();
-        for (source, grouped) in by_source {
+        for (source, source_origin, grouped) in by_source {
             let binding = &outcome.sources[source.index()];
             let mut contributed = plan.universe().empty_set();
             let mut reached = plan.universe().empty_set();
@@ -108,7 +153,26 @@ pub(super) fn build_report<Provider: CompositionProvider>(
                 contributed = contributed.union(&path.contributed);
                 reached = reached.union(&path.reached);
                 match witnesses.witness(path, request)? {
-                    Some(witness) => retained.push(Arc::new(witness)),
+                    Some((witness, boundaries)) => {
+                        let witness = Arc::new(witness);
+                        for boundary in boundaries {
+                            store_crossings.push(ComposedStoreCrossing {
+                                source: source_origin.clone(),
+                                original_source: binding.origin.clone(),
+                                sink: plan
+                                    .value_flow()
+                                    .sink(sink)
+                                    .expect("a report sink is live")
+                                    .key()
+                                    .clone(),
+                                witness: Arc::clone(&witness),
+                                write_call: boundary.write_call,
+                                read_call: boundary.read_call,
+                                prefix_steps: boundary.prefix_steps,
+                            });
+                        }
+                        retained.push(witness);
+                    }
                     None => witness_unavailable = true,
                 }
                 for closure in path_closures(plan, provider, path)? {
@@ -120,10 +184,22 @@ pub(super) fn build_report<Provider: CompositionProvider>(
             // The search's table holds the plan's sources first; a source
             // after them was matched on the frontier, and the plan cannot
             // answer its specification.
-            let frontier_source = (source.index() >= plan.sources().len())
-                .then(|| (binding.phase, binding.carrier.clone()));
+            let read_source = grouped.iter().find_map(|path| {
+                path.hops.iter().rev().find_map(|hop| match hop {
+                    Hop::Store {
+                        read_phase,
+                        read_carrier,
+                        ..
+                    } => Some((*read_phase, read_carrier.clone())),
+                    _ => None,
+                })
+            });
+            let frontier_source = read_source.or_else(|| {
+                (source.index() >= plan.sources().len())
+                    .then(|| (binding.phase, binding.carrier.clone()))
+            });
             evidence.push(TaintOriginFindingEvidence::composed(
-                binding.origin.clone(),
+                source_origin,
                 contributed,
                 reached,
                 retained,
@@ -189,6 +265,7 @@ pub(super) fn build_report<Provider: CompositionProvider>(
     Ok((
         TaintFindingReport::composed(result, findings),
         finding_incompleteness,
+        store_crossings,
     ))
 }
 
@@ -209,6 +286,11 @@ fn path_calls(
         .iter()
         .flat_map(|hop| match hop {
             Hop::Model { call, .. } => vec![call.clone()],
+            Hop::Store {
+                write_call,
+                read_call,
+                ..
+            } => vec![write_call.clone(), read_call.clone()],
             Hop::Interior {
                 procedure, crossed, ..
             }
@@ -228,7 +310,9 @@ fn path_calls(
 /// takes, of every call its stored and interior flows cross, and of the
 /// sink's own call, as the ICFG engine's `witness_arm_closures` reads them
 /// from a witness's call steps.
-fn path_closures<Provider: CompositionProvider>(
+fn path_closures<
+    Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>,
+>(
     plan: &TaintAnalysisPlan,
     provider: &Provider,
     path: &LabeledPath,
@@ -280,16 +364,19 @@ fn termination(budget: CompositionBudget, incomplete: &[Incompleteness]) -> Solv
     }
 }
 
-struct WitnessBuilder<'a, Provider> {
+struct WitnessBuilder<'a, 'u, Provider> {
     plan: &'a TaintAnalysisPlan,
     /// The search's source table.
     sources: &'a [BoundSource],
     provider: &'a Provider,
+    functions: &'a super::labels::LabelFunctions<super::labels::TaintLabels<'u>>,
     /// Live handles of procedures a witness run has served.
     handles: HashMap<DurableProcedureKey, ProcedureHandle>,
 }
 
-impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
+impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>>
+    WitnessBuilder<'_, '_, Provider>
+{
     /// The witness of one path: the recorded steps of every interior and
     /// stored hop, and a call or return step at every caller and callee hop.
     /// `None` when a hop's steps cannot be recorded.
@@ -297,7 +384,7 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
         &mut self,
         path: &LabeledPath,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<Option<SummaryWitness>, ComposeError> {
+    ) -> Result<Option<(SummaryWitness, Vec<StoreWitnessBoundary>)>, ComposeError> {
         self.provider
             .prepare_value_type_witness(&self.sources[path.source.index()], path.sink);
         // Record the interior runs first: they also give the live handles
@@ -309,14 +396,16 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
                     procedure,
                     from,
                     to,
+                    function,
                     ..
-                } => self.interior_steps(procedure, from, to, request)?,
+                } => self.interior_steps(procedure, from, to, *function, request)?,
                 Hop::Stored {
                     procedure,
                     from,
                     to,
+                    function,
                     ..
-                } => self.stored_steps(procedure, from, to, request)?,
+                } => self.stored_steps(procedure, from, to, *function, request)?,
                 _ => Some(Vec::new()),
             };
             let Some(steps) = steps else {
@@ -325,8 +414,21 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
             recorded.push(steps);
         }
         let mut steps = Vec::new();
+        let mut store_boundaries = Vec::new();
         for (hop, recorded) in path.hops.iter().zip(recorded) {
             steps.extend(recorded);
+            if let Hop::Store {
+                write_call,
+                read_call,
+                ..
+            } = hop
+            {
+                store_boundaries.push(StoreWitnessBoundary {
+                    write_call: write_call.clone(),
+                    read_call: read_call.clone(),
+                    prefix_steps: steps.len(),
+                });
+            }
             let (Hop::Caller { call, .. } | Hop::Callee { call, .. }) = hop else {
                 continue;
             };
@@ -374,14 +476,17 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
         let retained_bytes = std::mem::size_of::<SummaryWitness>()
             .saturating_add(std::mem::size_of_val(steps.as_slice()));
         let emitted = steps.len();
-        Ok(Some(SummaryWitness::from_parts(
-            steps,
-            quality,
-            None,
-            0,
-            false,
-            retained_bytes,
-            WitnessReconstructionWork::new(0, emitted),
+        Ok(Some((
+            SummaryWitness::from_parts(
+                steps,
+                quality,
+                None,
+                0,
+                false,
+                retained_bytes,
+                WitnessReconstructionWork::new(0, emitted),
+            ),
+            store_boundaries,
         )))
     }
 
@@ -390,11 +495,12 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
         procedure: &DurableProcedureKey,
         from: &crate::analyzer::semantic::partial_flow::PartialFlowPort,
         to: &crate::analyzer::semantic::partial_flow::PartialFlowPort,
+        function: super::labels::LabelFunctionId,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<Vec<SummaryWitnessStep>>, ComposeError> {
-        let flows = self
+        let projections = self
             .provider
-            .stored_interior_flows(
+            .projected_stored_interior_flows(
                 procedure,
                 &[InteriorSeed::Port(from.clone())],
                 &[],
@@ -402,6 +508,17 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
                 request,
             )
             .map_err(provider_error)?;
+        let selected = self.functions.function(function);
+        let flows = projections
+            .into_iter()
+            .find_map(|(restriction, flows)| {
+                (restriction.as_ref().map_or(
+                    function == super::labels::LabelFunctionId::IDENTITY,
+                    |restriction| restriction == selected,
+                ))
+                .then_some(flows)
+            })
+            .expect("a witness hop's label partition is stable");
         self.recorded_steps(procedure, flows, &InteriorTarget::Port(to.clone()))
     }
 
@@ -443,14 +560,27 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
         procedure: &DurableProcedureKey,
         from: &Endpoint,
         to: &Endpoint,
+        function: super::labels::LabelFunctionId,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<Vec<SummaryWitnessStep>>, ComposeError> {
         let Some(seed) = interior_seed(self.sources, from) else {
             return Ok(None);
         };
         let (observations, target) = match to {
+            Endpoint::StoreWrite(write) => {
+                let writes = self.provider.store_writes();
+                let observation = &writes[*write];
+                (
+                    vec![InteriorObservation::Sink {
+                        point: observation.point,
+                        phase: observation.phase,
+                        carrier: observation.carrier.clone(),
+                    }],
+                    InteriorTarget::Observation(0),
+                )
+            }
             Endpoint::Sink(sink) => (
-                vec![interior_observation(self.plan, *sink)],
+                vec![interior_observation(self.plan.value_flow(), *sink)],
                 InteriorTarget::Observation(0),
             ),
             Endpoint::Location(location) => (
@@ -458,20 +588,55 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
                 InteriorTarget::Observation(0),
             ),
             Endpoint::Port(port) => (Vec::new(), InteriorTarget::Port(port.clone())),
-            Endpoint::Source(_) => return Ok(None),
+            Endpoint::Source(_) | Endpoint::Execution(_) | Endpoint::Writeback { .. } => {
+                return Ok(None);
+            }
         };
-        let flows = self
+        let projections = self
             .provider
-            .interior_flows(procedure, &[seed], &observations, true, request)
+            .projected_interior_flows(procedure, &[seed], &observations, true, request)
             .map_err(provider_error)?;
+        let selected = self.functions.function(function);
+        let flows = projections
+            .into_iter()
+            .find_map(|(restriction, flows)| {
+                (restriction.as_ref().map_or(
+                    function == super::labels::LabelFunctionId::IDENTITY,
+                    |restriction| restriction == selected,
+                ))
+                .then_some(flows)
+            })
+            .expect("a witness hop's label partition is stable");
         self.recorded_steps(procedure, flows, &target)
     }
 }
 
 /// The seed of an interior run that starts at `from`.
-pub(super) fn interior_seed(sources: &[BoundSource], from: &Endpoint) -> Option<InteriorSeed> {
+pub(super) fn interior_seed<Fact>(
+    sources: &[BoundSource<Fact>],
+    from: &Endpoint,
+) -> Option<InteriorSeed> {
     match from {
         Endpoint::Port(port) => Some(InteriorSeed::Port(port.clone())),
+        Endpoint::Writeback {
+            call,
+            heap,
+            storage,
+            ..
+        } => {
+            let PartialFlowPort::Heap {
+                selectors, tail, ..
+            } = heap
+            else {
+                unreachable!("a writeback names a heap output");
+            };
+            Some(InteriorSeed::Writeback {
+                call: *call,
+                storage: storage.clone(),
+                selectors: selectors.clone(),
+                tail: *tail,
+            })
+        }
         Endpoint::Source(source) => {
             let source = &sources[source.index()];
             Some(InteriorSeed::Source {
@@ -480,16 +645,18 @@ pub(super) fn interior_seed(sources: &[BoundSource], from: &Endpoint) -> Option<
                 carrier: source.carrier.clone(),
             })
         }
-        Endpoint::Sink(_) | Endpoint::Location(_) => None,
+        Endpoint::Sink(_)
+        | Endpoint::StoreWrite(_)
+        | Endpoint::Location(_)
+        | Endpoint::Execution(_) => None,
     }
 }
 
 pub(super) fn interior_observation(
-    plan: &TaintAnalysisPlan,
+    value_flow: &crate::value_flow::ValueFlowPlan,
     sink: ValueFlowSinkId,
 ) -> InteriorObservation {
-    let spec = plan
-        .value_flow()
+    let spec = value_flow
         .sink(sink)
         .expect("a path names a sink of its plan");
     InteriorObservation::Sink {

@@ -2,12 +2,18 @@
 //! procedure and hops are the composition edges, read in the forward
 //! direction (from where a value is to where it goes).
 
-use crate::analyzer::semantic::CallSiteId;
 use crate::analyzer::semantic::partial_flow::PartialFlowPort;
-use crate::value_flow::{DurableCallSiteKey, DurableProcedureKey, ValueFlowSinkId};
+use crate::analyzer::semantic::{
+    AbstractLocation, CallSiteId, DispatchBoundaryKind, ExactExternalProcedureTarget,
+    UnmaterializedExternalTarget,
+};
+use crate::value_flow::{
+    DurableCallSiteKey, DurableProcedureKey, ValueFlowCarrier, ValueFlowObservationPhase,
+    ValueFlowSinkId,
+};
 
-use super::provider::CallerLocation;
-use crate::taint::{TaintClassSet, TaintEdgeFunction};
+use super::labels::LabelFunctionId;
+use super::provider::{CallerLocation, DispatchCandidate};
 
 /// A source of one composition: its index in the search's source table,
 /// which holds the plan's bound sources first and then the sources the
@@ -15,8 +21,27 @@ use crate::taint::{TaintClassSet, TaintEdgeFunction};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ComposedSourceId(pub(super) u32);
 
+/// A call target with no body retains the resolver's typed identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExternalTargetIdentity {
+    Unmaterialized {
+        target: Box<UnmaterializedExternalTarget>,
+        boundary: DispatchBoundaryKind,
+    },
+    Exact {
+        target: Box<ExactExternalProcedureTarget>,
+        boundary: DispatchBoundaryKind,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExecutionTarget {
+    Procedure(Box<DurableProcedureKey>),
+    External(Box<ExternalTargetIdentity>),
+}
+
 impl ComposedSourceId {
-    pub(super) fn index(self) -> usize {
+    pub fn index(self) -> usize {
         usize::try_from(self.0).expect("a source index fits usize")
     }
 }
@@ -26,10 +51,19 @@ impl ComposedSourceId {
 /// positions only an interior run sees.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Endpoint {
+    Execution(Box<ExecutionTarget>),
     Source(ComposedSourceId),
     Sink(ValueFlowSinkId),
+    StoreWrite(usize),
     Port(PartialFlowPort),
     Location(CallerLocation),
+    Writeback {
+        call: CallSiteId,
+        candidate: Box<DispatchCandidate>,
+        heap: PartialFlowPort,
+        storage: Box<AbstractLocation>,
+        uncertain: bool,
+    },
 }
 
 /// One node of the port graph.
@@ -111,6 +145,23 @@ impl HopQuality {
 /// applies.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Hop {
+    Invocation {
+        call: DurableCallSiteKey,
+        /// Ordinal in this call's dispatch answer; distinguishes arms with the same target.
+        ordinal: usize,
+        target: Box<ExecutionTarget>,
+        function: LabelFunctionId,
+        quality: HopQuality,
+    },
+    /// A selected store write reaches a may-alias read output.
+    Store {
+        write_call: DurableCallSiteKey,
+        read_call: DurableCallSiteKey,
+        read_origin: crate::taint::SourceEventKey,
+        read_phase: ValueFlowObservationPhase,
+        read_carrier: ValueFlowCarrier,
+        uncertain: bool,
+    },
     /// An interior run of `procedure`: from a source or an input port to a
     /// sink, an output port or a caller-side location. `crossed` are the
     /// calls of `procedure` that the path class this hop names crossed.
@@ -118,6 +169,7 @@ pub enum Hop {
         procedure: DurableProcedureKey,
         from: Endpoint,
         to: Endpoint,
+        function: LabelFunctionId,
         quality: HopQuality,
         crossed: Box<[CallSiteId]>,
     },
@@ -127,6 +179,7 @@ pub enum Hop {
         procedure: DurableProcedureKey,
         from: PartialFlowPort,
         to: PartialFlowPort,
+        function: LabelFunctionId,
         quality: HopQuality,
         crossed: Box<[CallSiteId]>,
     },
@@ -158,15 +211,13 @@ pub enum Hop {
         uncertain: bool,
     },
     /// A model transfer that replaces a call to `candidate`, from a call input
-    /// port to the call's result. `moved` and `removed` are the model's
-    /// labels, resolved against the plan's universe. `quality` is the
-    /// model's own ([`super::CallModel::quality`]).
+    /// port to the call's result. `function` is what the model's labels do.
+    /// `quality` is the model's own ([`super::CallModel::quality`]).
     Model {
         call: DurableCallSiteKey,
         actual: PartialFlowPort,
         result: PartialFlowPort,
-        moved: Option<TaintClassSet>,
-        removed: TaintClassSet,
+        function: LabelFunctionId,
         quality: HopQuality,
     },
     /// The paranoid unmodeled-call fallback at `call`: a call input to the
@@ -178,10 +229,11 @@ pub enum Hop {
         output: PartialFlowPort,
     },
     /// A bound sanitizer on the path through `call`. Only a proven sanitizer
-    /// removes its classes; an unresolved one makes the hop uncertain.
+    /// removes its labels, so an unproven one's `function` is the identity;
+    /// an unresolved one makes the hop uncertain.
     Sanitizer {
         call: DurableCallSiteKey,
-        removed: TaintClassSet,
+        function: LabelFunctionId,
         proven: bool,
         uncertain: bool,
     },
@@ -190,7 +242,7 @@ pub enum Hop {
     /// its own flow from a call input to a call output.
     Transform {
         call: DurableCallSiteKey,
-        function: TaintEdgeFunction,
+        function: LabelFunctionId,
         uncertain: bool,
     },
 }
@@ -198,7 +250,8 @@ pub enum Hop {
 impl Hop {
     pub const fn quality(&self) -> HopQuality {
         match self {
-            Self::Interior { quality, .. }
+            Self::Invocation { quality, .. }
+            | Self::Interior { quality, .. }
             | Self::Stored { quality, .. }
             | Self::Model { quality, .. } => *quality,
             Self::Callee { uncertain, .. }
@@ -206,6 +259,7 @@ impl Hop {
             | Self::Closure { uncertain, .. }
             | Self::Sanitizer { uncertain, .. }
             | Self::Transform { uncertain, .. } => HopQuality::from_uncertain(*uncertain),
+            Self::Store { uncertain, .. } => HopQuality::from_uncertain(*uncertain),
             Self::Unmodeled { .. } => HopQuality::UNCERTAIN,
         }
     }

@@ -162,7 +162,7 @@ checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arc-swap",
  "brokk-bifrost-core",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-core"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "bincode",
  "brokk-bifrost-test-macros",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-cpp"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-cpp-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-csharp"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-csharp-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-flow"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-go"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-go-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-js-ts"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-js-ts-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-jvm"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-jvm-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-php"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-php-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-policy"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-cpp-analysis",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-python"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-python-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rql"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-ruby"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-ruby-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rust"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rust-analysis"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-cpp",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-csharp-analysis",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-store"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "bincode",
  "brokk-bifrost-core",
@@ -923,14 +923,14 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-test-macros"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-tools"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",

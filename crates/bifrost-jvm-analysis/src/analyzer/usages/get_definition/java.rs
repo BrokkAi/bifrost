@@ -1784,6 +1784,7 @@ fn resolve_java_constructor_call(
         let proof =
             ExactExternalCallProof::java_external_constructor(&owner, &member, parameter_count);
         let evidence = CallEvidence {
+            source_member_evidence: None,
             native_resolution: None,
             model_member_selection: None,
             call_application: proof.call_application(),
@@ -2564,6 +2565,7 @@ fn java_external_call_evidence(
         member.to_owned(),
     );
     CallEvidence {
+        source_member_evidence: None,
         native_resolution: None,
         model_member_selection: None,
         call_application: proof.call_application(),
@@ -6891,7 +6893,11 @@ pub(crate) fn resolve_definition_dispatch<'a>(
                     BoundedResolution::Complete {
                         value: (outcome, evidence),
                         ..
-                    } => DefinitionResolution { outcome, evidence },
+                    } => DefinitionResolution {
+                        outcome,
+                        evidence,
+                        call_binding_discharge_digests: Vec::new(),
+                    },
                     BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
                         limit,
                         format!(
@@ -6918,7 +6924,11 @@ pub(crate) fn resolve_definition_dispatch<'a>(
         evidence = resolution.evidence;
         resolution.outcome
     };
-    std::ops::ControlFlow::Continue(DefinitionResolution { outcome, evidence })
+    std::ops::ControlFlow::Continue(DefinitionResolution {
+        outcome,
+        evidence,
+        call_binding_discharge_digests: Vec::new(),
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -6944,6 +6954,7 @@ pub(crate) fn trial_definition_in_batch(
             BoundedResolution::Complete { value, .. } => DefinitionResolution {
                 outcome: value.outcome,
                 evidence: value.evidence,
+                call_binding_discharge_digests: value.call_binding_reason_digests,
             },
             BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
                 limit,

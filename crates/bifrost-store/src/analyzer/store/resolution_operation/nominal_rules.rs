@@ -161,7 +161,7 @@ impl NominalPackageRules for JvmPackageRules {
         }
     }
     fn admits_qualified_type_bridge_source(&self, source: Language) -> bool {
-        self.admits(source) && source != Language::Java
+        self.admits(source)
     }
     fn member_continuation_mounts(&self, language: Language) -> Option<ImportTargetMounts> {
         if !self.admits(language) {
@@ -230,9 +230,20 @@ pub(in crate::analyzer) enum ImportOriginRoute {
     PackagePrefix(CompilationUnitRelation),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::analyzer) enum RootTypeVisibility {
+    Visible,
+    Hidden,
+    Unknown,
+}
+
 /// Per-language inputs to the shared nominal-package algorithms.
 /// Values are static; no workspace or operation inventory is retained here.
 pub(in crate::analyzer) trait NominalLanguageRules: Sync + 'static {
+    fn unnamed_package_types_visible(&self, _source_package: Option<&str>) -> RootTypeVisibility {
+        RootTypeVisibility::Visible
+    }
+
     /// Required identity and family; every nominal language supplies both.
     fn language(&self) -> Language;
     fn family(&self) -> &'static dyn NominalPackageRules;
@@ -421,6 +432,10 @@ pub(in crate::analyzer) trait NominalLanguageRules: Sync + 'static {
     fn has_projected_value_qualifiers(&self) -> bool {
         false
     }
+    /// Whether a bound expression head may continue a qualified name through its declared type.
+    fn expression_prefix_members(&self) -> bool {
+        false
+    }
     /// Required: projection kinds eligible to provide a qualifier.
     fn qualifier_projection_kinds(&self) -> &'static [BindingProjectionKind];
     /// Required: normalized declared name for member comparison.
@@ -545,6 +560,7 @@ struct JvmLanguageRules {
     callable_values: bool,
     static_owner_languages: &'static [Language],
     projected_values: bool,
+    expression_prefix_members: bool,
     projections: &'static [BindingProjectionKind],
     member_suffix: Option<&'static str>,
     record_gap: RecordImportGap,
@@ -570,6 +586,19 @@ struct JvmLanguageRules {
 }
 
 impl NominalLanguageRules for JvmLanguageRules {
+    fn unnamed_package_types_visible(&self, source_package: Option<&str>) -> RootTypeVisibility {
+        match self.language {
+            // Preparation retains Some("") for an unnamed unit because same-package
+            // and access consumers distinguish it from unavailable metadata.
+            Language::Java | Language::Scala => match source_package {
+                Some("") => RootTypeVisibility::Visible,
+                Some(_) => RootTypeVisibility::Hidden,
+                None => RootTypeVisibility::Unknown,
+            },
+            _ => RootTypeVisibility::Visible,
+        }
+    }
+
     fn root_import_origin(&self, kind: ResolutionRootImportKind) -> BindingOrigin {
         match kind {
             ResolutionRootImportKind::Named => self.named_import_origin,
@@ -841,6 +870,9 @@ impl NominalLanguageRules for JvmLanguageRules {
     fn has_projected_value_qualifiers(&self) -> bool {
         self.projected_values
     }
+    fn expression_prefix_members(&self) -> bool {
+        self.expression_prefix_members
+    }
     fn qualifier_projection_kinds(&self) -> &'static [BindingProjectionKind] {
         self.projections
     }
@@ -891,7 +923,7 @@ static JAVA_RULES: JvmLanguageRules = JvmLanguageRules {
     export_bound: Some(1),
     export_mounts: exact_package_export_mounts,
     qualified_bridges: |operation, language, half, completion, cancellation| {
-        operation.java_qualified_type_publication(language, half, completion, cancellation)
+        operation.common_qualified_type_publication(language, half, completion, cancellation)
     },
     package_peers: &[Language::Java],
     lexical_package: |_, _| Ok(None),
@@ -930,6 +962,7 @@ static JAVA_RULES: JvmLanguageRules = JvmLanguageRules {
     callable_values: false,
     static_owner_languages: &[Language::Java, Language::Kotlin, Language::Scala],
     projected_values: false,
+    expression_prefix_members: true,
     projections: &[
         BindingProjectionKind::TargetTypeOrDeclaredValueType,
         BindingProjectionKind::TargetTypeIdentity,
@@ -998,6 +1031,7 @@ static KOTLIN_RULES: JvmLanguageRules = JvmLanguageRules {
     callable_values: false,
     static_owner_languages: &[],
     projected_values: false,
+    expression_prefix_members: false,
     projections: &[
         BindingProjectionKind::TargetTypeOrDeclaredValueType,
         BindingProjectionKind::TargetTypeIdentity,
@@ -1079,6 +1113,7 @@ static SCALA_RULES: JvmLanguageRules = JvmLanguageRules {
     callable_values: true,
     static_owner_languages: &[],
     projected_values: true,
+    expression_prefix_members: false,
     projections: &[
         BindingProjectionKind::TargetTypeOrDeclaredValueType,
         BindingProjectionKind::TargetTypeIdentity,
@@ -1097,8 +1132,15 @@ fn selected_java_import_context(
     lookup: Option<&str>,
     cancellation: &CancellationToken,
 ) -> Result<JvmImportContext> {
+    // #7314 6b: operation-owned oracle selection; no production override.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(selection) = operation.java_oracle_selection {
+        return operation
+            .java_oracle_context_for_test(selection, path, lookup, cancellation)
+            .map(JvmImportContext::with_open_inventory_gap);
+    }
     operation
-        .selected_java_import_context_with_jvm_peers(path, lookup, cancellation)
+        .assemble_jvm_import_context(Language::Java, path, lookup, cancellation)
         .map(JvmImportContext::with_open_inventory_gap)
 }
 fn reverse_java_import_context(
@@ -1107,7 +1149,12 @@ fn reverse_java_import_context(
     path: &str,
     cancellation: &CancellationToken,
 ) -> Result<JvmImportContext> {
-    operation.selected_java_import_context_with_jvm_peers(path, None, cancellation)
+    // #7314 6b: reverse keeps its own inventory policy on both oracle paths.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(selection) = operation.java_oracle_selection {
+        return operation.java_oracle_context_for_test(selection, path, None, cancellation);
+    }
+    operation.assemble_jvm_import_context(Language::Java, path, None, cancellation)
 }
 
 fn selected_common_import_context(

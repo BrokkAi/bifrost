@@ -34,7 +34,7 @@ bytes.
 
 `bifrost` with no arguments is the compatibility command. It analyzes the
 current directory with the `searchtools` toolset. `bifrost --lsp` fails: the
-language server is a separate program; see [LSP Server](/lsp/).
+language server is a separate program; see [LSP Server](https://github.com/BrokkAi/bifrost-lsp/blob/main/docs/lsp.md).
 
 ### Toolset expression
 

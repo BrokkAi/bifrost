@@ -19,14 +19,19 @@
 //!   `brokk_bifrost_core::analyzer::structural::materialization`: an axis a
 //!   provider does not name is explicitly unsupported, and an unsupported axis
 //!   produces an incomplete topology rather than an empty one.
-//! - The [`BuildModelProvider`] seam one build ecosystem implements. The
-//!   providers themselves live with their ecosystem (the Maven reader is
-//!   `crate::analyzer::jvm::topology`), and the registry that names them is
-//!   assembly, in `crate::analyzer::languages`.
+//! - The fold ([`WorkspaceTopology::fold`]) that combines what every applicable
+//!   build model declares into one workspace answer.
+//!
+//! The `BuildModelProvider` seam one build ecosystem implements, and the
+//! `workspace_topology` entry point that runs every provider, are assembly in
+//! `crate::analyzer::languages`: a provider reads the analyzer's stored rows,
+//! and this module sits below the analyzer in the crate layering (#4452). The
+//! providers themselves live with their ecosystem (the Maven reader is
+//! `crate::analyzer::jvm::topology`, the Cargo reader
+//! `crate::analyzer::rust::topology`).
 
 use std::path::{Path, PathBuf};
 
-use crate::analyzer::Project;
 use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 
 const TOPOLOGY_ENTITY_DOMAIN: &[u8] = b"bifrost.topology.entity.v1";
@@ -258,16 +263,22 @@ pub enum FileOwnershipState {
     /// No build file this producer read claims the file. This is a statement
     /// about the evidence, never a fallback derived from the path.
     Unknown,
+    /// The producer knows the file is a source of its ecosystem but cannot say
+    /// which build project compiles it: a Rust file outside every Cargo
+    /// target, for one. Unlike [`FileOwnershipState::Unknown`] in a complete
+    /// topology, this is never a proven absence.
+    Unresolved,
 }
 
 impl FileOwnershipState {
-    pub const LABELS: &'static [&'static str] = &["owned", "ambiguous", "unknown"];
+    pub const LABELS: &'static [&'static str] = &["owned", "ambiguous", "unknown", "unresolved"];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Owned => "owned",
             Self::Ambiguous => "ambiguous",
             Self::Unknown => "unknown",
+            Self::Unresolved => "unresolved",
         }
     }
 }
@@ -286,11 +297,17 @@ impl FileOwnership {
     /// The row for a file no build file claims. Its own state says so; there is
     /// no path-shaped guess behind it.
     pub fn unknown(file: impl Into<PathBuf>) -> Self {
+        Self::unowned(file, FileOwnershipState::Unknown)
+    }
+
+    /// The row for a file with no single owner, in the given non-owned state.
+    pub fn unowned(file: impl Into<PathBuf>, state: FileOwnershipState) -> Self {
+        debug_assert_ne!(state, FileOwnershipState::Owned);
         Self {
             file: file.into(),
             source_set: None,
             target: None,
-            state: FileOwnershipState::Unknown,
+            state,
         }
     }
 }
@@ -455,6 +472,55 @@ impl WorkspaceTopology {
         }
     }
 
+    /// The topology of a workspace as every build model that applies to it
+    /// declares it, given each applicable provider's support table and answer.
+    ///
+    /// Providers are folded rather than selected: a polyglot workspace can
+    /// carry two build models, and the union of what they declare is the
+    /// workspace's structure. Completeness is the meet over the providers that
+    /// apply, so one provider that found sources of its ecosystem but no build
+    /// file it understands leaves the whole answer incomplete -- which is the
+    /// point, because the missing model is exactly the evidence a policy would
+    /// have concluded from. A provider with nothing of its ecosystem in the
+    /// workspace does not apply and is not passed here, so a Cargo workspace is
+    /// not incomplete for lacking a pom. A workspace no provider applies to is
+    /// incomplete: nothing was read.
+    pub fn fold<'a>(
+        applied: impl IntoIterator<Item = (&'a TopologySupport, WorkspaceTopology)>,
+    ) -> Self {
+        let mut entities = Vec::new();
+        let mut edges = Vec::new();
+        let mut ownership = Vec::new();
+        let mut support = TopologySupport::NONE;
+        let mut completeness = TopologyCompleteness::Complete;
+        let mut provider_failed = false;
+        let mut any_applied = false;
+        for (provider_support, topology) in applied {
+            any_applied = true;
+            completeness = completeness.meet(topology.completeness);
+            provider_failed |= topology.provider_failed;
+            for (axis, axis_support) in provider_support.iter() {
+                if axis_support.is_supported() {
+                    support = support.supported(axis);
+                }
+            }
+            entities.extend(topology.entities);
+            edges.extend(topology.edges);
+            ownership.extend(topology.ownership);
+        }
+        if !any_applied {
+            completeness = TopologyCompleteness::Incomplete;
+        }
+        Self {
+            entities,
+            edges,
+            ownership,
+            support,
+            completeness,
+            provider_failed,
+        }
+    }
+
     pub fn entities(&self) -> &[TopologyEntity] {
         &self.entities
     }
@@ -515,62 +581,6 @@ impl WorkspaceTopology {
                 completeness.meet(edge.completeness)
             });
         (!matched.is_empty(), completeness)
-    }
-}
-
-/// One build ecosystem's reader of its own build files.
-///
-/// A provider is the only code that knows what its build files mean, so it
-/// alone decides which axes it answers and what justifies each row. The
-/// registry that names the providers is assembly
-/// (`crate::analyzer::languages::build_model_providers`); nothing else
-/// dispatches over ecosystems.
-#[doc(hidden)]
-pub trait BuildModelProvider: Send + Sync {
-    /// The axes this provider answers from build evidence.
-    fn support(&self) -> &'static TopologySupport;
-
-    /// Read this workspace's build files. Must not run a build tool or open a
-    /// network connection: a topology row is derived from checked-in build
-    /// metadata alone.
-    fn topology(&self, project: &dyn Project) -> WorkspaceTopology;
-}
-
-/// The topology of `project` as every registered build model declares it.
-///
-/// Providers are folded rather than selected: a polyglot workspace can carry
-/// two build models, and the union of what they declare is the workspace's
-/// structure. Completeness is the meet, so one provider that found no build
-/// file it understands leaves the whole answer incomplete -- which is the
-/// point, because the missing model is exactly the evidence a policy would
-/// have concluded from.
-pub fn workspace_topology(project: &dyn Project) -> WorkspaceTopology {
-    let mut entities = Vec::new();
-    let mut edges = Vec::new();
-    let mut ownership = Vec::new();
-    let mut support = TopologySupport::NONE;
-    let mut completeness = TopologyCompleteness::Complete;
-    let mut provider_failed = false;
-    for provider in crate::analyzer::languages::build_model_providers() {
-        let topology = provider.topology(project);
-        completeness = completeness.meet(topology.completeness);
-        provider_failed |= topology.provider_failed;
-        for (axis, axis_support) in provider.support().iter() {
-            if axis_support.is_supported() {
-                support = support.supported(axis);
-            }
-        }
-        entities.extend(topology.entities);
-        edges.extend(topology.edges);
-        ownership.extend(topology.ownership);
-    }
-    WorkspaceTopology {
-        entities,
-        edges,
-        ownership,
-        support,
-        completeness,
-        provider_failed,
     }
 }
 
