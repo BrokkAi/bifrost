@@ -143,6 +143,14 @@ semantic digests include it. Catalog rows and hydrated provenance retain it.
 Older and curated packs have no extraction authority. Producer names and
 activation-source labels alone do not establish authority.
 
+Activation decides which extraction claims keep their authority. An extraction
+selected by coordinates alone, such as a JDK toolchain range or a package
+version, defers to an active extraction of the exact artifact behind every
+evidence row it matched. The exact artifact is what the workspace compiles
+against, and two producers' facts for one owner need not agree structurally.
+The deferred pack stays active and contributes as curated facts. An evidence row
+with no exact extraction keeps the coordinate extraction's authority.
+
 Rust implementation inventories make two independent claims within one artifact
 source set: a type's direct implementations of source-set traits, and a trait's
 generic implementation rules. Inventory-based absence requires both claims,

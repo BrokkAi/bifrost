@@ -7204,7 +7204,17 @@ impl SelectedResolutionOperation<'_, '_> {
                         competing_source,
                         cancellation,
                     )?);
-                } else if is_default_import && planned.empty && !indexed_external && !compiler_root
+                } else if is_default_import
+                    && planned.empty
+                    && !indexed_external
+                    && !compiler_root
+                    // A platform package declares only classes. With the JDK's
+                    // declarations extracted, a value or callable name is
+                    // absent from it, as a Kotlin or Scala default import of
+                    // `java.lang` is asked for every name a body spells.
+                    && !(source_recipe.namespace() != ResolutionNamespace::Type
+                        && reserved_jdk_package(package)
+                        && self.jdk_declaration_extraction_selected())
                 {
                     scoped_gaps.push(self.jvm_import_context_boundary_gap_with_same_package_shadow(
                         JvmImportContextGapSpec {
@@ -8696,29 +8706,6 @@ impl SelectedResolutionOperation<'_, '_> {
             Language::Java,
             &format!("{}.{}", evidence.package, evidence.lookup.spelling()),
         );
-        let jdk_extraction_selected = self
-            .ready
-            .model_authority()
-            .as_ref()
-            .and_then(|authority| authority.active_models())
-            .is_some_and(|models| {
-                models.shards().iter().any(|shard| {
-                    shard.manifest.ecosystem == "jdk"
-                        && shard
-                            .manifest
-                            .extraction
-                            .as_ref()
-                            .is_some_and(|extraction| {
-                                matches!(
-                        extraction.kind,
-                        crate::analyzer::semantic_model::ArtifactExtractionKind::JdkSourceZip
-                            | crate::analyzer::semantic_model::ArtifactExtractionKind::JdkJmodSet
-                    )
-                            })
-                        && shard.descriptor.payload_kind
-                            == crate::analyzer::semantic_model::PayloadKind::DeclarationFacts
-                })
-            });
         classify_jvm_package(JvmPackageClassificationEvidence {
             external_owner: None,
             has_exports: evidence.published_bridge.is_some(),
@@ -8727,9 +8714,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 .then_some(evidence.whole_package_targets_present.unwrap_or(false)),
             partial,
             intrinsic,
-            reserved_jdk_package: evidence.package == "java"
-                || evidence.package.starts_with("java."),
-            jdk_extraction_selected,
+            reserved_jdk_package: reserved_jdk_package(&evidence.package),
+            jdk_extraction_selected: self.jdk_declaration_extraction_selected(),
         })
     }
 
@@ -14890,6 +14876,39 @@ pub(super) struct JvmPackageClassificationEvidence {
     pub(super) jdk_extraction_selected: bool,
 }
 
+/// Only `java.*` is reserved to the platform: the JVM refuses to define a
+/// class there from any loader but the boot loader, so no library, Kotlin
+/// facade or Scala package object can add to these packages.
+fn reserved_jdk_package(package: &str) -> bool {
+    package == "java" || package.starts_with("java.")
+}
+
+impl SelectedResolutionOperation<'_, '_> {
+    /// A reviewed JDK model with a few declaration facts is not an acquired
+    /// JDK inventory; an extraction-backed declaration shard is required to
+    /// prove absence in a reserved package.
+    fn jdk_declaration_extraction_selected(&self) -> bool {
+        self.ready
+            .model_authority()
+            .as_ref()
+            .and_then(|authority| authority.active_models())
+            .is_some_and(|models| {
+                models.shards().iter().any(|shard| {
+                    shard.manifest.ecosystem == "jdk"
+                        && shard.extraction().is_some_and(|extraction| {
+                            matches!(
+                                extraction.kind,
+                                crate::analyzer::semantic_model::ArtifactExtractionKind::JdkSourceZip
+                                    | crate::analyzer::semantic_model::ArtifactExtractionKind::JdkJmodSet
+                            )
+                        })
+                        && shard.descriptor.payload_kind
+                            == crate::analyzer::semantic_model::PayloadKind::DeclarationFacts
+                })
+            })
+    }
+}
+
 pub(super) fn classify_jvm_package(
     evidence: JvmPackageClassificationEvidence,
 ) -> JvmPackageOutcome {
@@ -15306,33 +15325,16 @@ impl SelectedResolutionOperation<'_, '_> {
                 source_language,
                 &format!("{package}.{}", requested.spelling()),
             );
-        // Only java.* is reserved to the platform. A reviewed JDK model with
-        // a few declaration facts is not an acquired JDK inventory; require
-        // an extraction-backed declaration shard to prove reserved absence.
-        let jdk_extraction_selected = needs_absence_classification && !intrinsic && self
-            .ready
-            .model_authority()
-            .as_ref()
-            .and_then(|a| a.active_models())
-            .is_some_and(|models| {
-                models.shards().iter().any(|shard| {
-                    shard.manifest.ecosystem == "jdk"
-                        && shard.manifest.extraction.as_ref().is_some_and(|extraction| {
-                            matches!(extraction.kind,
-                                crate::analyzer::semantic_model::ArtifactExtractionKind::JdkSourceZip
-                                | crate::analyzer::semantic_model::ArtifactExtractionKind::JdkJmodSet)
-                        })
-                        && shard.descriptor.payload_kind
-                            == crate::analyzer::semantic_model::PayloadKind::DeclarationFacts
-                })
-            });
+        let jdk_extraction_selected = needs_absence_classification
+            && !intrinsic
+            && self.jdk_declaration_extraction_selected();
         let outcome = classify_jvm_package(JvmPackageClassificationEvidence {
             external_owner,
             has_exports: !result.is_empty(),
             selected_package: Some(!targets.ordered.is_empty()),
             partial,
             intrinsic,
-            reserved_jdk_package: package == "java" || package.starts_with("java."),
+            reserved_jdk_package: reserved_jdk_package(package),
             jdk_extraction_selected,
         });
         Ok(

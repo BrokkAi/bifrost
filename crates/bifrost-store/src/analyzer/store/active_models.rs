@@ -449,6 +449,21 @@ pub struct ActiveSemanticModelShardMetadata {
     pub matching_evidence: Vec<SemanticModelActivationEvidence>,
     pub evidence_rank: EvidenceRank,
     pub source_rank: u8,
+    /// Coordinates alone selected this extraction, and an extraction of the
+    /// exact artifact behind every row it matched is also active (#9474). Its
+    /// records then contribute as curated facts to that exact extraction.
+    pub extraction_deferred: bool,
+}
+
+impl ActiveSemanticModelShardMetadata {
+    /// The extraction authority this activation grants. Readers use this,
+    /// never the manifest's claim.
+    pub fn extraction(&self) -> Option<&crate::analyzer::semantic_model::ArtifactExtraction> {
+        self.manifest
+            .extraction
+            .as_ref()
+            .filter(|_| !self.extraction_deferred)
+    }
 }
 
 #[derive(Debug)]
@@ -1381,7 +1396,7 @@ impl ResolvedActiveSemanticModels {
         let direct = owners.get(owner).and_then(|members| members.get(member));
         let mut names = std::collections::HashSet::new();
         for declaration in self.all_type_records_named(owner) {
-            if declaration.shard.manifest.extraction.is_some()
+            if declaration.shard.extraction().is_some()
                 && semantic_pack_realm(&declaration.shard.manifest.language) == realm
             {
                 names.insert(declaration.record.name.clone());

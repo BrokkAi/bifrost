@@ -98,7 +98,7 @@ pub fn provenance_with_visits<E>(
         }
     }
     Ok(SemanticModelProvenance {
-        extraction: shard.manifest.extraction.clone(),
+        extraction: shard.extraction().cloned(),
         active_model_set_hash: active.active_model_set_hash().to_string(),
         pack_digest: shard.manifest.semantic_sha256.clone(),
         pack_id: shard.manifest.pack_id.clone(),

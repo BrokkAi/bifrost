@@ -412,6 +412,9 @@ pub(crate) struct CandidateSelection {
     /// explanation can name them (#3465).
     matched_requirements: Vec<MatchedVersionRequirement>,
     source_rank: u8,
+    /// The exact artifact extraction this candidate's extraction defers to
+    /// (#9474), so the activation explanation can name it.
+    extraction_deferred_to: Option<(CatalogPackSourceKind, String)>,
 }
 
 pub fn resolve_active_semantic_models(
@@ -747,6 +750,7 @@ fn resolve_active_semantic_models_with_loader(
             evidence_rank,
             matched_requirements,
             source_rank: loaded.source_kind.precedence(),
+            extraction_deferred_to: None,
             active: {
                 let has_callable_values = loaded.has_callable_values;
                 ActiveSemanticModelShard {
@@ -764,6 +768,7 @@ fn resolve_active_semantic_models_with_loader(
                             matching_evidence,
                             evidence_rank,
                             source_rank: loaded.source_kind.precedence(),
+                            extraction_deferred: false,
                         },
                     ),
                     decoded: loaded.shard,
@@ -871,6 +876,63 @@ fn resolve_active_semantic_models_with_loader(
         pack_ranks.len(),
         "retain visits every selection once, in order"
     );
+    // An extraction selected by coordinates defers to an extraction of the
+    // exact artifact behind the same coordinates (#9474). A released JDK pack
+    // extracted from src.zip matches any JDK 21 toolchain, while the
+    // production generated from the workspace's jmods matches that JDK's
+    // digest. Both claim extraction authority over every JDK owner, and two
+    // producers' facts never agree structurally, so two authorities left every
+    // owner ambiguous. The exact artifact is what the workspace compiles
+    // against, so it keeps the authority and the coordinate pack stays active
+    // as a curated contributor. A coordinate pack keeps its authority while
+    // any row it matched has no exact extraction.
+    let extracted_declarations = |selection: &CandidateSelection| {
+        selection.active.manifest.extraction.is_some()
+            && selection.payload_kind == PayloadKind::DeclarationFacts
+    };
+    let coordinates = |row: &SemanticModelActivationEvidence| SemanticModelActivationEvidence {
+        artifact_sha256: None,
+        ..row.clone()
+    };
+    let mut exact_extractions =
+        HashMap::<SemanticModelActivationEvidence, (CatalogPackSourceKind, String)>::default();
+    for selection in selected.iter().filter(|selection| {
+        extracted_declarations(selection) && selection.evidence_rank == EvidenceRank::ExactArtifact
+    }) {
+        let source = (
+            selection.active.source_kind,
+            selection.active.source_id.clone(),
+        );
+        for row in &selection.active.matching_evidence {
+            let named = exact_extractions
+                .entry(coordinates(row))
+                .or_insert_with(|| source.clone());
+            if source < *named {
+                named.clone_from(&source);
+            }
+        }
+    }
+    for selection in &mut selected {
+        if !extracted_declarations(selection)
+            || selection.evidence_rank == EvidenceRank::ExactArtifact
+            || selection.active.matching_evidence.is_empty()
+        {
+            continue;
+        }
+        let Some(exact) = selection
+            .active
+            .matching_evidence
+            .iter()
+            .map(|row| exact_extractions.get(&coordinates(row)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        selection.extraction_deferred_to = exact.into_iter().min().cloned();
+        Arc::get_mut(&mut selection.active.metadata)
+            .expect("a candidate owns its shard metadata until activation publishes it")
+            .extraction_deferred = true;
+    }
     selected.sort_by(compare_selection);
     let mut active = Vec::new();
     let mut by_semantic_shard = BTreeMap::<(String, PayloadKind), usize>::new();
@@ -940,6 +1002,12 @@ fn resolve_active_semantic_models_with_loader(
                 reason.push_str("; ");
                 reason.push_str(&matched.describe());
             }
+        }
+        if let Some((source_kind, source_id)) = &selection.extraction_deferred_to {
+            reason.push_str(&format!(
+                "; extraction authority defers to the exact artifact extraction from {} source {source_id}",
+                source_kind.as_str()
+            ));
         }
         push_explanation(
             &mut report,
@@ -1582,6 +1650,9 @@ pub(crate) fn active_model_set_hash(
         if selection.active.approximate {
             hasher.update(b"approximate\0");
         }
+        if selection.active.extraction_deferred {
+            hasher.update(b"extraction_deferred\0");
+        }
         hash_key_part(&mut hasher, &selection.semantic_sha256);
         hasher.update([match selection.payload_kind {
             PayloadKind::DeclarationFacts => 0,
@@ -1914,6 +1985,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
                     matching_evidence: vec![evidence],
                     evidence_rank,
                     source_rank,
+                    extraction_deferred: false,
                 },
             ),
             decoded: Some(decoded),
@@ -2082,6 +2154,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
                         matching_evidence: vec![evidence],
                         evidence_rank: EvidenceRank::Language,
                         source_rank: 0,
+                        extraction_deferred: false,
                     },
                 ),
                 decoded: Some(decoded),
@@ -2499,6 +2572,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
                         matching_evidence: vec![first.clone(), second.clone()],
                         evidence_rank: EvidenceRank::Language,
                         source_rank: 0,
+                        extraction_deferred: false,
                     },
                 ),
                 decoded: Some(decoded),
@@ -2584,6 +2658,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
                             matching_evidence: vec![evidence],
                             evidence_rank: EvidenceRank::Language,
                             source_rank: 0,
+                            extraction_deferred: false,
                         },
                     ),
                     decoded: Some(decoded),
@@ -2628,6 +2703,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
                         matching_evidence: vec![second.clone()],
                         evidence_rank: EvidenceRank::Language,
                         source_rank: 1,
+                        extraction_deferred: false,
                     },
                 ),
                 decoded: Some(decoded),
@@ -2907,6 +2983,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
                         matching_evidence: vec![evidence.clone()],
                         evidence_rank: EvidenceRank::ExactArtifact,
                         source_rank: 1,
+                        extraction_deferred: false,
                     },
                 ),
                 decoded: Some(decoded),
@@ -3251,6 +3328,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
                         matched_evidence,
                         evidence_rank: EvidenceRank::Language,
                         source_rank: 0,
+                        extraction_deferred: false,
                     },
                 ),
                 decoded: Some(decoded),
@@ -3440,6 +3518,7 @@ pub(crate) mod active_model_set_identity_tests {
             evidence_rank,
             matched_requirements: Vec::new(),
             source_rank: 0,
+            extraction_deferred_to: None,
             active: {
                 let decoded = shard;
                 let manifest = std::sync::Arc::new(compiled.manifest);
@@ -3464,6 +3543,7 @@ pub(crate) mod active_model_set_identity_tests {
                             matched_evidence,
                             evidence_rank,
                             source_rank: 0,
+                            extraction_deferred: false,
                         },
                     ),
                     decoded: Some(decoded),

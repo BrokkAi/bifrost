@@ -83,7 +83,7 @@ impl<'a> RowCompositionReads<'a> {
                     && super::admits_defining_owner(
                         self.defining_owner,
                         &provider,
-                        shard.manifest.extraction.as_ref(),
+                        shard.extraction(),
                     )
             })
             .map(|shard| {

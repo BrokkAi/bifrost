@@ -163,7 +163,7 @@ fn procedure_owner_names(
     let realm = brokk_bifrost_core::analyzer::model::semantic_pack_realm(key.language);
     let mut owners = HashSet::default();
     for declaration in declarations {
-        if declaration.shard.manifest.extraction.is_some()
+        if declaration.shard.extraction().is_some()
             && brokk_bifrost_core::analyzer::model::semantic_pack_realm(
                 &declaration.shard.manifest.language,
             ) == realm
@@ -275,7 +275,7 @@ pub fn representative_identity(
             .all_type_records_with_id(&symbol.id)?
             .iter()
             .any(|other| {
-                other.shard.manifest.extraction.is_some()
+                other.shard.extraction().is_some()
                     && !owner_structure_agrees(&first.record, &other.record)
             });
     }
@@ -559,7 +559,7 @@ pub(super) fn compose(
             let mut artifacts = active
                 .all_member_records_with_id(&symbols[index].id)?
                 .into_iter()
-                .filter(|r| r.shard.manifest.extraction.is_some());
+                .filter(|r| r.shard.extraction().is_some());
             if let Some(first) = artifacts.next() {
                 symbols[index].provenance.ambiguous = !owner_ids.contains(&first.record.owner)
                     || artifacts.any(|other| {

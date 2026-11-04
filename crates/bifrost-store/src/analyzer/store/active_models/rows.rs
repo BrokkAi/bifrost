@@ -267,7 +267,7 @@ impl ResolvedActiveSemanticModels {
         let realm = semantic_pack_realm(key.language);
         let mut names = HashSet::default();
         for declaration in self.all_type_records_named(key.owner) {
-            if declaration.shard.manifest.extraction.is_some()
+            if declaration.shard.extraction().is_some()
                 && semantic_pack_realm(&declaration.shard.manifest.language) == realm
             {
                 names.insert(declaration.record.name.clone());

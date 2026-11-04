@@ -176,7 +176,7 @@ fn with_artifact_declarations<T: PartialEq>(
     mut matched: SemanticModelMatch<T>,
     records: impl Iterator<Item = crate::analyzer::semantic_model::ActivatedSemanticModelRecord<T>>,
 ) -> SemanticModelMatch<T> {
-    for record in records.filter(|r| r.shard.manifest.extraction.is_some()) {
+    for record in records.filter(|r| r.shard.extraction().is_some()) {
         if matched.records.iter().any(|existing| {
             Arc::ptr_eq(&existing.record, &record.record)
                 && Arc::ptr_eq(&existing.shard, &record.shard)

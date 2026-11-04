@@ -10372,6 +10372,14 @@ enum JvmExtensionReceiverMatch {
     Incompatible,
 }
 
+/// How a Kotlin call candidate's declaring member is reached: through a
+/// dispatch receiver, or as a type-accessed (Java static) member of `owner`.
+enum KotlinMemberOwner {
+    Dispatch(SemanticId),
+    Static(SemanticId),
+    Unknown,
+}
+
 /// Members the qualifier's own implementations declare, every one of them an
 /// item of an `impl Trait for Type` block, with the traits those blocks
 /// implement.
@@ -34604,7 +34612,34 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 // called on the enclosing instance the walk came through, so the
                 // dispatch owner is not an open receiver contract.
                 (None, None, Some(_)) => {}
-                (None, Some(_), None) => complete = false,
+                (None, Some(actual), None) => {
+                    // A Java static member is called on its class name. The
+                    // qualifier is then a type object, which must name the
+                    // declaring class or one of its subclasses.
+                    let Some(owner) = self.kotlin_member_owner(candidate)? else {
+                        return Ok(None);
+                    };
+                    let qualifier = previous_states.get(&actual).and_then(|state| {
+                        *completion = completion.combine(state.completion());
+                        call_applicability_adapter(obligation.language())
+                            .receiver_formal_type(state)
+                    });
+                    match (owner, qualifier) {
+                        (KotlinMemberOwner::Static(owner), Some(qualifier)) => {
+                            let Some(evidence) = self.kotlin_receiver_type_owner_evidence(
+                                Some(qualifier),
+                                owner,
+                                previous_states,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            complete &= evidence.kind != ConversionKind::Unknown;
+                            conversions.push(evidence);
+                        }
+                        _ => complete = false,
+                    }
+                }
                 (None, None, None) => {}
             }
         }
@@ -34654,6 +34689,36 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         &mut self,
         candidate: SemanticId,
     ) -> StoreResult<Option<Option<SemanticId>>> {
+        let Some(owner) = self.kotlin_member_owner(candidate)? else {
+            return Ok(None);
+        };
+        Ok(Some(match owner {
+            KotlinMemberOwner::Dispatch(owner) => Some(owner),
+            KotlinMemberOwner::Static(_) | KotlinMemberOwner::Unknown => None,
+        }))
+    }
+
+    fn kotlin_member_owner(
+        &mut self,
+        candidate: SemanticId,
+    ) -> StoreResult<Option<KotlinMemberOwner>> {
+        let read = self.session.member_owners_for_definitions(&[candidate])?;
+        let Some(rows) = self.accept_session_read(read) else {
+            return Ok(None);
+        };
+        // A constructor or other type-accessed member needs no dispatch
+        // receiver, so its owner is not a receiver contract, even when a
+        // qualified route recorded the owner it was found in.
+        let declared = match rows.as_slice() {
+            [row] => Some((
+                row.get(self.session).row().access(),
+                row.get(self.session).row().owner_definition(),
+            )),
+            _ => None,
+        };
+        if let Some((ResolutionMemberAccess::Type, owner)) = declared {
+            return Ok(Some(KotlinMemberOwner::Static(owner)));
+        }
         if let Some(owner) = self
             .member_owner_by_target
             .get(&candidate)
@@ -34661,21 +34726,12 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             .filter(|owner| owner.route_kind() != FactMemberRouteKind::Extension)
             .map(FactMemberOwner::owner)
         {
-            return Ok(Some(Some(owner)));
+            return Ok(Some(KotlinMemberOwner::Dispatch(owner)));
         }
-        let read = self.session.member_owners_for_definitions(&[candidate])?;
-        let Some(rows) = self.accept_session_read(read) else {
-            return Ok(None);
-        };
-        // A constructor or other type-accessed member needs no dispatch
-        // receiver, so its owner is not a receiver contract.
-        let owner = match rows.as_slice() {
-            [row] if row.get(self.session).row().access() == ResolutionMemberAccess::Instance => {
-                Some(row.get(self.session).row().owner_definition())
-            }
-            _ => None,
-        };
-        Ok(Some(owner))
+        Ok(Some(match declared {
+            Some((ResolutionMemberAccess::Instance, owner)) => KotlinMemberOwner::Dispatch(owner),
+            _ => KotlinMemberOwner::Unknown,
+        }))
     }
 
     #[doc(hidden)]

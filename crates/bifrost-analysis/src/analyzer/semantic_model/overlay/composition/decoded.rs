@@ -22,7 +22,7 @@ impl SelectedDecodedReads<'_> {
             pack_digest: shard.manifest.semantic_sha256.clone(),
         };
         shard.manifest.language == self.language
-            && self.admits_provider(&provider, shard.manifest.extraction.as_ref())
+            && self.admits_provider(&provider, shard.extraction())
     }
 
     fn shards(&self) -> impl Iterator<Item = &Arc<ActiveSemanticModelShard>> {
